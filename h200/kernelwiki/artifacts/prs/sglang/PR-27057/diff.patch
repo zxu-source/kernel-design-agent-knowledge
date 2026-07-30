@@ -1,0 +1,143 @@
+diff --git a/python/sglang/srt/layers/quantization/quark/quark.py b/python/sglang/srt/layers/quantization/quark/quark.py
+index 33ef806d61ba..9f58de0a7f6f 100644
+--- a/python/sglang/srt/layers/quantization/quark/quark.py
++++ b/python/sglang/srt/layers/quantization/quark/quark.py
+@@ -37,6 +37,18 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++_MOE_SHARED_EXPERT_QUANT_LAYER0_BASES: tuple[str, ...] = (
++    "model.layers.0",
++    "model.language_model.layers.0",
++)
++
++_SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
++    "gate_proj",
++    "up_proj",
++    "gate_up_proj",
++    "down_proj",
++)
++
+ 
+ class QuarkConfig(QuantizationConfig):
+ 
+@@ -492,6 +504,38 @@ def get_moe_scheme(
+     def get_scaled_act_names(self) -> List[str]:
+         return []
+ 
++    def can_fuse_shared_expert(self) -> bool:
++        # Shared-expert body excluded from quant; the gate must not veto fusion.
++        if any(
++            "shared_expert" in layer
++            and "shared_expert_gate" not in layer
++            and not layer.startswith("mtp.")
++            for layer in self.exclude_layers
++        ):
++            return False
++
++        # No per-layer config -> uniform spec, nothing to compare.
++        layer_quant_config = self.quant_config.get("layer_quant_config") or {}
++        if not layer_quant_config:
++            return True
++
++        # Compare routed vs shared specs at layer 0 (stub module needed by
++        # _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
++        lookup_stub = torch.nn.Module()
++        try:
++            for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES:
++                moe_name = f"{base}.mlp.experts"
++                moe_cfg = self._find_matched_config(moe_name, lookup_stub)
++                for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
++                    shared_name = f"{base}.mlp.shared_expert.{suffix}"
++                    shared_cfg = self._find_matched_config(shared_name, lookup_stub)
++                    if not deep_compare(moe_cfg, shared_cfg):
++                        return False
++        except ValueError:
++            return False
++
++        return True
++
+ 
+ class QuarkLinearMethod(LinearMethodBase):
+ 
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index 6fa7bb5497eb..736c2e4248f8 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -156,20 +156,17 @@ def can_fuse_shared_expert(
+     ):
+         return False
+ 
+-    # If the shared expert is excluded from quantization (stored as FP32 in the
+-    # checkpoint), fusing it into the quantized MoE weight tensor requires online
+-    # quantization which is not supported. Disable fusion in this case.
+     if quant_config is not None:
+         exclude_layers = getattr(quant_config, "exclude_layers", None)
+         if exclude_layers is None:
+             exclude_layers = getattr(quant_config, "ignored_layers", [])
+-        if any(
+-            "shared_expert" in layer
+-            and "shared_expert_gate" not in layer
+-            and not layer.startswith("mtp.")
+-            for layer in exclude_layers
+-        ):
+-            return False
++
++        # Other backends than quark do not exclude the shared expert here, so they
++        # intentionally fall through and remain fusable
++        can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
++        if can_fuse_fn is not None:
++            if not can_fuse_fn():
++                return False
+ 
+     return True
+ 
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 2c059217c344..19ab50c2ac21 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -80,7 +80,11 @@
+     default_weight_loader,
+     sharded_weight_loader,
+ )
+-from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
++from sglang.srt.models.qwen2_moe import (
++    Qwen2MoeMLP,
++    Qwen2MoeSparseMoeBlock,
++    can_fuse_shared_expert,
++)
+ 
+ # Models
+ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+@@ -1117,6 +1121,21 @@ def get_hidden_dim(self, module_name: str, layer_idx: int):
+                 f"get_hidden_dim not implemented for {module_name}"
+             )
+ 
++    def _maybe_autodisable_shared_experts_fusion(self, config, quant_config):
++        # Auto-disable fusion when the checkpoint can't fuse (e.g. MXFP4 Qwen3.5)
++        # so the model still gets the #25885 multi-streaming path. ROCm-only.
++        server_args = get_global_server_args()
++        if (
++            config.model_type == "qwen3_5_moe_text"
++            and not server_args.disable_shared_experts_fusion
++            and not can_fuse_shared_expert(config, quant_config)
++        ):
++            server_args.disable_shared_experts_fusion = True
++            logger.info(
++                "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
++                "auto-disabling (multi-streaming #25885 still applies)."
++            )
++
+     def __init__(
+         self,
+         config: Qwen3_5TextConfig,
+@@ -1129,6 +1148,9 @@ def __init__(
+         self.hidden_size = config.hidden_size
+         self.pp_group = get_pp_group()
+ 
++        if _is_hip:
++            self._maybe_autodisable_shared_experts_fusion(config, quant_config)
++
+         alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
+ 
+         # Embedding layer

@@ -1,0 +1,232 @@
+diff --git a/.github/workflows/pr-states.yml b/.github/workflows/pr-states.yml
+index 288151b8d3e1..1af84dad4789 100644
+--- a/.github/workflows/pr-states.yml
++++ b/.github/workflows/pr-states.yml
+@@ -198,7 +198,8 @@ jobs:
+ 
+             const body = pr.body || '';
+ 
+-            const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
++            // \n* absorbs preceding blank lines so repeated PATCHes don't accumulate them.
++            const blockRe = new RegExp(`\\n*(?:---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
+             let newBody;
+             if (blockRe.test(body)) {
+               newBody = body.replace(blockRe, `\n\n${newBlock}`);
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index d5beef75bb47..aadb2171bc51 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -808,7 +808,7 @@ class Envs:
+     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+ 
+     # Logits processor
+-    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
++    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(True)
+     SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+ 
+     # Tool-Call behavior
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index ad1c70a0deb0..a168481c5c61 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -793,9 +793,13 @@ def process_input_logprobs_by_chunk(
+             # This is needed to correctly index into extend_input_logprob_token_ids_gpu
+             mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
+ 
+-            # Get the logits for this chunk
++            # Get the logits for this chunk. Each chunk must own its output:
++            # writing through the shared graph logits buffer would alias
++            # chunks whose shape happens to match the buffer.
+             chunk_states = pruned_states[start_idx:end_idx]
+-            chunk_logits = self._get_logits(chunk_states, lm_head, logits_metadata)
++            chunk_logits = self._get_logits(
++                chunk_states, lm_head, logits_metadata, use_logits_buffer=False
++            )
+ 
+             # Initialize sampled_logits on first chunk
+             if i == 0:
+@@ -896,6 +900,7 @@ def _get_logits(
+         lm_head: VocabParallelEmbedding,
+         logits_metadata: LogitsMetadata,
+         embedding_bias: Optional[torch.Tensor] = None,
++        use_logits_buffer: bool = True,
+     ) -> torch.Tensor:
+         """Get logits from hidden_states.
+ 
+@@ -922,7 +927,9 @@ def _get_logits(
+             logits, local_hidden_states, logits_metadata
+         )
+ 
+-        logits = self._copy_logits_to_buffer(logits, logits_metadata)
++        logits = self._copy_logits_to_buffer(
++            logits, logits_metadata, use_buffer=use_logits_buffer
++        )
+ 
+         if self.final_logit_softcapping:
+             if not (_is_npu or _is_cpu):
+@@ -1038,9 +1045,12 @@ def _scatter_dp_attn_logits(
+         return logits
+ 
+     def _copy_logits_to_buffer(
+-        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
++        self,
++        logits: torch.Tensor,
++        logits_metadata: LogitsMetadata,
++        use_buffer: bool = True,
+     ) -> torch.Tensor:
+-        logits_buffer = logits_metadata.next_token_logits_buffer
++        logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
+         if logits.shape[-1] > self.vocab_size:
+             logits = logits[:, : self.vocab_size]
+         logits_width = logits.shape[-1]
+diff --git a/python/sglang/srt/lora/backend/triton_backend.py b/python/sglang/srt/lora/backend/triton_backend.py
+index dfadc3a67c42..e08fa2410835 100644
+--- a/python/sglang/srt/lora/backend/triton_backend.py
++++ b/python/sglang/srt/lora/backend/triton_backend.py
+@@ -339,7 +339,7 @@ def _prepare_lm_head_batch_info(
+                     merged_segments = merge_and_chunk_segments(
+                         seg_wi, seg_lens_list, chunk_size=pass_total
+                     )
+-                    self.lm_head_pass_batch_infos.append(
++                    lm_head_pass_batch_infos.append(
+                         self._build_lm_head_batch_info(
+                             merged_segments, batch_info, pass_total
+                         )
+diff --git a/test/registered/core/test_srt_endpoint.py b/test/registered/core/test_srt_endpoint.py
+index 4b55136fe484..04c2fa2eda46 100644
+--- a/test/registered/core/test_srt_endpoint.py
++++ b/test/registered/core/test_srt_endpoint.py
+@@ -28,8 +28,8 @@
+     run_logprob_check,
+ )
+ 
+-register_cuda_ci(est_time=134, stage="base-b", runner_config="1-gpu-small")
+-register_amd_ci(est_time=130, suite="stage-b-test-1-gpu-small-amd")
++register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-small")
++register_amd_ci(est_time=160, suite="stage-b-test-1-gpu-small-amd")
+ 
+ SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
+ 
+@@ -43,7 +43,10 @@ def setUpClass(cls):
+             cls.model,
+             cls.base_url,
+             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+-            env=SERVER_ENV,
++            # The tiny logprob chunk size routes this file's logprob tests
++            # through the multi-chunk stitching path (requests at or below 64
++            # rows still cover the non-chunked path).
++            env={**SERVER_ENV, "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "64"},
+             other_args=(
+                 "--enable-custom-logit-processor",
+                 "--mem-fraction-static",
+@@ -269,6 +272,47 @@ def test_logprob_mixed(self):
+         with ThreadPoolExecutor(8) as executor:
+             list(executor.map(func, args))
+ 
++    def test_logprob_token_ids_chunked(self):
++        """input_token_ids_logprobs must line up with input_token_logprobs across chunks.
++
++        The two fields are stitched by separate code paths
++        (get_token_ids_logprobs_chunk vs the arange gather), so at positions
++        where the actual next token is probed their values must agree.
++        """
++        prompt_ids = list(range(5, 305))
++        probe_ids = list(range(5, 305, 37))
++        response = requests.post(
++            self.base_url + "/generate",
++            json={
++                "input_ids": prompt_ids,
++                "sampling_params": {
++                    "temperature": 0,
++                    "max_new_tokens": 4,
++                    "ignore_eos": True,
++                },
++                "return_logprob": True,
++                "logprob_start_len": 0,
++                "token_ids_logprob": probe_ids,
++            },
++        )
++        meta = response.json()["meta_info"]
++        input_token_logprobs = meta["input_token_logprobs"]
++        input_token_ids_logprobs = meta["input_token_ids_logprobs"]
++        self.assertEqual(len(input_token_ids_logprobs), len(input_token_logprobs))
++
++        probe_id_set = set(probe_ids)
++        checked = 0
++        for (logprob, token_id, *_), probes in zip(
++            input_token_logprobs, input_token_ids_logprobs
++        ):
++            if logprob is None or token_id not in probe_id_set:
++                continue
++            probe_logprobs = {tid: lp for lp, tid, *_ in probes}
++            self.assertAlmostEqual(probe_logprobs[token_id], logprob, places=4)
++            checked += 1
++        # The consecutive-id prompt guarantees every 37th position is probed.
++        self.assertGreater(checked, 4)
++
+     def test_logprob_grammar(self):
+         prompts = "Question: Is Paris the Capital of France? Answer:"
+         allowed_tokens = [" Yes", " No"]
+diff --git a/test/registered/lora/test_lora_moe_tp_logprob_diff.py b/test/registered/lora/test_lora_moe_tp_logprob_diff.py
+index cd277662b82d..6ee668fe2926 100644
+--- a/test/registered/lora/test_lora_moe_tp_logprob_diff.py
++++ b/test/registered/lora/test_lora_moe_tp_logprob_diff.py
+@@ -19,6 +19,7 @@
+ 
+ import torch
+ 
++from sglang.srt.environ import envs
+ from sglang.test.ci.ci_register import register_cuda_ci
+ from sglang.test.lora_utils import (
+     MOE_BASE_MODEL_PATH,
+@@ -32,9 +33,12 @@
+     is_in_ci,
+ )
+ 
+-register_cuda_ci(est_time=200, stage="extra-a", runner_config="2-gpu-large")
++register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
+ 
+ LOGPROB_THRESHOLD = 5e-04
++# Chunked vs non-chunked runs differ only in lm_head matmul shape (16-row
++# chunks vs one full pass), which shifts bf16 rounding slightly.
++CHUNK_LOGPROB_THRESHOLD = 5e-03
+ MAX_NEW_TOKENS = 10
+ 
+ 
+@@ -146,6 +150,36 @@ def test_moe_lora_tp2_vs_tp1_basic(self):
+             label="MoE LoRA TP parity (basic)",
+         )
+ 
++    def test_moe_lora_tp2_chunked_vs_unchunked_logprobs(self):
++        """TP=2 input logprobs must match between chunked and non-chunked runs.
++
++        Fixing tp_size isolates the chunk grid as the only variable (a TP1 vs
++        TP2 comparison is polluted by MoE router near-ties on input positions).
++        The tiny chunk size forces multi-chunk stitching and the per-chunk
++        vocab all-gather under TP=2.
++        """
++        prompts = MOE_LORA_TEST_PROMPTS[:3]
++        baseline = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
++        torch.cuda.empty_cache()
++        with envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.override(16):
++            chunked = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
++
++        for i in range(len(prompts)):
++            self.assertEqual(
++                baseline["output_strs"][i].strip(),
++                chunked["output_strs"][i].strip(),
++            )
++            base_in = torch.tensor(baseline["top_input_logprobs"][i])
++            chunk_in = torch.tensor(chunked["top_input_logprobs"][i])
++            self.assertEqual(base_in.shape, chunk_in.shape)
++            max_diff = torch.max(torch.abs(base_in - chunk_in)).item()
++            self.assertLessEqual(
++                max_diff,
++                CHUNK_LOGPROB_THRESHOLD,
++                f"Chunked vs non-chunked input logprob diff too large on "
++                f"prompt {i}: max_diff={max_diff:.6e}",
++            )
++
+     @unittest.skipIf(is_in_ci(), "Skipping full test in CI")
+     def test_moe_lora_tp2_vs_tp1_full(self):
+         """Full TP=1 vs TP=2 parity across all prompts."""

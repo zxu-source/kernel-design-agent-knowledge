@@ -1,0 +1,143 @@
+diff --git a/tests/v1/attention/test_attention_backends.py b/tests/v1/attention/test_attention_backends.py
+index abbdeac1ef8c..3110e4b4ee17 100644
+--- a/tests/v1/attention/test_attention_backends.py
++++ b/tests/v1/attention/test_attention_backends.py
+@@ -646,6 +646,33 @@ class MockLayer:
+     assert impl.get_xqa_bmm1_scale(MockLayer, torch.float8_e4m3fn) == 3.0
+ 
+ 
++@pytest.mark.skipif(
++    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
++    reason="FlashInfer is not available.",
++)
++@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
++def test_flashinfer_attention_sinks_refreshed_after_reload(dtype):
++    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
++
++    source_sinks = torch.tensor([1.0, 2.0], dtype=dtype)
++    impl = object.__new__(flashinfer_backend.FlashInferImpl)
++    impl._sinks_source = source_sinks
++    impl.sinks = source_sinks
++
++    impl.process_weights_after_loading(dtype)
++
++    assert impl.sinks is not None
++    sinks_ptr = impl.sinks.data_ptr()
++    assert impl.sinks.dtype == torch.float32
++    torch.testing.assert_close(impl.sinks, source_sinks.float())
++
++    source_sinks.copy_(torch.tensor([3.0, 4.0], dtype=dtype))
++    impl.process_weights_after_loading(dtype)
++
++    assert impl.sinks.data_ptr() == sinks_ptr
++    torch.testing.assert_close(impl.sinks, source_sinks.float())
++
++
+ @pytest.mark.skipif(
+     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+     reason="FlashInfer is not available.",
+diff --git a/tests/v1/attention/test_mla_backends.py b/tests/v1/attention/test_mla_backends.py
+index 3afa8eca9255..b7f9abafc5bc 100644
+--- a/tests/v1/attention/test_mla_backends.py
++++ b/tests/v1/attention/test_mla_backends.py
+@@ -77,6 +77,45 @@
+         BACKENDS_TO_TEST.remove(AttentionBackendEnum.TOKENSPEED_MLA)
+ 
+ 
++def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
++    layer = MLAAttention.__new__(MLAAttention)
++    torch.nn.Module.__init__(layer)
++    layer.kv_lora_rank = 2
++    layer.num_heads = 2
++    layer.qk_nope_head_dim = 3
++    layer.v_head_dim = 4
++    layer.kv_b_proj = torch.nn.Module()
++    layer.kv_b_proj.weight = torch.nn.Parameter(
++        torch.arange(28.0, dtype=torch.float16).reshape(14, 2)
++    )
++    layer.kv_b_proj.quant_method = None
++    layer.is_aiter_triton_fp4_bmm_enabled = False
++    layer.is_aiter_triton_fp8_bmm_enabled = False
++    layer.quant_config = None
++    layer.layer_name = "test"
++
++    monkeypatch.setattr(
++        mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
++    )
++
++    with torch.no_grad():
++        layer.process_weights_after_loading(torch.float32)
++        assert isinstance(layer.W_UV, torch.nn.Parameter)
++        assert isinstance(layer.W_UK_T, torch.nn.Parameter)
++        w_uv_ptr = layer.W_UV.data_ptr()
++        w_uk_t_ptr = layer.W_UK_T.data_ptr()
++        old_w_uv = layer.W_UV.clone()
++        old_w_uk_t = layer.W_UK_T.clone()
++
++        layer.kv_b_proj.weight.add_(100)
++        layer.process_weights_after_loading(torch.float32)
++
++    assert layer.W_UV.data_ptr() == w_uv_ptr
++    assert layer.W_UK_T.data_ptr() == w_uk_t_ptr
++    torch.testing.assert_close(layer.W_UV, old_w_uv + 100)
++    torch.testing.assert_close(layer.W_UK_T, old_w_uk_t + 100)
++
++
+ # Filtered per-test via validate_configuration (capability/deps/dims).
+ PREFILL_BACKENDS_TO_TEST = [
+     MLAPrefillBackendEnum.FLASH_ATTN,
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 108e6ff1524d..881af1d20878 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -240,6 +240,7 @@
+     kFp8StaticTensorSym,
+     kNvfp4Dynamic,
+ )
++from vllm.model_executor.utils import replace_parameter
+ from vllm.platforms import current_platform
+ from vllm.utils.flashinfer import has_flashinfer
+ from vllm.utils.math_utils import cdiv, round_down
+@@ -989,9 +990,9 @@ def process_weights_after_loading(self, act_dtype: torch.dtype):
+                 )
+         else:
+             # Convert from (L, N, V) to (N, L, V)
+-            self.W_UV = W_UV.transpose(0, 1)
++            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+             # Convert from (L, N, P) to (N, P, L)
+-            self.W_UK_T = W_UK.permute(1, 2, 0)
++            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+ 
+         # If we should not load quant weights, we initialize the scales to 1.0
+         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 9eb1cdbef321..5a029747247d 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -1573,6 +1573,8 @@ def __init__(
+             )
+ 
+         self.sinks: torch.Tensor | None = None
++        # Keep the source so RL weight updates can refresh the runtime tensor.
++        self._sinks_source = sinks
+         if sinks is not None:
+             if sinks.shape[0] != num_heads:
+                 raise ValueError(
+@@ -1633,8 +1635,15 @@ def fused_output_quant_supported(self, quant_key: QuantKey):
+ 
+     # FlashInfer requires attention sinks to be float32
+     def process_weights_after_loading(self, act_dtype: torch.dtype):
+-        if self.sinks is not None and self.sinks.dtype != torch.float32:
+-            self.sinks = self.sinks.to(torch.float32)
++        source_sinks = self._sinks_source
++        if source_sinks is None:
++            return
++        if source_sinks.dtype == torch.float32:
++            self.sinks = source_sinks
++        elif self.sinks is None or self.sinks.dtype != torch.float32:
++            self.sinks = source_sinks.to(torch.float32)
++        else:
++            self.sinks.copy_(source_sinks)
+ 
+     def get_xqa_bmm1_scale(self, layer: torch.nn.Module, q_data_type: torch.dtype):
+         bmm1_scale = self.scale

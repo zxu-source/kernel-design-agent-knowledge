@@ -1,0 +1,470 @@
+diff --git a/docs/design/fusions.md b/docs/design/fusions.md
+index 371a9c593202..c9991f75cdb8 100644
+--- a/docs/design/fusions.md
++++ b/docs/design/fusions.md
+@@ -30,7 +30,7 @@ or just on the low or high end.
+ | [RMSNorm + Quant](#rmsnorm--quantization-fuse_norm_quant)                      | `fuse_norm_quant`            | RMSNorm (+residual add) → FP8/FP4 quant        | O1 (conditional)               | 1-4%               | No        | Always       |
+ | [SiLU+Mul + Quant](#silumul--quantization-fuse_act_quant)                      | `fuse_act_quant`             | SiLU+Mul activation → FP8/FP4 quant            | O1 (conditional)               | 1-4%               | No        | Always       |
+ | [RMSNorm + Padding](#rmsnorm--padding-fuse_act_padding)                        | `fuse_act_padding`           | Residual add + RMSNorm → padding               | O1 (ROCm/AITER only)           | TBD                | No        | Always       |
+-| [MLA Dual RMSNorm](#mla-dual-rmsnorm-fuse_mla_dual_rms_norm)                   | `fuse_mla_dual_rms_norm`     | Paired Q + KV RMSNorm → single kernel          | O1 (ROCm/AITER only)           | ~2%                | No        | Always       |
++| [MLA Dual RMSNorm](#mla-dual-rmsnorm-fuse_mla_dual_rms_norm)                   | `fuse_mla_dual_rms_norm`     | Paired Q + KV RMSNorm (+ FP8 quant) → 1 kernel | O1 (ROCm/AITER only)           | 1-2%               | No        | Always       |
+ 
+ ## Support Matrix
+ 
+@@ -381,11 +381,32 @@ q_normed, kv_normed = fused_mla_dual_rms_norm(
+ Requires: AMD ROCm with AITER enabled. Enabled by default at optimization level O1 and above
+ when AITER is available.
+ 
++**FP8 attention variant (per-token quant).** With a per-token FP8 `q_b_proj`,
++only the *q* latent is FP8-quantized while *kv* stays bf16.
++`RocmAiterRMSNormQuantFusionPass` first folds the q side into
++`rocm_aiter_rmsnorm_fused_dynamic_quant`, leaving kv a plain
++`rms_norm` — breaking the symmetric pattern above. The same pass then matches
++this asymmetric pair and lowers it to `fused_mla_dual_rms_norm_per_token_quant`.
++
++```text
++# Unfused (q norm+quant fused; kv still plain rms_norm):
++q_c, kv_lora = split(projected, [q_dim, kv_dim])
++kv_c, k_pe   = split(kv_lora,  [kv_c_dim, k_pe_dim])
++q_fp8, q_scale = rocm_aiter_rmsnorm_fused_dynamic_quant(q_c, q_weight, eps, fp8)
++kv_normed      = rms_norm(kv_c, kv_weight, eps)          # bf16
++
++# Fused:
++q_c, kv_lora = split(projected, [q_dim, kv_dim])
++kv_c, k_pe   = split(kv_lora,  [kv_c_dim, k_pe_dim])
++q_fp8, q_scale, kv_normed = fused_mla_dual_rms_norm_per_token_quant(
++    q_c, q_weight, kv_c, kv_weight, eps1, eps2)
++```
++
+ **Code locations.**
+ 
+-- Pass: [`vllm/compilation/passes/fusion/rocm_aiter_fusion.py`](https://github.com/vllm-project/vllm/blob/main/vllm/compilation/passes/fusion/rocm_aiter_fusion.py) (`MLADualRMSNormFusionPass`)
+-- Custom op: [`vllm/_aiter_ops.py`](https://github.com/vllm-project/vllm/blob/main/vllm/_aiter_ops.py) (`fused_mla_dual_rms_norm`)
+-- AITER kernel: [`fused_qk_rmsnorm`](https://github.com/ROCm/aiter/pull/2442)
++- Pass: [`vllm/compilation/passes/fusion/rocm_aiter_fusion.py`](https://github.com/vllm-project/vllm/blob/main/vllm/compilation/passes/fusion/rocm_aiter_fusion.py) (`MLADualRMSNormFusionPass`, `MLADualRMSPerTokenQuantPattern`)
++- Custom op: [`vllm/_aiter_ops.py`](https://github.com/vllm-project/vllm/blob/main/vllm/_aiter_ops.py) (`fused_mla_dual_rms_norm`, `fused_mla_dual_rms_norm_per_token_quant`)
++- AITER kernels: [`fused_qk_rmsnorm`](https://github.com/ROCm/aiter/pull/2442), `fused_qk_rmsnorm_per_token_quant`
+ 
+ ## See Also
+ 
+diff --git a/tests/compile/passes/test_fuse_mla_dual_rms_norm.py b/tests/compile/passes/test_fuse_mla_dual_rms_norm.py
+index 080417c98966..6f20d4e15874 100644
+--- a/tests/compile/passes/test_fuse_mla_dual_rms_norm.py
++++ b/tests/compile/passes/test_fuse_mla_dual_rms_norm.py
+@@ -12,7 +12,10 @@
+ 
+ import vllm.config
+ from tests.compile.backend import TestBackend
+-from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
++from vllm._aiter_ops import (
++    is_aiter_found_and_supported,
++    rocm_aiter_ops,
++)
+ from vllm.compilation.passes.utility.noop_elimination import NoOpEliminationPass
+ from vllm.compilation.passes.utility.post_cleanup import PostCleanupPass
+ from vllm.config import (
+@@ -23,6 +26,7 @@
+     VllmConfig,
+ )
+ from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.platforms import current_platform
+ 
+ # MLA attention geometry for DeepSeek-V3 / Kimi-K2
+ Q_DIM = 1536
+@@ -30,6 +34,8 @@
+ K_PE_DIM = 64
+ EPS = 1e-6
+ 
++FP8_DTYPE = current_platform.fp8_dtype()
++
+ 
+ class MLADualRMSNormTestModel(torch.nn.Module):
+     """
+@@ -146,3 +152,139 @@ def test_fuse_mla_dual_rms_norm(
+ 
+         backend.check_before_ops(model.ops_in_model_before())
+         backend.check_after_ops(model.ops_in_model_after())
++
++
++class MLADualRMSNormFp8PerTokenTestModel(torch.nn.Module):
++    """
++    Minimal model reproducing the FP8 MLA attention path with *per-token* quant:
++        linear -> split([q_dim, kv_dim])
++            +-- q_c (getitem 0) -> rocm_aiter_rmsnorm_fused_dynamic_quant -> dequant
++            +-- kv_lora (getitem 1) -> split([kv_c_dim, k_pe_dim])
++                    +-- kv_c (getitem 0) -> rms_norm (bf16)
++                    +-- k_pe
++    """
++
++    def __init__(
++        self,
++        hidden_size: int,
++        q_dim: int = Q_DIM,
++        kv_c_dim: int = KV_C_DIM,
++        k_pe_dim: int = K_PE_DIM,
++        eps: float = EPS,
++    ):
++        super().__init__()
++        self.q_dim = q_dim
++        self.kv_dim = kv_c_dim + k_pe_dim
++        self.kv_c_dim = kv_c_dim
++        self.k_pe_dim = k_pe_dim
++        self.eps = eps
++
++        self.proj = torch.nn.Linear(hidden_size, q_dim + self.kv_dim, bias=False)
++        self.q_weight = torch.nn.Parameter(torch.ones(q_dim))
++        self.kv_norm = RMSNorm(kv_c_dim, eps=eps)
++
++    def _dequant(self, x_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
++        # Per-token: a single (M, 1) scale broadcast across the row.
++        return (x_fp8.to(torch.float32) * scale).to(torch.bfloat16)
++
++    def forward(self, x: torch.Tensor):
++        # Avoid graph input being a direct arg to a matched pattern node
++        x = torch.relu(x)
++
++        projected = self.proj(x)
++
++        q_c, kv_lora = projected.split([self.q_dim, self.kv_dim], dim=-1)
++        kv_c, k_pe = kv_lora.split([self.kv_c_dim, self.k_pe_dim], dim=-1)
++
++        q_fp8, q_scale = torch.ops.vllm.rocm_aiter_rmsnorm_fused_dynamic_quant(
++            q_c, self.q_weight, self.eps, FP8_DTYPE
++        )
++        kv_normed = self.kv_norm(kv_c)
++
++        return self._dequant(q_fp8, q_scale), kv_normed, k_pe
++
++    def ops_in_model_before(self):
++        return [
++            torch.ops.vllm.rocm_aiter_rmsnorm_fused_dynamic_quant.default,
++            torch.ops.vllm_ir.rms_norm.default,
++        ]
++
++    def ops_in_model_after(self):
++        return [torch.ops.vllm.fused_mla_dual_rms_norm_per_token_quant.default]
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16])
++@pytest.mark.parametrize("hidden_size", [7168])
++@pytest.mark.skipif(
++    not is_aiter_found_and_supported(),
++    reason="Only test on ROCm with AITER installed and supported",
++)
++def test_fuse_mla_dual_rms_norm_fp8_per_token(
++    dtype: torch.dtype,
++    hidden_size: int,
++    monkeypatch: pytest.MonkeyPatch,
++):
++    torch._dynamo.reset()
++
++    vllm_config = VllmConfig(
++        model_config=ModelConfig(dtype=dtype),
++        compilation_config=CompilationConfig(
++            mode=CompilationMode.VLLM_COMPILE,
++            custom_ops=["+rms_norm"],
++            pass_config=PassConfig(
++                fuse_mla_dual_rms_norm=True,
++                eliminate_noops=True,
++            ),
++        ),
++    )
++
++    with vllm.config.set_current_vllm_config(vllm_config), monkeypatch.context() as m:
++        from vllm.compilation.passes.fusion.rocm_aiter_fusion import (
++            MLADualRMSNormFusionPass,
++        )
++
++        torch.set_default_device("cuda")
++        torch.set_default_dtype(dtype)
++        torch.manual_seed(42)
++
++        m.setenv("VLLM_ROCM_USE_AITER", "1")
++        rocm_aiter_ops.refresh_env_variables()
++
++        fusion_pass = MLADualRMSNormFusionPass(vllm_config)
++        passes = [
++            NoOpEliminationPass(vllm_config),
++            fusion_pass,
++            PostCleanupPass(vllm_config),
++        ]
++        backend = TestBackend(*passes)
++        model = MLADualRMSNormFp8PerTokenTestModel(hidden_size)
++
++        x = torch.randn(4, hidden_size)
++        torch._dynamo.mark_dynamic(x, 0)
++
++        with torch.inference_mode():
++            outputs_unfused = model(x)
++
++            model_fused = torch.compile(model, backend=backend)
++            outputs_fused = model_fused(x)
++
++        q_deq_u, kv_normed_u, k_pe_u = outputs_unfused
++        q_deq_f, kv_normed_f, k_pe_f = outputs_fused
++
++        torch.testing.assert_close(k_pe_u, k_pe_f, atol=0, rtol=0)
++
++        torch.testing.assert_close(kv_normed_u, kv_normed_f, atol=1e-2, rtol=1e-2)
++
++        E4M3_STEP = 0.125
++        exact_frac = (q_deq_u == q_deq_f).float().mean().item()
++        assert exact_frac > 0.99, (
++            f"q: only {exact_frac:.4f} of elements bit-exact; scales likely differ"
++        )
++        torch.testing.assert_close(q_deq_u, q_deq_f, atol=1e-2, rtol=E4M3_STEP)
++
++        assert fusion_pass.matched_count == 1, (
++            f"Expected 1 fused pair, got {fusion_pass.matched_count}"
++        )
++
++        backend.check_before_ops(model.ops_in_model_before())
++        backend.check_after_ops(model.ops_in_model_after())
+diff --git a/vllm/_aiter_ops.py b/vllm/_aiter_ops.py
+index 4a8b4209d874..40ccbcf9a28f 100644
+--- a/vllm/_aiter_ops.py
++++ b/vllm/_aiter_ops.py
+@@ -1355,6 +1355,63 @@ def _fused_mla_dual_rms_norm_fake(
+     return (torch.empty_like(x1), torch.empty_like(x2))
+ 
+ 
++def _fused_mla_dual_rms_norm_per_token_quant_impl(
++    q: torch.Tensor,
++    q_weight: torch.Tensor,
++    kv: torch.Tensor,
++    kv_weight: torch.Tensor,
++    q_epsilon: float,
++    kv_epsilon: float,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Fused MLA q/kv RMSNorm (+ FP8 per-token quant on q) via AITER.
++
++    Backs the ``fused_mla_dual_rms_norm_per_token_quant`` custom op used by the
++    MLA FP8 attention fusion when the q latent is quantized *per token* (a single
++    ``(M, 1)`` scale). Only the *q* latent is FP8 quantized (it feeds the
++    FP8 ``q_b_proj`` GEMM); the *kv* latent is RMS-normed and consumed by attention as bf16.
++    """
++    from aiter.ops.fused_qk_rmsnorm_group_quant import (
++        fused_qk_rmsnorm_per_token_quant,
++    )
++
++    mq, nq = q.shape
++    q_out = torch.empty((mq, nq), dtype=FP8_DTYPE, device=q.device)
++    q_scale = torch.empty((mq, 1), dtype=torch.float32, device=q.device)
++    kv_normed = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
++
++    # q -> RMSNorm + FP8 per-token quant (q slot); kv -> RMSNorm only (k slot).
++    # `split` views are accepted directly (unit inner stride); the kernel
++    # handles strided inputs, matching the aiter op-test usage.
++    fused_qk_rmsnorm_per_token_quant(
++        q_out_quantized=q_out,
++        q_out_scale=q_scale,
++        q=q,
++        q_weight=q_weight,
++        q_epsilon=q_epsilon,
++        k_out=kv_normed,
++        k=kv,
++        k_weight=kv_weight,
++        k_epsilon=kv_epsilon,
++        gemma_norm=False,
++    )
++    return q_out, q_scale, kv_normed
++
++
++def _fused_mla_dual_rms_norm_per_token_quant_fake(
++    q: torch.Tensor,
++    q_weight: torch.Tensor,
++    kv: torch.Tensor,
++    kv_weight: torch.Tensor,
++    q_epsilon: float,
++    kv_epsilon: float,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    mq, nq = q.shape
++    q_out = torch.empty((mq, nq), dtype=FP8_DTYPE, device=q.device)
++    q_scale = torch.empty((mq, 1), dtype=torch.float32, device=q.device)
++    kv_normed = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
++    return q_out, q_scale, kv_normed
++
++
+ def _rocm_aiter_gemm_a8wfp4_impl(
+     x: torch.Tensor,
+     w: torch.Tensor,
+@@ -2046,6 +2103,13 @@ def register_ops_once() -> None:
+                 fake_impl=_fused_mla_dual_rms_norm_fake,
+             )
+ 
++            direct_register_custom_op(
++                op_name="fused_mla_dual_rms_norm_per_token_quant",
++                op_func=_fused_mla_dual_rms_norm_per_token_quant_impl,
++                mutates_args=[],
++                fake_impl=_fused_mla_dual_rms_norm_per_token_quant_fake,
++            )
++
+             _OPS_REGISTERED = True
+ 
+     @staticmethod
+@@ -2120,6 +2184,10 @@ def has_fused_allreduce_rmsnorm_quant_per_group(cls) -> bool:
+     def get_fused_mla_dual_rms_norm_op() -> OpOverload:
+         return torch.ops.vllm.fused_mla_dual_rms_norm.default
+ 
++    @staticmethod
++    def get_fused_mla_dual_rms_norm_per_token_quant_op() -> OpOverload:
++        return torch.ops.vllm.fused_mla_dual_rms_norm_per_token_quant.default
++
+     @staticmethod
+     def w8a8_gemm(
+         A: torch.Tensor,
+diff --git a/vllm/compilation/passes/fusion/rocm_aiter_fusion.py b/vllm/compilation/passes/fusion/rocm_aiter_fusion.py
+index 03d291d4d94f..7ed107028d38 100644
+--- a/vllm/compilation/passes/fusion/rocm_aiter_fusion.py
++++ b/vllm/compilation/passes/fusion/rocm_aiter_fusion.py
+@@ -922,11 +922,145 @@ def _replacement(
+         return _replacement
+ 
+ 
++class MLADualRMSPerTokenQuantPattern(
++    VllmPatternReplacement[
++        ...,
++        tuple[
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++        ],
++    ]
++):
++    """
++    Fuse the MLA FP8 attention path -- q-latent RMSNorm + FP8 *per-token* quant
++    plus kv-latent RMSNorm -- into AITER's ``fused_qk_rmsnorm_per_token_quant``.
++
++    With a per-token FP8 ``q_b_proj`` (Quark / ModelOpt), the earlier
++    ``RocmAiterRMSNormQuantFusionPass`` folds the q side into
++    ``rocm_aiter_rmsnorm_fused_dynamic_quant`` and leaves the kv side a plain
++    ``vllm_ir.rms_norm``. This pattern matches that asymmetric pair::
++
++        gemm -> split_with_sizes([q_dim, kv_dim])
++            +-- q_c     -> rocm_aiter_rmsnorm_fused_dynamic_quant -> (q_fp8, q_scale)
++            +-- kv_lora -> split_with_sizes([kv_c_dim, k_pe_dim])
++                            +-- kv_c -> vllm_ir.rms_norm -> kv_normed (bf16)
++                            +-- k_pe
++    """
++
++    DYNAMIC_QUANT_OP = rocm_aiter_ops.get_rmsnorm_fused_dynamic_quant_op()
++    FUSED_OP = rocm_aiter_ops.get_fused_mla_dual_rms_norm_per_token_quant_op()
++
++    def __init__(self, epsilon: float) -> None:
++        self._epsilon = epsilon
++
++    def get_inputs(self) -> list[torch.Tensor]:
++        q_dim, kv_c_dim, k_pe_dim = 256, 128, 64
++        return [
++            self.empty_bf16(5, q_dim + kv_c_dim + k_pe_dim),
++            self.empty_bf16(q_dim),
++            self.empty_bf16(kv_c_dim),
++        ]
++
++    @property
++    def pattern(
++        self,
++    ) -> Callable[
++        ...,
++        tuple[
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++        ],
++    ]:
++        eps = self._epsilon
++        dynamic_quant_op = self.DYNAMIC_QUANT_OP
++
++        def _pattern(
++            projected: torch.Tensor,
++            q_weight: torch.Tensor,
++            kv_weight: torch.Tensor,
++        ) -> tuple[
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++        ]:
++            q_dim = q_weight.shape[0]
++            kv_dim = projected.shape[-1] - q_dim
++            kv_c_dim = kv_weight.shape[0]
++            k_pe_dim = kv_dim - kv_c_dim
++            q_c, kv_lora = projected.split([q_dim, kv_dim], dim=-1)
++            kv_c, k_pe = kv_lora.split([kv_c_dim, k_pe_dim], dim=-1)
++            q_quant = dynamic_quant_op(
++                x=q_c,
++                weight=q_weight,
++                epsilon=eps,
++                quant_dtype=FP8_DTYPE,
++            )
++            kv_normed = vllm.ir.ops.rms_norm(kv_c, kv_weight, eps)
++            return q_quant[0], q_quant[1], kv_normed, k_pe
++
++        return _pattern
++
++    @property
++    def replacement(
++        self,
++    ) -> Callable[
++        ...,
++        tuple[
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++        ],
++    ]:
++        eps = self._epsilon
++        fused_op = self.FUSED_OP
++
++        def _replacement(
++            projected: torch.Tensor,
++            q_weight: torch.Tensor,
++            kv_weight: torch.Tensor,
++        ) -> tuple[
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++            torch.Tensor,
++        ]:
++            q_dim = q_weight.shape[0]
++            kv_dim = projected.shape[-1] - q_dim
++            kv_c_dim = kv_weight.shape[0]
++            k_pe_dim = kv_dim - kv_c_dim
++            q_c, kv_lora = projected.split([q_dim, kv_dim], dim=-1)
++            kv_c, k_pe = kv_lora.split([kv_c_dim, k_pe_dim], dim=-1)
++            at = fused_op(
++                q_c,
++                q_weight,
++                kv_c,
++                kv_weight,
++                eps,
++                eps,
++            )
++            # q_fp8, q_scale, kv_normed, k_pe
++            return at[0], at[1], at[2], k_pe
++
++        return _replacement
++
++
+ class MLADualRMSNormFusionPass(VllmFusionPatternMatcherPass):
+     """
+     Post-grad PatternMatcher pass that fuses paired q / kv RMS norms in
+     MLA attention into ``fused_mla_dual_rms_norm`` backed by aiter's
+     ``fused_qk_rmsnorm`` HIP kernel.
++
++    The FP8 attention path is also handled via
++    :class:`MLADualRMSPerTokenQuantPattern`, which fuses the q-latent RMSNorm +
++    FP8 per-token quant together with the kv-latent RMSNorm into
++    ``fused_mla_dual_rms_norm_per_token_quant`` backed by aiter's
++    ``fused_qk_rmsnorm_per_token_quant`` HIP kernel.
+     """
+ 
+     def __init__(self, config: VllmConfig) -> None:
+@@ -934,3 +1068,4 @@ def __init__(self, config: VllmConfig) -> None:
+ 
+         for epsilon in [1e-5, 1e-6]:
+             self.register(MLADualRMSNormPattern(epsilon))
++            self.register(MLADualRMSPerTokenQuantPattern(epsilon))

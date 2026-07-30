@@ -1,0 +1,386 @@
+diff --git a/tests/model_executor/model_loader/test_mtp_validation.py b/tests/model_executor/model_loader/test_mtp_validation.py
+new file mode 100644
+index 000000000000..ecccaa0cd74b
+--- /dev/null
++++ b/tests/model_executor/model_loader/test_mtp_validation.py
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++
++from vllm.model_executor.model_loader.mtp_validation import (
++    disable_mtp_completeness_check,
++    is_mtp_completeness_check_enabled,
++)
++
++
++def test_disable_mtp_completeness_check_is_scoped():
++    assert is_mtp_completeness_check_enabled()
++
++    with pytest.raises(RuntimeError), disable_mtp_completeness_check():
++        assert not is_mtp_completeness_check_enabled()
++        raise RuntimeError
++
++    assert is_mtp_completeness_check_enabled()
+diff --git a/vllm/distributed/weight_transfer/ipc_engine.py b/vllm/distributed/weight_transfer/ipc_engine.py
+index f1b6070893bf..b191e8c50dba 100644
+--- a/vllm/distributed/weight_transfer/ipc_engine.py
++++ b/vllm/distributed/weight_transfer/ipc_engine.py
+@@ -274,7 +274,12 @@ def receive_weights(self, update_info: IPCWeightTransferUpdateInfo) -> None:
+                 weight = rebuild_cuda_tensor(*list_args)
+                 weights.append((name, weight))
+ 
+-        self.model.load_weights(weights)
++        from vllm.model_executor.model_loader.mtp_validation import (
++            disable_mtp_completeness_check,
++        )
++
++        with disable_mtp_completeness_check():
++            self.model.load_weights(weights)
+ 
+     def shutdown(self) -> None:
+         pass
+diff --git a/vllm/distributed/weight_transfer/nccl_engine.py b/vllm/distributed/weight_transfer/nccl_engine.py
+index 5838a8ba8a1d..0ba44f3486e8 100644
+--- a/vllm/distributed/weight_transfer/nccl_engine.py
++++ b/vllm/distributed/weight_transfer/nccl_engine.py
+@@ -168,36 +168,41 @@ def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
+                 "Call init_transfer_engine() first."
+             )
+ 
+-        if update_info.packed:
+-            # Build iterator of (name, (shape, dtype)) from update_info
+-            def state_dict_info_iterator():
++        from vllm.model_executor.model_loader.mtp_validation import (
++            disable_mtp_completeness_check,
++        )
++
++        with disable_mtp_completeness_check():
++            if update_info.packed:
++                # Build iterator of (name, (shape, dtype)) from update_info
++                def state_dict_info_iterator():
++                    for name, dtype_name, shape in zip(
++                        update_info.names, update_info.dtype_names, update_info.shapes
++                    ):
++                        dtype = getattr(torch, dtype_name)
++                        yield (name, (shape, dtype))
++
++                packed_nccl_broadcast_consumer(
++                    iterator=state_dict_info_iterator(),
++                    group=self.model_update_group,
++                    src=0,
++                    post_unpack_func=self.model.load_weights,
++                    buffer_size_bytes=update_info.packed_buffer_size_bytes,
++                    num_buffers=update_info.packed_num_buffers,
++                    device=self.device,
++                )
++            else:
++                # Use simple one-by-one broadcasting
+                 for name, dtype_name, shape in zip(
+                     update_info.names, update_info.dtype_names, update_info.shapes
+                 ):
+                     dtype = getattr(torch, dtype_name)
+-                    yield (name, (shape, dtype))
+-
+-            packed_nccl_broadcast_consumer(
+-                iterator=state_dict_info_iterator(),
+-                group=self.model_update_group,
+-                src=0,
+-                post_unpack_func=self.model.load_weights,
+-                buffer_size_bytes=update_info.packed_buffer_size_bytes,
+-                num_buffers=update_info.packed_num_buffers,
+-                device=self.device,
+-            )
+-        else:
+-            # Use simple one-by-one broadcasting
+-            for name, dtype_name, shape in zip(
+-                update_info.names, update_info.dtype_names, update_info.shapes
+-            ):
+-                dtype = getattr(torch, dtype_name)
+-                weight = torch.empty(shape, dtype=dtype, device=self.device)
+-                self.model_update_group.broadcast(
+-                    weight, src=0, stream=torch.cuda.current_stream()
+-                )
+-                self.model.load_weights([(name, weight)])
+-                del weight
++                    weight = torch.empty(shape, dtype=dtype, device=self.device)
++                    self.model_update_group.broadcast(
++                        weight, src=0, stream=torch.cuda.current_stream()
++                    )
++                    self.model.load_weights([(name, weight)])
++                    del weight
+ 
+     def shutdown(self) -> None:
+         if self.model_update_group is not None:
+diff --git a/vllm/model_executor/model_loader/mtp_validation.py b/vllm/model_executor/model_loader/mtp_validation.py
+new file mode 100644
+index 000000000000..3f20756abce2
+--- /dev/null
++++ b/vllm/model_executor/model_loader/mtp_validation.py
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Scoped controls for MTP checkpoint completeness validation."""
++
++from collections.abc import Iterator
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++_mtp_completeness_check_enabled: ContextVar[bool] = ContextVar(
++    "mtp_completeness_check_enabled", default=True
++)
++
++
++def is_mtp_completeness_check_enabled() -> bool:
++    """Return whether MTP completeness validation is enabled in this scope."""
++    return _mtp_completeness_check_enabled.get()
++
++
++@contextmanager
++def disable_mtp_completeness_check() -> Iterator[None]:
++    """Temporarily disable MTP completeness validation for one weight load."""
++    token = _mtp_completeness_check_enabled.set(False)
++    try:
++        yield
++    finally:
++        _mtp_completeness_check_enabled.reset(token)
+diff --git a/vllm/model_executor/models/bailing_moe_mtp.py b/vllm/model_executor/models/bailing_moe_mtp.py
+index da6b1ddb8b66..53679edf89b9 100644
+--- a/vllm/model_executor/models/bailing_moe_mtp.py
++++ b/vllm/model_executor/models/bailing_moe_mtp.py
+@@ -20,6 +20,9 @@
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import (
+     default_weight_loader,
+     maybe_remap_kv_scale_name,
+@@ -370,7 +373,10 @@ def load_lm_head(loaded_weight: torch.Tensor) -> None:
+             self.model.mtp_start_layer_idx,
+             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
+         ):
+-            if layer_idx not in loaded_mtp_layers:
++            if (
++                layer_idx not in loaded_mtp_layers
++                and is_mtp_completeness_check_enabled()
++            ):
+                 raise ValueError(
+                     f"Bailing MTP speculative decoding layer {layer_idx} "
+                     "weights are missing from checkpoint. Use a checkpoint "
+diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
+index 3a0c21fe7d29..65f860a4a3ff 100644
+--- a/vllm/model_executor/models/deepseek_mtp.py
++++ b/vllm/model_executor/models/deepseek_mtp.py
+@@ -21,6 +21,9 @@
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import (
+     default_weight_loader,
+     maybe_remap_kv_scale_name,
+@@ -516,7 +519,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+             self.model.mtp_start_layer_idx,
+             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
+         ):
+-            if layer_idx not in loaded_layers:
++            if layer_idx not in loaded_layers and is_mtp_completeness_check_enabled():
+                 raise ValueError(
+                     f"MTP speculative decoding layer {layer_idx} weights "
+                     f"missing from checkpoint. The checkpoint may have "
+diff --git a/vllm/model_executor/models/step3p5_mtp.py b/vllm/model_executor/models/step3p5_mtp.py
+index b533a9111dcf..7e95274771da 100644
+--- a/vllm/model_executor/models/step3p5_mtp.py
++++ b/vllm/model_executor/models/step3p5_mtp.py
+@@ -15,6 +15,9 @@
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.sequence import IntermediateTensors
+ 
+@@ -283,7 +286,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+             and getattr(param, "requires_grad", False) is False
+         }
+         params_need_to_load -= optional_params
+-        if params_need_to_load != loaded_params:
++        if params_need_to_load != loaded_params and is_mtp_completeness_check_enabled():
+             missing_params = list(params_need_to_load - loaded_params)
+             param_name_example = missing_params[0]
+             raise RuntimeError(
+diff --git a/vllm/models/deepseek_v32/nvidia/mtp.py b/vllm/models/deepseek_v32/nvidia/mtp.py
+index d3d8e5aae9c5..c8f2fcc5ffef 100644
+--- a/vllm/models/deepseek_v32/nvidia/mtp.py
++++ b/vllm/models/deepseek_v32/nvidia/mtp.py
+@@ -17,6 +17,9 @@
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import (
+     default_weight_loader,
+     maybe_remap_kv_scale_name,
+@@ -416,7 +419,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+             self.model.mtp_start_layer_idx,
+             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
+         ):
+-            if layer_idx not in loaded_layers:
++            if layer_idx not in loaded_layers and is_mtp_completeness_check_enabled():
+                 raise ValueError(
+                     f"MTP speculative decoding layer {layer_idx} weights "
+                     f"missing from checkpoint."
+diff --git a/vllm/models/deepseek_v4/amd/mtp.py b/vllm/models/deepseek_v4/amd/mtp.py
+index f5ef4bb06746..a12b401f0d46 100644
+--- a/vllm/models/deepseek_v4/amd/mtp.py
++++ b/vllm/models/deepseek_v4/amd/mtp.py
+@@ -32,6 +32,9 @@
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.deepseek_mtp import SharedHead
+ from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
+@@ -461,7 +464,7 @@ def _find_mtp_layer_idx(name: str) -> int:
+             self.model.mtp_start_layer_idx,
+             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
+         ):
+-            if layer_idx not in loaded_layers:
++            if layer_idx not in loaded_layers and is_mtp_completeness_check_enabled():
+                 raise ValueError(
+                     f"MTP speculative decoding layer {layer_idx} weights "
+                     f"missing from checkpoint. The checkpoint may have "
+diff --git a/vllm/models/deepseek_v4/nvidia/mtp.py b/vllm/models/deepseek_v4/nvidia/mtp.py
+index 64715deae99b..8aa3d2c9a299 100644
+--- a/vllm/models/deepseek_v4/nvidia/mtp.py
++++ b/vllm/models/deepseek_v4/nvidia/mtp.py
+@@ -37,6 +37,9 @@
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.deepseek_mtp import SharedHead
+ from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
+@@ -467,7 +470,7 @@ def _find_mtp_layer_idx(name: str) -> int:
+             self.model.mtp_start_layer_idx,
+             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
+         ):
+-            if layer_idx not in loaded_layers:
++            if layer_idx not in loaded_layers and is_mtp_completeness_check_enabled():
+                 raise ValueError(
+                     f"MTP speculative decoding layer {layer_idx} weights "
+                     f"missing from checkpoint. The checkpoint may have "
+diff --git a/vllm/models/deepseek_v4/xpu/mtp.py b/vllm/models/deepseek_v4/xpu/mtp.py
+index 8baca78b8ba1..35687ccf169e 100644
+--- a/vllm/models/deepseek_v4/xpu/mtp.py
++++ b/vllm/models/deepseek_v4/xpu/mtp.py
+@@ -32,6 +32,9 @@
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.deepseek_mtp import SharedHead
+ from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
+@@ -469,7 +472,7 @@ def _find_mtp_layer_idx(name: str) -> int:
+             self.model.mtp_start_layer_idx,
+             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
+         ):
+-            if layer_idx not in loaded_layers:
++            if layer_idx not in loaded_layers and is_mtp_completeness_check_enabled():
+                 raise ValueError(
+                     f"MTP speculative decoding layer {layer_idx} weights "
+                     f"missing from checkpoint. The checkpoint may have "
+diff --git a/vllm/models/inkling/nvidia/mtp.py b/vllm/models/inkling/nvidia/mtp.py
+index a2559d4cf057..34cde020ed38 100644
+--- a/vllm/models/inkling/nvidia/mtp.py
++++ b/vllm/models/inkling/nvidia/mtp.py
+@@ -25,6 +25,9 @@
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.utils import maybe_prefix
+ from vllm.sequence import IntermediateTensors
+@@ -396,7 +399,7 @@ def _load(name: str, weight: torch.Tensor, shard_id: object = None) -> bool:
+         for name in params
+         if name.startswith("model.layers.") or name.startswith("model.chain_norm.")
+     }
+-    if missing := sorted(required - loaded):
++    if (missing := sorted(required - loaded)) and is_mtp_completeness_check_enabled():
+         raise ValueError(
+             "Inkling MTP checkpoint is missing required parameters: "
+             + ", ".join(missing)
+diff --git a/vllm/models/minimax_m3/amd/mtp.py b/vllm/models/minimax_m3/amd/mtp.py
+index f62face1d2e1..cfb26d7948df 100644
+--- a/vllm/models/minimax_m3/amd/mtp.py
++++ b/vllm/models/minimax_m3/amd/mtp.py
+@@ -35,6 +35,9 @@
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import (
+     default_weight_loader,
+     maybe_remap_kv_scale_name,
+@@ -322,7 +325,10 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+ 
+         # Validate that weights were loaded for each MTP layer.
+         for layer_idx in range(self.model.num_mtp_layers):
+-            if layer_idx not in loaded_mtp_layers:
++            if (
++                layer_idx not in loaded_mtp_layers
++                and is_mtp_completeness_check_enabled()
++            ):
+                 raise ValueError(
+                     f"Failed to load MTP layer {layer_idx} weights from checkpoint."
+                 )
+diff --git a/vllm/models/minimax_m3/nvidia/mtp.py b/vllm/models/minimax_m3/nvidia/mtp.py
+index e2c7f8821d96..832c872a1006 100644
+--- a/vllm/models/minimax_m3/nvidia/mtp.py
++++ b/vllm/models/minimax_m3/nvidia/mtp.py
+@@ -19,6 +19,9 @@
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import (
+     default_weight_loader,
+     maybe_remap_kv_scale_name,
+@@ -304,7 +307,10 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+ 
+         # Validate that weights were loaded for each MTP layer.
+         for layer_idx in range(self.model.num_mtp_layers):
+-            if layer_idx not in loaded_mtp_layers:
++            if (
++                layer_idx not in loaded_mtp_layers
++                and is_mtp_completeness_check_enabled()
++            ):
+                 raise ValueError(
+                     f"Failed to load MTP layer {layer_idx} weights from checkpoint."
+                 )

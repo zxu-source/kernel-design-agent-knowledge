@@ -1,0 +1,297 @@
+diff --git a/python/sglang/srt/layers/communicator.py b/python/sglang/srt/layers/communicator.py
+index 5715f1e93976..65e5441ebcf8 100644
+--- a/python/sglang/srt/layers/communicator.py
++++ b/python/sglang/srt/layers/communicator.py
+@@ -59,7 +59,10 @@
+     should_use_dp_reduce_scatterv,
+     should_use_flashinfer_cutlass_moe_fp4_allgather,
+ )
+-from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
++from sglang.srt.layers.quantization.fp8_utils import (
++    _use_aiter_bpreshuffle_gfx95,
++    materialize_bpreshuffle_fp8_scale_tuple,
++)
+ from sglang.srt.layers.utils.cp_utils import (
+     is_mla_prefill_cp_enabled,
+     mla_use_prefill_cp,
+@@ -606,8 +609,12 @@ def prepare_attn(
+                             dtype_quant=torch.float8_e4m3fn,
+                             res1=None,
+                             output_unquantized_inp1=_dsa_needs_bf16,
+-                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                            transpose_scale=False,
+                         )
++                        if _use_aiter_bpreshuffle_gfx95:
++                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
++                                hidden_states
++                            )
+                         if _dsa_needs_bf16:
+                             hidden_states = (
+                                 hidden_states[0],
+@@ -652,9 +659,13 @@ def prepare_attn(
+                                 dtype_quant=torch.float8_e4m3fn,
+                                 res1=residual,
+                                 output_unquantized_inp1=_dsa_needs_bf16,
+-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                                transpose_scale=False,
+                             )
+                         )
++                        if _use_aiter_bpreshuffle_gfx95:
++                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
++                                hidden_states
++                            )
+                         if _dsa_needs_bf16:
+                             hidden_states = (
+                                 hidden_states[0],
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index cd5129f7e131..72d4942faa04 100755
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -104,6 +104,22 @@ def set_force_ck_w8a8(enabled: bool = True) -> None:
+     _FORCE_CK_W8A8 = enabled
+ 
+ 
++def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
++    """Materialize the physical scale layout consumed by gfx95 bpreshuffle GEMM."""
++    return scale.t().contiguous().t() if scale.dim() == 2 else scale
++
++
++def materialize_bpreshuffle_fp8_scale_tuple(
++    value: Tuple[torch.Tensor, ...],
++) -> Tuple[torch.Tensor, ...]:
++    """Materialize the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
++    return (
++        value[0],
++        materialize_bpreshuffle_fp8_scale(value[1]),
++        *value[2:],
++    )
++
++
+ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
+     if _FORCE_CK_W8A8:
+         return False
+@@ -867,16 +883,21 @@ def aiter_w8a8_block_fp8_linear(
+     if input_scale is not None:
+         q_input = input_2d
+         x_scale = input_scale
++        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
++            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
+         # Triton needs a row-major view, so adjust strides only. No copy.
+-        if use_triton and _use_aiter_bpreshuffle_gfx95:
++        elif use_triton and _use_aiter_bpreshuffle_gfx95:
+             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
+     else:
++        materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+         q_input, x_scale = aiter_per1x128_quant(
+             input_2d,
+             quant_dtype=aiter.dtypes.fp8,
+-            transpose_scale=(_use_aiter_bpreshuffle_gfx95 and not use_triton),
++            transpose_scale=False,
+         )
++        if materialize_bpreshuffle_scale:
++            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+ 
+     if use_triton:
+         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
+index cd8f89332242..7c3cd571e9d7 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
+@@ -15,6 +15,9 @@
+     dcp_enabled,
+     filter_dcp_local_kv_indices,
+ )
++from sglang.srt.layers.quantization.fp8_utils import (
++    materialize_bpreshuffle_fp8_scale_tuple,
++)
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_executor.forward_context import (
+     get_attn_backend,
+@@ -159,8 +162,10 @@ def forward_normal_prepare(
+                         dtype_quant=torch.float8_e4m3fn,
+                         res1=None,
+                         output_unquantized_inp1=True,
+-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                        transpose_scale=False,
+                     )
++                    if _use_aiter_bpreshuffle_gfx95:
++                        q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
+                     q = self.q_b_proj(q_quanted)[0].view(
+                         -1, self.num_local_heads, self.qk_head_dim
+                     )
+@@ -202,8 +207,10 @@ def forward_normal_prepare(
+                     dtype_quant=torch.float8_e4m3fn,
+                     res1=None,
+                     output_unquantized_inp1=False,
+-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                    transpose_scale=False,
+                 )
++                if _use_aiter_bpreshuffle_gfx95:
++                    q = materialize_bpreshuffle_fp8_scale_tuple(q)
+                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+             else:
+                 q = self.q_a_layernorm(q)
+@@ -232,8 +239,10 @@ def forward_normal_prepare(
+                 dtype_quant=torch.float8_e4m3fn,
+                 res1=None,
+                 output_unquantized_inp1=True,  # return unqaunt kv_a
+-                transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                transpose_scale=False,
+             )
++            if _use_aiter_bpreshuffle_gfx95:
++                kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
+ 
+         else:
+             kv_a = self.kv_a_layernorm(kv_a)
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+index f48a55f70fc0..4d2d52427311 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+@@ -27,6 +27,9 @@
+     per_tensor_quant_mla_fp8,
+     per_token_group_quant_mla_deep_gemm_masked_fp8,
+ )
++from sglang.srt.layers.quantization.fp8_utils import (
++    materialize_bpreshuffle_fp8_scale_tuple,
++)
+ from sglang.srt.layers.radix_attention import unified_attention_with_output
+ from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+ from sglang.srt.lora.deepseek_mla_correction import (
+@@ -324,8 +327,12 @@ def forward_absorb_prepare(
+                                 dtype_quant=torch.float8_e4m3fn,
+                                 res1=None,
+                                 output_unquantized_inp1=True,
+-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                                transpose_scale=False,
+                             )
++                            if _use_aiter_bpreshuffle_gfx95:
++                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(
++                                    q_quanted
++                                )
+                             q = q_quanted
+                         else:
+                             q, _, k_nope, _ = fused_rms_fp8_group_quant(
+@@ -339,8 +346,10 @@ def forward_absorb_prepare(
+                                 dtype_quant=torch.float8_e4m3fn,
+                                 res1=None,
+                                 output_unquantized_inp1=False,
+-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                                transpose_scale=False,
+                             )
++                            if _use_aiter_bpreshuffle_gfx95:
++                                q = materialize_bpreshuffle_fp8_scale_tuple(q)
+ 
+                     elif _use_aiter:
+                         q, k_nope = fused_qk_rmsnorm_bf16(
+@@ -884,8 +893,12 @@ def forward_absorb_core(
+                         _bmm_buf,
+                         group_size=128,
+                         dtype_quant=torch.float8_e4m3fn,
+-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                        transpose_scale=False,
+                     )
++                    if _use_aiter_bpreshuffle_gfx95:
++                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
++                            attn_bmm_output
++                        )
+                 else:
+                     attn_bmm_output = _bmm_buf.flatten(1, 2)
+             elif self.o_proj.weight.dtype == torch.uint8:
+@@ -897,8 +910,12 @@ def forward_absorb_core(
+                     attn_bmm_output,
+                     group_size=128,
+                     dtype_quant=torch.float8_e4m3fn,
+-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                    transpose_scale=False,
+                 )
++                if _use_aiter_bpreshuffle_gfx95:
++                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
++                        attn_bmm_output
++                    )
+             else:
+                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+ 
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 4e342f4482e8..514828955988 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -112,6 +112,9 @@
+ from sglang.srt.layers.quantization.fp8_kernel import (
+     create_per_token_group_quant_fp8_output_scale,
+ )
++from sglang.srt.layers.quantization.fp8_utils import (
++    materialize_bpreshuffle_fp8_scale,
++)
+ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+     maybe_fuse_routed_scale_and_shared_add,
+ )
+@@ -394,8 +397,10 @@ def forward(
+                     swiglu_limit=self.swiglu_limit,
+                     activation="silu",
+                     dtype_quant=dtypes.fp8,
+-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
++                    transpose_scale=False,
+                 )
++                if _use_aiter_bpreshuffle_gfx95:
++                    x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+                 x = (x_fp8, x_scale)
+             else:
+                 x = fused_clamp_act_mul(
+diff --git a/test/registered/unit/layers/test_fp8_bpreshuffle_scale.py b/test/registered/unit/layers/test_fp8_bpreshuffle_scale.py
+new file mode 100644
+index 000000000000..34b49c52746d
+--- /dev/null
++++ b/test/registered/unit/layers/test_fp8_bpreshuffle_scale.py
+@@ -0,0 +1,51 @@
++import unittest
++
++import torch
++
++from sglang.srt.layers.quantization.fp8_utils import (
++    materialize_bpreshuffle_fp8_scale,
++    materialize_bpreshuffle_fp8_scale_tuple,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++
++class TestBpreshuffleScaleMaterialization(CustomTestCase):
++    def test_materializes_transposed_physical_storage(self):
++        scale = torch.arange(12, dtype=torch.float32).reshape(3, 4)
++
++        materialized = materialize_bpreshuffle_fp8_scale(scale)
++
++        self.assertTrue(torch.equal(materialized, scale))
++        self.assertEqual(materialized.shape, scale.shape)
++        self.assertEqual(materialized.stride(), (1, scale.shape[0]))
++        self.assertTrue(materialized.t().is_contiguous())
++
++    def test_materialization_is_idempotent_for_bpreshuffle_layout(self):
++        scale = torch.arange(12, dtype=torch.float32).reshape(3, 4)
++        materialized = materialize_bpreshuffle_fp8_scale(scale)
++
++        rematerialized = materialize_bpreshuffle_fp8_scale(materialized)
++
++        self.assertTrue(torch.equal(rematerialized, scale))
++        self.assertEqual(rematerialized.stride(), materialized.stride())
++
++    def test_tuple_helper_keeps_extra_tuple_payload(self):
++        q_input = torch.ones((3, 8), dtype=torch.float32)
++        scale = torch.arange(12, dtype=torch.float32).reshape(3, 4)
++        bf16_side = torch.ones((3, 8), dtype=torch.bfloat16)
++
++        q_out, scale_out, bf16_out = materialize_bpreshuffle_fp8_scale_tuple(
++            (q_input, scale, bf16_side)
++        )
++
++        self.assertIs(q_out, q_input)
++        self.assertIs(bf16_out, bf16_side)
++        self.assertTrue(torch.equal(scale_out, scale))
++        self.assertEqual(scale_out.stride(), (1, scale.shape[0]))
++
++
++if __name__ == "__main__":
++    unittest.main()

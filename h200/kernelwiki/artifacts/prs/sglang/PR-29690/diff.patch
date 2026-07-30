@@ -1,0 +1,1564 @@
+diff --git a/python/sglang/jit_kernel/csrc/attention/fused_fp8_qkv_kv_cache.cuh b/python/sglang/jit_kernel/csrc/attention/fused_fp8_qkv_kv_cache.cuh
+new file mode 100644
+index 000000000000..aa93e4c545a4
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/attention/fused_fp8_qkv_kv_cache.cuh
+@@ -0,0 +1,202 @@
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/utils.cuh>
++#include <sgl_kernel/vec.cuh>
++
++#include <dlpack/dlpack.h>
++#include <tvm/ffi/container/tensor.h>
++
++#include <cstdint>
++
++namespace {
++
++struct FusedQkvParams {
++  const void* __restrict__ q;
++  const void* __restrict__ k;
++  const void* __restrict__ v;
++  void* __restrict__ q_out;
++  void* __restrict__ k_cache;
++  void* __restrict__ v_cache;
++  const void* __restrict__ cache_loc;
++  const float* __restrict__ k_scale;
++  const float* __restrict__ v_scale;
++  int64_t q_stride;
++  int64_t k_stride;
++  int64_t v_stride;
++  uint32_t num_tokens;
++  uint32_t q_dim;
++  uint32_t kv_dim;
++};
++
++constexpr uint32_t kBlockSize = 128;
++
++template <typename T, int kVecN>
++SGL_DEVICE void quant_row(const T* __restrict__ src, fp8_e4m3_t* __restrict__ dst, uint32_t n, float inv_scale) {
++  using namespace device;
++  using in_vec = AlignedVector<T, kVecN>;
++  using out_vec = AlignedVector<fp8_e4m3_t, kVecN>;
++
++  const uint32_t n_vec = n / kVecN;
++  for (uint32_t vi = threadIdx.x; vi < n_vec; vi += blockDim.x) {
++    in_vec iv;
++    iv.load(src, vi);
++    out_vec ov;
++#pragma unroll
++    for (int i = 0; i < kVecN; ++i) {
++      ov[i] = static_cast<fp8_e4m3_t>(static_cast<float>(iv[i]) * inv_scale);
++    }
++    ov.store(dst, vi);
++  }
++
++  const uint32_t base = n_vec * kVecN;
++  for (uint32_t i = base + threadIdx.x; i < n; i += blockDim.x) {
++    dst[i] = static_cast<fp8_e4m3_t>(static_cast<float>(src[i]) * inv_scale);
++  }
++}
++
++template <typename T, typename IdxT, int kVecN, bool kUsePDL, bool kQuantizeQ>
++__global__ void fused_fp8_qkv_kv_cache_kernel(const __grid_constant__ FusedQkvParams params) {
++  using namespace device;
++  const uint32_t token = blockIdx.x;
++  if (token >= params.num_tokens) return;
++
++  PDLWaitPrimary<kUsePDL>();
++
++  const IdxT slot = static_cast<const IdxT*>(params.cache_loc)[token];
++  const float inv_k = 1.0f / (*params.k_scale);
++  const float inv_v = 1.0f / (*params.v_scale);
++
++  if constexpr (kQuantizeQ) {
++    quant_row<T, kVecN>(
++        static_cast<const T*>(params.q) + static_cast<size_t>(token) * params.q_stride,
++        static_cast<fp8_e4m3_t*>(params.q_out) + static_cast<size_t>(token) * params.q_dim,
++        params.q_dim,
++        1.0f);
++  }
++  quant_row<T, kVecN>(
++      static_cast<const T*>(params.k) + static_cast<size_t>(token) * params.k_stride,
++      static_cast<fp8_e4m3_t*>(params.k_cache) + static_cast<size_t>(slot) * params.kv_dim,
++      params.kv_dim,
++      inv_k);
++  quant_row<T, kVecN>(
++      static_cast<const T*>(params.v) + static_cast<size_t>(token) * params.v_stride,
++      static_cast<fp8_e4m3_t*>(params.v_cache) + static_cast<size_t>(slot) * params.kv_dim,
++      params.kv_dim,
++      inv_v);
++
++  PDLTriggerSecondary<kUsePDL>();
++}
++
++template <typename T, bool kUsePDL>
++struct FusedFp8QkvKvCache {
++  static constexpr int kVecWide = device::kMaxVecBytes / sizeof(T);
++  static constexpr int kVec128 = 16 / sizeof(T);
++
++  template <typename IdxT, int kVecN, bool kQuantizeQ>
++  static constexpr auto kernel = fused_fp8_qkv_kv_cache_kernel<T, IdxT, kVecN, kUsePDL, kQuantizeQ>;
++
++  template <typename IdxT, bool kQuantizeQ>
++  static auto get_kernel(int vec_n) {
++    if (vec_n == kVecWide) return kernel<IdxT, kVecWide, kQuantizeQ>;
++    if (vec_n == kVec128) return kernel<IdxT, kVec128, kQuantizeQ>;
++    return kernel<IdxT, 1, kQuantizeQ>;
++  }
++
++  static bool aligned(const void* p, int bytes) {
++    return reinterpret_cast<uintptr_t>(p) % bytes == 0;
++  }
++
++  static void
++  run(const tvm::ffi::Optional<tvm::ffi::TensorView> q,
++      const tvm::ffi::TensorView k,
++      const tvm::ffi::TensorView v,
++      const tvm::ffi::Optional<tvm::ffi::TensorView> q_out,
++      const tvm::ffi::TensorView k_cache,
++      const tvm::ffi::TensorView v_cache,
++      const tvm::ffi::TensorView cache_loc,
++      const tvm::ffi::TensorView k_scale,
++      const tvm::ffi::TensorView v_scale) {
++    using namespace host;
++    const bool quantize_q = q.has_value();
++    RuntimeCheck(
++        quantize_q == q_out.has_value(), "fused_fp8_qkv_kv_cache: q and q_out must both be given or both omitted");
++
++    auto N = SymbolicSize{"num_tokens"};
++    auto Dkv = SymbolicSize{"kv_dim"};
++    auto S = SymbolicSize{"num_slots"};
++    auto SK = SymbolicSize{"k_stride"};
++    auto SV = SymbolicSize{"v_stride"};
++    auto device = SymbolicDevice{};
++    auto idx_dtype = SymbolicDType{};
++    device.set_options<kDLCUDA>();
++
++    TensorMatcher({N, Dkv}).with_strides({SK, 1}).with_dtype<T>().with_device(device).verify(k);
++    TensorMatcher({N, Dkv}).with_strides({SV, 1}).with_dtype<T>().with_device(device).verify(v);
++    TensorMatcher({S, Dkv}).with_dtype<fp8_e4m3_t>().with_device(device).verify(k_cache).verify(v_cache);
++    TensorMatcher({N}).with_dtype<int32_t, int64_t>(idx_dtype).with_device(device).verify(cache_loc);
++    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(k_scale).verify(v_scale);
++
++    uint32_t q_dim = 0;
++    int64_t q_stride = 0;
++    const void* q_ptr = nullptr;
++    void* q_out_ptr = nullptr;
++    if (quantize_q) {
++      auto Dq = SymbolicSize{"q_dim"};
++      auto SQ = SymbolicSize{"q_stride"};
++      TensorMatcher({N, Dq}).with_strides({SQ, 1}).with_dtype<T>().with_device(device).verify(q.value());
++      TensorMatcher({N, Dq}).with_dtype<fp8_e4m3_t>().with_device(device).verify(q_out.value());
++      q_dim = static_cast<uint32_t>(Dq.unwrap());
++      q_stride = SQ.unwrap();
++      q_ptr = q.value().data_ptr();
++      q_out_ptr = q_out.value().data_ptr();
++    }
++
++    const uint32_t num_tokens = static_cast<uint32_t>(N.unwrap());
++    const uint32_t kv_dim = static_cast<uint32_t>(Dkv.unwrap());
++    const int64_t k_stride = SK.unwrap();
++    const int64_t v_stride = SV.unwrap();
++    RuntimeCheck(num_tokens > 0, "fused_fp8_qkv_kv_cache: num_tokens must be > 0, got ", num_tokens);
++
++    auto fits = [&](int vec) {
++      const int in_bytes = vec * static_cast<int>(sizeof(T));
++      bool ok = kv_dim % vec == 0 && k_stride % vec == 0 && v_stride % vec == 0 && aligned(k.data_ptr(), in_bytes) &&
++                aligned(v.data_ptr(), in_bytes);
++      if (quantize_q) {
++        ok = ok && q_dim % vec == 0 && q_stride % vec == 0 && aligned(q_ptr, in_bytes);
++      }
++      return ok;
++    };
++    const int vec_n = fits(kVecWide) ? kVecWide : (fits(kVec128) ? kVec128 : 1);
++
++    const auto params = FusedQkvParams{
++        .q = q_ptr,
++        .k = k.data_ptr(),
++        .v = v.data_ptr(),
++        .q_out = q_out_ptr,
++        .k_cache = k_cache.data_ptr(),
++        .v_cache = v_cache.data_ptr(),
++        .cache_loc = cache_loc.data_ptr(),
++        .k_scale = static_cast<const float*>(k_scale.data_ptr()),
++        .v_scale = static_cast<const float*>(v_scale.data_ptr()),
++        .q_stride = q_stride,
++        .k_stride = k_stride,
++        .v_stride = v_stride,
++        .num_tokens = num_tokens,
++        .q_dim = q_dim,
++        .kv_dim = kv_dim,
++    };
++
++    auto launch = [&](auto kernel) {
++      LaunchKernel(num_tokens, kBlockSize, device.unwrap())  //
++          .enable_pdl(kUsePDL)(kernel, params);
++    };
++    if (quantize_q) {
++      launch(idx_dtype.is_type<int32_t>() ? get_kernel<int32_t, true>(vec_n) : get_kernel<int64_t, true>(vec_n));
++    } else {
++      launch(idx_dtype.is_type<int32_t>() ? get_kernel<int32_t, false>(vec_n) : get_kernel<int64_t, false>(vec_n));
++    }
++  }
++};
++
++}  // namespace
+diff --git a/python/sglang/jit_kernel/fused_fp8_qkv_kv_cache.py b/python/sglang/jit_kernel/fused_fp8_qkv_kv_cache.py
+new file mode 100644
+index 000000000000..d412cae5594f
+--- /dev/null
++++ b/python/sglang/jit_kernel/fused_fp8_qkv_kv_cache.py
+@@ -0,0 +1,70 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Optional
++
++import torch
++
++from sglang.jit_kernel.utils import (
++    cache_once,
++    is_arch_support_pdl,
++    load_jit,
++    make_cpp_args,
++)
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++
++@cache_once
++def _jit_fused_fp8_qkv_kv_cache_module(dtype: torch.dtype, use_pdl: bool) -> Module:
++    args = make_cpp_args(dtype, use_pdl)
++    return load_jit(
++        "fused_fp8_qkv_kv_cache",
++        *args,
++        cuda_files=["attention/fused_fp8_qkv_kv_cache.cuh"],
++        cuda_wrappers=[("fused_fp8_qkv_kv_cache", f"FusedFp8QkvKvCache<{args}>::run")],
++    )
++
++
++def _scale_to_f32(scale: Optional[torch.Tensor], device: torch.device) -> torch.Tensor:
++    if scale is None:
++        return torch.ones(1, dtype=torch.float32, device=device)
++    return scale.to(torch.float32).reshape(1)
++
++
++def fused_fp8_qkv_kv_cache(
++    q: torch.Tensor | None,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    cache_loc: torch.Tensor,
++    k_scale: Optional[torch.Tensor] = None,
++    v_scale: Optional[torch.Tensor] = None,
++) -> torch.Tensor | None:
++    """Fused FP8 quant of K/V (+ optional Q) + paged KV-cache write."""
++    if k.dtype not in (torch.bfloat16, torch.float16):
++        raise RuntimeError(f"Unsupported dtype {k.dtype}. Supported: bfloat16, float16")
++
++    num_tokens = k.shape[0]
++    k2 = k.reshape(num_tokens, -1)
++    v2 = v.reshape(num_tokens, -1)
++    kv_dim = k2.shape[1]
++
++    k_cache2 = k_cache.view(-1, kv_dim)
++    v_cache2 = v_cache.view(-1, kv_dim)
++
++    ks = _scale_to_f32(k_scale, k.device)
++    vs = _scale_to_f32(v_scale, k.device)
++
++    q2 = None
++    q_out = None
++    if q is not None:
++        q2 = q.reshape(num_tokens, -1)
++        q_out = torch.empty(q2.shape, dtype=torch.float8_e4m3fn, device=q.device)
++
++    module = _jit_fused_fp8_qkv_kv_cache_module(k.dtype, is_arch_support_pdl())
++    module.fused_fp8_qkv_kv_cache(
++        q2, k2, v2, q_out, k_cache2, v_cache2, cache_loc, ks, vs
++    )
++    return q_out
+diff --git a/python/sglang/kernels/ops/kvcache/trtllm_fp8_kv_kernel.py b/python/sglang/kernels/ops/kvcache/trtllm_fp8_kv_kernel.py
+deleted file mode 100644
+index 41cc9c9dc367..000000000000
+--- a/python/sglang/kernels/ops/kvcache/trtllm_fp8_kv_kernel.py
++++ /dev/null
+@@ -1,504 +0,0 @@
+-"""
+-Fused FP8 quantization + paged KV cache write kernel for TRTLLM MHA backend.
+-
+-This kernel fuses the following operations:
+-1. FP8 quantization of K and V tensors (from BF16/FP16 to FP8)
+-2. Per-token or per-page scale computation
+-3. Writing quantized K/V to paged KV cache layout
+-
+-Performance benefits:
+-- Eliminates intermediate FP8 tensors in memory
+-- Reduces kernel launch overhead
+-- Better memory bandwidth utilization
+-"""
+-
+-import logging
+-from typing import Optional
+-
+-import torch
+-import triton
+-import triton.language as tl
+-
+-logger = logging.getLogger(__name__)
+-
+-
+-@triton.jit
+-def _process_kv_tensor(
+-    token_id,
+-    head_block_id,
+-    page_id,
+-    page_offset,
+-    input_ptr,
+-    cache_ptr,
+-    inv_scale,
+-    use_provided_scale: tl.constexpr,
+-    num_kv_heads: tl.constexpr,
+-    head_dim: tl.constexpr,
+-    input_stride_token: tl.constexpr,
+-    input_stride_head: tl.constexpr,
+-    input_stride_dim: tl.constexpr,
+-    cache_stride_page: tl.constexpr,
+-    cache_stride_offset: tl.constexpr,
+-    cache_stride_head: tl.constexpr,
+-    cache_stride_dim: tl.constexpr,
+-    BLOCK_HEAD: tl.constexpr,
+-    BLOCK_DIM: tl.constexpr,
+-):
+-    """Process a block of heads for a single K or V tensor."""
+-    head_idx = head_block_id * BLOCK_HEAD
+-    num_heads_in_block = min(BLOCK_HEAD, num_kv_heads - head_idx)
+-
+-    for dim_idx in range(0, head_dim, BLOCK_DIM):
+-        num_dims_in_block = min(BLOCK_DIM, head_dim - dim_idx)
+-
+-        head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
+-        dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
+-
+-        head_mask = head_offsets < (head_idx + num_heads_in_block)
+-        dim_mask = dim_offsets < (dim_idx + num_dims_in_block)
+-
+-        # Load from input using 3D strides
+-        input_offsets = (
+-            token_id * input_stride_token
+-            + head_offsets[:, None] * input_stride_head
+-            + dim_offsets[None, :] * input_stride_dim
+-        )
+-        mask = head_mask[:, None] & dim_mask[None, :]
+-
+-        block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+-
+-        # Quantize to FP8
+-        if use_provided_scale:
+-            block_fp8 = (block * inv_scale).to(tl.float8e4nv)
+-        else:
+-            block_fp8 = block.to(tl.float8e4nv)
+-
+-        # Write to cache at [page_id, page_offset, head, dim]
+-        cache_offsets = (
+-            page_id * cache_stride_page
+-            + page_offset * cache_stride_offset
+-            + head_offsets[:, None] * cache_stride_head
+-            + dim_offsets[None, :] * cache_stride_dim
+-        )
+-
+-        tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+-
+-
+-@triton.jit
+-def _fused_fp8_set_kv_buffer_kernel(
+-    # Input tensors (post-RoPE K and V in FP16/BF16)
+-    k_ptr,  # [num_tokens, num_kv_heads, head_dim]
+-    v_ptr,  # [num_tokens, num_kv_heads, head_dim]
+-    # Output KV cache buffers (FP8 paged layout)
+-    k_cache_ptr,  # [total_slots, num_kv_heads, head_dim]
+-    v_cache_ptr,  # [total_slots, num_kv_heads, head_dim]
+-    # Cache location indices
+-    cache_loc_ptr,  # [num_tokens] -> token to cache location mapping
+-    # Pointers to scalar inverse scales (computed on GPU in wrapper)
+-    inv_k_scale_ptr,  # pointer to 0-D tensor on GPU
+-    inv_v_scale_ptr,  # pointer to 0-D tensor on GPU
+-    use_provided_scale: tl.constexpr,  # whether to use provided scale
+-    # Tensor dimensions
+-    num_kv_heads: tl.constexpr,
+-    head_dim: tl.constexpr,
+-    page_size: tl.constexpr,
+-    # Strides for K input [num_tokens, num_kv_heads, head_dim]
+-    k_stride_token: tl.constexpr,
+-    k_stride_head: tl.constexpr,
+-    k_stride_dim: tl.constexpr,
+-    # Strides for K cache [total_slots, num_kv_heads, head_dim] (logically paged)
+-    k_cache_stride_page: tl.constexpr,
+-    k_cache_stride_offset: tl.constexpr,
+-    k_cache_stride_head: tl.constexpr,
+-    k_cache_stride_dim: tl.constexpr,
+-    # Strides for V input [num_tokens, num_kv_heads, head_dim]
+-    v_stride_token: tl.constexpr,
+-    v_stride_head: tl.constexpr,
+-    v_stride_dim: tl.constexpr,
+-    # Strides for V cache [total_slots, num_kv_heads, head_dim] (logically paged)
+-    v_cache_stride_page: tl.constexpr,
+-    v_cache_stride_offset: tl.constexpr,
+-    v_cache_stride_head: tl.constexpr,
+-    v_cache_stride_dim: tl.constexpr,
+-    # Block sizes
+-    BLOCK_HEAD: tl.constexpr,  # Number of heads per block
+-    BLOCK_DIM: tl.constexpr,  # Head dimension block size
+-):
+-    """
+-    Fused FP8 quantization + paged KV cache write kernel.
+-
+-    Each program processes one token-head_block-kv combination, quantizing and writing
+-    to the appropriate page in the KV cache.
+-
+-    Grid: (num_tokens, num_head_blocks, 2) where dim2: 0=K, 1=V
+-    """
+-    # Get program IDs
+-    token_id = tl.program_id(0)
+-    head_block_id = tl.program_id(1)
+-    kv_idx = tl.program_id(2)  # 0 for K, 1 for V
+-
+-    # Get cache location for this token
+-    cache_loc = tl.load(cache_loc_ptr + token_id)
+-
+-    # Compute page_id and offset within page
+-    page_id = cache_loc // page_size
+-    page_offset = cache_loc % page_size
+-
+-    # Select K or V based on kv_idx
+-    if kv_idx == 0:
+-        # Process K tensor
+-        if use_provided_scale:
+-            inv_scale = tl.load(inv_k_scale_ptr)
+-        else:
+-            inv_scale = 1.0
+-        _process_kv_tensor(
+-            token_id,
+-            head_block_id,
+-            page_id,
+-            page_offset,
+-            k_ptr,
+-            k_cache_ptr,
+-            inv_scale,
+-            use_provided_scale,
+-            num_kv_heads,
+-            head_dim,
+-            k_stride_token,
+-            k_stride_head,
+-            k_stride_dim,
+-            k_cache_stride_page,
+-            k_cache_stride_offset,
+-            k_cache_stride_head,
+-            k_cache_stride_dim,
+-            BLOCK_HEAD,
+-            BLOCK_DIM,
+-        )
+-    else:
+-        # Process V tensor
+-        if use_provided_scale:
+-            inv_scale = tl.load(inv_v_scale_ptr)
+-        else:
+-            inv_scale = 1.0
+-        _process_kv_tensor(
+-            token_id,
+-            head_block_id,
+-            page_id,
+-            page_offset,
+-            v_ptr,
+-            v_cache_ptr,
+-            inv_scale,
+-            use_provided_scale,
+-            num_kv_heads,
+-            head_dim,
+-            v_stride_token,
+-            v_stride_head,
+-            v_stride_dim,
+-            v_cache_stride_page,
+-            v_cache_stride_offset,
+-            v_cache_stride_head,
+-            v_cache_stride_dim,
+-            BLOCK_HEAD,
+-            BLOCK_DIM,
+-        )
+-
+-
+-def fused_fp8_set_kv_buffer(
+-    k: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim] or [num_tokens, num_kv_heads * head_dim]
+-    v: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim] or [num_tokens, num_kv_heads * head_dim]
+-    k_cache: torch.Tensor,  # [total_slots, num_kv_heads, head_dim] or [num_pages, page_size, num_kv_heads, head_dim]
+-    v_cache: torch.Tensor,  # [total_slots, num_kv_heads, head_dim] or [num_pages, page_size, num_kv_heads, head_dim]
+-    cache_loc: torch.Tensor,  # [num_tokens], dtype=int32
+-    k_scale: Optional[
+-        float
+-    ] = None,  # Scalar scale (matching original set_kv_buffer signature)
+-    v_scale: Optional[float] = None,
+-    page_size: int = 16,
+-    use_triton: bool = True,  # Whether to use Triton kernel (set to False to force naive fallback)
+-) -> None:
+-    """
+-    Python wrapper for the fused FP8 quantization + paged KV cache write kernel.
+-
+-    This function replicates the exact behavior of the original set_kv_buffer but with
+-    a fused kernel that combines FP8 quantization and cache write.
+-
+-    Args:
+-        k: Key tensor after RoPE, can be 2D or 3D
+-        v: Value tensor, can be 2D or 3D
+-        k_cache: Paged K cache buffer in FP8
+-        v_cache: Paged V cache buffer in FP8
+-        cache_loc: Cache location for each token, shape [num_tokens]
+-        k_scale: Optional scalar scale for K (matching original set_kv_buffer)
+-        v_scale: Optional scalar scale for V (matching original set_kv_buffer)
+-        page_size: Number of tokens per page
+-        use_triton: Whether to use optimized Triton kernel
+-    """
+-    num_tokens = k.shape[0]
+-
+-    # Step 1: Infer num_kv_heads and head_dim from cache shape
+-    if k_cache.ndim == 3:
+-        # 3D cache layout: [total_slots, num_kv_heads, head_dim]
+-        total_slots, num_kv_heads, head_dim = k_cache.shape
+-        assert (
+-            total_slots % page_size == 0
+-        ), f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
+-        num_pages = total_slots // page_size
+-    elif k_cache.ndim == 4:
+-        # 4D cache layout: [num_pages, page_size, num_kv_heads, head_dim]
+-        num_pages, ps, num_kv_heads, head_dim = k_cache.shape
+-        assert (
+-            ps == page_size
+-        ), f"page_size mismatch: cache has {ps}, expected {page_size}"
+-        total_slots = num_pages * page_size
+-    else:
+-        raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}, expected 3 or 4")
+-
+-    # Step 2: Validate k, v shapes and normalize
+-    # Store original 3D shape for Triton path
+-    k_3d = None
+-    v_3d = None
+-
+-    if k.ndim == 3:
+-        # Input is [num_tokens, num_kv_heads, head_dim]
+-        assert (
+-            k.shape[1] == num_kv_heads
+-        ), f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
+-        assert (
+-            k.shape[2] == head_dim
+-        ), f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
+-        assert v.shape[1] == num_kv_heads and v.shape[2] == head_dim, "v shape mismatch"
+-
+-        # Keep 3D for Triton kernel
+-        k_3d = k
+-        v_3d = v
+-        # Create 2D view for naive fallback (will be used only if use_triton=False)
+-        k_2d = k.reshape(num_tokens, num_kv_heads * head_dim)
+-        v_2d = v.reshape(num_tokens, num_kv_heads * head_dim)
+-    elif k.ndim == 2:
+-        # Input is already [num_tokens, num_kv_heads * head_dim]
+-        assert (
+-            k.shape[1] == num_kv_heads * head_dim
+-        ), f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
+-        assert (
+-            v.shape[1] == num_kv_heads * head_dim
+-        ), f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
+-
+-        # Create 3D view for Triton kernel
+-        k_3d = k.view(num_tokens, num_kv_heads, head_dim)
+-        v_3d = v.view(num_tokens, num_kv_heads, head_dim)
+-        # Keep 2D for naive
+-        k_2d = k
+-        v_2d = v
+-    else:
+-        raise ValueError(f"Unsupported k.ndim={k.ndim}, expected 2 or 3")
+-
+-    # Step 3: Compute cache strides based on layout
+-    if k_cache.ndim == 3:
+-        # 3D cache: [total_slots, num_kv_heads, head_dim]
+-        stride_slot = k_cache.stride(0)
+-        stride_head = k_cache.stride(1)
+-        stride_dim = k_cache.stride(2)
+-
+-        k_cache_stride_page = stride_slot * page_size
+-        k_cache_stride_offset = stride_slot
+-        k_cache_stride_head = stride_head
+-        k_cache_stride_dim = stride_dim
+-
+-        v_stride_slot = v_cache.stride(0)
+-        v_stride_head = v_cache.stride(1)
+-        v_stride_dim = v_cache.stride(2)
+-
+-        v_cache_stride_page = v_stride_slot * page_size
+-        v_cache_stride_offset = v_stride_slot
+-        v_cache_stride_head = v_stride_head
+-        v_cache_stride_dim = v_stride_dim
+-    else:
+-        # 4D cache: [num_pages, page_size, num_kv_heads, head_dim]
+-        k_cache_stride_page = k_cache.stride(0)
+-        k_cache_stride_offset = k_cache.stride(1)
+-        k_cache_stride_head = k_cache.stride(2)
+-        k_cache_stride_dim = k_cache.stride(3)
+-
+-        v_cache_stride_page = v_cache.stride(0)
+-        v_cache_stride_offset = v_cache.stride(1)
+-        v_cache_stride_head = v_cache.stride(2)
+-        v_cache_stride_dim = v_cache.stride(3)
+-
+-    # Decide whether to use provided scale
+-    use_provided_scale = k_scale is not None and v_scale is not None
+-
+-    if use_triton and num_tokens > 0:
+-        # Use optimized Triton kernel
+-        # Compute input strides for 3D k, v: [num_tokens, num_kv_heads, head_dim]
+-        k_stride_token = k_3d.stride(0)
+-        k_stride_head = k_3d.stride(1)
+-        k_stride_dim = k_3d.stride(2)
+-
+-        v_stride_token = v_3d.stride(0)
+-        v_stride_head = v_3d.stride(1)
+-        v_stride_dim = v_3d.stride(2)
+-
+-        # Block sizes for tiling (tunable)
+-        BLOCK_HEAD = min(num_kv_heads, 8)  # Process up to 8 heads at once
+-        BLOCK_DIM = min(head_dim, 128)  # Process up to 128 dims at once
+-
+-        # Compute number of head blocks
+-        num_head_blocks = (num_kv_heads + BLOCK_HEAD - 1) // BLOCK_HEAD
+-
+-        # Grid: (num_tokens, num_head_blocks, 2)
+-        # - dim 0: tokens
+-        # - dim 1: head blocks
+-        # - dim 2: K/V (0=K, 1=V)
+-        grid = (num_tokens, num_head_blocks, 2)
+-
+-        device = k_3d.device
+-
+-        def _to_tensor_scale(scale):
+-            """Convert scale to 0-D CUDA tensor (accepts Python float or Tensor)."""
+-            if isinstance(scale, torch.Tensor):
+-                return scale.to(device=device, dtype=torch.float32)
+-            else:
+-                # Python float / np scalar
+-                return torch.tensor(float(scale), device=device, dtype=torch.float32)
+-
+-        # Compute inverse scales on GPU to avoid GPU→CPU sync in CUDA graph capture.
+-        # Previously we used float(k_scale) which triggers synchronization and fails
+-        # during CUDA graph capture with cudaErrorStreamCaptureUnsupported.
+-        if use_provided_scale:
+-            k_scale_tensor = _to_tensor_scale(k_scale)
+-            v_scale_tensor = _to_tensor_scale(v_scale)
+-
+-            # Pure GPU scalar operation, safe for CUDA graph
+-            inv_k_scale = (1.0 / k_scale_tensor).to(device=device, dtype=torch.float32)
+-            inv_v_scale = (1.0 / v_scale_tensor).to(device=device, dtype=torch.float32)
+-
+-            inv_k_scale_ptr = inv_k_scale
+-            inv_v_scale_ptr = inv_v_scale
+-        else:
+-            # When use_provided_scale=False, kernel uses constant 1.0 for inv_scale.
+-            # Triton will optimize away the tl.load() calls via constant folding.
+-            # We pass dummy pointers (k_3d) which won't be accessed in the kernel.
+-            # This avoids creating new GPU tensors during CUDA graph capture.
+-            inv_k_scale_ptr = k_3d
+-            inv_v_scale_ptr = k_3d
+-
+-        # Launch Triton kernel
+-        _fused_fp8_set_kv_buffer_kernel[grid](
+-            k_3d,
+-            v_3d,
+-            k_cache,
+-            v_cache,
+-            cache_loc,
+-            inv_k_scale_ptr,
+-            inv_v_scale_ptr,
+-            use_provided_scale,
+-            num_kv_heads,
+-            head_dim,
+-            page_size,
+-            k_stride_token,
+-            k_stride_head,
+-            k_stride_dim,
+-            k_cache_stride_page,
+-            k_cache_stride_offset,
+-            k_cache_stride_head,
+-            k_cache_stride_dim,
+-            v_stride_token,
+-            v_stride_head,
+-            v_stride_dim,
+-            v_cache_stride_page,
+-            v_cache_stride_offset,
+-            v_cache_stride_head,
+-            v_cache_stride_dim,
+-            BLOCK_HEAD=BLOCK_HEAD,
+-            BLOCK_DIM=BLOCK_DIM,
+-        )
+-    else:
+-        # Fallback to naive implementation
+-        _naive_fp8_set_kv_buffer(
+-            k_2d, v_2d, k_cache, v_cache, cache_loc, k_scale, v_scale, page_size
+-        )
+-
+-
+-def _naive_fp8_set_kv_buffer(
+-    k: torch.Tensor,
+-    v: torch.Tensor,
+-    k_cache: torch.Tensor,
+-    v_cache: torch.Tensor,
+-    cache_loc: torch.Tensor,
+-    k_scale: Optional[float],
+-    v_scale: Optional[float],
+-    page_size: int,
+-) -> None:
+-    """
+-    Naive fallback implementation that mimics the original set_kv_buffer logic.
+-
+-    This directly replicates the behavior of MHATokenToKVPool.set_kv_buffer:
+-    1. Apply scale (if k.dtype != cache.dtype and scale is provided)
+-    2. Convert to FP8
+-    3. Write to cache at cache_loc
+-
+-    Args:
+-        k: [num_tokens, num_kv_heads * head_dim], already reshaped to 2D
+-        v: [num_tokens, num_kv_heads * head_dim], already reshaped to 2D
+-        k_cache: [total_slots, num_kv_heads, head_dim] or [num_pages, page_size, num_kv_heads, head_dim]
+-        v_cache: Same shape as k_cache
+-        cache_loc: [num_tokens]
+-        k_scale: Optional scale for K
+-        v_scale: Optional scale for V
+-        page_size: Tokens per page
+-    """
+-    num_tokens = k.shape[0]
+-
+-    # Infer dimensions from cache
+-    if k_cache.ndim == 3:
+-        num_kv_heads = k_cache.shape[1]
+-        head_dim = k_cache.shape[2]
+-    elif k_cache.ndim == 4:
+-        num_kv_heads = k_cache.shape[2]
+-        head_dim = k_cache.shape[3]
+-    else:
+-        raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}")
+-
+-    # Determine target dtype and storage dtype
+-    # See: python/sglang/srt/mem_cache/memory_pool.py:445-449
+-    store_dtype = k_cache.dtype
+-    if store_dtype == torch.uint8:
+-        # Cache is stored as uint8 for FP8 (due to index_put limitation)
+-        dtype = torch.float8_e4m3fn  # Logical dtype
+-    else:
+-        dtype = store_dtype  # Cache dtype is the logical dtype
+-
+-    # Replicate the original set_kv_buffer behavior
+-    # See: python/sglang/srt/mem_cache/memory_pool.py:777-799
+-    if k.dtype != dtype:
+-        # Need quantization - clone first to avoid modifying input
+-        k = k.clone()
+-        v = v.clone()
+-
+-        if k_scale is not None:
+-            k.div_(k_scale)  # In-place division
+-        if v_scale is not None:
+-            v.div_(v_scale)  # In-place division
+-
+-        k = k.to(dtype)
+-        v = v.to(dtype)
+-
+-    # View FP8 as uint8 if needed (for index_put compatibility)
+-    if store_dtype == torch.uint8 and dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+-        k = k.view(torch.uint8)
+-        v = v.view(torch.uint8)
+-
+-    # Reshape from [T, H*D] to [T, H, D]
+-    k = k.view(num_tokens, num_kv_heads, head_dim)
+-    v = v.view(num_tokens, num_kv_heads, head_dim)
+-
+-    # Write to cache using advanced indexing (same as original)
+-    if k_cache.ndim == 3:
+-        # 3D cache: [total_slots, H, D]
+-        k_cache[cache_loc] = k
+-        v_cache[cache_loc] = v
+-    else:
+-        # 4D cache: [num_pages, page_size, H, D]
+-        # Decompose loc into page_id and page_offset (vectorized)
+-        page_ids = cache_loc // page_size
+-        page_offsets = cache_loc % page_size
+-        k_cache[page_ids, page_offsets] = k
+-        v_cache[page_ids, page_offsets] = v
+diff --git a/python/sglang/srt/layers/attention/trtllm_mha_backend.py b/python/sglang/srt/layers/attention/trtllm_mha_backend.py
+index c3e3346b1302..4b30c797352a 100644
+--- a/python/sglang/srt/layers/attention/trtllm_mha_backend.py
++++ b/python/sglang/srt/layers/attention/trtllm_mha_backend.py
+@@ -12,9 +12,6 @@
+ import torch
+ 
+ from sglang.kernels.ops.attention.utils import canonicalize_stride
+-from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
+-    fused_fp8_set_kv_buffer,
+-)
+ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+     Q_MODE_NONE,
+     Q_MODE_STRIDED,
+@@ -618,30 +615,27 @@ def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bo
+         """Check if we should use the fused FP8 KV cache write path."""
+         return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
+ 
+-    def _fused_fp8_set_kv_buffer(
++    def _fused_fp8_qkv_kv_cache(
+         self,
+-        q: torch.Tensor,
++        q: torch.Tensor | None,
+         k: torch.Tensor,
+         v: torch.Tensor,
+         layer: RadixAttention,
+         forward_batch: ForwardBatch,
+-        **kwargs,
+-    ):
+-        """Fused FP8 quantization and KV cache write."""
+-        cache_loc = self._get_layer_cache_loc(layer, forward_batch)
++    ) -> torch.Tensor | None:
++        from sglang.jit_kernel.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
+ 
+-        # Get K/V cache buffers from token_to_kv_pool
++        cache_loc = self._get_layer_cache_loc(layer, forward_batch)
+         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+-
+-        fused_fp8_set_kv_buffer(
++        return fused_fp8_qkv_kv_cache(
++            q=q,
+             k=k,
+             v=v,
+             k_cache=k_cache,
+             v_cache=v_cache,
+             cache_loc=cache_loc,
+-            k_scale=layer.k_scale,  # May be None
+-            v_scale=layer.v_scale,  # May be None
+-            page_size=self.page_size,
++            k_scale=layer.k_scale,
++            v_scale=layer.v_scale,
+         )
+ 
+     def init_forward_metadata_out_graph(
+@@ -867,16 +861,14 @@ def forward_decode(
+         cache_loc = forward_batch.out_cache_loc
+ 
+         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
++        use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
+ 
+         if use_fused_fp8_path:
+-            # Use fused FP8 quantization + KV cache write path
+-            self._fused_fp8_set_kv_buffer(
+-                q=q,
+-                k=k,
+-                v=v,
+-                layer=layer,
+-                forward_batch=forward_batch,
++            fused_q = self._fused_fp8_qkv_kv_cache(
++                q if use_fused_qkv else None, k, v, layer, forward_batch
+             )
++            if fused_q is not None:
++                q = fused_q
+             k = None
+             v = None
+         else:
+@@ -894,7 +886,11 @@ def forward_decode(
+         # For XQA, q_dtype should be bf16. For trtllm-gen,
+         # q_dtype should be FP8 when KV is in FP8.
+         q_scale = 1.0
+-        if self.data_type == torch.float8_e4m3fn and not self.is_xqa_impl:
++        if (
++            self.data_type == torch.float8_e4m3fn
++            and not self.is_xqa_impl
++            and not use_fused_qkv
++        ):
+             q = q.to(torch.float8_e4m3fn)
+         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+@@ -952,16 +948,14 @@ def forward_extend(
+         cache_loc = forward_batch.out_cache_loc
+ 
+         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
++        use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
+ 
+         if use_fused_fp8_path:
+-            # Use fused FP8 quantization + KV cache write path
+-            self._fused_fp8_set_kv_buffer(
+-                q=q,
+-                k=k,
+-                v=v,
+-                layer=layer,
+-                forward_batch=forward_batch,
++            fused_q = self._fused_fp8_qkv_kv_cache(
++                q if use_fused_qkv else None, k, v, layer, forward_batch
+             )
++            if fused_q is not None:
++                q = fused_q
+             k = None
+             v = None
+         else:
+@@ -977,8 +971,13 @@ def forward_extend(
+                 )
+ 
+         q_scale = 1.0
+-        if self.data_type == torch.float8_e4m3fn and (
+-            not self.is_xqa_impl or not forward_batch.forward_mode.is_target_verify()
++        if (
++            self.data_type == torch.float8_e4m3fn
++            and (
++                not self.is_xqa_impl
++                or not forward_batch.forward_mode.is_target_verify()
++            )
++            and not use_fused_qkv
+         ):
+             q = q.to(torch.float8_e4m3fn)
+         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+diff --git a/test/manual/test_trtllm_fp8_kv_kernel.py b/test/manual/test_trtllm_fp8_kv_kernel.py
+deleted file mode 100644
+index 1ff63d781852..000000000000
+--- a/test/manual/test_trtllm_fp8_kv_kernel.py
++++ /dev/null
+@@ -1,481 +0,0 @@
+-"""
+-Unit tests for TRTLLM FP8 KV cache fusion kernel.
+-"""
+-
+-import unittest
+-
+-import torch
+-
+-from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
+-    fused_fp8_set_kv_buffer,
+-)
+-from sglang.test.test_utils import CustomTestCase
+-
+-
+-class TestTRTLLMFP8KVKernel(CustomTestCase):
+-    """Test fused FP8 KV cache write kernel correctness."""
+-
+-    @classmethod
+-    def setUpClass(cls):
+-        if not torch.cuda.is_available():
+-            raise unittest.SkipTest("CUDA not available")
+-
+-        if torch.cuda.get_device_capability()[0] < 9:
+-            raise unittest.SkipTest("FP8 requires compute capability >= 9.0")
+-
+-    def _test_kernel_correctness(
+-        self,
+-        num_tokens,
+-        num_kv_heads,
+-        head_dim,
+-        page_size,
+-        use_scale,
+-        input_ndim,
+-        cache_ndim,
+-    ):
+-        """Compare Triton kernel output against naive implementation."""
+-        device = torch.device("cuda")
+-        dtype = torch.bfloat16
+-
+-        # Create input tensors
+-        if input_ndim == 3:
+-            k = torch.randn(
+-                num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype
+-            )
+-            v = torch.randn(
+-                num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype
+-            )
+-        else:
+-            k = torch.randn(
+-                num_tokens, num_kv_heads * head_dim, device=device, dtype=dtype
+-            )
+-            v = torch.randn(
+-                num_tokens, num_kv_heads * head_dim, device=device, dtype=dtype
+-            )
+-
+-        # Create cache tensors (use FP8 to match real runtime behavior)
+-        num_pages = 128
+-        total_slots = num_pages * page_size
+-        cache_dtype = torch.float8_e4m3fn
+-        if cache_ndim == 3:
+-            k_cache_triton = torch.zeros(
+-                total_slots, num_kv_heads, head_dim, device=device, dtype=cache_dtype
+-            )
+-            v_cache_triton = torch.zeros(
+-                total_slots, num_kv_heads, head_dim, device=device, dtype=cache_dtype
+-            )
+-            k_cache_naive = torch.zeros(
+-                total_slots, num_kv_heads, head_dim, device=device, dtype=cache_dtype
+-            )
+-            v_cache_naive = torch.zeros(
+-                total_slots, num_kv_heads, head_dim, device=device, dtype=cache_dtype
+-            )
+-        else:
+-            k_cache_triton = torch.zeros(
+-                num_pages,
+-                page_size,
+-                num_kv_heads,
+-                head_dim,
+-                device=device,
+-                dtype=cache_dtype,
+-            )
+-            v_cache_triton = torch.zeros(
+-                num_pages,
+-                page_size,
+-                num_kv_heads,
+-                head_dim,
+-                device=device,
+-                dtype=cache_dtype,
+-            )
+-            k_cache_naive = torch.zeros(
+-                num_pages,
+-                page_size,
+-                num_kv_heads,
+-                head_dim,
+-                device=device,
+-                dtype=cache_dtype,
+-            )
+-            v_cache_naive = torch.zeros(
+-                num_pages,
+-                page_size,
+-                num_kv_heads,
+-                head_dim,
+-                device=device,
+-                dtype=cache_dtype,
+-            )
+-
+-        # Create cache locations (ensure unique indices to avoid race conditions)
+-        cache_loc = torch.randperm(total_slots, device=device, dtype=torch.int32)[
+-            :num_tokens
+-        ]
+-
+-        # Optional scales
+-        k_scale = 0.5 if use_scale else None
+-        v_scale = 0.75 if use_scale else None
+-
+-        # Run Triton kernel
+-        fused_fp8_set_kv_buffer(
+-            k.clone(),
+-            v.clone(),
+-            k_cache_triton,
+-            v_cache_triton,
+-            cache_loc,
+-            k_scale,
+-            v_scale,
+-            page_size,
+-            use_triton=True,
+-        )
+-
+-        # Run naive fallback
+-        fused_fp8_set_kv_buffer(
+-            k.clone(),
+-            v.clone(),
+-            k_cache_naive,
+-            v_cache_naive,
+-            cache_loc,
+-            k_scale,
+-            v_scale,
+-            page_size,
+-            use_triton=False,
+-        )
+-
+-        # Compare results (bit-exact match expected)
+-        self.assertTrue(
+-            torch.equal(k_cache_triton, k_cache_naive),
+-            "K cache mismatch between Triton and naive",
+-        )
+-        self.assertTrue(
+-            torch.equal(v_cache_triton, v_cache_naive),
+-            "V cache mismatch between Triton and naive",
+-        )
+-
+-    def test_basic_3d_input_3d_cache(self):
+-        """Test basic case: 3D input, 3D cache, no scale."""
+-        self._test_kernel_correctness(
+-            num_tokens=16,
+-            num_kv_heads=8,
+-            head_dim=128,
+-            page_size=16,
+-            use_scale=False,
+-            input_ndim=3,
+-            cache_ndim=3,
+-        )
+-
+-    def test_basic_3d_input_4d_cache(self):
+-        """Test basic case: 3D input, 4D cache, no scale."""
+-        self._test_kernel_correctness(
+-            num_tokens=16,
+-            num_kv_heads=8,
+-            head_dim=128,
+-            page_size=16,
+-            use_scale=False,
+-            input_ndim=3,
+-            cache_ndim=4,
+-        )
+-
+-    def test_with_scale_3d_cache(self):
+-        """Test with scale: 3D input, 3D cache."""
+-        self._test_kernel_correctness(
+-            num_tokens=16,
+-            num_kv_heads=8,
+-            head_dim=128,
+-            page_size=16,
+-            use_scale=True,
+-            input_ndim=3,
+-            cache_ndim=3,
+-        )
+-
+-    def test_with_scale_4d_cache(self):
+-        """Test with scale: 3D input, 4D cache."""
+-        self._test_kernel_correctness(
+-            num_tokens=16,
+-            num_kv_heads=8,
+-            head_dim=128,
+-            page_size=16,
+-            use_scale=True,
+-            input_ndim=3,
+-            cache_ndim=4,
+-        )
+-
+-    def test_2d_input_3d_cache(self):
+-        """Test 2D input (flattened): 2D input, 3D cache."""
+-        self._test_kernel_correctness(
+-            num_tokens=16,
+-            num_kv_heads=8,
+-            head_dim=128,
+-            page_size=16,
+-            use_scale=False,
+-            input_ndim=2,
+-            cache_ndim=3,
+-        )
+-
+-    def test_2d_input_4d_cache(self):
+-        """Test 2D input (flattened): 2D input, 4D cache."""
+-        self._test_kernel_correctness(
+-            num_tokens=16,
+-            num_kv_heads=8,
+-            head_dim=128,
+-            page_size=16,
+-            use_scale=False,
+-            input_ndim=2,
+-            cache_ndim=4,
+-        )
+-
+-    def test_single_token(self):
+-        """Test edge case: single token."""
+-        self._test_kernel_correctness(
+-            num_tokens=1,
+-            num_kv_heads=8,
+-            head_dim=128,
+-            page_size=16,
+-            use_scale=True,
+-            input_ndim=3,
+-            cache_ndim=3,
+-        )
+-
+-    def test_large_batch(self):
+-        """Test larger batch size."""
+-        self._test_kernel_correctness(
+-            num_tokens=128,
+-            num_kv_heads=16,
+-            head_dim=64,
+-            page_size=16,
+-            use_scale=True,
+-            input_ndim=3,
+-            cache_ndim=4,
+-        )
+-
+-    def test_different_head_dims(self):
+-        """Test different head dimensions."""
+-        for head_dim in [64, 128]:
+-            self._test_kernel_correctness(
+-                num_tokens=16,
+-                num_kv_heads=8,
+-                head_dim=head_dim,
+-                page_size=16,
+-                use_scale=False,
+-                input_ndim=3,
+-                cache_ndim=3,
+-            )
+-
+-    def test_empty_input(self):
+-        """Test edge case: empty input (0 tokens)."""
+-        device = torch.device("cuda")
+-        dtype = torch.bfloat16
+-        num_kv_heads = 8
+-        head_dim = 128
+-        page_size = 16
+-        num_tokens = 0
+-
+-        # Empty inputs
+-        k = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+-        v = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+-
+-        # Cache (use FP8 to match real runtime behavior)
+-        total_slots = 128
+-        k_cache = torch.zeros(
+-            total_slots,
+-            num_kv_heads,
+-            head_dim,
+-            device=device,
+-            dtype=torch.float8_e4m3fn,
+-        )
+-        v_cache = torch.zeros(
+-            total_slots,
+-            num_kv_heads,
+-            head_dim,
+-            device=device,
+-            dtype=torch.float8_e4m3fn,
+-        )
+-
+-        # Empty cache locations
+-        cache_loc = torch.empty(num_tokens, device=device, dtype=torch.int32)
+-
+-        # Should not crash
+-        fused_fp8_set_kv_buffer(
+-            k,
+-            v,
+-            k_cache,
+-            v_cache,
+-            cache_loc,
+-            k_scale=None,
+-            v_scale=None,
+-            page_size=page_size,
+-        )
+-
+-    def test_fp8_kv_kernel_accepts_tensor_scales(self):
+-        """
+-        Regression test for B200 Triton compilation issue.
+-
+-        This test ensures that fused_fp8_set_kv_buffer correctly handles
+-        k_scale/v_scale when they are 0-dimensional tensors (torch.nn.Parameter).
+-
+-        Previously, Triton would treat 0-D tensor arguments as pointers,
+-        causing a type error when performing "1.0 / k_scale" inside the kernel.
+-        The fix converts tensor scales to Python floats in the wrapper.
+-        """
+-        device = torch.device("cuda")
+-
+-        num_tokens = 4
+-        num_kv_heads = 2
+-        head_dim = 64
+-        page_size = 16
+-        total_slots = page_size
+-
+-        k = torch.randn(
+-            num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+-        )
+-        v = torch.randn_like(k)
+-
+-        k_cache = torch.empty(
+-            total_slots,
+-            num_kv_heads,
+-            head_dim,
+-            device=device,
+-            dtype=torch.float8_e4m3fn,
+-        )
+-        v_cache = torch.empty_like(k_cache)
+-
+-        cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+-
+-        # Use 0D tensor form of scale to reproduce the original bug scenario
+-        k_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+-        v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+-
+-        # Old code would trigger Triton's IncompatibleTypeError here
+-        # New code should handle this gracefully by converting to float
+-        fused_fp8_set_kv_buffer(
+-            k,
+-            v,
+-            k_cache,
+-            v_cache,
+-            cache_loc,
+-            k_scale=k_scale,
+-            v_scale=v_scale,
+-            page_size=page_size,
+-            use_triton=True,
+-        )
+-
+-        # If we get here without exception, the regression is fixed
+-
+-    def test_fp8_kv_kernel_cuda_graph_compatible(self):
+-        """
+-        Regression test for CUDA graph capture compatibility.
+-
+-        This test ensures that fused_fp8_set_kv_buffer works correctly within
+-        CUDA graph capture, which is used in production for performance.
+-
+-        Previously, float(k_scale) caused GPU→CPU synchronization, triggering
+-        cudaErrorStreamCaptureUnsupported during graph capture. The fix computes
+-        inverse scales purely on GPU using tensor operations.
+-        """
+-        device = torch.device("cuda")
+-
+-        num_tokens = 4
+-        num_kv_heads = 2
+-        head_dim = 64
+-        page_size = 16
+-        total_slots = page_size
+-
+-        k = torch.randn(
+-            num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+-        )
+-        v = torch.randn_like(k)
+-
+-        k_cache = torch.empty(
+-            total_slots,
+-            num_kv_heads,
+-            head_dim,
+-            device=device,
+-            dtype=torch.float8_e4m3fn,
+-        )
+-        v_cache = torch.empty_like(k_cache)
+-
+-        cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+-
+-        # Use 0D tensor scales (like nn.Parameter) to reproduce production scenario
+-        k_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+-        v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+-
+-        # Test that kernel works under CUDA graph capture
+-        graph = torch.cuda.CUDAGraph()
+-        with torch.cuda.graph(graph):
+-            # Old code would fail here with cudaErrorStreamCaptureUnsupported
+-            # New code should succeed because all operations stay on GPU
+-            fused_fp8_set_kv_buffer(
+-                k,
+-                v,
+-                k_cache,
+-                v_cache,
+-                cache_loc,
+-                k_scale=k_scale,
+-                v_scale=v_scale,
+-                page_size=page_size,
+-                use_triton=True,
+-            )
+-
+-        # Replay the graph to verify it works
+-        graph.replay()
+-
+-        # If we get here without exception, CUDA graph compatibility is confirmed
+-
+-    def test_fp8_kv_kernel_cuda_graph_compatible_no_scale(self):
+-        """
+-        Regression test for CUDA graph capture compatibility without scales.
+-
+-        This test ensures that fused_fp8_set_kv_buffer works correctly within
+-        CUDA graph capture when k_scale/v_scale are None (use_provided_scale=False).
+-
+-        Previously, the code created new GPU tensors (torch.tensor(1.0, device=...))
+-        during graph capture, triggering cudaErrorStreamCaptureUnsupported.
+-        The fix passes dummy pointers when use_provided_scale=False, as the kernel
+-        uses constant 1.0 and Triton optimizes away the pointer loads.
+-        """
+-        device = torch.device("cuda")
+-
+-        num_tokens = 4
+-        num_kv_heads = 2
+-        head_dim = 64
+-        page_size = 16
+-        total_slots = page_size
+-
+-        k = torch.randn(
+-            num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+-        )
+-        v = torch.randn_like(k)
+-
+-        k_cache = torch.empty(
+-            total_slots,
+-            num_kv_heads,
+-            head_dim,
+-            device=device,
+-            dtype=torch.float8_e4m3fn,
+-        )
+-        v_cache = torch.empty_like(k_cache)
+-
+-        cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+-
+-        # Test that kernel works under CUDA graph capture WITHOUT scales
+-        graph = torch.cuda.CUDAGraph()
+-        with torch.cuda.graph(graph):
+-            # No k_scale/v_scale provided - use_provided_scale=False branch
+-            # Old code would fail here with cudaErrorStreamCaptureUnsupported
+-            # New code should succeed by using dummy pointers
+-            fused_fp8_set_kv_buffer(
+-                k,
+-                v,
+-                k_cache,
+-                v_cache,
+-                cache_loc,
+-                page_size=page_size,
+-                use_triton=True,
+-            )
+-
+-        # Replay the graph to verify it works
+-        graph.replay()
+-
+-        # If we get here without exception, no-scale CUDA graph compatibility is confirmed
+-
+-
+-if __name__ == "__main__":
+-    unittest.main()
+diff --git a/test/registered/jit/benchmark/bench_fused_fp8_qkv_kv_cache.py b/test/registered/jit/benchmark/bench_fused_fp8_qkv_kv_cache.py
+new file mode 100644
+index 000000000000..9db0cebcc466
+--- /dev/null
++++ b/test/registered/jit/benchmark/bench_fused_fp8_qkv_kv_cache.py
+@@ -0,0 +1,53 @@
++import torch
++
++from sglang.jit_kernel.benchmark import marker
++from sglang.jit_kernel.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(
++    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
++)
++
++FP8 = torch.float8_e4m3fn
++D = 128
++
++
++def fused_qkv(q, k, v, k_cache, v_cache, cache_loc, k_scale, v_scale):
++    return fused_fp8_qkv_kv_cache(
++        q, k, v, k_cache, v_cache, cache_loc, k_scale, v_scale
++    )
++
++
++def fused_kv_only(q, k, v, k_cache, v_cache, cache_loc, k_scale, v_scale):
++    fused_fp8_qkv_kv_cache(None, k, v, k_cache, v_cache, cache_loc, k_scale, v_scale)
++    return q.to(FP8)
++
++
++FN_MAP = {"fused_qkv": fused_qkv, "fused_kv_only": fused_kv_only}
++
++
++@marker.parametrize("num_tokens", [8, 128, 2048, 4096, 8192, 16384], [8, 2048])
++@marker.parametrize("hq,hkv", [(64, 2), (16, 1), (8, 1)])
++@marker.benchmark("impl", ["fused_qkv", "fused_kv_only"])
++def benchmark(num_tokens: int, hq: int, hkv: int, impl: str):
++    qd, kvd = hq * D, hkv * D
++    qkv = torch.randn(num_tokens, qd + 2 * kvd, dtype=torch.bfloat16, device="cuda")
++    q = qkv[:, :qd]
++    k = qkv[:, qd : qd + kvd].view(num_tokens, hkv, D)
++    v = qkv[:, qd + kvd :].view(num_tokens, hkv, D)
++    slots = num_tokens + 16
++    k_cache = torch.zeros(slots, hkv, D, dtype=FP8, device="cuda")
++    v_cache = torch.zeros(slots, hkv, D, dtype=FP8, device="cuda")
++    cache_loc = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
++    k_scale = torch.tensor(0.5, dtype=torch.float32, device="cuda")
++    v_scale = torch.tensor(0.7, dtype=torch.float32, device="cuda")
++    return marker.do_bench(
++        FN_MAP[impl],
++        input_args=(q, k, v, k_cache, v_cache, cache_loc, k_scale, v_scale),
++        graph_clone_args=(0,),
++        memory_output=(k_cache, v_cache),
++    )
++
++
++if __name__ == "__main__":
++    benchmark.run()
+diff --git a/test/registered/jit/test_fused_fp8_qkv_kv_cache.py b/test/registered/jit/test_fused_fp8_qkv_kv_cache.py
+new file mode 100644
+index 000000000000..2525b2666e2b
+--- /dev/null
++++ b/test/registered/jit/test_fused_fp8_qkv_kv_cache.py
+@@ -0,0 +1,91 @@
++import pytest
++import torch
++
++from sglang.jit_kernel.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
++register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
++
++FP8 = torch.float8_e4m3fn
++
++
++def _ref_quant(x_f32: torch.Tensor, inv_scale: float) -> torch.Tensor:
++    y = (x_f32 * inv_scale).clamp(-448.0, 448.0)
++    return y.to(FP8)
++
++
++def _bytes(t: torch.Tensor) -> torch.Tensor:
++    return t.reshape(-1).view(torch.uint8)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize(
++    "hq,hkv,head_dim", [(8, 1, 128), (8, 8, 128), (4, 2, 64), (64, 2, 128)]
++)
++@pytest.mark.parametrize(
++    "num_tokens", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
++)
++@pytest.mark.parametrize("scale", [None, 0.5, 2.0])
++@pytest.mark.parametrize("fused_qkv", [False, True])
++@pytest.mark.parametrize("quantize_q", [True, False])
++def test_fused_fp8_qkv_kv_cache(
++    dtype, hq, hkv, head_dim, num_tokens, scale, fused_qkv, quantize_q
++):
++    idx_dtype = torch.int64
++    torch.manual_seed(0)
++    device = "cuda"
++    q_dim = hq * head_dim
++    kv_dim = hkv * head_dim
++    total_slots = num_tokens + 4
++
++    if fused_qkv:
++        qkv = torch.randn(num_tokens, q_dim + 2 * kv_dim, dtype=dtype, device=device)
++        q = qkv[:, :q_dim]
++        k = qkv[:, q_dim : q_dim + kv_dim].view(num_tokens, hkv, head_dim)
++        v = qkv[:, q_dim + kv_dim :].view(num_tokens, hkv, head_dim)
++        if num_tokens > 1:
++            assert not q.is_contiguous()
++    else:
++        q = torch.randn(num_tokens, q_dim, dtype=dtype, device=device)
++        k = torch.randn(num_tokens, hkv, head_dim, dtype=dtype, device=device)
++        v = torch.randn(num_tokens, hkv, head_dim, dtype=dtype, device=device)
++    k_cache = torch.zeros(total_slots, hkv, head_dim, dtype=FP8, device=device)
++    v_cache = torch.zeros(total_slots, hkv, head_dim, dtype=FP8, device=device)
++
++    cache_loc = torch.randperm(total_slots, device=device)[:num_tokens].to(idx_dtype)
++
++    if scale is None:
++        k_scale = v_scale = None
++        inv_k = inv_v = 1.0
++    else:
++        k_scale = torch.tensor(scale, dtype=torch.float32, device=device)
++        v_scale = torch.tensor(scale * 1.5, dtype=torch.float32, device=device)
++        inv_k = 1.0 / float(k_scale)
++        inv_v = 1.0 / float(v_scale)
++
++    q_out = fused_fp8_qkv_kv_cache(
++        q if quantize_q else None, k, v, k_cache, v_cache, cache_loc, k_scale, v_scale
++    )
++
++    if quantize_q:
++        q_ref = q.to(FP8)
++        torch.testing.assert_close(_bytes(q_out), _bytes(q_ref), rtol=0, atol=0)
++    else:
++        assert q_out is None
++
++    k_ref = _ref_quant(k.reshape(num_tokens, kv_dim).float(), inv_k)
++    v_ref = _ref_quant(v.reshape(num_tokens, kv_dim).float(), inv_v)
++    loc = cache_loc.long()
++    torch.testing.assert_close(
++        _bytes(k_cache.reshape(total_slots, kv_dim)[loc]), _bytes(k_ref), rtol=0, atol=0
++    )
++    torch.testing.assert_close(
++        _bytes(v_cache.reshape(total_slots, kv_dim)[loc]), _bytes(v_ref), rtol=0, atol=0
++    )
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v", "-s"]))

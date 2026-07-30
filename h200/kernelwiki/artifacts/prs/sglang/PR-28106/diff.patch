@@ -1,0 +1,692 @@
+diff --git a/python/sglang/srt/layers/attention/triton_ops/trtllm_mha_page_table.py b/python/sglang/srt/layers/attention/triton_ops/trtllm_mha_page_table.py
+new file mode 100644
+index 000000000000..7a7de6fc089d
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/triton_ops/trtllm_mha_page_table.py
+@@ -0,0 +1,126 @@
++"""Device-side page-table builder for the trtllm_mha attention backend.
++
++trtllm_mha builds its block (page) table from the global ``req_to_token`` pool.
++Doing it with a host-max PyTorch gather forces a ``seq_lens.max().item()`` D2H
++sync (the CPU must know the page-table width before launching). This kernel
++instead derives the per-request page count from the device-side ``seq_lens``
++tensor, so the build is sync-free: the grid/buffer use the static
++``max_num_pages`` upper bound, while each program self-guards on the real length.
++
++The kernel is MHA-owned (no dependency on the MLA kv-index kernels) and also
++emits the SWA-translated block table in the same pass via the full->SWA lookup
++table, so SWA hybrid models stay sync-free too.
++"""
++
++from typing import Optional
++
++import torch
++import triton
++import triton.language as tl
++
++# Tokens covered per CTA along the page-block (grid axis-1) dimension.
++_MHA_KV_INDEX_BLOCK_TOKENS = 4096
++# Triton kernels can only read module globals that are tl.constexpr instances.
++_MHA_KV_INDEX_BLOCK_TOKENS_TL = tl.constexpr(_MHA_KV_INDEX_BLOCK_TOKENS)
++
++
++def get_num_mha_kv_index_blocks(num_pages: int, page_size: int) -> int:
++    """Grid axis-1 size: number of page-block CTAs spanning the widest sequence.
++
++    ``num_pages`` is the per-row width of the page-table buffer (the static
++    ``max_num_pages`` upper bound). One CTA handles ``_MHA_KV_INDEX_BLOCK_TOKENS
++    // page_size`` pages.
++    """
++    pages_per_block = _MHA_KV_INDEX_BLOCK_TOKENS // page_size
++    return (num_pages + pages_per_block - 1) // pages_per_block
++
++
++@triton.jit
++def create_trtllm_mha_kv_indices_triton(
++    req_to_token_ptr,  # [max_reqs, max_context_len], int32
++    req_pool_indices_ptr,  # [bs]
++    seq_lens_ptr,  # [bs], per-request KV length in tokens
++    full_to_swa_ptr,  # full->SWA token-slot lookup table, or dummy when not SWA
++    page_table_ptr,  # [bs, num_pages] int32 block ids (output)
++    swa_page_table_ptr,  # [bs, num_pages] int32 SWA block ids (output), or dummy
++    req_to_token_stride: tl.constexpr,
++    page_table_stride: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    HAS_SWA: tl.constexpr,
++):
++    """Fill ``page_table_ptr`` (and ``swa_page_table_ptr`` when ``HAS_SWA``).
++
++    Program ``(pid_req, pid_blk)`` writes the block ids of request ``pid_req`` for
++    the page-block ``pid_blk``. It reads the KV token slot at each page boundary
++    from ``req_to_token`` and converts it to a block id (``slot // PAGE_SIZE``).
++    Programs past the request's page count are guarded out, so the work (and the
++    DRAM traffic) is bounded by the device-side ``seq_lens`` — no host max needed.
++    """
++    PAGES_PER_BLOCK: tl.constexpr = _MHA_KV_INDEX_BLOCK_TOKENS_TL // PAGE_SIZE
++    pid_req = tl.program_id(0)
++    pid_blk = tl.program_id(1)
++
++    seq_len = tl.load(seq_lens_ptr + pid_req)
++    num_pages = tl.cdiv(seq_len, PAGE_SIZE)
++    num_page_blocks = tl.cdiv(seq_len, _MHA_KV_INDEX_BLOCK_TOKENS_TL)
++    if pid_blk >= num_page_blocks:
++        return
++
++    req_pool_index = tl.load(req_pool_indices_ptr + pid_req)
++    page_idx = tl.arange(0, PAGES_PER_BLOCK) + pid_blk * PAGES_PER_BLOCK
++    token_pos = page_idx.to(tl.int64) * PAGE_SIZE
++    mask = page_idx < num_pages
++
++    slot = tl.load(
++        req_to_token_ptr
++        + req_pool_index.to(tl.int64) * req_to_token_stride
++        + token_pos,
++        mask=mask,
++    )
++    out_off = pid_req * page_table_stride + page_idx
++    tl.store(page_table_ptr + out_off, (slot // PAGE_SIZE).to(tl.int32), mask=mask)
++    if HAS_SWA:
++        swa_slot = tl.load(full_to_swa_ptr + slot.to(tl.int64), mask=mask)
++        tl.store(
++            swa_page_table_ptr + out_off,
++            (swa_slot // PAGE_SIZE).to(tl.int32),
++            mask=mask,
++        )
++
++
++def build_trtllm_mha_page_table(
++    req_to_token: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    cache_seqlens: torch.Tensor,
++    page_table: torch.Tensor,
++    page_size: int,
++    swa_page_table: Optional[torch.Tensor] = None,
++    full_to_swa: Optional[torch.Tensor] = None,
++) -> None:
++    """Fill ``page_table`` (and ``swa_page_table`` when SWA) on-device, no D2H sync.
++
++    Computes the launch grid from the static page-table width and dispatches
++    ``create_trtllm_mha_kv_indices_triton``. ``page_table`` (and, for SWA models,
++    ``swa_page_table``) are written in place; the caller owns the buffers so the
++    cuda-graph path can reuse its pre-allocated tensors. SWA is enabled iff
++    ``full_to_swa`` is provided, which then also requires ``swa_page_table``.
++    """
++    has_swa = full_to_swa is not None
++    assert has_swa == (
++        swa_page_table is not None
++    ), "full_to_swa and swa_page_table must be provided together"
++    bs, num_pages = page_table.shape
++    create_trtllm_mha_kv_indices_triton[
++        (bs, get_num_mha_kv_index_blocks(num_pages, page_size))
++    ](
++        req_to_token,
++        req_pool_indices,
++        cache_seqlens,
++        full_to_swa,
++        page_table,
++        swa_page_table,
++        req_to_token.stride(0),
++        page_table.stride(0),
++        PAGE_SIZE=page_size,
++        HAS_SWA=has_swa,
++    )
+diff --git a/python/sglang/srt/layers/attention/trtllm_mha_backend.py b/python/sglang/srt/layers/attention/trtllm_mha_backend.py
+index 5792a6cc9aaa..5ce1a4302d6d 100644
+--- a/python/sglang/srt/layers/attention/trtllm_mha_backend.py
++++ b/python/sglang/srt/layers/attention/trtllm_mha_backend.py
+@@ -19,6 +19,9 @@
+ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
+     fused_fp8_set_kv_buffer,
+ )
++from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
++    build_trtllm_mha_page_table,
++)
+ from sglang.srt.layers.attention.utils import canonicalize_stride
+ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+@@ -68,6 +71,11 @@ class TRTLLMMHAMetadata:
+ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+     """TRTLLM MHA attention kernel from flashinfer."""
+ 
++    # Build the page table on-device from seq_lens (incl. the SWA-translated table
++    # via the full->SWA lookup; see _fill_page_table_device), so we never need the
++    # seq_lens_cpu D2H sync; opt out of it, matching trtllm_mla / triton.
++    needs_cpu_seq_lens: bool = False
++
+     def __init__(
+         self,
+         model_runner: ModelRunner,
+@@ -131,6 +139,13 @@ def __init__(
+         # separate index spaces; SWA layers need a translated page_table.
+         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+ 
++        # Static page-table width (upper bound). The CUDA-graph path builds the
++        # page table on-device sized to this constant, so it never reads a runtime
++        # max. See _fill_page_table_device.
++        self.max_num_pages = (
++            self.max_context_len + self.page_size - 1
++        ) // self.page_size
++
+         # Forward metadata
+         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+ 
+@@ -166,20 +181,6 @@ def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
+         kvcache = allocator.get_kvcache()
+         return kvcache if isinstance(kvcache, SWAKVPool) else None
+ 
+-    def _maybe_translate_swa(
+-        self, token_indices: torch.Tensor
+-    ) -> Optional[torch.Tensor]:
+-        """Translate full-pool token indices to SWA-pool indices, or return None."""
+-        if self._swa_kv_pool is None:
+-            return None
+-        shape = token_indices.shape
+-        # trtllm-gen SWA attention kernels require int32 page indices.
+-        return (
+-            self._swa_kv_pool.translate_loc_from_full_to_swa(token_indices.reshape(-1))
+-            .reshape(shape)
+-            .to(torch.int32)
+-        )
+-
+     def _alloc_swa_page_table(
+         self, max_bs: int, max_num_pages: int
+     ) -> Optional[torch.Tensor]:
+@@ -188,17 +189,33 @@ def _alloc_swa_page_table(
+             return None
+         return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
+ 
+-    def _copy_swa_page_table(
++    def _fill_page_table_device(
+         self,
+         metadata: TRTLLMMHAMetadata,
+-        page_indices: torch.Tensor,
+-        num_pages: int,
++        req_pool_indices: torch.Tensor,
++        cache_seqlens: torch.Tensor,
+     ):
+-        """Translate and copy SWA page indices into metadata. No-op for non-SWA."""
+-        if metadata.swa_page_table is None:
+-            return
+-        swa_indices = self._maybe_translate_swa(page_indices)
+-        metadata.swa_page_table[:, :num_pages].copy_(swa_indices // self.page_size)
++        """Build the page table on-device from per-request KV lengths (no sync).
++
++        Fills ``metadata.page_table`` (a [bs, max_num_pages] buffer) in place with
++        block ids derived from ``cache_seqlens`` (a GPU tensor); for SWA models it
++        also fills ``metadata.swa_page_table`` via the full->SWA lookup. The Triton
++        kernel self-guards per request on the device-side length, so the grid and
++        buffer width use the static ``max_num_pages`` upper bound while the actual
++        writes stay bounded by ``cache_seqlens`` — no host-side max / D2H sync.
++        """
++        has_swa = self._swa_kv_pool is not None
++        build_trtllm_mha_page_table(
++            req_to_token=self.req_to_token,
++            req_pool_indices=req_pool_indices,
++            cache_seqlens=cache_seqlens,
++            page_table=metadata.page_table,
++            page_size=self.page_size,
++            swa_page_table=metadata.swa_page_table if has_swa else None,
++            full_to_swa=(
++                self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
++            ),
++        )
+ 
+     def _get_layer_cache_loc(
+         self,
+@@ -250,9 +267,6 @@ def init_cuda_graph_state(
+                 device=self.device,
+             ),
+             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+-            "strided_indices": torch.arange(
+-                0, self.max_context_len, self.page_size, device=self.device
+-            ),
+         }
+ 
+         # SWA write-target buffer; bound as a [:num_tokens] view in
+@@ -305,9 +319,6 @@ def init_cuda_graph_state(
+                     device=self.device,
+                 ),
+                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+-                "strided_indices": torch.arange(
+-                    0, self.max_context_len, self.page_size, device=self.device
+-                ),
+             }
+ 
+             self.draft_extend_metadata = {
+@@ -329,9 +340,6 @@ def init_cuda_graph_state(
+                     device=self.device,
+                 ),
+                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+-                "strided_indices": torch.arange(
+-                    0, self.max_context_len, self.page_size, device=self.device
+-                ),
+             }
+ 
+     def _build_cuda_graph_metadata(
+@@ -439,15 +447,16 @@ def _apply_cuda_graph_metadata(
+         seq_lens: torch.Tensor,
+         forward_mode: ForwardMode,
+         spec_info: Optional[SpecInput],
+-        seq_lens_cpu: Optional[torch.Tensor],
+     ):
+         """Shared capture+replay body for the cuda-graph init path.
+ 
+         Public entry: :py:meth:`init_forward_metadata_out_graph`.
+         """
+         seq_lens = seq_lens[:bs]
+-        seq_lens_cpu = seq_lens_cpu[:bs]
+         req_pool_indices = req_pool_indices[:bs]
++        # max_seq_len_k is the page-table width upper bound; the device-side build
++        # (_fill_page_table_device) sizes to the static max_num_pages and bounds
++        # the actual writes by cache_seqlens, so no runtime host max is needed.
+         metadata = None
+         if forward_mode.is_decode_or_idle():
+             if spec_info is not None:
+@@ -460,58 +469,33 @@ def _apply_cuda_graph_metadata(
+                 metadata.cache_seqlens_int32.copy_(
+                     seq_lens + self.speculative_step_id + 1
+                 )
+-                metadata.max_seq_len_k = seq_lens.max().item() + (
+-                    self.speculative_step_id + 1
+-                )
+-
+-                max_seq_pages = (
+-                    metadata.max_seq_len_k + self.page_size - 1
+-                ) // self.page_size
+             else:
+                 # Normal Decode
+                 metadata = self.decode_cuda_graph_metadata[bs]
+-                max_len = seq_lens_cpu.max().item()
+-                max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+-                metadata.max_seq_len_k = max_len
+-
+                 metadata.cache_seqlens_int32.copy_(seq_lens)
+ 
++            metadata.max_seq_len_k = self.max_context_len
+             metadata.cu_seqlens_k[1:].copy_(
+                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+             )
+-            page_indices = self.req_to_token[
+-                req_pool_indices[:, None],
+-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
+-                    None, :
+-                ],
+-            ]
+-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
++            self._fill_page_table_device(
++                metadata, req_pool_indices, metadata.cache_seqlens_int32
++            )
+         elif forward_mode.is_target_verify():
+             # Here we only support topk = 1 for now.
+             metadata = self.target_verify_metadata[bs]
+             metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
+-
+-            metadata.max_seq_len_k = seq_lens_cpu.max().item() + metadata.max_seq_len_q
+-            max_len = seq_lens_cpu.max().item()
++            metadata.max_seq_len_k = self.max_context_len
+             metadata.cu_seqlens_k[1:].copy_(
+                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+             )
+-            max_seq_pages = (
+-                metadata.max_seq_len_k + self.page_size - 1
+-            ) // self.page_size
+-            page_indices = self.req_to_token[
+-                req_pool_indices[:, None],
+-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+-            ]
+-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
++            self._fill_page_table_device(
++                metadata, req_pool_indices, metadata.cache_seqlens_int32
++            )
+         elif forward_mode.is_draft_extend_v2():
+             metadata = self.draft_extend_metadata[bs]
+             metadata.cache_seqlens_int32.copy_(seq_lens)
+-
+-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+-            max_len = seq_lens_cpu.max().item()
++            metadata.max_seq_len_k = self.max_context_len
+             metadata.cu_seqlens_k[1:].copy_(
+                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+             )
+@@ -544,15 +528,9 @@ def _apply_cuda_graph_metadata(
+                     torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
+                 )
+ 
+-            max_seq_pages = (
+-                metadata.max_seq_len_k + self.page_size - 1
+-            ) // self.page_size
+-            page_indices = self.req_to_token[
+-                req_pool_indices[:, None],
+-                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+-            ]
+-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
++            self._fill_page_table_device(
++                metadata, req_pool_indices, metadata.cache_seqlens_int32
++            )
+         self.forward_metadata = metadata
+ 
+     def update_verify_buffers_to_fill_after_draft(
+@@ -608,7 +586,6 @@ def init_forward_metadata_out_graph(
+ 
+         if in_capture:
+             num_tokens = forward_batch.positions.numel()
+-            seq_lens_cpu = seq_lens.cpu()
+             self._build_cuda_graph_metadata(
+                 bs, num_tokens, forward_mode, spec_info, seq_lens.device
+             )
+@@ -618,7 +595,6 @@ def init_forward_metadata_out_graph(
+                 seq_lens=seq_lens,
+                 forward_mode=forward_mode,
+                 spec_info=spec_info,
+-                seq_lens_cpu=seq_lens_cpu,
+             )
+         else:
+             self._apply_cuda_graph_metadata(
+@@ -627,7 +603,6 @@ def init_forward_metadata_out_graph(
+                 seq_lens=seq_lens,
+                 forward_mode=forward_mode,
+                 spec_info=spec_info,
+-                seq_lens_cpu=forward_batch.seq_lens_cpu,
+             )
+ 
+         # Refill the SWA write-target buffer from the live out_cache_loc before
+@@ -656,9 +631,6 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+                 metadata.cache_seqlens_int32 = (
+                     seqlens_in_batch + (self.speculative_step_id + 1)
+                 ).to(torch.int32)
+-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+-                    self.speculative_step_id + 1
+-                )
+                 metadata.cu_seqlens_q = torch.arange(
+                     0, batch_size + 1, dtype=torch.int32, device=device
+                 )
+@@ -668,22 +640,15 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+                     ),
+                     (1, 0),
+                 )
+-                metadata.page_table = self.req_to_token_pool.req_to_token[
+-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+-                ]
+             else:
+                 # Normal Decode
+                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                 metadata.cu_seqlens_q = torch.arange(
+                     0, batch_size + 1, dtype=torch.int32, device=device
+                 )
+                 metadata.cu_seqlens_k = torch.nn.functional.pad(
+                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                 )
+-                metadata.page_table = self.req_to_token_pool.req_to_token[
+-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+-                ]
+         elif forward_batch.forward_mode.is_target_verify():
+             # Only support topk = 1 for now.
+             tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
+@@ -691,9 +656,6 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+                 torch.int32
+             )
+             metadata.max_seq_len_q = tokens_per_req
+-            metadata.max_seq_len_k = (
+-                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
+-            )
+             metadata.cu_seqlens_q = torch.arange(
+                 0,
+                 batch_size * tokens_per_req + 1,
+@@ -705,40 +667,46 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
+                 (1, 0),
+             )
+-            metadata.page_table = self.req_to_token_pool.req_to_token[
+-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+-            ]
+ 
+         else:
+             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+             metadata.cu_seqlens_k = torch.nn.functional.pad(
+                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+             )
+-            metadata.page_table = self.req_to_token_pool.req_to_token[
+-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+-            ]
+-
++            # Query-side max length, sourced from the host-resident extend lengths
++            # (sync-free); for plain prefill these equal the full seq lens.
++            # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
++            # Python's max() returns a 0-d tensor, but flashinfer expects an int.
++            max_q = max(forward_batch.extend_seq_lens_cpu)
++            metadata.max_seq_len_q = (
++                int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
++            )
+             if (
+-                any(forward_batch.extend_prefix_lens_cpu)
+-                or forward_batch.forward_mode.is_draft_extend_v2()
+-            ):
++                forward_batch.extend_prefix_lens_cpu is not None
++                and any(forward_batch.extend_prefix_lens_cpu)
++            ) or forward_batch.forward_mode.is_draft_extend_v2():
+                 extend_seq_lens = forward_batch.extend_seq_lens
+-                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+-                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+-                max_q = max(forward_batch.extend_seq_lens_cpu)
+-                metadata.max_seq_len_q = (
+-                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+-                )
+                 metadata.cu_seqlens_q = torch.nn.functional.pad(
+                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                 )
+             else:
+-                metadata.max_seq_len_q = metadata.max_seq_len_k
+                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
+ 
+-        # Compute SWA page table (None for non-SWA models)
+-        metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
++        metadata.max_seq_len_k = self.max_context_len
++        has_swa = self._swa_kv_pool is not None
++        metadata.page_table = torch.empty(
++            (batch_size, self.max_num_pages), dtype=torch.int32, device=device
++        )
++        metadata.swa_page_table = (
++            torch.empty(
++                (batch_size, self.max_num_pages), dtype=torch.int32, device=device
++            )
++            if has_swa
++            else None
++        )
++        self._fill_page_table_device(
++            metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
++        )
+ 
+         # int64 scatter index (unlike the int32 read page table above).
+         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+@@ -748,19 +716,6 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+                 )
+             )
+ 
+-        # Convert the page tables to a strided format
+-        if self.page_size > 1:
+-            self.strided_indices = torch.arange(
+-                0, metadata.page_table.shape[1], self.page_size, device=self.device
+-            )
+-            metadata.page_table = (
+-                metadata.page_table[:, self.strided_indices] // self.page_size
+-            )
+-            if metadata.swa_page_table is not None:
+-                metadata.swa_page_table = (
+-                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
+-                )
+-
+         self.forward_metadata = metadata
+ 
+     def forward_decode(
+@@ -970,6 +925,10 @@ def forward_extend(
+ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
+     """Multi-step TRTLLM MHA attention kernel used by EAGLE."""
+ 
++    # Per-step backends build the page table on-device (sync-free); mirror that so
++    # decide_needs_cpu_seq_lens sees a consistent target + draft value.
++    needs_cpu_seq_lens: bool = False
++
+     def __init__(
+         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+     ):
+diff --git a/test/registered/attention/test_trtllm_mha_page_table.py b/test/registered/attention/test_trtllm_mha_page_table.py
+new file mode 100644
+index 000000000000..44b5d8d114fb
+--- /dev/null
++++ b/test/registered/attention/test_trtllm_mha_page_table.py
+@@ -0,0 +1,150 @@
++"""Unit test for the device-side page-table build used by trtllm_mha.
++
++trtllm_mha builds its CUDA-graph block table on-device from ``seq_lens`` (via
++``create_trtllm_mha_kv_indices_triton``) instead of a host-max PyTorch gather, so
++it never reads a runtime max (no D2H sync). This test checks the device build is
++bit-identical to the legacy gather for the columns each request uses, for both
++the full page table and the SWA-translated page table, across context lengths,
++page sizes, and batch sizes.
++"""
++
++import unittest
++from typing import Optional
++
++import torch
++
++from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
++    build_trtllm_mha_page_table,
++)
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.test_utils import CustomTestCase
++
++# Triton kernel unit test for the trtllm_mha device-side page-table build.
++register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
++
++
++def _build_page_table_reference(
++    req_to_token: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    cache_seqlens: torch.Tensor,
++    page_size: int,
++    max_num_pages: int,
++    full_to_swa: Optional[torch.Tensor] = None,
++) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
++    """Reference impl: host-side strided gather, then // page_size.
++
++    Sized to the batch max (uses a host-side ``.max()``, which the kernel path
++    avoids). Returns the same (page_table, swa_page_table) block-id tables as
++    ``_build_page_table_kernel`` for the columns each request uses.
++    """
++    max_len = int(cache_seqlens.max().item())
++    max_seq_pages = (max_len + page_size - 1) // page_size
++    strided = torch.arange(
++        0, req_to_token.shape[1], page_size, device=req_to_token.device
++    )[:max_seq_pages]
++    slots = req_to_token[req_pool_indices[:, None], strided[None, :]]  # token slots
++    page_table = slots // page_size
++    swa_page_table = (
++        full_to_swa[slots] // page_size if full_to_swa is not None else None
++    )
++    return page_table, swa_page_table
++
++
++def _build_page_table_kernel(
++    req_to_token: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    cache_seqlens: torch.Tensor,
++    page_size: int,
++    max_num_pages: int,
++    full_to_swa: Optional[torch.Tensor] = None,
++) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
++    """Device-side impl."""
++    dev = req_to_token.device
++    bs = req_pool_indices.shape[0]
++    page_table = torch.zeros((bs, max_num_pages), dtype=torch.int32, device=dev)
++    swa_page_table = (
++        torch.zeros((bs, max_num_pages), dtype=torch.int32, device=dev)
++        if full_to_swa is not None
++        else None
++    )
++    build_trtllm_mha_page_table(
++        req_to_token=req_to_token,
++        req_pool_indices=req_pool_indices,
++        cache_seqlens=cache_seqlens,
++        page_table=page_table,
++        page_size=page_size,
++        swa_page_table=swa_page_table,
++        full_to_swa=full_to_swa,
++    )
++    return page_table, swa_page_table
++
++
++@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
++class TestTrtllmMhaPageTable(CustomTestCase):
++    def _run_case(self, max_context_len, page_size, num_reqs, bs, swa=False):
++        torch.manual_seed(0)
++        dev = "cuda"
++        max_num_pages = (max_context_len + page_size - 1) // page_size
++        n_slots = num_reqs * max_context_len
++        req_to_token = torch.randint(
++            0, n_slots, (num_reqs, max_context_len), dtype=torch.int32, device=dev
++        )
++        req_pool_indices = torch.randperm(num_reqs, device=dev)[:bs].to(torch.int32)
++        cache_seqlens = torch.randint(
++            1, max_context_len + 1, (bs,), dtype=torch.int32, device=dev
++        )
++        full_to_swa = None
++        if swa:
++            # Arbitrary full-slot -> SWA-slot lookup table.
++            full_to_swa = torch.randint(
++                0, n_slots, (n_slots,), dtype=torch.int32, device=dev
++            )
++
++        pt_kernel, swa_kernel = _build_page_table_kernel(
++            req_to_token,
++            req_pool_indices,
++            cache_seqlens,
++            page_size,
++            max_num_pages,
++            full_to_swa=full_to_swa,
++        )
++        pt_ref, swa_ref = _build_page_table_reference(
++            req_to_token,
++            req_pool_indices,
++            cache_seqlens,
++            page_size,
++            max_num_pages,
++            full_to_swa=full_to_swa,
++        )
++
++        for i in range(bs):
++            npages = (int(cache_seqlens[i].item()) + page_size - 1) // page_size
++            self.assertTrue(
++                torch.equal(pt_kernel[i, :npages], pt_ref[i, :npages]),
++                f"page_table mismatch req={i} max_ctx={max_context_len} "
++                f"page_size={page_size} bs={bs} swa={swa}",
++            )
++            if swa:
++                self.assertTrue(
++                    torch.equal(swa_kernel[i, :npages], swa_ref[i, :npages]),
++                    f"swa_page_table mismatch req={i} max_ctx={max_context_len} "
++                    f"page_size={page_size} bs={bs}",
++                )
++
++    def test_matches_reference_gather(self):
++        for max_ctx in (2048, 4096, 131072):
++            for page_size in (1, 32, 64, 128):
++                for bs in (1, 7, 32):
++                    self._run_case(max_ctx, page_size, num_reqs=max(64, bs), bs=bs)
++
++    def test_swa_matches_reference(self):
++        for max_ctx in (2048, 4096):
++            for page_size in (1, 64, 128):
++                for bs in (1, 7, 32):
++                    self._run_case(
++                        max_ctx, page_size, num_reqs=max(64, bs), bs=bs, swa=True
++                    )
++
++
++if __name__ == "__main__":
++    unittest.main()

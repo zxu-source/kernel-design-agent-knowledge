@@ -1,0 +1,852 @@
+diff --git a/csrc/deepep/deep_ep.cpp b/csrc/deepep/deep_ep.cpp
+index 53e7d14b..c68a4877 100644
+--- a/csrc/deepep/deep_ep.cpp
++++ b/csrc/deepep/deep_ep.cpp
+@@ -506,10 +506,33 @@ Buffer::internode_dispatch(
+         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
+     }
+ 
++    // dispatch normal param
++    int64_t tp_size = 1;
++    int64_t tp_rank = 0;
++    int64_t expertShardType = 0;
++    int64_t sharedExpertNum = 1;
++    int64_t sharedExpertRankNum = 0;
++    int64_t expertTokenNumsType = 0;
++
++    int64_t quant_mode = use_quant ? DYNAMIC_SCALES : NO_SCALES;
++    int64_t global_bs = static_cast<int64_t>(MAX_BATCH_SIZE * num_ranks);
++    at::Tensor expert_ids = new_topk_idx.to(at::kInt);
++    at::Tensor xActiveMask = at::empty({1}, at::dtype(at::kInt).device(x.device()));
++
++    auto expertTokenNums = at::zeros({1}, at::dtype(at::kLong).device(x.device()));
++    auto epRecvCount = at::zeros({1}, at::dtype(at::kInt).device(x.device()));
++    auto tpRecvCount = at::zeros({1}, at::dtype(at::kInt).device(x.device()));
++    at::Tensor dispatch_wait_recv_cost_stats_out;
++    auto recv_topk_idx = std::optional<at::Tensor>();
++    auto recv_topk_weights = std::optional<at::Tensor>();
++    // Wait streams
++    std::optional<EventHandle> event;
++
+     int64_t local_rank_size = A2_MAX_HCCS_PEERS;
+     int32_t server_num = num_ranks / local_rank_size;
+     int64_t local_rank_id = rank % local_rank_size;
+     auto new_num_tokens_per_expert = num_tokens_per_expert.value();
++    std::vector<int> num_recv_tokens_per_expert_list;
+ 
+     // 对应于layout的输出数据和长度
+     auto new_send_data = this->notify_send_data;
+@@ -525,7 +548,7 @@ Buffer::internode_dispatch(
+     at::Tensor ep_rank_token_cnt =
+         at::empty({num_experts, num_ranks}, at::dtype(at::kInt).device(x.device()));  // 包含全局的
+     // 本卡上每个专家接收的token数，不是前缀和
+-    at::Tensor local_ep_token_cnt = at::empty({num_local_experts}, at::dtype(at::kInt).device(x.device()));
++    at::Tensor recv_tokens_per_expert = at::empty({num_local_experts}, at::dtype(at::kLong).device(x.device()));
+     at::Tensor src_offset_rank_token_idx =
+         at::empty({num_experts, num_ranks, MAX_BATCH_SIZE}, at::dtype(at::kInt).device(x.device()));
+     at::Tensor dst_offset_rank_token_idx =
+@@ -534,6 +557,7 @@ Buffer::internode_dispatch(
+     at::Tensor offset_inner = at::empty({2, MAX_BATCH_SIZE, num_experts}, at::dtype(at::kInt).device(x.device()));
+     at::Tensor count_outer = at::empty({MAX_BATCH_SIZE}, at::dtype(at::kInt).device(x.device()));
+     at::Tensor expand_idx = at::empty({MAX_BATCH_SIZE, num_experts}, at::dtype(at::kInt).device(x.device()));
++    at::Tensor total_recv_token = torch::empty({1}, at::dtype(at::kInt).device(x.device()));
+ 
+     // get ep name
+     char hcom_ep_name[HCOMM_NAME_LEN];
+@@ -550,48 +574,21 @@ Buffer::internode_dispatch(
+                  rank,          // rankId
+                  local_rank_size, local_rank_id,
+                  send_data_offset,  // A2未使用
+-                 recv_data, token_server_idx, token_unique_per_server, ep_rank_token_cnt, local_ep_token_cnt,
+-                 src_offset_rank_token_idx, dst_offset_rank_token_idx, offset_inner, count_outer, expand_idx);
+-
+-    int total_recv_tokens = 0;
+-    std::vector<int> num_recv_tokens_per_expert_list;
+-
+-    auto ep_rank_token_cnt_cpu = ep_rank_token_cnt.to(at::kCPU);
+-    auto ep_rank_token_cnt_ptr = ep_rank_token_cnt_cpu.data_ptr<int>();
+-    for (int local_e = 0; local_e < num_local_experts; ++local_e) {
+-        int64_t local_expert_recv_tokens = 0;
+-        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+-            int64_t index = local_e * num_ranks + src_rank;
+-            int recv_cnt =
+-                ep_rank_token_cnt_ptr[(rank * num_local_experts * num_ranks) + local_e * num_ranks + src_rank];
+-
+-            total_recv_tokens += recv_cnt;
+-            local_expert_recv_tokens += recv_cnt;
+-        }
+-        num_recv_tokens_per_expert_list.push_back(local_expert_recv_tokens);
+-    }
+-    int num_recv_tokens = (total_recv_tokens == 0) ? 1 : total_recv_tokens;
+-
+-    int64_t tp_size = 1;
+-    int64_t tp_rank = 0;
+-    int64_t expertShardType = 0;
+-    int64_t sharedExpertNum = 1;
+-    int64_t sharedExpertRankNum = 0;
+-    int64_t expertTokenNumsType = 0;
++                 recv_data, token_server_idx, token_unique_per_server, ep_rank_token_cnt, recv_tokens_per_expert,
++                 src_offset_rank_token_idx, dst_offset_rank_token_idx, offset_inner, count_outer, expand_idx,
++                 total_recv_token);
+ 
+-    int64_t quant_mode = use_quant ? DYNAMIC_SCALES : NO_SCALES;
+-    int64_t global_bs = static_cast<int64_t>(MAX_BATCH_SIZE * num_ranks);
+-    at::Tensor expert_ids = new_topk_idx.to(at::kInt);
+-    at::Tensor xActiveMask = at::empty({1}, at::dtype(at::kInt).device(x.device()));
++    int total_count = total_recv_token.item<int>();
++    int num_recv_tokens = (total_count == 0) ? 1 : total_count;
+ 
+     auto expandx_out = use_quant ? at::empty({num_recv_tokens, hidden}, at::dtype(at::kChar).device(x.device()))
+                                  : at::empty({num_recv_tokens, hidden}, x.options());
+     auto dynamic_scales_out = at::empty({num_recv_tokens}, at::dtype(at::kFloat).device(x.device()));
+-    auto expertTokenNums = at::zeros({1}, at::dtype(at::kLong).device(x.device()));
+-    auto epRecvCount = at::zeros({1}, at::dtype(at::kInt).device(x.device()));
+-    auto tpRecvCount = at::zeros({1}, at::dtype(at::kInt).device(x.device()));
+     auto expand_scales = at::empty({num_recv_tokens}, at::dtype(at::kFloat).device(x.device()));
+-    at::Tensor dispatch_wait_recv_cost_stats_out;
++    if (topk_idx.has_value()) {
++        recv_topk_idx = at::empty({total_count, num_topk}, topk_idx->options());
++        recv_topk_weights = at::empty({total_count, num_topk}, topk_weights->options());
++    }
+ 
+     EXEC_NPU_CMD(aclnnDispatchNormalA2, new_x, expert_ids, x_scales, xActiveMask, new_topk_weights, token_server_idx,
+                  token_unique_per_server, ep_rank_token_cnt, src_offset_rank_token_idx, dst_offset_rank_token_idx,
+@@ -600,14 +597,12 @@ Buffer::internode_dispatch(
+                  dynamic_scales_out, expand_idx, expertTokenNums, epRecvCount, expand_scales,
+                  dispatch_wait_recv_cost_stats_out);
+ 
+-    auto recv_topk_idx = std::optional<at::Tensor>();
+-    auto recv_topk_weights = std::optional<at::Tensor>();
+-    if (topk_idx.has_value()) {
+-        recv_topk_idx = at::empty({num_recv_tokens, num_topk}, topk_idx->options());
+-        recv_topk_weights = at::empty({num_recv_tokens, num_topk}, topk_weights->options());
++    auto recv_token_per_exp_cpu = recv_tokens_per_expert.to(at::kCPU);
++    auto recv_token_per_exp_ptr = recv_token_per_exp_cpu.data_ptr<int64_t>();
++    for (int local_e = 0; local_e < num_local_experts; ++local_e) {
++        int token_cnt = static_cast<int>(recv_token_per_exp_ptr[local_e]);
++        num_recv_tokens_per_expert_list.emplace_back(token_cnt);
+     }
+-    // Wait streams
+-    std::optional<EventHandle> event;
+ 
+     return {expandx_out,
+             dynamic_scales_out,
+diff --git a/csrc/deepep/ops2/op_host/notify_dispatch.cpp b/csrc/deepep/ops2/op_host/notify_dispatch.cpp
+index 8928cb8f..1a025b97 100644
+--- a/csrc/deepep/ops2/op_host/notify_dispatch.cpp
++++ b/csrc/deepep/ops2/op_host/notify_dispatch.cpp
+@@ -26,7 +26,31 @@ public:
+             .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_INT32})
+             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+-
++        this->Output("totalRecvTokens")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Output("recvCount")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Output("recvOffset")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Output("maxBs")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Output("recvTokensPerExpert")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT64, ge::DT_INT64, ge::DT_INT64})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+         this->Attr("sendCount").Int();
+         this->Attr("num_tokens").Int();
+         this->Attr("comm_group").String();
+diff --git a/csrc/deepep/ops2/op_host/notify_dispatch_a2.cpp b/csrc/deepep/ops2/op_host/notify_dispatch_a2.cpp
+index 25cd7897..532745cc 100644
+--- a/csrc/deepep/ops2/op_host/notify_dispatch_a2.cpp
++++ b/csrc/deepep/ops2/op_host/notify_dispatch_a2.cpp
+@@ -48,7 +48,7 @@ public:
+             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+         this->Output("localEpTokenCnt")
+             .ParamType(REQUIRED)
+-            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_INT32})
++            .DataType({ge::DT_INT64, ge::DT_INT64, ge::DT_INT64})
+             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+         this->Output("srcOffsetRankTokenIdx")
+@@ -76,6 +76,11 @@ public:
+             .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_INT32})
+             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Output("totalRecvTokens")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+ 
+         this->Attr("sendCount").Int();
+         this->Attr("num_tokens").Int();
+diff --git a/csrc/deepep/ops2/op_host/notify_dispatch_tiling_a2.cc b/csrc/deepep/ops2/op_host/notify_dispatch_tiling_a2.cc
+index c29913ae..74b6dab1 100644
+--- a/csrc/deepep/ops2/op_host/notify_dispatch_tiling_a2.cc
++++ b/csrc/deepep/ops2/op_host/notify_dispatch_tiling_a2.cc
+@@ -68,6 +68,7 @@ constexpr uint32_t OUTPUT_DST_OFFSET_RANK_TOKEN_INDEX = 7;
+ constexpr uint32_t OUTPUT_OFFSET_INNER_INDEX = 8;
+ constexpr uint32_t OUTPUT_COUNT_OUTER_INDEX = 9;
+ constexpr uint32_t OUTPUT_EXPAND_IDX_INDEX = 10;
++constexpr uint32_t OUTPUT_TOTAL_RECV_TOKENS_INDEX = 11;
+ 
+ constexpr uint32_t ATTR_SEND_COUNT_INDEX = 0;
+ constexpr uint32_t ATTR_NUM_TOKENS_INDEX = 1;
+@@ -293,13 +294,10 @@ static bool CheckTensorDataType(gert::TilingContext *context, const char *nodeNa
+ 
+     auto localEpTokenCnt = context->GetOutputDesc(OUTPUT_LOCAL_EP_TOKEN_CNT_INDEX);
+     OP_TILING_CHECK(localEpTokenCnt == nullptr, OP_LOGE(nodeName, "localEpTokenCnt is null."), return false);
+-    OP_TILING_CHECK(
+-        (localEpTokenCnt->GetDataType() != ge::DT_BF16) && (localEpTokenCnt->GetDataType() != ge::DT_FLOAT16) &&
+-            (localEpTokenCnt->GetDataType() != ge::DT_FLOAT) && (localEpTokenCnt->GetDataType() != ge::DT_INT32),
+-        OP_LOGE(nodeName,
+-                "localEpTokenCnt datatype is invalid, datatype should be bf16 or float16 or float or int, but is %d.",
+-                static_cast<ge::DataType>(localEpTokenCnt->GetDataType())),
+-        return false);
++    OP_TILING_CHECK((localEpTokenCnt->GetDataType() != ge::DT_INT64),
++                    OP_LOGE(nodeName, "localEpTokenCnt datatype is invalid, datatype should be int64, but is %d.",
++                            static_cast<ge::DataType>(localEpTokenCnt->GetDataType())),
++                    return false);
+ 
+     auto srcOffsetRankTokenIdx = context->GetOutputDesc(OUTPUT_SRC_OFFSET_RANK_TOKEN_INDEX);
+     OP_TILING_CHECK(srcOffsetRankTokenIdx == nullptr, OP_LOGE(nodeName, "srcOffsetRankTokenIdx is null."),
+@@ -359,6 +357,16 @@ static bool CheckTensorDataType(gert::TilingContext *context, const char *nodeNa
+                 static_cast<ge::DataType>(expandIdx->GetDataType())),
+         return false);
+ 
++    auto totalRecvTokens = context->GetOutputDesc(OUTPUT_TOTAL_RECV_TOKENS_INDEX);
++    OP_TILING_CHECK(totalRecvTokens == nullptr, OP_LOGE(nodeName, "totalRecvTokens is null."), return false);
++    OP_TILING_CHECK(
++        (totalRecvTokens->GetDataType() != ge::DT_BF16) && (totalRecvTokens->GetDataType() != ge::DT_FLOAT16) &&
++            (totalRecvTokens->GetDataType() != ge::DT_FLOAT) && (totalRecvTokens->GetDataType() != ge::DT_INT32),
++        OP_LOGE(nodeName,
++                "totalRecvTokens datatype is invalid, datatype should be bf16 or float16 or float or int, but is %d.",
++                static_cast<ge::DataType>(totalRecvTokens->GetDataType())),
++        return false);
++
+     // Verify the size of the win area
+     NotifyDispatchA2TilingData *tilingData = context->GetTilingData<NotifyDispatchA2TilingData>();
+     uint64_t maxWindowSize = Mc2TilingUtils::GetMaxWindowSize();
+diff --git a/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch.cpp b/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch.cpp
+index 5d0754cd..2f6facc0 100644
+--- a/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch.cpp
++++ b/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch.cpp
+@@ -20,11 +20,15 @@ aclnnStatus aclnnNotifyDispatchGetWorkspaceSize(const aclTensor *sendData, const
+                                                 int64_t sendCount, int64_t numTokens, char *commGroup, int64_t rankSize,
+                                                 int64_t rankId, int64_t localRankSize, int64_t localRankId,
+                                                 const aclTensor *sendDataOffset, const aclTensor *recvData,
+-                                                uint64_t *workspaceSize, aclOpExecutor **executor)
++                                                const aclTensor *totalRecvTokens, const aclTensor *recvCount,
++                                                const aclTensor *recvOffset, const aclTensor *maxBs,
++                                                const aclTensor *recvTokensPerExpert, uint64_t *workspaceSize,
++                                                aclOpExecutor **executor)
+ {
+     return aclnnInnerNotifyDispatchGetWorkspaceSize(sendData, tokenPerExpertData, sendCount, numTokens, commGroup,
+                                                     rankSize, rankId, localRankSize, localRankId, sendDataOffset,
+-                                                    recvData, workspaceSize, executor);
++                                                    recvData, totalRecvTokens, recvCount, recvOffset, maxBs,
++                                                    recvTokensPerExpert, workspaceSize, executor);
+ }
+ 
+ aclnnStatus aclnnNotifyDispatch(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream)
+diff --git a/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch.h b/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch.h
+index 10b63445..17feb3cc 100644
+--- a/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch.h
++++ b/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch.h
+@@ -27,7 +27,9 @@ extern "C" {
+ __attribute__((visibility("default"))) aclnnStatus aclnnNotifyDispatchGetWorkspaceSize(
+     const aclTensor *sendData, const aclTensor *tokenPerExpertData, int64_t sendCount, int64_t numTokens,
+     char *commGroup, int64_t rankSize, int64_t rankId, int64_t localRankSize, int64_t localRankId,
+-    const aclTensor *sendDataOffset, const aclTensor *recvData, uint64_t *workspaceSize, aclOpExecutor **executor);
++    const aclTensor *sendDataOffset, const aclTensor *recvData, const aclTensor *totalRecvTokens,
++    const aclTensor *recvCount, const aclTensor *recvOffset, const aclTensor *maxBs,
++    const aclTensor *recvTokensPerExpert, uint64_t *workspaceSize, aclOpExecutor **executor);
+ 
+ /* function: aclnnNotifyDispatch
+  * parameters :
+diff --git a/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch_a2.cpp b/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch_a2.cpp
+index 11dfcdde..af712a74 100644
+--- a/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch_a2.cpp
++++ b/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch_a2.cpp
+@@ -1,4 +1,3 @@
+-#include <string.h>
+ #include "graph/types.h"
+ #include "aclnn_notify_dispatch_a2.h"
+ #include "aclnnInner_notify_dispatch_a2.h"
+@@ -22,14 +21,14 @@ aclnnStatus aclnnNotifyDispatchA2GetWorkspaceSize(
+     int64_t localRankSize, int64_t localRankId, const aclTensor *sendDataOffset, const aclTensor *recvData,
+     const aclTensor *tokenServerIdx, const aclTensor *tokenUniquePerServer, const aclTensor *epRankTokenCnt,
+     const aclTensor *localEpTokenCnt, const aclTensor *srcOffsetRankTokenIdx, const aclTensor *dstOffsetRankTokenIdx,
+-    const aclTensor *offsetInner, const aclTensor *countOuter, const aclTensor *expandIdx, uint64_t *workspaceSize,
+-    aclOpExecutor **executor)
++    const aclTensor *offsetInner, const aclTensor *countOuter, const aclTensor *expandIdx,
++    const aclTensor *totalRecvTokens, uint64_t *workspaceSize, aclOpExecutor **executor)
+ {
+     return aclnnInnerNotifyDispatchA2GetWorkspaceSize(
+         sendData, tokenPerExpertData, tmpData, sendCount, numTokens, topkNum, numExperts, commGroup, rankSize, rankId,
+         localRankSize, localRankId, sendDataOffset, recvData, tokenServerIdx, tokenUniquePerServer, epRankTokenCnt,
+         localEpTokenCnt, srcOffsetRankTokenIdx, dstOffsetRankTokenIdx, offsetInner, countOuter, expandIdx,
+-        workspaceSize, executor);
++        totalRecvTokens, workspaceSize, executor);
+ }
+ 
+ aclnnStatus aclnnNotifyDispatchA2(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream)
+diff --git a/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch_a2.h b/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch_a2.h
+index 6694f476..8e1f3b5c 100644
+--- a/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch_a2.h
++++ b/csrc/deepep/ops2/op_host/op_api/aclnn_notify_dispatch_a2.h
+@@ -41,8 +41,8 @@ __attribute__((visibility("default"))) aclnnStatus aclnnNotifyDispatchA2GetWorks
+     int64_t localRankSize, int64_t localRankId, const aclTensor *sendDataOffset, const aclTensor *recvData,
+     const aclTensor *tokenServerIdx, const aclTensor *tokenUniquePerServer, const aclTensor *epRankTokenCnt,
+     const aclTensor *localEpTokenCnt, const aclTensor *srcOffsetRankTokenIdx, const aclTensor *dstOffsetRankTokenIdx,
+-    const aclTensor *offsetInner, const aclTensor *countOuter, const aclTensor *expandIdx, uint64_t *workspaceSize,
+-    aclOpExecutor **executor);
++    const aclTensor *offsetInner, const aclTensor *countOuter, const aclTensor *expandIdx,
++    const aclTensor *totalRecvTokens, uint64_t *workspaceSize, aclOpExecutor **executor);
+ 
+ /* function: aclnnNotifyDispatch
+  * parameters :
+diff --git a/csrc/deepep/ops2/op_kernel/notify_dispatch.cpp b/csrc/deepep/ops2/op_kernel/notify_dispatch.cpp
+index 3d444809..f9b28c20 100644
+--- a/csrc/deepep/ops2/op_kernel/notify_dispatch.cpp
++++ b/csrc/deepep/ops2/op_kernel/notify_dispatch.cpp
+@@ -1,5 +1,6 @@
+ #include "kernel_operator.h"
+ #include "notify_dispatch.h"
++#include "notify_dispatch_tiling.h"
+ 
+ #define TILING_KEY_FLOAT16 20
+ #define TILING_KEY_BFLOAT16 21
+@@ -9,8 +10,9 @@
+ #define KERNEL_USE_WORKSPACE (1 * 1024 * 1024)
+ 
+ extern "C" __global__ __aicore__ void notify_dispatch(GM_ADDR sendData, GM_ADDR tokenPerExpertData,
+-                                                      GM_ADDR sendDataOffset, GM_ADDR recvData, GM_ADDR workspace,
+-                                                      GM_ADDR tilingGM)
++                                                      GM_ADDR sendDataOffset, GM_ADDR recvData, GM_ADDR totalRecvTokens,
++                                                      GM_ADDR recvCount, GM_ADDR recvOffset, GM_ADDR maxBs,
++                                                      GM_ADDR recvTokensPerExpert, GM_ADDR workspace, GM_ADDR tilingGM)
+ {
+     REGISTER_TILING_DEFAULT(NotifyDispatchTilingData);
+     GET_TILING_DATA_WITH_STRUCT(NotifyDispatchTilingData, tilingData, tilingGM);
+diff --git a/csrc/deepep/ops2/op_kernel/notify_dispatch.h b/csrc/deepep/ops2/op_kernel/notify_dispatch.h
+index 0f35c1e8..96fae366 100644
+--- a/csrc/deepep/ops2/op_kernel/notify_dispatch.h
++++ b/csrc/deepep/ops2/op_kernel/notify_dispatch.h
+@@ -13,23 +13,32 @@
+ using namespace AscendC;
+ using namespace Moe;
+ 
+-#define KERNELS_ARGS_FUN_ALL2ALL()                                                                                \
+-    GM_ADDR sendDataInput, GM_ADDR tokenPerExpertDataInput, GM_ADDR sendDataOffsetOutput, GM_ADDR recvDataOutput, \
+-        int64_t len, int64_t numTokens, int op, int root, int cycleCount, GM_ADDR scale, int64_t scaleCount,      \
++template <AscendC::HardEvent event>
++__aicore__ inline void SyncFunc()
++{
++    int32_t eventID = static_cast<int32_t>(GetTPipePtr()->FetchEventID(event));
++    AscendC::SetFlag<event>(eventID);
++    AscendC::WaitFlag<event>(eventID);
++}
++
++#define KERNELS_ARGS_FUN_ALL2ALL()                                                                                  \
++    GM_ADDR sendDataInput, GM_ADDR tokenPerExpertDataInput, GM_ADDR sendDataOffsetOutput, GM_ADDR recvDataOutput,   \
++        GM_ADDR totalRecvTokens, GM_ADDR recvCount, GM_ADDR recvOffset, GM_ADDR maxBs, GM_ADDR recvTokensPerExpert, \
++        int64_t len, int64_t numTokens, int op, int root, int cycleCount, GM_ADDR scale, int64_t scaleCount,        \
+         GM_ADDR offset, int localRank, int localRankSize, GM_ADDR tilingGM
+ 
+-#define KERNELS_ARGS_CALL_ALL2ALL()                                                                         \
+-    sendDataInput, tokenPerExpertDataInput, sendDataOffsetOutput, recvDataOutput, len, numTokens, op, root, \
+-        cycleCount, scale, scaleCount, offset, localRank, localRankSize, tilingGM
++#define KERNELS_ARGS_CALL_ALL2ALL()                                                                              \
++    sendDataInput, tokenPerExpertDataInput, sendDataOffsetOutput, recvDataOutput, totalRecvTokens, recvCount,    \
++        recvOffset, maxBs, recvTokensPerExpert, len, numTokens, op, root, cycleCount, scale, scaleCount, offset, \
++        localRank, localRankSize, tilingGM
+ 
+ template <typename T>
+ class NotifyDispatch
+ {
+-    constexpr static int64_t MAX_CORE_NUM = 48;
+     constexpr static int64_t MAX_RANK_PER_CORE = 8;
+-    constexpr static int64_t MULTI_RANK_SIZE = 48;
++    constexpr static int64_t MULTI_RANK_SIZE = 40;
+     constexpr static int64_t MAX_BUFFER_NUMBER = 10;
+-
++    constexpr static uint32_t UB_FLAG_SIZE = 8U * 1024U;
+     // Synchronization flag occupies length
+     constexpr static int64_t FLAG_UNIT_INT_NUM = 4;
+     constexpr static int64_t MAGIC_MASK = ~((1LL << 32) - 1);
+@@ -47,7 +56,12 @@ public:
+         localNodeId = rank / localRankSize;
+         perNodeDataNum = GetDataCount(len, nodeNum);   // 128K/4 = 32K
+         perRankDataNum = GetDataCount(len, rankSize);  // 128K/64 = 2K
+-
++        totalRecvTokens_ = totalRecvTokens;
++        recvCount_ = recvCount;
++        recvOffset_ = recvOffset;
++        maxBs_ = maxBs;
++        recvTokensPerExpert_ = recvTokensPerExpert;
++        recvDataAlignLen = Ceil(numExperts * sendPerGroup * sizeof(int32_t), UB_ALIGN_SIZE) * UB_ALIGN_SIZE;
+         tokenPerExpertDataAlignLen = Ceil(numExperts * sizeof(int32_t), UB_ALIGN_SIZE) * UB_ALIGN_SIZE;
+         sendDataOffsetAlignLen = Ceil(numExperts * sizeof(T), UB_ALIGN_SIZE) * UB_ALIGN_SIZE;
+         sendDataAlignLen = Ceil(numExperts * sendPerGroup * sizeof(T), UB_ALIGN_SIZE) * UB_ALIGN_SIZE;
+@@ -65,6 +79,10 @@ public:
+         tokenPerExpertDataInputGt.SetGlobalBuffer((__gm__ int32_t *)tokenPerExpertDataInput);
+         sendDataOffsetOutputGt.SetGlobalBuffer((__gm__ T *)sendDataOffsetOutput);
+         recvDataOutputGt.SetGlobalBuffer((__gm__ T *)recvDataOutput);
++        recvDataOutGt.SetGlobalBuffer((__gm__ int32_t *)recvDataOutput);
++        pipe.InitBuffer(sendCountBuf, tokenPerExpertDataAlignLen);
++        pipe.InitBuffer(sendOffsetBuf, tokenPerExpertDataAlignLen);
++        pipe.InitBuffer(recvDataBuf, recvDataAlignLen);
+     }
+ 
+     __aicore__ inline void Process()
+@@ -79,6 +97,13 @@ public:
+         if (blockIdx < coreNumPerStageY) {
+             ShareToShareSlice();
+         }
++        SyncAll<true>();
++        ReorderOutput();
++        BuildTotalRecvTokens();
++        BuildRecvCount();
++        BuildRecvOffset();
++        BuildMaxBs();
++        BuildRecvTokenPerExp();
+         hccl_.Finalize();
+     }
+ 
+@@ -224,6 +249,164 @@ private:
+         }
+     }
+ 
++    __aicore__ inline void ReorderOutput()
++    {
++        recvDataTensor = recvDataBuf.Get<int32_t>();
++        DataCopyExtParams recvDataParams = {1U, static_cast<uint32_t>(recvDataAlignLen), 0, 0, 0};
++        DataCopyPadExtParams<int32_t> DataCopyPadExtParams{false, 0U, 0U, 0U};
++        DataCopyPad(recvDataTensor, recvDataOutGt, recvDataParams, DataCopyPadExtParams);
++    }
++
++    __aicore__ inline void ReorderSendCountOutput()
++    {
++        sendCountTensor = sendCountBuf.Get<int32_t>();
++        Duplicate<int32_t>(sendCountTensor, 0, tokenPerExpertDataAlignLen / sizeof(int32_t));
++        SyncFunc<AscendC::HardEvent::V_S>();
++        SyncFunc<AscendC::HardEvent::MTE2_S>();
++        for (uint32_t expId = 0; expId < numExperts / rankSize; ++expId) {
++            for (uint32_t srcRank = 0; srcRank < rankSize; ++srcRank) {
++                uint32_t index = expId * rankSize + srcRank;
++                uint32_t pair_idx = sendPerGroup * (srcRank * numExperts / rankSize + expId);
++                sendCountTensor(index) = recvDataTensor(pair_idx);
++            }
++        }
++    }
++
++    __aicore__ inline void ReorderSendOffsetOutput()
++    {
++        sendOffsetTensor = sendOffsetBuf.Get<int32_t>();
++        Duplicate<int32_t>(sendOffsetTensor, 0, tokenPerExpertDataAlignLen / sizeof(int32_t));
++        SyncFunc<AscendC::HardEvent::V_S>();
++        SyncFunc<AscendC::HardEvent::MTE2_S>();
++        for (uint32_t expId = 0; expId < numExperts / rankSize; ++expId) {
++            for (uint32_t srcRank = 0; srcRank < rankSize; ++srcRank) {
++                uint32_t index = expId * rankSize + srcRank;
++                uint32_t pair_idx = sendPerGroup * (srcRank * numExperts / rankSize + expId);
++                sendOffsetTensor(index) = recvDataTensor(pair_idx + 1);
++            }
++        }
++    }
++
++    __aicore__ inline void ReorderMaxBsOutput()
++    {
++        SyncFunc<AscendC::HardEvent::MTE2_S>();
++        for (uint32_t expId = 0; expId < numExperts / rankSize; ++expId) {
++            for (uint32_t srcRank = 0; srcRank < rankSize; ++srcRank) {
++                uint32_t pair_idx = sendPerGroup * (srcRank * numExperts / rankSize + expId);
++                uint32_t BsCnt = recvDataTensor(pair_idx + 2);
++                maxBsNum = maxBsNum < BsCnt ? BsCnt : maxBsNum;
++            }
++        }
++    }
++
++    __aicore__ inline void BuildTotalRecvTokens()
++    {
++        // 只需要sendCountTensor
++        if (blockIdx > 0) {
++            return;
++        }
++        ReorderSendCountOutput();
++        pipe.InitBuffer(tmpBuf_, Ceil(numExperts * sizeof(int32_t), UB_ALIGN_SIZE) * UB_ALIGN_SIZE);
++        pipe.InitBuffer(tmpBuf2_, Ceil(numExperts * sizeof(float), UB_ALIGN_SIZE) * UB_ALIGN_SIZE);
++        pipe.InitBuffer(tmpBuf3_, Ceil(numExperts * sizeof(float), UB_ALIGN_SIZE) * UB_ALIGN_SIZE);
++        pipe.InitBuffer(tmpBuf4_, Ceil(numExperts * sizeof(float), UB_ALIGN_SIZE) * UB_ALIGN_SIZE);
++
++        LocalTensor<int32_t> totalCntLt = tmpBuf_.Get<int32_t>();
++        LocalTensor<float> floatExpTokenCntLt = tmpBuf2_.Get<float>();
++        LocalTensor<float> floatExpTokenSumCntLt = tmpBuf3_.Get<float>();
++        LocalTensor<float> sharedTmpBuffer = tmpBuf4_.Get<float>();
++        SyncFunc<AscendC::HardEvent::S_V>();
++        Cast(floatExpTokenCntLt, sendCountTensor, RoundMode::CAST_NONE, numExperts);
++        PipeBarrier<PIPE_V>();
++        ReduceSum(floatExpTokenSumCntLt, floatExpTokenCntLt, sharedTmpBuffer, numExperts);
++        SyncFunc<AscendC::HardEvent::V_S>();
++        int32_t sumVal = static_cast<int32_t>(floatExpTokenSumCntLt.GetValue(0));
++        PipeBarrier<PIPE_V>();
++        totalCntLt(0) = sumVal;
++        PipeBarrier<PIPE_V>();
++        SyncFunc<AscendC::HardEvent::MTE2_MTE3>();
++
++        // 拷贝到outputGT
++        GlobalTensor<int32_t> totalCntGt;
++        totalCntGt.SetGlobalBuffer((__gm__ int32_t *)totalRecvTokens_);
++        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(int32_t)), 0, 0, 0};
++        DataCopyPad(totalCntGt, totalCntLt, copyParams);
++    }
++
++    __aicore__ inline void BuildRecvCount()
++    {
++        // 只需要sendCountTensor
++        if (blockIdx != 1) {
++            return;
++        }
++        ReorderSendCountOutput();
++        int32_t recvCountNum = 0;
++        for (uint32_t expId = 0; expId < numExperts / rankSize; ++expId) {
++            for (uint32_t srcRank = 0; srcRank < rankSize; ++srcRank) {
++                uint32_t index = expId * rankSize + srcRank;
++                recvCountNum += sendCountTensor(index);
++                sendCountTensor(index) = recvCountNum;
++            }
++        }
++        GlobalTensor<int32_t> recvCntGt;
++        recvCntGt.SetGlobalBuffer((__gm__ int32_t *)recvCount_);
++        DataCopyExtParams copyParams{1, static_cast<uint32_t>(numExperts * sizeof(int32_t)), 0, 0, 0};
++        SyncFunc<AscendC::HardEvent::S_MTE3>();
++        DataCopyPad(recvCntGt, sendCountTensor, copyParams);
++    }
++
++    __aicore__ inline void BuildRecvOffset()
++    {
++        // 只需要sendOffsetTensor
++        if (blockIdx != 2) {
++            return;
++        }
++        ReorderSendOffsetOutput();
++        GlobalTensor<int32_t> recvOffsetGt;
++        recvOffsetGt.SetGlobalBuffer((__gm__ int32_t *)recvOffset_);
++        DataCopyExtParams copyParams{1, static_cast<uint32_t>(numExperts * sizeof(int32_t)), 0, 0, 0};
++        SyncFunc<AscendC::HardEvent::S_MTE3>();
++        DataCopyPad(recvOffsetGt, sendOffsetTensor, copyParams);
++    }
++
++    __aicore__ inline void BuildMaxBs()
++    {
++        // 只需要maxBsNum
++        if (blockIdx != 3) {
++            return;
++        }
++        ReorderMaxBsOutput();
++        GlobalTensor<int32_t> maxBsGt;
++        maxBsGt.SetGlobalBuffer((__gm__ int32_t *)maxBs_);
++        maxBsGt.SetValue(0, maxBsNum);
++        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(maxBsGt);
++    }
++
++    __aicore__ inline void BuildRecvTokenPerExp()
++    {
++        // 只需要sendCountTensor
++        if (blockIdx != 4) {
++            return;
++        }
++        ReorderSendCountOutput();
++        pipe.InitBuffer(tmpBuf_, Ceil(numExperts / rankSize * sizeof(int64_t), UB_ALIGN_SIZE) * UB_ALIGN_SIZE);
++        LocalTensor<int64_t> tmpTensor = tmpBuf_.Get<int64_t>();
++        for (uint32_t expId = 0; expId < numExperts / rankSize; ++expId) {
++            int64_t localRecvCount = 0;
++            for (uint32_t srcRank = 0; srcRank < rankSize; ++srcRank) {
++                uint32_t index = expId * rankSize + srcRank;
++                localRecvCount += sendCountTensor(index);
++            }
++            tmpTensor(expId) = localRecvCount;
++        }
++        SyncFunc<AscendC::HardEvent::S_MTE3>();
++        GlobalTensor<int64_t> recvTokenPerExpGt;
++        recvTokenPerExpGt.SetGlobalBuffer((__gm__ int64_t *)recvTokensPerExpert_);
++        DataCopyExtParams copyParams{1, static_cast<uint32_t>(numExperts / rankSize * sizeof(int64_t)), 0, 0, 0};
++        SyncFunc<AscendC::HardEvent::S_MTE3>();
++        DataCopyPad(recvTokenPerExpGt, tmpTensor, copyParams);
++    }
++
+     __aicore__ inline int64_t GetDataCount(const int64_t dataLen, const int64_t useBlockNum);
+     __aicore__ inline GM_ADDR GetWindAddrByRankId(const int32_t rankId, uint8_t ctxIdx);
+     __aicore__ inline uint64_t GetMagicValue(void);
+@@ -241,6 +424,7 @@ private:
+     GlobalTensor<int> tokenPerExpertDataInputGt;
+     GlobalTensor<T> sendDataOffsetOutputGt;
+     GlobalTensor<T> recvDataOutputGt;
++    GlobalTensor<int32_t> recvDataOutGt;
+     GlobalTensor<T> readGt;
+     GlobalTensor<T> writeGt;
+     GlobalTensor<T> readGt1[MAX_BUFFER_NUMBER];
+@@ -290,6 +474,12 @@ private:
+     uint64_t magic{0};
+     int64_t blockIdx;  // Index of the current aicore
+     int64_t blockNum;  // Total number of aicores for the current rank
++    uint32_t maxBsNum{0};
++    GM_ADDR totalRecvTokens_;
++    GM_ADDR recvCount_;
++    GM_ADDR recvOffset_;
++    GM_ADDR maxBs_;
++    GM_ADDR recvTokensPerExpert_;
+     GM_ADDR scale;
+     GM_ADDR shareAddrs[CAM_MAX_RANK_SIZE];  // List of shared memory addresses
+     __gm__ HcclOpResParam *winContext_[COMM_NUM]{nullptr, nullptr};
+@@ -298,11 +488,23 @@ private:
+     TBuf<QuePosition::VECCALC> tBuf;
+     TBuf<> tokenPerExpertDataBuf;
+     TBuf<> sendDataOffsetBuf;
++    TBuf<> sendCountBuf;
++    TBuf<> sendOffsetBuf;
+     TBuf<> sendDataBuf;
++    TBuf<> recvDataBuf;
++    LocalTensor<int32_t> sendCountTensor;
++    LocalTensor<int32_t> sendOffsetTensor;
++    LocalTensor<int32_t> recvDataTensor;
+ 
+     uint32_t sendDataAlignLen{0};
+     uint32_t tokenPerExpertDataAlignLen{0};
+     uint32_t sendDataOffsetAlignLen{0};
++    uint32_t recvDataAlignLen{0};
++
++    TBuf<> tmpBuf_;
++    TBuf<> tmpBuf2_;
++    TBuf<> tmpBuf3_;
++    TBuf<> tmpBuf4_;
+ };
+ 
+ template <typename T>
+@@ -399,7 +601,7 @@ __aicore__ inline void NotifyDispatch<T>::InitSmallFullMesh(KERNELS_ARGS_FUN_ALL
+                                (this->magic % PING_PONG_SIZE) * (IPC_BUFF_MAX_SIZE + IPC_DATA_OFFSET);
+     }
+ 
+-    pipe.InitBuffer(tBuf, UB_SINGLE_TOTAL_SIZE_MAX);
++    pipe.InitBuffer(tBuf, UB_FLAG_SIZE);
+ }
+ 
+ /**
+diff --git a/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.cpp b/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.cpp
+index 9c40e78d..6e2726a7 100644
+--- a/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.cpp
++++ b/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.cpp
+@@ -19,7 +19,7 @@ extern "C" __global__ __aicore__ void notify_dispatch_a2(GM_ADDR sendData, GM_AD
+                                                          GM_ADDR epRankTokenCnt, GM_ADDR localEpTokenCnt,
+                                                          GM_ADDR srcOffsetRankTokenIdx, GM_ADDR dstOffsetRankTokenIdx,
+                                                          GM_ADDR offsetInner, GM_ADDR countOuter, GM_ADDR expandIdx,
+-                                                         GM_ADDR workspace, GM_ADDR tiling)
++                                                         GM_ADDR totalRecvTokens, GM_ADDR workspace, GM_ADDR tiling)
+ {
+     REGISTER_TILING_DEFAULT(NotifyDispatchA2TilingData);
+     GET_TILING_DATA_WITH_STRUCT(NotifyDispatchA2TilingData, tilingData, tiling);
+@@ -48,6 +48,7 @@ extern "C" __global__ __aicore__ void notify_dispatch_a2(GM_ADDR sendData, GM_AD
+     GM_ADDR offsetInnerOutput = offsetInner;
+     GM_ADDR countOuterOutput = countOuter;
+     GM_ADDR expandIdxOutput = expandIdx;
++    GM_ADDR totalRecvTokensOutput = totalRecvTokens;
+ 
+     // fill in unused args
+     uint32_t extraFlag = 0;
+diff --git a/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.h b/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.h
+index 8dd554b1..7d6d8402 100644
+--- a/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.h
++++ b/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.h
+@@ -18,15 +18,15 @@ using namespace Moe;
+         int cycleCount, GM_ADDR scale, int64_t scaleCount, GM_ADDR offset, int localRank, int localRankSize,           \
+         GM_ADDR tokenServerIdxOutput, GM_ADDR tokensUniquePerServerOutput, GM_ADDR epRankTokenCntOutput,               \
+         GM_ADDR localEpTokenCntOutput, GM_ADDR srcOffsetRankTokenIdxOutput, GM_ADDR dstOffsetRankTokenIdxOutput,       \
+-        GM_ADDR offsetInnerOutput, GM_ADDR countOuterOutput, GM_ADDR expandIdxOutput, GM_ADDR workspace,               \
+-        GM_ADDR tiling
++        GM_ADDR offsetInnerOutput, GM_ADDR countOuterOutput, GM_ADDR expandIdxOutput, GM_ADDR totalRecvTokensOutput,   \
++        GM_ADDR workspace, GM_ADDR tiling
+ 
+ #define KERNELS_ARGS_CALL_A2_ALL2ALL()                                                                          \
+     sendDataInput, tokenPerExpertDataInput, tmpDataInput, sendDataOffsetOutput, recvDataOutput, len, numTokens, \
+         topkNum, numExperts, op, root, cycleCount, scale, scaleCount, offset, localRank, localRankSize,         \
+         tokenServerIdxOutput, tokensUniquePerServerOutput, epRankTokenCntOutput, localEpTokenCntOutput,         \
+         srcOffsetRankTokenIdxOutput, dstOffsetRankTokenIdxOutput, offsetInnerOutput, countOuterOutput,          \
+-        expandIdxOutput, workspace, tiling
++        expandIdxOutput, totalRecvTokensOutput, workspace, tiling
+ 
+ // #define ENABLE_PRINT
+ #ifdef ENABLE_PRINT
+@@ -133,12 +133,13 @@ public:
+         tokenServerIdxOutputGT_.SetGlobalBuffer((__gm__ int32_t *)tokenServerIdxOutput);
+         tokensUniquePerServerOutputGT_.SetGlobalBuffer((__gm__ int32_t *)tokensUniquePerServerOutput);
+         epRankTokenCntOutputGT_.SetGlobalBuffer((__gm__ int32_t *)epRankTokenCntOutput);
+-        localEpTokenCntOutputGT_.SetGlobalBuffer((__gm__ int32_t *)localEpTokenCntOutput);
++        localEpTokenCntOutputGT_.SetGlobalBuffer((__gm__ int64_t *)localEpTokenCntOutput);
+         srcOffsetRankTokenIdxOutputGT_.SetGlobalBuffer((__gm__ int32_t *)srcOffsetRankTokenIdxOutput);
+         dstOffsetRankTokenIdxOutputGT_.SetGlobalBuffer((__gm__ int32_t *)dstOffsetRankTokenIdxOutput);
+         offsetInnerOutputGT_.SetGlobalBuffer((__gm__ int32_t *)offsetInnerOutput);
+         countOuterOutputGT_.SetGlobalBuffer((__gm__ int32_t *)countOuterOutput);
+         expandIdxOutputGT_.SetGlobalBuffer((__gm__ int32_t *)expandIdxOutput);
++        totalRecvTokensOutputGT_.SetGlobalBuffer((__gm__ int32_t *)totalRecvTokensOutput);
+ 
+         // 初始化RDMA相关变量
+         // dataSpaceGT_ = workspace; // 需要预留大一些空间供存放交换后拆分出来的数据
+@@ -622,6 +623,8 @@ private:
+         pipe.InitBuffer(tempBuf5_, 1000 * sizeof(float));  // 存放中间临时数据
+         pipe.InitBuffer(tempBuf6_, 1000 * sizeof(float));  // 存放中间临时数据
+ 
++        pipe.InitBuffer(tempBuf11_, Ceil(1 * sizeof(int64_t), UB_ALIGN) * UB_ALIGN);  // 存放中间临时数据
++
+         GetRankEpTokenCntData(0, blockNum);
+         GetExpertMaxBsSrcData(0, blockNum);
+         SyncAll<true>();
+@@ -633,6 +636,7 @@ private:
+         if (blockIdx < coreNumPerFunc) {
+             if (blockIdx == 0) {
+                 BuildTokenUniquePerServerData();
++                BuildTotalRecvTokensData();
+             }
+             if (blockIdx == 1) {
+                 BuildTokenSeverIdxData();
+@@ -1021,6 +1025,41 @@ private:
+         SyncFunc<AscendC::HardEvent::MTE3_S>();
+     }
+ 
++    __aicore__ inline void BuildTotalRecvTokensData()
++    {
++        // 单核计算
++        LocalTensor<int32_t> totalCnt = tempBuf_.Get<int32_t>();
++        LocalTensor<int32_t> tmpLt = tempBuf2_.Get<int32_t>();
++        LocalTensor<float> floatTmpLt = tempBuf4_.Get<float>();
++        LocalTensor<float> floatTmpSumLt = tempBuf5_.Get<float>();
++        LocalTensor<float> sharedTmpBuffer = tempBuf6_.Get<float>();
++
++        DataCopyExtParams copyParams{1, static_cast<uint32_t>(rankSize * sizeof(int32_t)), 0, 0, 0};
++        DataCopyPadExtParams<int32_t> padParams{false, 0, 0, 0};
++
++        int32_t localExpertNum = numExperts / rankSize;
++        int32_t sumVal = 0;
++        AscendC::SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);  // MTE2 waits for MTE3
++        for (int index = 0; index < localExpertNum; ++index) {
++            int expId = rank * localExpertNum + index;
++            DataCopyPad(tmpLt, epRankTokenCntOutputGT_[expId * rankSize], copyParams, padParams);
++            SyncFunc<AscendC::HardEvent::MTE2_V>();
++            Cast(floatTmpLt, tmpLt, RoundMode::CAST_NONE, rankSize);
++            PipeBarrier<PIPE_V>();
++            ReduceSum(floatTmpSumLt, floatTmpLt, sharedTmpBuffer, rankSize);
++            SyncFunc<AscendC::HardEvent::V_S>();
++            // 加上该专家接收的token数
++            sumVal += static_cast<int32_t>(floatTmpSumLt.GetValue(0));
++        }
++        AscendC::WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);  // MTE2 waits for MTE3
++
++        totalCnt(0) = sumVal;
++        PipeBarrier<PIPE_ALL>();
++        SyncFunc<AscendC::HardEvent::MTE2_MTE3>();
++        DataCopyExtParams copyParams1{1, static_cast<uint32_t>(1 * sizeof(int32_t)), 0, 0, 0};
++        DataCopyPad(totalRecvTokensOutputGT_, totalCnt, copyParams1);
++    }
++
+     __aicore__ inline void BuildLocalEpRankTokenCntData(int32_t beginCoreId, int32_t validCoreNum)
+     {
+         // 计算 localEpTokenCntOutputGT_ , shape[localExperts]  value: tokenCnt 非前缀和
+@@ -1040,32 +1079,33 @@ private:
+             return;
+         }
+ 
++        LocalTensor<int64_t> tmpEpRecvLt = tempBuf11_.Get<int64_t>();
++        DataCopyExtParams copyParams1{1, static_cast<uint32_t>(1 * sizeof(int64_t)), 0, 0, 0};
++
+         LocalTensor<int32_t> tmpLt = tempBuf2_.Get<int32_t>();
+-        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(int32_t)), 0, 0, 0};
++        LocalTensor<float> floatTmpLt = tempBuf4_.Get<float>();
++        LocalTensor<float> floatTmpSumLt = tempBuf5_.Get<float>();
++        LocalTensor<float> sharedTmpBuffer = tempBuf6_.Get<float>();
++        DataCopyExtParams copyParams{1, static_cast<uint32_t>(rankSize * sizeof(int32_t)), 0, 0, 0};
+         DataCopyPadExtParams<int32_t> padParams{false, 0, 0, 0};
++
+         AscendC::SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);  // MTE2 waits for MTE3
+         for (int i = startExpId; i < endExpId; ++i) {
+-            int32_t preCnt = 0;  // 每个专家接收的token单独统计
+-            for (int j = 0; j < rankSize; ++j) {
+-                int32_t inOffset = (rank * localExpertNum + i) * rankSize + j;  // 拷贝当前专家的1个值，对应不同rank来的
+-
+-                event_t eventId = EVENT_ID0;
+-                AscendC::WaitFlag<HardEvent::MTE3_MTE2>(eventId);
+-
+-                DataCopyPad(tmpLt, epRankTokenCntOutputGT_[inOffset], copyParams, padParams);
+-
+-                SyncFunc<AscendC::HardEvent::MTE2_S>();
+-                preCnt += tmpLt(0);
+-                pipe_barrier(PIPE_ALL);
++            int expId = rank * localExpertNum + i;
++            DataCopyPad(tmpLt, epRankTokenCntOutputGT_[expId * rankSize], copyParams, padParams);
++            SyncFunc<AscendC::HardEvent::MTE2_V>();
++            Cast(floatTmpLt, tmpLt, RoundMode::CAST_NONE, rankSize);
++            PipeBarrier<PIPE_V>();
++            ReduceSum(floatTmpSumLt, floatTmpLt, sharedTmpBuffer, rankSize);
++            SyncFunc<AscendC::HardEvent::V_S>();
++            // 该专家接收的token数
++            int64_t recvCnt = static_cast<int64_t>(floatTmpSumLt.GetValue(0));
+ 
+-                AscendC::SetFlag<HardEvent::MTE3_MTE2>(eventId);
+-            }
+-            tmpLt(0) = preCnt;
++            tmpEpRecvLt(0) = recvCnt;
+             pipe_barrier(PIPE_ALL);
+-            DataCopyPad(localEpTokenCntOutputGT_[i], tmpLt, copyParams);
++            DataCopyPad(localEpTokenCntOutputGT_[i], tmpEpRecvLt, copyParams1);
+         }
+         AscendC::WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);  // MTE2 waits for MTE3
+-        SyncFunc<AscendC::HardEvent::MTE3_S>();
+     }
+ 
+     __aicore__ inline void BuildSrcDstOffsetData(int32_t beginCoreId, int32_t validCoreNum)
+@@ -1123,7 +1163,7 @@ private:
+                 PipeBarrier<PIPE_V>();
+                 ReduceSum(floatExpTokenSumCntLt, floatExpTokenCntLt, sharedTmpBuffer, copyCnt);
+                 SyncFunc<AscendC::HardEvent::V_S>();
+-                // 当前专家的起始偏移，从 localEpTokenCntOutputGT_ 中获取，为上一个本地专家收的token总数
++                // 当前专家的起始偏移，为上一个本地专家收的token总数
+                 dstOffsetStart = static_cast<int32_t>(floatExpTokenSumCntLt.GetValue(0));
+             }
+ 
+@@ -1251,6 +1291,7 @@ private:
+     TBuf<> tempBuf8_;
+     TBuf<> tempBuf9_;
+     TBuf<> tempBuf10_;
++    TBuf<> tempBuf11_;
+ 
+     uint32_t sendDataAlignLen{0};
+     uint32_t tokenPerExpertDataAlignLen{0};
+@@ -1283,7 +1324,7 @@ private:
+         tokensUniquePerServerOutputGT_;  // 当前rank发送给对应server的token个数 [serverNum] -> value:count数量
+     GlobalTensor<int32_t>
+         epRankTokenCntOutputGT_;  // 每个专家、从rank接收的token数量 [expert_num, rank_num] -> value:token_cnt
+-    GlobalTensor<int32_t> localEpTokenCntOutputGT_;  // 本卡每个专家、从rank接收的token数量 [local_expert_num, rank_num]
++    GlobalTensor<int64_t> localEpTokenCntOutputGT_;  // 本卡每个专家接收的token数量 [local_expert_num]
+     GlobalTensor<int32_t> srcOffsetRankTokenIdxOutputGT_;  // 每个专家、从rank接收的token源端偏移 [expert_num, rank_num,
+                                                            // token_idx] -> value:src_offset
+     GlobalTensor<int32_t> dstOffsetRankTokenIdxOutputGT_;  // 每个专家、从rank接收的token目的端偏移 [expert_num,
+@@ -1294,6 +1335,7 @@ private:
+     GlobalTensor<int32_t> offsetOuterOutputGT_;  // 每个token在server上的位次    同tokenServerIdxOutputGT_
+     GlobalTensor<int32_t>
+         expandIdxOutputGT_;  // 给同一专家的token个数 [bs * numExperts], topk_idx的同专家前缀和扩维到所有专家维度
++    GlobalTensor<int32_t> totalRecvTokensOutputGT_;  // 本卡收到的token总数, [1] -> value:count
+ };
+ 
+ template <typename T>

@@ -1,0 +1,661 @@
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py b/python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py
+index 8b76557e26a5..c33aad1cdadc 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py
+@@ -84,10 +84,37 @@ def topk_transform(
+         row_starts: Optional[torch.Tensor] = None,
+         batch_idx_list: Optional[List[int]] = None,
+         force_unfused_topk: bool = False,
++        allow_topk_v2: bool = True,
+     ) -> torch.Tensor:
+         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
+             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+ 
++        # Decode-shaped PAGED top-k routes to the DeepSeek-V4 top-k v2 JIT kernel,
++        # which fuses top-k selection and the page-table transform in one launch and
++        # consumes the indexer's own page_size>=1 table directly, so no page_size=1
++        # table is materialized. Shared by DeepSeek-V3.2 and GLM DSA. This is a
++        # deterministic dispatch on the work shape, not a best-effort attempt: the
++        # fused-decode CUDA graph drops the page_size=1 table for exactly this case
++        # (see dsa_drop_wide_page_table), so once the shape matches we commit to v2
++        # and never silently fall back to the legacy page_size=1 path from here.
++        if (
++            allow_topk_v2
++            and envs.SGLANG_OPT_USE_TOPK_V2.get()
++            and topk_transform_method == TopkTransformMethod.PAGED
++            and row_starts is None
++            and batch_idx_list is None
++            and 0 < topk <= 2048
++            and lengths.shape[0]
++            == logits.shape[0]
++            == attn_metadata.real_page_table.shape[0]
++        ):
++            return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
++
++        # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
++        # which is always present here: the fold only drops it for the decode case
++        # dispatched to v2 above.
++        assert attn_metadata.page_table_1 is not None
++
+         if self.is_sgl_kernel():
+             from sgl_kernel import (
+                 fast_topk_transform_fused,
+@@ -207,6 +234,69 @@ def _topk_unfused(
+     return topk_indices
+ 
+ 
++def _topk_transform_v2_paged(
++    logits: torch.Tensor,
++    lengths: torch.Tensor,
++    topk: int,
++    attn_metadata,
++) -> torch.Tensor:
++    """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
++
++    Returns the transformed page indices ``(num_rows, topk)`` int32 (physical
++    page_size=1 KV slots, ``-1`` padded) -- identical in meaning to
++    ``fast_topk_transform_fused`` / ``flashinfer.top_k_page_table_transform``.
++    The kernel selects, per row, the top-k of ``logits[row, :lengths[row]]`` and
++    maps each selected position ``p`` through the page table as
++    ``real_page_table[row, p // page_size] * page_size + (p % page_size)``. Feeding
++    it the indexer's compact ``real_page_table`` (page_size = pool page size,
++    typically 64) yields the same physical slots as gathering the page_size=1
++    table, without materializing that wide table.
++
++    This is a committed contract, not a best-effort path: ``topk_transform`` routes
++    here only for the decode-shaped PAGED case, and the fused-decode CUDA graph
++    drops the page_size=1 table for exactly this case (see
++    ``dsa_drop_wide_page_table``). The preconditions below are therefore
++    invariants the caller must uphold -- they assert (raise) on violation rather
++    than fall back to the slow legacy path (which may not even have a page_size=1
++    table to fall back to) or silently paper over bad input (padding, recomputing
++    the plan) at the cost of the performance this path exists to deliver.
++    """
++    from sglang.jit_kernel.dsv4.topk import topk_transform_512_v2
++    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
++
++    num_rows = logits.shape[0]
++
++    # The indexer (DeepGEMM) emits fp32 scores with unit row stride and a 16B-aligned
++    # row stride (a multiple of 4), which is exactly the kernel's ABI (it checks
++    # score_stride % 4 == 0 with strides {S, 1}). This holds even though the scores
++    # may be a padded view (stride(0) > width, so not `is_contiguous()`); assert the
++    # real requirement rather than force a contiguous copy of the wide score buffer.
++    assert (
++        logits.dtype == torch.float32
++        and logits.stride(1) == 1
++        and logits.stride(0) % 4 == 0
++    ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
++    assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
++
++    page_table = attn_metadata.real_page_table
++    assert page_table.dtype == torch.int32
++    lengths_i32 = lengths.to(torch.int32)
++
++    # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
++    # refreshed in-place under CUDA graph) and reused across layers. A missing or
++    # mismatched plan means the caller skipped that preprocessing -- fail loudly
++    # rather than silently recompute it per layer.
++    plan = attn_metadata.topk_v2_plan
++    assert (
++        plan is not None and plan.shape[0] == num_rows + 1
++    ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
++
++    page_size = get_token_to_kv_pool().page_size
++    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
++    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
++    return out
++
++
+ def _build_flashinfer_paged_args(
+     attn_metadata,
+     row_starts: Optional[torch.Tensor],
+diff --git a/python/sglang/srt/layers/attention/dsa_backend.py b/python/sglang/srt/layers/attention/dsa_backend.py
+index e5b6b2337b1d..1f367c0b8722 100644
+--- a/python/sglang/srt/layers/attention/dsa_backend.py
++++ b/python/sglang/srt/layers/attention/dsa_backend.py
+@@ -172,8 +172,12 @@ class DSAMetadata:
+     # Cumulative sequence lengths for key
+     cu_seqlens_k: torch.Tensor
+     # Page table, the index of KV Cache Tables/Blocks
+-    # this table is always with page_size = 1
+-    page_table_1: torch.Tensor
++    # this table is always with page_size = 1.
++    # None for fused-decode CUDA graphs where the wide [bs, max_ctx_len] table is
++    # never read (attention uses topk_indices, indexer uses real_page_table); the
++    # graph then only materializes the compact real_page_table. See
++    # `dsa_drop_wide_page_table`.
++    page_table_1: Optional[torch.Tensor]
+ 
+     # NOTE(dark): This will property be used in:
+     # 1. dense decode/prefill, we use paged flash attention, need real_page_table
+@@ -195,6 +199,10 @@ class DSAMetadata:
+     # 2D context_lens used to build the schedule above; the indexer reuses it
+     # as DG's `context_lens` arg so the broadcast doesn't rebuild per layer.
+     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
++    # Precomputed once per forward batch and reused across layers: the
++    # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
++    # decode top-k transform. None unless SGLANG_OPT_USE_TOPK_V2 and decode.
++    topk_v2_plan: Optional[torch.Tensor] = None
+     # The sum of sequence lengths for key, prefill only
+     seq_lens_sum: Optional[int] = None
+     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
+@@ -243,6 +251,12 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
+     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+     force_unfused_topk: bool = False
++    # Whether the fused top-k v2 kernel may be used for this forward. Disabled for
++    # spec verify / draft-extend: the v2 small-batch path illegal-addresses under
++    # those multi-query-per-request CUDA graphs (GLM 5.2 MTP), and it is only
++    # e2e-validated for single-query decode. TODO(dsa-topk-v2): re-enable once the
++    # small-batch kernel is fixed; see the crash analysis in the PR.
++    allow_topk_v2: bool = True
+ 
+     def get_seqlens_int32(self) -> torch.Tensor:
+         return self.attn_metadata.cache_seqlens_int32
+@@ -312,6 +326,7 @@ def topk_transform(
+             row_starts=ks,
+             batch_idx_list=batch_idx_list,
+             force_unfused_topk=self.force_unfused_topk,
++            allow_topk_v2=self.allow_topk_v2,
+         )
+ 
+ 
+@@ -621,6 +636,35 @@ def _refresh_paged_mqa_schedule_metadata(
+         else:
+             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+ 
++    def _build_topk_v2_plan(
++        self, seqlens_expanded: torch.Tensor
++    ) -> Optional[torch.Tensor]:
++        # Preprocess the folded top-k v2 plan once per forward (shared across
++        # layers), at metadata-build time, from the same seqlens the transform
++        # receives as `lengths` (dsa_seqlens_expanded). This must cover EVERY shape
++        # that dispatches to `_topk_transform_v2_paged` -- decode AND MTP
++        # target-verify / draft-extend, whose expanded row count is exactly what v2
++        # sees -- otherwise the helper's plan-present assertion fires. None only
++        # when the fold is disabled; such metadata is never dispatched to v2.
++        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
++            return None
++        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
++
++        return plan_topk_v2(seqlens_expanded)
++
++    def _refresh_topk_v2_plan(self, metadata: DSAMetadata) -> None:
++        # Refresh the plan in-place under CUDA graph replay so the captured
++        # read sees fresh cluster metadata for the replay's decode seq lengths.
++        # `copy_` preserves the buffer's data_ptr captured by the graph. None
++        # means it was not built (fold disabled / non-decode shape), and such a
++        # metadata object is never dispatched to the v2 helper, so there is
++        # nothing to refresh.
++        if metadata.topk_v2_plan is None:
++            return
++        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
++
++        metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
++
+     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
+         if (
+             self.dsa_topk_backend.is_sgl_kernel()
+@@ -639,6 +683,14 @@ def get_device_int32_arange(self, length: int) -> torch.Tensor:
+             )
+         return self._arange_buf[:length]
+ 
++    def _graph_page_table_width(self, metadata: DSAMetadata) -> int:
++        """Column count to scan req_to_token during graph replay. Reads the wide
++        page_table_1 width when present, else req_to_token's width (the wide table
++        is dropped for fused decode graphs, see `dsa_drop_wide_page_table`)."""
++        if metadata.page_table_1 is not None:
++            return metadata.page_table_1.shape[1]
++        return self.req_to_token.shape[1]
++
+     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
+         page_size = self.real_page_size
+         if page_size == 1:
+@@ -957,6 +1009,7 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
+             indexer_seq_lens=indexer_seq_lens,
+             token_to_batch_idx=token_to_batch_idx,
++            topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+         )
+         self.forward_metadata = metadata
+ 
+@@ -1045,6 +1098,32 @@ def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+         This creates fixed-size tensors that will be reused during CUDA graph replay
+         to avoid memory allocations.
+         """
++        # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
++        # page table in the decode CUDA graph. It is dead weight there only when the
++        # decode top-k routes to the fused v2 kernel: attention reads topk_indices
++        # and the indexer reads the compact real_page_table, so nothing reads the
++        # page_size=1 table. This MUST match the exact condition under which
++        # `DSATopKBackend.topk_transform` dispatches decode PAGED to
++        # `_topk_transform_v2_paged` -- otherwise the legacy transform would read a
++        # dropped (None) table. Hence: fused top-k AND v2 enabled AND index_topk in
++        # the kernel's supported range, on CUDA with page_size>1. Excludes HIP (its
++        # indexer reads page_table_1), hisparse (needs page_size=1 loc translation),
++        # and spec decoding (MTP precompute fast-path + target-verify/draft-extend
++        # still consume the wide table). Computed once from stable config; the graph
++        # is captured once per process.
++        self.dsa_drop_wide_page_table = (
++            is_cuda()
++            and not _is_hip
++            and self.real_page_size > 1
++            and self.hisparse_coordinator is None
++            and not self.speculative_num_draft_tokens
++            and envs.SGLANG_DSA_FUSE_TOPK.get()
++            and envs.SGLANG_OPT_USE_TOPK_V2.get()
++            and self.dsa_index_topk is not None
++            and self.dsa_index_topk <= 2048
++        )
++
++        max_ctx_len = self.req_to_token.shape[1]
+         self.decode_cuda_graph_metadata: Dict = {
+             "cache_seqlens": torch.ones(
+                 max_num_tokens, dtype=torch.int32, device=self.device
+@@ -1058,11 +1137,28 @@ def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+             # fake page_table for sparse_prefill
+             # Match req_to_token's width exactly. It is over-allocated beyond
+             # context_len because spec decoding lets seq_len transiently overshoot.
+-            "page_table": torch.zeros(
+-                max_num_tokens,
+-                self.req_to_token.shape[1],
+-                dtype=torch.int32,
+-                device=self.device,
++            # When dropping the wide table (fused decode), allocate only the compact
++            # page_size=64 real table; else allocate the wide page_size=1 table and
++            # derive real from it per batch size.
++            "real_page_table": (
++                torch.zeros(
++                    max_num_tokens,
++                    (max_ctx_len + self.real_page_size - 1) // self.real_page_size,
++                    dtype=torch.int32,
++                    device=self.device,
++                )
++                if self.dsa_drop_wide_page_table
++                else None
++            ),
++            "page_table": (
++                None
++                if self.dsa_drop_wide_page_table
++                else torch.zeros(
++                    max_num_tokens,
++                    max_ctx_len,
++                    dtype=torch.int32,
++                    device=self.device,
++                )
+             ),
+             "flashmla_metadata": (
+                 self._compute_flashmla_metadata(
+@@ -1098,9 +1194,14 @@ def _build_forward_metadata_cuda_graph(
+             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+ 
+             # Use max context length for seq_len_k
+-            page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
++            real_rows = bs
++            if self.dsa_drop_wide_page_table:
++                page_table_1 = None
++                max_seqlen_k = self.req_to_token.shape[1]
++            else:
++                page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
++                max_seqlen_k = page_table_1.shape[1]
+             max_seqlen_q = 1
+-            max_seqlen_k = page_table_1.shape[1]
+ 
+             # Precompute page table
+             # Precompute cumulative sequence lengths
+@@ -1131,10 +1232,15 @@ def _build_forward_metadata_cuda_graph(
+             )
+             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+             max_seqlen_q = 1
+-            page_table_1 = self.decode_cuda_graph_metadata["page_table"][
+-                : bs * self.speculative_num_draft_tokens, :
+-            ]
+-            max_seqlen_k = page_table_1.shape[1]
++            real_rows = bs * self.speculative_num_draft_tokens
++            if self.dsa_drop_wide_page_table:
++                page_table_1 = None
++                max_seqlen_k = self.req_to_token.shape[1]
++            else:
++                page_table_1 = self.decode_cuda_graph_metadata["page_table"][
++                    :real_rows, :
++                ]
++                max_seqlen_k = page_table_1.shape[1]
+ 
+             cu_seqlens_q = torch.arange(
+                 0,
+@@ -1186,7 +1292,14 @@ def _build_forward_metadata_cuda_graph(
+ 
+         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
+         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
+-        real_page_table = self._transform_table_1_to_real(page_table_1)
++        if self.dsa_drop_wide_page_table:
++            # Compact page_size=64 static buffer; filled per-replay by the fused
++            # metadata kernel straight from req_to_token (no wide table needed).
++            real_page_table = self.decode_cuda_graph_metadata["real_page_table"][
++                :real_rows, :
++            ]
++        else:
++            real_page_table = self._transform_table_1_to_real(page_table_1)
+ 
+         paged_mqa_schedule_metadata = None
+         paged_mqa_ctx_lens_2d = None
+@@ -1219,6 +1332,7 @@ def _build_forward_metadata_cuda_graph(
+             dsa_seqlens_expanded=seqlens_expanded,
+             real_page_table=real_page_table,
+             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
++            topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+         )
+         self.decode_cuda_graph_metadata[bs] = metadata
+         self.forward_metadata = metadata
+@@ -1265,7 +1379,7 @@ def _apply_cuda_graph_metadata(
+         target_verify_ctx_lens_written = False
+         if forward_mode.is_decode_or_idle():
+             # Normal Decode
+-            max_len = metadata.page_table_1.shape[1]
++            max_len = self._graph_page_table_width(metadata)
+ 
+             if is_cuda() and not _is_hip:
+                 from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+@@ -1307,7 +1421,7 @@ def _apply_cuda_graph_metadata(
+                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
+                 seqlens_expanded = cache_seqlens
+         elif forward_mode.is_target_verify():
+-            max_seqlen_k = metadata.page_table_1.shape[1]
++            max_seqlen_k = self._graph_page_table_width(metadata)
+ 
+             if is_cuda() and not _is_hip:
+                 from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+@@ -1395,7 +1509,7 @@ def _apply_cuda_graph_metadata(
+             # already includes the draft KV written by prepare_for_draft_extend;
+             # the per-req accept length is handled downstream by output
+             # selection, not by reshaping the page table here.
+-            max_seqlen_k = metadata.page_table_1.shape[1]
++            max_seqlen_k = self._graph_page_table_width(metadata)
+             total_extend_len = self.speculative_num_draft_tokens * bs
+ 
+             # See target-verify note: fill on-device to avoid the blocking
+@@ -1486,6 +1600,7 @@ def _apply_cuda_graph_metadata(
+                     bs,
+                 )
+             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
++            self._refresh_topk_v2_plan(metadata)
+             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
+             if not target_verify_ctx_lens_written:
+                 if metadata.paged_mqa_ctx_lens_2d is None:
+@@ -1682,6 +1797,7 @@ def init_forward_metadata_replay_cuda_graph_from_precomputed(
+                     bs,
+                 )
+             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
++            self._refresh_topk_v2_plan(metadata)
+             if metadata.paged_mqa_ctx_lens_2d is None:
+                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+             else:
+@@ -2733,6 +2849,14 @@ def get_indexer_metadata(
+             self.hisparse_coordinator is not None
+             and forward_batch.forward_mode.is_decode_or_idle()
+         )
++        # TEMP(dsa-topk-v2): the fused v2 small-batch path illegal-addresses under
++        # spec verify / draft-extend CUDA graphs (GLM 5.2 MTP). Restrict v2 to the
++        # single-query decode shape it is e2e-validated on; spec falls back to the
++        # legacy transform (page_table_1 is present for spec, not dropped).
++        allow_topk_v2 = not (
++            forward_batch.forward_mode.is_target_verify()
++            or forward_batch.forward_mode.is_draft_extend_v2()
++        )
+         return DSAIndexerMetadata(
+             attn_metadata=self.forward_metadata,
+             topk_transform_method=self.get_topk_transform_method(
+@@ -2742,6 +2866,7 @@ def get_indexer_metadata(
+             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
+             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
+             force_unfused_topk=force_unfused,
++            allow_topk_v2=allow_topk_v2,
+         )
+ 
+     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
+diff --git a/python/sglang/srt/layers/attention/triton_ops/dsa_metadata.py b/python/sglang/srt/layers/attention/triton_ops/dsa_metadata.py
+index 38686484b0e0..633b485fb4d5 100644
+--- a/python/sglang/srt/layers/attention/triton_ops/dsa_metadata.py
++++ b/python/sglang/srt/layers/attention/triton_ops/dsa_metadata.py
+@@ -1,3 +1,5 @@
++from typing import Optional
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -33,6 +35,7 @@ def _fused_dsa_decode_metadata_kernel(
+     dsa_index_topk: tl.constexpr,
+     real_page_size: tl.constexpr,
+     HAS_REAL_PAGE_TABLE: tl.constexpr,
++    HAS_PAGE_TABLE_1: tl.constexpr,
+     BLOCK_BS: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+ ):
+@@ -73,11 +76,14 @@ def _fused_dsa_decode_metadata_kernel(
+         mask=mask,
+         other=0,
+     ).to(tl.int32)
+-    tl.store(
+-        page_table_1 + row * page_table_stride_0 + offs_n * page_table_stride_1,
+-        vals,
+-        mask=mask,
+-    )
++    # Write the wide page_size=1 table only when the caller provides it; the
++    # fused decode CUDA graph drops it and consumes real_page_table alone.
++    if HAS_PAGE_TABLE_1:
++        tl.store(
++            page_table_1 + row * page_table_stride_0 + offs_n * page_table_stride_1,
++            vals,
++            mask=mask,
++        )
+ 
+     if HAS_REAL_PAGE_TABLE:
+         real_mask = mask & ((offs_n % real_page_size) == 0)
+@@ -97,7 +103,7 @@ def fused_dsa_decode_metadata(
+     req_to_token: torch.Tensor,
+     cache_seqlens: torch.Tensor,
+     cu_seqlens_k: torch.Tensor,
+-    page_table_1: torch.Tensor,
++    page_table_1: Optional[torch.Tensor],
+     dsa_cache_seqlens: torch.Tensor,
+     dsa_cu_seqlens_k: torch.Tensor,
+     real_page_table: torch.Tensor,
+@@ -106,12 +112,20 @@ def fused_dsa_decode_metadata(
+     dsa_index_topk: int,
+     real_page_size: int,
+ ) -> None:
++    """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
++
++    ``page_table_1`` (the wide page_size=1 table) is optional: pass ``None`` to
++    skip materializing it and write only the compact ``real_page_table``
++    (page_size=``real_page_size``). This is used by the fused decode CUDA graph,
++    where the wide table is never read (attention uses topk_indices, the indexer
++    uses real_page_table); ``real_page_size`` must be >1 in that case. When a
++    tensor is passed, behavior is unchanged (both tables are written).
++    """
+     assert seq_lens.is_cuda
+     assert req_pool_indices.is_cuda
+     assert req_to_token.is_cuda
+     assert cache_seqlens.is_cuda
+     assert cu_seqlens_k.is_cuda
+-    assert page_table_1.is_cuda
+     assert dsa_cache_seqlens.is_cuda
+     assert dsa_cu_seqlens_k.is_cuda
+ 
+@@ -125,8 +139,19 @@ def fused_dsa_decode_metadata(
+         assert real_page_table is not None
+         assert real_page_table.is_cuda
+     else:
++        # page_size==1: real IS page_table_1, so page_table_1 must be present.
++        assert page_table_1 is not None
+         real_page_table = page_table_1
+ 
++    # page_table_1 (the wide page_size=1 table) may be dropped for the fused
++    # decode CUDA graph; the kernel then writes only real_page_table.
++    has_page_table_1 = page_table_1 is not None
++    if not has_page_table_1:
++        assert has_real_page_table
++        page_table_1 = real_page_table  # dummy pointer for stride args
++    else:
++        assert page_table_1.is_cuda
++
+     block_bs = triton.next_power_of_2(bs)
+     block_n = 128
+     num_col_blocks = triton.cdiv(max_len, block_n)
+@@ -155,6 +180,7 @@ def fused_dsa_decode_metadata(
+         dsa_index_topk,
+         real_page_size,
+         has_real_page_table,
++        has_page_table_1,
+         BLOCK_BS=block_bs,
+         BLOCK_N=block_n,
+     )
+@@ -196,6 +222,7 @@ def _fused_dsa_target_verify_metadata_kernel(
+     next_n: tl.constexpr,
+     HAS_REAL_PAGE_TABLE: tl.constexpr,
+     HAS_PAGED_MQA_CTX_LENS: tl.constexpr,
++    HAS_PAGE_TABLE_1: tl.constexpr,
+     BLOCK_BS: tl.constexpr,
+     BLOCK_EXPANDED: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -261,11 +288,14 @@ def _fused_dsa_target_verify_metadata_kernel(
+         mask=mask,
+         other=0,
+     ).to(tl.int32)
+-    tl.store(
+-        page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
+-        vals,
+-        mask=mask,
+-    )
++    # Write the wide page_size=1 table only when the caller provides it (see
++    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
++    if HAS_PAGE_TABLE_1:
++        tl.store(
++            page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
++            vals,
++            mask=mask,
++        )
+ 
+     if HAS_REAL_PAGE_TABLE:
+         real_mask = mask & ((offs_n % real_page_size) == 0)
+@@ -285,7 +315,7 @@ def fused_dsa_target_verify_metadata(
+     req_to_token: torch.Tensor,
+     cache_seqlens: torch.Tensor,
+     cu_seqlens_k: torch.Tensor,
+-    page_table_1: torch.Tensor,
++    page_table_1: Optional[torch.Tensor],
+     seqlens_expanded: torch.Tensor,
+     dsa_cache_seqlens: torch.Tensor,
+     dsa_cu_seqlens_k: torch.Tensor,
+@@ -302,7 +332,6 @@ def fused_dsa_target_verify_metadata(
+     assert req_to_token.is_cuda
+     assert cache_seqlens.is_cuda
+     assert cu_seqlens_k.is_cuda
+-    assert page_table_1.is_cuda
+     assert seqlens_expanded.is_cuda
+     assert dsa_cache_seqlens.is_cuda
+     assert dsa_cu_seqlens_k.is_cuda
+@@ -318,8 +347,18 @@ def fused_dsa_target_verify_metadata(
+         assert real_page_table is not None
+         assert real_page_table.is_cuda
+     else:
++        assert page_table_1 is not None
+         real_page_table = page_table_1
+ 
++    # page_table_1 (the wide page_size=1 table) may be dropped for the fused
++    # decode CUDA graph; the kernel then writes only real_page_table.
++    has_page_table_1 = page_table_1 is not None
++    if not has_page_table_1:
++        assert has_real_page_table
++        page_table_1 = real_page_table  # dummy pointer for stride args
++    else:
++        assert page_table_1.is_cuda
++
+     has_paged_mqa_ctx_lens = paged_mqa_ctx_lens_2d is not None
+     if has_paged_mqa_ctx_lens:
+         assert paged_mqa_ctx_lens_2d.is_cuda
+@@ -366,6 +405,7 @@ def fused_dsa_target_verify_metadata(
+         next_n,
+         has_real_page_table,
+         has_paged_mqa_ctx_lens,
++        has_page_table_1,
+         BLOCK_BS=block_bs,
+         BLOCK_EXPANDED=block_expanded,
+         BLOCK_N=block_n,
+@@ -407,6 +447,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
+     dsa_index_topk: tl.constexpr,
+     real_page_size: tl.constexpr,
+     HAS_REAL_PAGE_TABLE: tl.constexpr,
++    HAS_PAGE_TABLE_1: tl.constexpr,
+     STATIC_EXTEND_LEN: tl.constexpr,
+     BLOCK_BS: tl.constexpr,
+     BLOCK_EXPANDED: tl.constexpr,
+@@ -502,13 +543,16 @@ def _fused_dsa_draft_extend_metadata_kernel(
+         mask=col_mask & has_rows,
+         other=0,
+     ).to(tl.int32)
+-    tl.store(
+-        page_table_1
+-        + out_rows[:, None] * page_table_stride_0
+-        + offs_n[None, :] * page_table_stride_1,
+-        vals[None, :],
+-        mask=mask,
+-    )
++    # Write the wide page_size=1 table only when the caller provides it (see
++    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
++    if HAS_PAGE_TABLE_1:
++        tl.store(
++            page_table_1
++            + out_rows[:, None] * page_table_stride_0
++            + offs_n[None, :] * page_table_stride_1,
++            vals[None, :],
++            mask=mask,
++        )
+ 
+     if HAS_REAL_PAGE_TABLE:
+         real_mask = mask & ((offs_n[None, :] % real_page_size) == 0)
+@@ -529,7 +573,7 @@ def fused_dsa_draft_extend_metadata(
+     req_to_token: torch.Tensor,
+     cache_seqlens: torch.Tensor,
+     cu_seqlens_k: torch.Tensor,
+-    page_table_1: torch.Tensor,
++    page_table_1: Optional[torch.Tensor],
+     seqlens_expanded: torch.Tensor,
+     dsa_cache_seqlens: torch.Tensor,
+     dsa_cu_seqlens_k: torch.Tensor,
+@@ -549,7 +593,6 @@ def fused_dsa_draft_extend_metadata(
+     assert req_to_token.is_cuda
+     assert cache_seqlens.is_cuda
+     assert cu_seqlens_k.is_cuda
+-    assert page_table_1.is_cuda
+     assert seqlens_expanded.is_cuda
+     assert dsa_cache_seqlens.is_cuda
+     assert dsa_cu_seqlens_k.is_cuda
+@@ -577,8 +620,18 @@ def fused_dsa_draft_extend_metadata(
+         assert real_page_table is not None
+         assert real_page_table.is_cuda
+     else:
++        assert page_table_1 is not None
+         real_page_table = page_table_1
+ 
++    # page_table_1 (the wide page_size=1 table) may be dropped for the fused
++    # decode CUDA graph; the kernel then writes only real_page_table.
++    has_page_table_1 = page_table_1 is not None
++    if not has_page_table_1:
++        assert has_real_page_table
++        page_table_1 = real_page_table  # dummy pointer for stride args
++    else:
++        assert page_table_1.is_cuda
++
+     block_bs = triton.next_power_of_2(bs)
+     block_expanded = triton.next_power_of_2(max_total_len)
+     block_rows = triton.next_power_of_2(max_extend_len)
+@@ -613,6 +666,7 @@ def fused_dsa_draft_extend_metadata(
+         dsa_index_topk,
+         real_page_size,
+         has_real_page_table,
++        has_page_table_1,
+         static_extend_len,
+         BLOCK_BS=block_bs,
+         BLOCK_EXPANDED=block_expanded,

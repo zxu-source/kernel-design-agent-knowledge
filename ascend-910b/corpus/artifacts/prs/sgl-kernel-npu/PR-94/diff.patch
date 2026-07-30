@@ -1,0 +1,202 @@
+diff --git a/csrc/deepep/deep_ep.cpp b/csrc/deepep/deep_ep.cpp
+index 56d573be..6ea86824 100644
+--- a/csrc/deepep/deep_ep.cpp
++++ b/csrc/deepep/deep_ep.cpp
+@@ -592,4 +592,94 @@ std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<v
+     return {combined_x, event, std::function<void()>([] {})};
+ }
+ 
++std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>> Buffer::fused_deep_moe(
++    const at::Tensor &x, const at::Tensor &expertIds, const at::Tensor &gmm1PermutedWeight,
++    const at::Tensor &gmm1PermutedWeightScale, const at::Tensor &gmm2Weight, const at::Tensor &gmm2WeightScale,
++    const at::Tensor &expertScalesOptional, int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, bool use_fp8)
++{
++    EP_HOST_ASSERT(expertIds.dim() == 2);
++    EP_HOST_ASSERT(expertScalesOptional.dim() == 2);
++
++    this->is_padding = false;
++    at::Tensor new_x = x;
++    this->new_topk_idx = expertIds;
++    at::Tensor new_scales = expertScalesOptional;
++
++    if (expertIds.size(0) < PADDING_SIZE) {
++        this->is_padding = true;
++        this->padding_cnt = PADDING_SIZE - expertIds.size(0);
++
++        std::vector<at::Tensor> x_blocks;
++        std::vector<at::Tensor> idx_blocks;
++
++        if (expertIds.size(0) != 0) {
++            x_blocks.emplace_back(x);
++            idx_blocks.emplace_back(expertIds);
++        } else {
++            this->ori_x = x.clone();  //  Store the original input when the batch is completely empty.
++        }
++
++        int topk = static_cast<int>(expertIds.size(1));
++        for (int i = 0; i < this->padding_cnt; i++) {
++            at::Tensor tmp_x = torch::ones({1, x.size(1)}, x.options());
++            at::Tensor tmp_idx = torch::arange(0, topk, expertIds.options()).reshape({1, topk});
++            x_blocks.emplace_back(tmp_x);
++            idx_blocks.emplace_back(tmp_idx);
++        }
++
++        new_x = torch::cat(x_blocks, 0);
++        this->new_topk_idx = torch::cat(idx_blocks, 0);
++
++        // padding expertScalesOptional
++        std::vector<at::Tensor> scales_blocks;
++        if (this->padding_cnt != PADDING_SIZE) {
++            scales_blocks.emplace_back(expertScalesOptional);
++        }
++        for (int i = 0; i < this->padding_cnt; i++) {
++            at::Tensor tmp_scales = torch::zeros({1, expertScalesOptional.size(1)}, expertScalesOptional.options());
++            scales_blocks.emplace_back(tmp_scales);
++        }
++
++        new_scales = torch::cat(scales_blocks, 0);
++    }
++
++    char hcom_ep_name[128];
++    if (!moe_all_to_all_group_name.empty()) {
++        std::memcpy(hcom_ep_name, moe_all_to_all_group_name.data(), moe_all_to_all_group_name.size() + 1);
++    } else {
++        HCCL_CHECK(HcclGetCommName(ep_comm, hcom_ep_name));
++    }
++
++    int64_t quantMode = use_fp8 ? 2 : 0;
++    int64_t globalBs = std::max(new_topk_idx.size(0), num_max_dispatch_tokens_per_rank) * num_ranks;
++
++    auto xShape = x.sizes();
++    auto expertIdsShape = expertIds.sizes();
++    int h = xShape[1];
++    int bs = this->new_topk_idx.size(0);
++    at::Tensor output = at::empty({bs, h}, x.options());
++
++    EXEC_NPU_CMD(aclnnFusedDeepMoe,
++                 // input
++                 x, expertIds, gmm1PermutedWeight, gmm1PermutedWeightScale, gmm2Weight, gmm2WeightScale,
++                 static_cast<const std::nullptr_t &>(nullptr), new_scales,
++                 // attr
++                 hcom_ep_name, num_ranks, rank, num_experts, shared_expert_num, shared_expert_rank_num, quantMode,
++                 globalBs,
++                 // output
++                 output);
++
++    // ---------- Unpadding ----------
++    if (this->is_padding) {
++        if (expertIds.size(0) == 0) {
++            output = this->ori_x;
++        } else {
++            output = output.slice(0, 0, PADDING_SIZE - this->padding_cnt);
++        }
++        this->is_padding = false;
++    }
++
++    std::optional<EventHandle> event;
++    return {output, event, std::function<void()>([] {})};
++}
+ }  // namespace deep_ep
+diff --git a/csrc/deepep/deep_ep.hpp b/csrc/deepep/deep_ep.hpp
+index f536c3fe..e4a760a1 100644
+--- a/csrc/deepep/deep_ep.hpp
++++ b/csrc/deepep/deep_ep.hpp
+@@ -84,6 +84,11 @@ public:
+         const at::Tensor &layout_range, int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
+         const at::Tensor &packed_recv_count, bool zero_copy, bool async, bool return_recv_hook,
+         const std::optional<at::Tensor> &out);
+-};
+ 
++    std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
++    fused_deep_moe(const at::Tensor &x, const at::Tensor &expertIds, const at::Tensor &gmm1PermutedWeight,
++                   const at::Tensor &gmm1PermutedWeightScale, const at::Tensor &gmm2Weight,
++                   const at::Tensor &gmm2WeightScale, const at::Tensor &expertScalesOptional,
++                   int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, bool use_fp8);
++};
+ }  // namespace deep_ep
+diff --git a/csrc/deepep/pybind_extension.cpp b/csrc/deepep/pybind_extension.cpp
+index 1002fb29..9b587840 100644
+--- a/csrc/deepep/pybind_extension.cpp
++++ b/csrc/deepep/pybind_extension.cpp
+@@ -36,5 +36,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
+         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
+         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
+-        .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine);
++        .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
++        .def("fused_deep_moe", &deep_ep::Buffer::fused_deep_moe);
+ }
+diff --git a/python/deep_ep/deep_ep/buffer.py b/python/deep_ep/deep_ep/buffer.py
+index 53767920..dbccd8bd 100644
+--- a/python/deep_ep/deep_ep/buffer.py
++++ b/python/deep_ep/deep_ep/buffer.py
+@@ -585,3 +585,69 @@ class Buffer:
+             EventOverlap(event, tensors_to_record if async_finish else None),
+             hook,
+         )
++
++    def fused_deep_moe(
++        self,
++        x: torch.Tensor,
++        topk_idx: torch.Tensor,
++        topk_weights: torch.Tensor,
++        gmm1PermutedWeight: torch.Tensor,
++        gmm1PermutedWeightScale: torch.Tensor,
++        gmm2Weight: torch.Tensor,
++        gmm2WeightScale: torch.Tensor,
++        num_max_dispatch_tokens_per_rank: int,
++        num_experts: int,
++        use_fp8: bool = True,
++    ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
++        """
++        A fused low-latency implementation for MoE expert forward and combination.
++
++        Arguments:
++            x: `[bs, hidden]` with `torch.bfloat16` (or supported precision),
++                the token representations to be processed by selected experts.
++            topk_idx: `[bs, num_topk]` with `torch.int64`, the selected expert indices
++                for each token. `-1` indices are supported (meaning no expert selected).
++            topk_weights: `[num_combined_tokens, num_topk]` with `torch.float`, the expert weights selected by the dispatched
++                tokens. The received tokens will be reduced with the weights in this tensor.
++            gmm1PermutedWeight: weight tensor for the first stage (e.g., projection) with
++                a permuted layout according to grouped-matmul requirements.
++            gmm1PermutedWeightScale: quantization scale tensor corresponding to
++                `gmm1PermutedWeight`. Typically `torch.float32` or `torch.float16`,
++                depending on `quantMode`.
++            gmm2Weight: weight tensor for the second stage (e.g., projection or FFN output).
++            gmm2WeightScale: quantization scale tensor corresponding to `gmm2Weight`.
++
++            num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, all the ranks must hold the same value.
++            num_experts: the number of experts.
++            use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
++
++        Notes:
++            - The first dimension of `topk_idx` defines the batch size `bs`.
++            - The second dimension of `x` defines the hidden dimension `hidden`.
++            - Exact shapes of weight/scale tensors depend on GMM permutation and sharding.
++            - If optional scale tensors are empty, the kernel skips those transforms.
++
++        Returns:
++            output: `torch.Tensor`, shape `[bs, hidden]` and usually `torch.bfloat16`,
++                the fused expert output.
++            event: `EventOverlap`, the event handle after kernel execution.
++            hook: `Callable`, the completion/receiving hook for delayed or staged execution.
++        """
++        gmm1PermutedWeightScale = gmm1PermutedWeightScale.float()
++        gmm2WeightScale = gmm2WeightScale.float()
++        topk_ids = topk_idx.int()
++
++        output, event, hook = self.runtime.fused_deep_moe(
++            x,
++            topk_ids,
++            gmm1PermutedWeight,
++            gmm1PermutedWeightScale,
++            gmm2Weight,
++            gmm2WeightScale,
++            topk_weights,
++            num_max_dispatch_tokens_per_rank,
++            num_experts,
++            use_fp8,
++        )
++
++        return output, EventOverlap(event), hook

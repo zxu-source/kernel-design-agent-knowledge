@@ -1,0 +1,338 @@
+diff --git a/tests/config/test_model_arch_config.py b/tests/config/test_model_arch_config.py
+index 46790be6e4e1..212f3a9a2549 100644
+--- a/tests/config/test_model_arch_config.py
++++ b/tests/config/test_model_arch_config.py
+@@ -131,6 +131,23 @@ def test_head_size_falls_back_when_head_dim_is_zero():
+     assert convertor.get_head_size() == 128
+ 
+ 
++def test_legacy_modelopt_config_without_producer_is_normalized():
++    quantization_config = {
++        "quantization": {
++            "quant_algo": "NVFP4",
++            "group_size": 16,
++            "kv_cache_quant_algo": None,
++            "exclude_modules": [],
++            "modelopt_quant_config": {"quant_cfg": {}},
++        }
++    }
++    hf_config = PretrainedConfig(quantization_config=quantization_config)
++
++    convertor = ModelArchConfigConvertorBase(hf_config, hf_config)
++
++    assert convertor.get_quantization_config()["quant_method"] == "modelopt_fp4"
++
++
+ @pytest.mark.parametrize("model", BASE_MODELS_TO_TEST)
+ def test_base_model_arch_config(model: str):
+     """Test model architecture config for base models."""
+diff --git a/tests/models/inkling/test_moe_weight_layout.py b/tests/models/inkling/test_moe_weight_layout.py
+index e6c35c57b4d0..53a37e3e60bc 100644
+--- a/tests/models/inkling/test_moe_weight_layout.py
++++ b/tests/models/inkling/test_moe_weight_layout.py
+@@ -7,6 +7,7 @@
+ import torch
+ 
+ from vllm.lora.utils import get_supported_lora_modules
++from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+ from vllm.models.inkling.nvidia import moe
+ from vllm.models.inkling.nvidia.model import _TmlForCausalLMBase
+ from vllm.platforms import current_platform
+@@ -87,6 +88,30 @@ def test_custom_embedding_is_not_a_lora_target() -> None:
+     assert "lm_head" in supported
+ 
+ 
++def test_inkling_mapper_maps_modelopt_exclusions() -> None:
++    quant_config = ModelOptNvFp4Config.from_config(
++        {
++            "quantization": {
++                "quant_algo": "NVFP4",
++                "group_size": 16,
++                "kv_cache_quant_algo": None,
++                "exclude_modules": [
++                    "model.llm.layers.2.mlp.experts",
++                    "model.llm.layers.2.mlp.shared_experts",
++                ],
++            }
++        }
++    )
++
++    quant_config.apply_vllm_mapper(
++        _TmlForCausalLMBase.hf_to_vllm_mapper.get_unstacked_mapper()
++    )
++
++    assert quant_config.is_layer_excluded("model.layers.2.mlp.experts")
++    assert quant_config.is_layer_excluded("model.layers.2.mlp.shared_experts")
++    assert not quant_config.is_layer_excluded("model.layers.3.mlp.experts")
++
++
+ @pytest.mark.parametrize(("projection", "amax"), [("w13", 4.375), ("w2", 2960.0)])
+ def test_moe_loads_calibrated_input_scale(projection: str, amax: float) -> None:
+     experts = SimpleNamespace(
+diff --git a/vllm/models/inkling/nvfp4.py b/vllm/models/inkling/nvfp4.py
+deleted file mode 100644
+index 129ab82aa14e..000000000000
+--- a/vllm/models/inkling/nvfp4.py
++++ /dev/null
+@@ -1,64 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""NVFP4 (ModelOpt) support for the Inkling mixture-of-experts.
+-
+-Only the routed MoE experts are quantized in the Inkling checkpoint;
+-attention, the dense MLP, and the shared "sink" experts stay bf16 (they are
+-in the checkpoint ``exclude_modules``). The routed experts are served by
+-vLLM's standard ModelOpt NVFP4 fused-MoE stack (see ``moe.py``); this module
+-keeps the checkpoint detection.
+-"""
+-
+-from __future__ import annotations
+-
+-FLOAT8_E4M3_MAX = 448.0
+-FLOAT4_E2M1_MAX = 6.0
+-
+-
+-class InklingNvfp4Config:
+-    """Lightweight NVFP4 descriptor parsed from the checkpoint quant config.
+-
+-    Holds the (mapped) ``exclude_modules`` so the model can decide, per MoE
+-    layer and per expert group, whether the weights are NVFP4 or plain bf16.
+-    """
+-
+-    def __init__(self, group_size: int, exclude_modules: list[str]) -> None:
+-        self.group_size = group_size
+-        self.exclude_modules = set(exclude_modules)
+-
+-    @staticmethod
+-    def _is_nvfp4(quant_cfg: dict) -> bool:
+-        wq = quant_cfg["modelopt_quant_config"]["quant_cfg"]["*weight_quantizer"]
+-        return tuple(wq["num_bits"]) == (2, 1) and tuple(
+-            wq["block_sizes"].get("scale_bits", [])
+-        ) == (4, 3)
+-
+-    @classmethod
+-    def from_hf_config(cls, hf_config) -> InklingNvfp4Config | None:
+-        quant_cfg = getattr(hf_config, "quantization_config", None)
+-        text_config = getattr(hf_config, "text_config", None)
+-        if quant_cfg is None and text_config is not None:
+-            quant_cfg = getattr(text_config, "quantization_config", None)
+-        if quant_cfg is None:
+-            return None
+-        # ModelOpt <=0.29 nests everything under "quantization".
+-        if "quantization" in quant_cfg:
+-            quant_cfg = quant_cfg["quantization"]
+-        if not cls._is_nvfp4(quant_cfg):
+-            return None
+-        group_size = quant_cfg.get("group_size", 16)
+-        if group_size != 16:
+-            raise ValueError("Inkling NVFP4 only supports group size 16")
+-        exclude = list(quant_cfg.get("exclude_modules", []) or [])
+-        return cls(group_size=group_size, exclude_modules=exclude)
+-
+-    def experts_quantized(self, layer_id: int) -> bool:
+-        """Whether the routed experts of ``layer_id`` are NVFP4 (vs excluded)."""
+-        return f"model.llm.layers.{layer_id}.mlp.experts" not in self.exclude_modules
+-
+-    def shared_experts_quantized(self, layer_id: int) -> bool:
+-        """Whether the shared sink experts of ``layer_id`` are NVFP4."""
+-        return (
+-            f"model.llm.layers.{layer_id}.mlp.shared_experts"
+-            not in self.exclude_modules
+-        )
+diff --git a/vllm/models/inkling/nvidia/model.py b/vllm/models/inkling/nvidia/model.py
+index bf7f700dee66..a8506d92327b 100644
+--- a/vllm/models/inkling/nvidia/model.py
++++ b/vllm/models/inkling/nvidia/model.py
+@@ -47,7 +47,6 @@
+ from vllm.sequence import IntermediateTensors
+ 
+ from ..configs import InklingMMConfig, InklingModelConfig
+-from ..nvfp4 import InklingNvfp4Config
+ from .attention import InklingAttention, compute_log_scaling_tau
+ from .layernorm import InklingRMSNorm
+ from .logits_processor import InklingLogitsProcessor
+@@ -123,7 +122,6 @@ def __init__(
+         is_local: bool,
+         quant_config: QuantizationConfig | None,
+         prefix: str,
+-        nvfp4_config: InklingNvfp4Config | None = None,
+         force_dense_mlp: bool = False,
+     ) -> None:
+         super().__init__()
+@@ -172,14 +170,10 @@ def __init__(
+                 prefix=f"{prefix}.mlp",
+             )
+         else:
+-            # InklingMoE decides per layer (from the checkpoint exclude list)
+-            # whether the routed experts are NVFP4 or bf16; the shared sink
+-            # experts are always bf16.
+             self.mlp = InklingMoE(
+                 config,
+-                layer_id,
+                 prefix=f"{prefix}.mlp",
+-                nvfp4_config=nvfp4_config,
++                quant_config=quant_config,
+             )
+ 
+         # Short convolution on the attention-output and MLP-output residual
+@@ -261,7 +255,6 @@ def __init__(
+         config: InklingModelConfig,
+         quant_config: QuantizationConfig | None,
+         prefix: str,
+-        nvfp4_config: InklingNvfp4Config | None = None,
+     ) -> None:
+         super().__init__()
+         self.config = config
+@@ -278,7 +271,7 @@ def __init__(
+         def get_layer(prefix: str) -> InklingDecoderLayer:
+             idx = _layer_id(prefix + ".") or int(prefix.split(".")[-1])
+             return InklingDecoderLayer(
+-                config, idx, idx in local_ids, quant_config, prefix, nvfp4_config
++                config, idx, idx in local_ids, quant_config, prefix
+             )
+ 
+         self.start_layer, self.end_layer, self.layers = make_layers(
+@@ -408,11 +401,6 @@ def _build(
+     ) -> None:
+         quant_config = vllm_config.quant_config
+         self.config = text_config
+-        # NVFP4 experts are detected directly from the checkpoint quant config;
+-        # only the MoE experts are quantized (attention/dense MLP stay bf16).
+-        self.nvfp4_config = InklingNvfp4Config.from_hf_config(
+-            vllm_config.model_config.hf_config
+-        )
+         # Read by the MRV2 runner to publish per-request short-conv metadata.
+         # Short convolution is intrinsic to Inkling, so this is always set.
+         self.uses_sconv = True
+@@ -420,7 +408,6 @@ def _build(
+             config=text_config,
+             quant_config=quant_config,
+             prefix=maybe_prefix(prefix, "model"),
+-            nvfp4_config=self.nvfp4_config,
+         )
+         initialize_lamport_rs_conv(
+             text_config.hidden_size,
+diff --git a/vllm/models/inkling/nvidia/moe.py b/vllm/models/inkling/nvidia/moe.py
+index 255c9328c8aa..6d0a550b03d1 100644
+--- a/vllm/models/inkling/nvidia/moe.py
++++ b/vllm/models/inkling/nvidia/moe.py
+@@ -43,20 +43,19 @@
+ from vllm.utils.torch_utils import aux_stream
+ 
+ from ..configs import InklingModelConfig
+-from ..nvfp4 import FLOAT4_E2M1_MAX, FLOAT8_E4M3_MAX
+ 
+ if TYPE_CHECKING:
+     from vllm.model_executor.layers.fused_moe.routed_experts import (
+         RoutedExperts,
+     )
+-
+-    from ..nvfp4 import InklingNvfp4Config
++    from vllm.model_executor.layers.quantization import QuantizationConfig
+ 
+ # ---------------------------------------------------------------------------
+ # Gate / expert selection
+ # ---------------------------------------------------------------------------
+ 
+ _INKLING_LL_BF16_MAX_TOKENS = 64
++_NVFP4_INPUT_SCALE_DENOMINATOR = torch.finfo(torch.float8_e4m3fn).max * 6.0
+ 
+ 
+ def _linear_with_fp32_out(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+@@ -412,10 +411,9 @@ class InklingMoE(nn.Module):
+     def __init__(
+         self,
+         config: InklingModelConfig,
+-        layer_id: int,
+         *,
+         prefix: str = "",
+-        nvfp4_config: InklingNvfp4Config | None = None,
++        quant_config: QuantizationConfig | None = None,
+     ) -> None:
+         super().__init__()
+         # Overfit to the served checkpoint: sigmoid gate renormalized after
+@@ -436,22 +434,6 @@ def __init__(
+             use_gate_bias=config.use_gate_bias,
+         )
+ 
+-        moe_quant_config = None
+-        if nvfp4_config is not None and nvfp4_config.experts_quantized(layer_id):
+-            from vllm.model_executor.layers.quantization.modelopt import (
+-                ModelOptNvFp4Config,
+-            )
+-
+-            # The Inkling checkpoint is ModelOpt NVFP4; exclusion is decided per
+-            # layer right here, so no exclude list is needed.
+-            moe_quant_config = ModelOptNvFp4Config(
+-                quant_method="NVFP4",
+-                is_checkpoint_nvfp4_serialized=True,
+-                kv_cache_quant_algo=None,
+-                exclude_modules=[],
+-                group_size=nvfp4_config.group_size,
+-            )
+-
+         # TRTLLM MoE kernels assume equal, contiguous per-rank expert slabs
+         # (local_expert_offset = ep_rank * local_num_experts), so pad the
+         # expert count to a multiple of the EP size. A no-op for the usual
+@@ -464,7 +446,7 @@ def __init__(
+             hidden_size=config.hidden_size,
+             intermediate_size=config.intermediate_size,
+             renormalize=False,
+-            quant_config=moe_quant_config,
++            quant_config=quant_config,
+             prefix=f"{prefix}.experts",
+             custom_routing_function=self._select_routed,
+             router_logits_dtype=torch.float32,
+@@ -476,11 +458,6 @@ def __init__(
+         self.experts.moe_config.skip_final_all_reduce = True
+ 
+         self._routed_sel: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+-        # The sinks are always bf16; fail loudly on a checkpoint that
+-        # quantizes them instead of silently misloading.
+-        assert nvfp4_config is None or not nvfp4_config.shared_experts_quantized(
+-            layer_id
+-        ), f"layer {layer_id}: NVFP4 shared experts are not supported"
+ 
+         sink_experts_cls = (
+             InklingSinkExpertsLinear
+@@ -589,7 +566,7 @@ def load_expert_weight(self, name: str, weight: torch.Tensor) -> list[str]:
+                 f"bad {projection} input_amax: {amax}"
+             )
+             input_scale = getattr(experts, f"{projection}_input_scale")
+-            input_scale.data.fill_(amax / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX))
++            input_scale.data.fill_(amax / _NVFP4_INPUT_SCALE_DENOMINATOR)
+             return [f"experts.routed_experts.{projection}_input_scale"]
+ 
+         param = getattr(experts, key)
+diff --git a/vllm/models/inkling/nvidia/mtp.py b/vllm/models/inkling/nvidia/mtp.py
+index 868ede3bed64..a2559d4cf057 100644
+--- a/vllm/models/inkling/nvidia/mtp.py
++++ b/vllm/models/inkling/nvidia/mtp.py
+@@ -73,7 +73,6 @@ def __init__(self, config: InklingModelConfig, prefix: str, is_local: bool) -> N
+             is_local=is_local,
+             quant_config=None,
+             prefix=f"{prefix}.transformer_block",
+-            nvfp4_config=None,
+             force_dense_mlp=True,
+         )
+ 
+diff --git a/vllm/transformers_utils/model_arch_config_convertor.py b/vllm/transformers_utils/model_arch_config_convertor.py
+index b6f73f39f3dd..bd146dff7dc9 100644
+--- a/vllm/transformers_utils/model_arch_config_convertor.py
++++ b/vllm/transformers_utils/model_arch_config_convertor.py
+@@ -215,8 +215,13 @@ def _normalize_quantization_config(self, config: PretrainedConfig):
+         else:
+             # Set quant_method for ModelOpt models.
+             producer_name = quant_cfg.get("producer", {}).get("name")
+-            if producer_name == "modelopt":
+-                quant_algo = quant_cfg.get("quantization", {}).get("quant_algo")
++            modelopt_quant_cfg = quant_cfg.get("quantization", {})
++            is_legacy_modelopt = (
++                isinstance(modelopt_quant_cfg, dict)
++                and "modelopt_quant_config" in modelopt_quant_cfg
++            )
++            if producer_name == "modelopt" or is_legacy_modelopt:
++                quant_algo = modelopt_quant_cfg.get("quant_algo")
+                 if quant_algo is not None:
+                     quant_algo_upper = str(quant_algo).upper()
+                     if quant_algo_upper in {

@@ -1,0 +1,1061 @@
+diff --git a/tests/kernels/attention/test_minimax_m3.py b/tests/kernels/attention/test_minimax_m3.py
+index 83eeab5ed0f2..8a2bd5892a2d 100644
+--- a/tests/kernels/attention/test_minimax_m3.py
++++ b/tests/kernels/attention/test_minimax_m3.py
+@@ -185,6 +185,43 @@ def _assert_topk_indices_equal_unordered(
+         assert set(actual_row) == set(expected_row)
+ 
+ 
++def _reference_decode_index_score(
++    idx_q: torch.Tensor,
++    index_kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    decode_query_len: int,
++    score_block_stride: int,
++) -> torch.Tensor:
++    total_q, num_idx_heads, _ = idx_q.shape
++    out = torch.full(
++        (num_idx_heads, total_q, score_block_stride),
++        -float("inf"),
++        device=idx_q.device,
++        dtype=torch.float32,
++    )
++    for req_id, seq_len in enumerate(seq_lens.tolist()):
++        num_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
++        token_start = req_id * decode_query_len
++        q = idx_q[token_start : token_start + decode_query_len].float()
++        pages = block_table[req_id, :num_blocks]
++        k = index_kv_cache[pages].reshape(num_blocks * BLOCK_SIZE, -1).float()
++        score = torch.einsum("qhd,kd->hqk", q, k)
++        q_pos = (
++            seq_len
++            - decode_query_len
++            + torch.arange(decode_query_len, device=idx_q.device)
++        )
++        k_pos = torch.arange(k.shape[0], device=idx_q.device)
++        score.masked_fill_(k_pos[None, :] > q_pos[:, None], -float("inf"))
++        out[:, token_start : token_start + decode_query_len, :num_blocks] = (
++            score.reshape(num_idx_heads, decode_query_len, num_blocks, BLOCK_SIZE)
++            .max(dim=3)
++            .values
++        )
++    return out
++
++
+ def test_prefill_index_topk_correctness():
+     topk = 6
+     init_blocks = 0
+@@ -383,8 +420,8 @@ def test_fmha_sm100_indexer_matches_reference(q_lens, prefix_lens, index_dtype):
+     _assert_topk_indices_equal_unordered(actual, expected)
+ 
+ 
+-# Full impl-level parity: drive both MiniMaxM3IndexerMSAImpl (fmha_sm100 score +
+-# Triton top-k) and MiniMaxM3IndexerTritonImpl through their real metadata
++# Full impl-level parity: drive both MiniMaxM3IndexerMSAImpl (fmha/CuteDSL score
++# + unified top-k) and MiniMaxM3IndexerTritonImpl through their real metadata
+ # builders on the SAME CommonAttentionMetadata + index cache, and assert the
+ # selected blocks agree. This exercises all the metadata the impl/kernels consume
+ # (decode/prefill split, cu_seqlens_q rebasing, prefix_lens, kv_indices gather,
+@@ -395,7 +432,8 @@ def test_fmha_sm100_indexer_matches_reference(q_lens, prefix_lens, index_dtype):
+     reason="fmha_sm100 indexer requires SM100 (Blackwell).",
+ )
+ @pytest.mark.parametrize("topk", [8, 16])
+-def test_msa_indexer_impl_matches_triton(topk, monkeypatch):
++@pytest.mark.parametrize("index_dtype", [torch.bfloat16, torch.float8_e4m3fn])
++def test_msa_indexer_impl_matches_triton(topk, index_dtype, monkeypatch):
+     import vllm.models.minimax_m3.common.indexer as indexer_mod
+     from tests.v1.attention.utils import (
+         BatchSpec,
+@@ -439,13 +477,13 @@ def test_msa_indexer_impl_matches_triton(topk, monkeypatch):
+     block_table = common.block_table_tensor
+     num_pages = int(block_table.max().item()) + 1
+     index_cache = torch.zeros(
+-        num_pages, BLOCK_SIZE, head_dim, device=device, dtype=DTYPE
++        num_pages, BLOCK_SIZE, head_dim, device=device, dtype=index_dtype
+     )
+     for r, seq_len in enumerate(batch.seq_lens):
+         for b in range((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE):
+             index_cache[block_table[r, b]] = float(b + 1)
+     index_q = torch.ones(
+-        num_tokens, num_idx_heads * head_dim, device=device, dtype=DTYPE
++        num_tokens, num_idx_heads * head_dim, device=device, dtype=index_dtype
+     )
+ 
+     spec = MLAAttentionSpec(
+@@ -588,9 +626,8 @@ def test_decode_index_topk_correctness(
+ )
+ @pytest.mark.parametrize("num_idx_heads", [1, 4])
+ def test_decode_index_topk_fp8(num_idx_heads: int):
+-    """The fp8 (e4m3) indexer cache feeds the Triton decode kernel on the MSA
+-    path. The kernel must score in fp32 (no scaling) so its top-k matches a
+-    reference computed from the dequantized fp8 values."""
++    """The standalone Triton path must score FP8 inputs in FP32 so its top-k
++    matches a reference computed from the dequantized FP8 values."""
+     torch.manual_seed(0)
+     topk, init_blocks, local_blocks, head_dim = 8, 0, 1, 128
+     decode_query_len = 1
+@@ -641,6 +678,79 @@ def test_decode_index_topk_fp8(num_idx_heads: int):
+     _assert_topk_indices_equal_unordered(actual, expected)
+ 
+ 
++@pytest.mark.skipif(
++    not current_platform.is_device_capability_family(100),
++    reason="CuteDSL index decode score requires Blackwell.",
++)
++@pytest.mark.parametrize(
++    ("dtype", "decode_query_len", "max_decode_query_len"),
++    [
++        (torch.bfloat16, 1, 1),
++        (torch.bfloat16, 3, 8),
++        (torch.float8_e4m3fn, 1, 1),
++        (torch.float8_e4m3fn, 3, 8),
++        (torch.float8_e4m3fn, 8, 8),
++    ],
++)
++def test_decode_index_score_cutedsl_correctness(
++    dtype: torch.dtype,
++    decode_query_len: int,
++    max_decode_query_len: int,
++):
++    pytest.importorskip("cutlass")
++    from vllm.models.minimax_m3.nvidia.ops import (
++        minimax_m3_index_decode_score_cutedsl,
++    )
++
++    torch.manual_seed(0)
++    init_blocks, local_blocks = 0, 0
++    num_idx_heads, head_dim = 4, 128
++    active_seq_lens = torch.tensor((1025, 4097), device="cuda", dtype=torch.int32)
++    batch = active_seq_lens.numel()
++    total_q = batch * decode_query_len
++    max_seq_len = int(active_seq_lens.max())
++    max_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
++    score_block_stride = ((max_blocks + 15) // 16) * 16
++    num_pages = batch * max_blocks
++    block_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
++        batch, max_blocks
++    )
++    idx_q = torch.randn(total_q, num_idx_heads, head_dim, device="cuda").to(dtype)
++    index_kv_cache = torch.randn(num_pages, BLOCK_SIZE, head_dim, device="cuda").to(
++        dtype
++    )
++    unified_score = torch.full(
++        (total_q, num_idx_heads, score_block_stride),
++        -float("inf"),
++        device="cuda",
++        dtype=torch.float32,
++    )
++    score = unified_score.transpose(0, 1)
++
++    minimax_m3_index_decode_score_cutedsl(
++        idx_q,
++        index_kv_cache,
++        block_table,
++        active_seq_lens,
++        max_seq_len=max_seq_len,
++        init_blocks=init_blocks,
++        local_blocks=local_blocks,
++        num_kv_heads=num_idx_heads,
++        decode_query_len=decode_query_len,
++        max_decode_query_len=max_decode_query_len,
++        score_out=score,
++    )
++    expected = _reference_decode_index_score(
++        idx_q,
++        index_kv_cache,
++        block_table,
++        active_seq_lens,
++        decode_query_len,
++        score_block_stride,
++    )
++    torch.testing.assert_close(score, expected)
++
++
+ # Sparse attention kernels.
+ def _reference_sparse_attn(
+     q: torch.Tensor,
+diff --git a/vllm/cute_utils/__init__.py b/vllm/cute_utils/__init__.py
+index 1eee51019fda..ca445284bf41 100644
+--- a/vllm/cute_utils/__init__.py
++++ b/vllm/cute_utils/__init__.py
+@@ -1,11 +1,33 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from cutlass import BFloat16, Float32, Int64, Uint32, cute
++import torch
++from cutlass import (
++    BFloat16,
++    Float8E4M3FN,
++    Float16,
++    Float32,
++    Int32,
++    Int64,
++    Uint32,
++    cute,
++)
+ from cutlass._mlir import ir
+ from cutlass._mlir.dialects import llvm, vector
+ from cutlass.cute.nvgpu import cpasync
+ from cutlass.cutlass_dsl import T, dsl_user_op
+ 
++_TORCH_TO_CUTE_DTYPE = {
++    torch.bfloat16: BFloat16,
++    torch.float8_e4m3fn: Float8E4M3FN,
++}
++
++_CUTE_TO_PTX_DTYPE = {
++    BFloat16: "bf16",
++    Float16: "f16",
++    Float8E4M3FN: "e4m3",
++    Float32: "f32",
++}
++
+ # https://github.com/NVIDIA/cutlass/blob/v4.3.2/include/cute/arch/copy_sm90_desc.hpp#L193-L197
+ EVICT_NORMAL = Int64(0x1000000000000000)
+ EVICT_FIRST = Int64(0x12F0000000000000)
+@@ -63,22 +85,35 @@ def fence_before_tma_store(*, loc=None, ip=None):
+ 
+ 
+ @dsl_user_op
+-def mma_bf16(
+-    a: cute.TensorSSA, b: cute.TensorSSA, c: cute.TensorSSA, *, loc=None, ip=None
+-):
+-    if a.element_type == BFloat16:
+-        a = cute.recast_tensor(a, Uint32)
+-    if b.element_type == BFloat16:
+-        b = cute.recast_tensor(b, Uint32)
+-
+-    mlir_ty = Float32.mlir_type
++def mma_sync(a, b, c: cute.Tensor, *, loc=None, ip=None):
++    a_ty = _CUTE_TO_PTX_DTYPE[a.element_type]
++    b_ty = _CUTE_TO_PTX_DTYPE[b.element_type]
++    c_ty = _CUTE_TO_PTX_DTYPE[c.element_type]
++    mlir_ty = c.element_type.mlir_type
++    K = 256 // a.element_type.width  # 32B
++
++    # Recast expects tensor-backed fragments; materialize SSA fragments here so
++    # callsites can pass converted FP8 fragments directly.
++    if isinstance(a, cute.TensorSSA):
++        a_ = cute.make_rmem_tensor_like(a)
++        a_.store(a, loc=loc, ip=ip)
++        a = a_
++    if isinstance(b, cute.TensorSSA):
++        b_ = cute.make_rmem_tensor_like(b)
++        b_.store(b, loc=loc, ip=ip)
++        b = b_
++
++    a = cute.recast_tensor(a, Int32, loc=loc, ip=ip)
++    b = cute.recast_tensor(b, Int32, loc=loc, ip=ip)
+     out = llvm.inline_asm(
+         llvm.StructType.get_literal([mlir_ty] * 4),
+         [a[i].ir_value(loc=loc, ip=ip) for i in range(4)]
+         + [b[i].ir_value(loc=loc, ip=ip) for i in range(2)]
+         + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)],
+-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, "
++        f"mma.sync.aligned.m16n8k{K}.row.col.{c_ty}.{a_ty}.{b_ty}.{c_ty} "
++        "{$0, $1, $2, $3}, "
++        "{$4, $5, $6, $7}, "
++        "{$8, $9}, "
+         "{$10, $11, $12, $13};",
+         "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+         has_side_effects=False,
+@@ -92,7 +127,7 @@ def mma_bf16(
+         loc=loc,
+         ip=ip,
+     )
+-    return cute.TensorSSA(vec, 4, Float32)
++    return cute.TensorSSA(vec, 4, c.element_type)
+ 
+ 
+ def _bf16x2_unary(asm: str, a: Uint32, *, loc=None, ip=None) -> Uint32:
+diff --git a/vllm/cute_utils/cvt.py b/vllm/cute_utils/cvt.py
+index f4e8f0b0bc9b..4707f3f7421e 100644
+--- a/vllm/cute_utils/cvt.py
++++ b/vllm/cute_utils/cvt.py
+@@ -84,6 +84,32 @@ def fp8x4_to_bf16x4(x: Uint32, *, loc=None, ip=None) -> cute.TensorSSA:
+     return cute.TensorSSA(vec, 2, Uint32)
+ 
+ 
++@dsl_user_op
++def fp8x4_to_fp16x4(x: Uint32, *, loc=None, ip=None) -> cute.TensorSSA:
++    out = llvm.inline_asm(
++        llvm.StructType.get_literal([T.i32()] * 2),
++        [x.ir_value(loc=loc, ip=ip)],
++        "{\n\t"
++        ".reg .b16 lo, hi;\n\t"
++        "mov.b32 {lo, hi}, $2;\n\t"
++        "cvt.rn.f16x2.e4m3x2 $0, lo;\n\t"
++        "cvt.rn.f16x2.e4m3x2 $1, hi;\n\t"
++        "}\n",
++        "=r,=r,r",
++        has_side_effects=False,
++        is_align_stack=False,
++        loc=loc,
++        ip=ip,
++    )
++    vec = vector.from_elements(
++        ir.VectorType.get([2], T.i32(), loc=loc),
++        [llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip) for i in range(2)],
++        loc=loc,
++        ip=ip,
++    )
++    return cute.TensorSSA(vec, 2, Uint32)
++
++
+ @dsl_user_op
+ def fp32x4_to_fp8x4(
+     a0: Float32,
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_chunk_cutedsl/kernel_kkt_inv_uw.py b/vllm/model_executor/layers/mamba/ops/gdn_chunk_cutedsl/kernel_kkt_inv_uw.py
+index 2066c04f5224..ba61ec68b5cc 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_chunk_cutedsl/kernel_kkt_inv_uw.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_chunk_cutedsl/kernel_kkt_inv_uw.py
+@@ -16,7 +16,7 @@
+     _tcgen05,
+     cvt,
+     fence_before_tma_store,
+-    mma_bf16,
++    mma_sync,
+     simple_tma_copy,
+ )
+ 
+@@ -536,14 +536,16 @@ def store_ab_abg(
+                 zeros_f32.fill(0.0)
+ 
+                 Ai_bf16 = cute.make_rmem_tensor(8, BFloat16)
+-                mma_B_bf16 = cute.make_rmem_tensor(8, BFloat16)
+-                M_bf16 = cute.make_rmem_tensor(8, BFloat16)
++                mma_B_bf16 = cute.make_rmem_tensor((4, 2), BFloat16)
++                M_bf16 = cute.make_rmem_tensor((4, 2), BFloat16)
+                 acc = cute.make_rmem_tensor((4, 2), Float32)
+ 
+-                # share the same storage
++                # ldmatrix copies require rank-1 destination views.
++                mma_B_bf16_ldsm = cute.group_modes(mma_B_bf16, 0, 2)
++
++                # Packed aliases for BF16x2 arithmetic.
+                 Ai = cute.recast_tensor(Ai_bf16, Uint32)
+-                mma_B = cute.logical_divide(cute.recast_tensor(mma_B_bf16, Uint32), 2)
+-                M = cute.logical_divide(cute.recast_tensor(M_bf16, Uint32), 2)
++                M = cute.recast_tensor(M_bf16, Uint32)
+ 
+                 # construct rmem-backed identity matrix
+                 eye = cute.make_rmem_tensor(4, Uint32)
+@@ -563,7 +565,11 @@ def store_ab_abg(
+                 Ai_f32 = cute.logical_divide(cvt.bf16x2_to_fp32x2(Ai), 4)
+ 
+                 # M is holding -(I+A), stay constant throughout the iterations
+-                cute.copy(ldsm_trans_atom, sA_ldsm[None, (warp_id_, warp_id_)], M_bf16)
++                cute.copy(
++                    ldsm_trans_atom,
++                    sA_ldsm[None, (warp_id_, warp_id_)],
++                    cute.group_modes(M_bf16, 0, 2),
++                )
+                 for i in cutlass.range_constexpr(4):
+                     M[i] = _bf16x2_sub(_bf16x2_neg(eye[i]), M[i])
+ 
+@@ -572,8 +578,8 @@ def store_ab_abg(
+                     # First MMA: -AiM = Ai @ (-M)
+                     cute.copy(stsm_atom, Ai_bf16, sA_ldsm[None, (warp_id_, warp_id_)])
+                     cute.arch.sync_warp()
+-                    acc[None, 0] = mma_bf16(Ai, M[None, 0], zeros_f32)
+-                    acc[None, 1] = mma_bf16(Ai, M[None, 1], zeros_f32)
++                    acc[None, 0] = mma_sync(Ai_bf16, M_bf16[None, 0], zeros_f32)
++                    acc[None, 1] = mma_sync(Ai_bf16, M_bf16[None, 1], zeros_f32)
+                     Ai_bf16.store(acc.load().to(BFloat16))
+ 
+                     # Second MMA: Ai_new = 2Ai + (-AiM) @ Ai
+@@ -582,10 +588,14 @@ def store_ab_abg(
+                     cute.copy(
+                         ldsm_trans_atom,
+                         sA_ldsm[None, (warp_id_, warp_id_)],
+-                        mma_B_bf16,
++                        mma_B_bf16_ldsm,
++                    )
++                    Ai_f32[None, 0] = mma_sync(
++                        Ai_bf16, mma_B_bf16[None, 0], Ai_f32[None, 0]
++                    )
++                    Ai_f32[None, 1] = mma_sync(
++                        Ai_bf16, mma_B_bf16[None, 1], Ai_f32[None, 1]
+                     )
+-                    Ai_f32[None, 0] = mma_bf16(Ai, mma_B[None, 0], Ai_f32[None, 0])
+-                    Ai_f32[None, 1] = mma_bf16(Ai, mma_B[None, 1], Ai_f32[None, 1])
+                     Ai_bf16.store(Ai_f32.load().to(BFloat16))
+ 
+                 cute.copy(stsm_atom, Ai_bf16, sAi_ldsm[None, (warp_id_, warp_id_)])
+@@ -613,23 +623,24 @@ def store_ab_abg(
+                     neg_Ai = cute.make_rmem_tensor(4, Uint32)
+                     for i in cutlass.range_constexpr(4):
+                         neg_Ai[i] = _bf16x2_neg(Ai[i])
++                    neg_Ai_bf16 = cute.recast_tensor(neg_Ai, BFloat16)
+ 
+                     cute.copy(
+                         ldsm_trans_atom,
+                         sA_ldsm[None, (warp_id_, warp_id_ - 1)],
+-                        mma_B_bf16,
++                        mma_B_bf16_ldsm,
+                     )
+-                    acc[None, 0] = mma_bf16(neg_Ai, mma_B[None, 0], zeros_f32)
+-                    acc[None, 1] = mma_bf16(neg_Ai, mma_B[None, 1], zeros_f32)
++                    acc[None, 0] = mma_sync(neg_Ai_bf16, mma_B_bf16[None, 0], zeros_f32)
++                    acc[None, 1] = mma_sync(neg_Ai_bf16, mma_B_bf16[None, 1], zeros_f32)
+                     Ai_bf16.store(acc.load().to(BFloat16))
+ 
+                     cute.copy(
+                         ldsm_trans_atom,
+                         sAi_ldsm[None, (warp_id_ - 1, warp_id_ - 1)],
+-                        mma_B_bf16,
++                        mma_B_bf16_ldsm,
+                     )
+-                    acc[None, 0] = mma_bf16(Ai, mma_B[None, 0], zeros_f32)
+-                    acc[None, 1] = mma_bf16(Ai, mma_B[None, 1], zeros_f32)
++                    acc[None, 0] = mma_sync(Ai_bf16, mma_B_bf16[None, 0], zeros_f32)
++                    acc[None, 1] = mma_sync(Ai_bf16, mma_B_bf16[None, 1], zeros_f32)
+                     Ai_bf16.store(acc.load().to(BFloat16))
+                     store_ab_abg(
+                         acc,
+@@ -660,10 +671,10 @@ def store_ab_abg(
+                     cute.copy(
+                         ldsm_trans_atom,
+                         sAi_ldsm[None, (tile_col, tile_col)],
+-                        mma_B_bf16,
++                        mma_B_bf16_ldsm,
+                     )
+-                    acc[None, 0] = mma_bf16(Ai, mma_B[None, 0], zeros_f32)
+-                    acc[None, 1] = mma_bf16(Ai, mma_B[None, 1], zeros_f32)
++                    acc[None, 0] = mma_sync(Ai_bf16, mma_B_bf16[None, 0], zeros_f32)
++                    acc[None, 1] = mma_sync(Ai_bf16, mma_B_bf16[None, 1], zeros_f32)
+ 
+                     cute.copy(
+                         ldsm_atom, sA_ldsm[None, (warp_id_, tile_col + 1)], Ai_bf16
+@@ -671,10 +682,10 @@ def store_ab_abg(
+                     cute.copy(
+                         ldsm_trans_atom,
+                         sAi_ldsm[None, (tile_col + 1, tile_col)],
+-                        mma_B_bf16,
++                        mma_B_bf16_ldsm,
+                     )
+-                    acc[None, 0] = mma_bf16(Ai, mma_B[None, 0], acc[None, 0])
+-                    acc[None, 1] = mma_bf16(Ai, mma_B[None, 1], acc[None, 1])
++                    acc[None, 0] = mma_sync(Ai_bf16, mma_B_bf16[None, 0], acc[None, 0])
++                    acc[None, 1] = mma_sync(Ai_bf16, mma_B_bf16[None, 1], acc[None, 1])
+ 
+                     tmp = cute.make_rmem_tensor(8, BFloat16)
+                     tmp.store(acc.load().to(BFloat16))
+@@ -687,10 +698,10 @@ def store_ab_abg(
+                     cute.copy(
+                         ldsm_trans_atom,
+                         sAi_ldsm[None, (warp_id_, tile_col)],
+-                        mma_B_bf16,
++                        mma_B_bf16_ldsm,
+                     )
+-                    acc[None, 0] = mma_bf16(Ai, mma_B[None, 0], zeros_f32)
+-                    acc[None, 1] = mma_bf16(Ai, mma_B[None, 1], zeros_f32)
++                    acc[None, 0] = mma_sync(Ai_bf16, mma_B_bf16[None, 0], zeros_f32)
++                    acc[None, 1] = mma_sync(Ai_bf16, mma_B_bf16[None, 1], zeros_f32)
+                     tmp.store(acc.load().to(BFloat16))
+                     cute.copy(stsm_atom, tmp, sAi_ldsm[None, (warp_id_, tile_col)])
+                     store_ab_abg(
+@@ -708,15 +719,27 @@ def store_ab_abg(
+                 # warp3: Ai30 = -Ai33 @ (A30 @ Ai00 + A31 @ Ai10 + A32 @ Ai20)
+                 if warp_id_ == 3:
+                     cute.copy(ldsm_atom, sA_ldsm[None, (3, 0)], Ai_bf16)
+-                    cute.copy(ldsm_trans_atom, sAi_ldsm[None, (0, 0)], mma_B_bf16)
+-                    acc[None, 0] = mma_bf16(Ai, mma_B[None, 0], zeros_f32)
+-                    acc[None, 1] = mma_bf16(Ai, mma_B[None, 1], zeros_f32)
++                    cute.copy(
++                        ldsm_trans_atom,
++                        sAi_ldsm[None, (0, 0)],
++                        mma_B_bf16_ldsm,
++                    )
++                    acc[None, 0] = mma_sync(Ai_bf16, mma_B_bf16[None, 0], zeros_f32)
++                    acc[None, 1] = mma_sync(Ai_bf16, mma_B_bf16[None, 1], zeros_f32)
+ 
+                     for i in cutlass.range_constexpr(1, 3):
+                         cute.copy(ldsm_atom, sA_ldsm[None, (3, i)], Ai_bf16)
+-                        cute.copy(ldsm_trans_atom, sAi_ldsm[None, (i, 0)], mma_B_bf16)
+-                        acc[None, 0] = mma_bf16(Ai, mma_B[None, 0], acc[None, 0])
+-                        acc[None, 1] = mma_bf16(Ai, mma_B[None, 1], acc[None, 1])
++                        cute.copy(
++                            ldsm_trans_atom,
++                            sAi_ldsm[None, (i, 0)],
++                            mma_B_bf16_ldsm,
++                        )
++                        acc[None, 0] = mma_sync(
++                            Ai_bf16, mma_B_bf16[None, 0], acc[None, 0]
++                        )
++                        acc[None, 1] = mma_sync(
++                            Ai_bf16, mma_B_bf16[None, 1], acc[None, 1]
++                        )
+ 
+                     tmp = cute.make_rmem_tensor(8, BFloat16)
+                     tmp.store(acc.load().to(BFloat16))
+@@ -726,9 +749,13 @@ def store_ab_abg(
+                     cute.copy(ldsm_atom, sAi_ldsm[None, (3, 3)], Ai_bf16)
+                     for i in cutlass.range_constexpr(4):
+                         Ai[i] = _bf16x2_neg(Ai[i])
+-                    cute.copy(ldsm_trans_atom, sAi_ldsm[None, (3, 0)], mma_B_bf16)
+-                    acc[None, 0] = mma_bf16(Ai, mma_B[None, 0], zeros_f32)
+-                    acc[None, 1] = mma_bf16(Ai, mma_B[None, 1], zeros_f32)
++                    cute.copy(
++                        ldsm_trans_atom,
++                        sAi_ldsm[None, (3, 0)],
++                        mma_B_bf16_ldsm,
++                    )
++                    acc[None, 0] = mma_sync(Ai_bf16, mma_B_bf16[None, 0], zeros_f32)
++                    acc[None, 1] = mma_sync(Ai_bf16, mma_B_bf16[None, 1], zeros_f32)
+                     tmp.store(acc.load().to(BFloat16))
+                     cute.copy(stsm_atom, tmp, sAi_ldsm[None, (3, 0)])
+                     store_ab_abg(
+diff --git a/vllm/models/minimax_m3/nvidia/indexer_msa.py b/vllm/models/minimax_m3/nvidia/indexer_msa.py
+index 16a9277d11af..8a015d4e6eae 100644
+--- a/vllm/models/minimax_m3/nvidia/indexer_msa.py
++++ b/vllm/models/minimax_m3/nvidia/indexer_msa.py
+@@ -13,10 +13,9 @@
+ than Triton for the wide prefill score, benchmarked ~3-5x), writing its
+ ``max_score`` straight into the buffer's prefill region (stride-aware, no copy).
+ 
+-Decode scores with the Triton split-K ``minimax_m3_index_decode_score`` (a
+-purpose-built vector x matrix score, no wasted tensor-core tiles, 256-way
+-split-K, cudagraph-safe by shape-constant grids), writing into the decode
+-region. Its tuning heuristics are kept; only the top-k is shared with prefill.
++Decode scores with CuteDSL when the flattened query tile is supported and fall
++back to Triton otherwise, writing into the decode region. Only the top-k is
++shared with prefill.
+ 
+ ``fmha_sm100`` imports are function-local so this module is import-safe on
+ AMD / non-SM100.
+@@ -39,6 +38,7 @@
+ from vllm.models.minimax_m3.common.ops.index_topk import (
+     minimax_m3_index_decode_score,
+ )
++from vllm.models.minimax_m3.nvidia.ops import minimax_m3_index_decode_score_cutedsl
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionCGSupport,
+@@ -257,7 +257,7 @@ def build(
+ 
+ 
+ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
+-    """Decode: Triton fused score+top-k. Prefill: fmha_sm100 OnlyScore + top-k."""
++    """Decode: CuteDSL/Triton score. Prefill: fmha_sm100 OnlyScore + top-k."""
+ 
+     indexer_backend_cls: ClassVar[type[AttentionBackend]] = MiniMaxM3IndexerMSABackend
+ 
+@@ -296,7 +296,14 @@ def forward(
+         # writes by strides). Top-k is deferred to the single unified call below.
+         if md.decode is not None:
+             d = md.decode
+-            minimax_m3_index_decode_score(
++            # max_decode_query_len avoids recompiles across runtime decode sizes.
++            # Fall back when the flattened Q tile gets too wide for this kernel.
++            decode_score = (
++                minimax_m3_index_decode_score_cutedsl
++                if self.num_index_heads * d.max_decode_query_len <= 32
++                else minimax_m3_index_decode_score
++            )
++            decode_score(
+                 index_q[:nd],
+                 kv,
+                 d.block_table,
+diff --git a/vllm/models/minimax_m3/nvidia/ops/__init__.py b/vllm/models/minimax_m3/nvidia/ops/__init__.py
+new file mode 100644
+index 000000000000..f2557575536a
+--- /dev/null
++++ b/vllm/models/minimax_m3/nvidia/ops/__init__.py
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from .index_decode_score import minimax_m3_index_decode_score_cutedsl
++
++__all__ = ["minimax_m3_index_decode_score_cutedsl"]
+diff --git a/vllm/models/minimax_m3/nvidia/ops/index_decode_score.py b/vllm/models/minimax_m3/nvidia/ops/index_decode_score.py
+new file mode 100644
+index 000000000000..3d2919e39227
+--- /dev/null
++++ b/vllm/models/minimax_m3/nvidia/ops/index_decode_score.py
+@@ -0,0 +1,483 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CuteDSL MiniMax M3 index decode score kernel.
++
++The kernel computes decode-time index block scores with TMA + ``mma.sync``.
++We use ``mma.sync`` instead of tcgen05 because this score GEMM has a very small
++N dimension and benefits more from higher CTA occupancy than from a deeper
++single-CTA tcgen05 pipeline.
++
++The implementation should be portable to SM90/SM120 in principle, but it is
++currently validated only for SM100.
++"""
++
++from functools import cache
++
++import cutlass
++import torch
++from cuda.bindings.driver import CUstream
++from cutlass import Float8E4M3FN, Float16, Float32, Int32, Int64, Uint32, cute
++from cutlass.cute.nvgpu import cpasync, warp
++from quack.compile_utils import make_fake_tensor
++
++from vllm.cute_utils import (
++    _TORCH_TO_CUTE_DTYPE,
++    EVICT_FIRST,
++    cvt,
++    mma_sync,
++    simple_tma_copy,
++)
++
++
++@cute.jit
++def _fp8_to_f16_mma_fragments(src: cute.Tensor):
++    src_elems = cute.size(src)
++    src_u32 = cute.recast_tensor(src, Uint32)
++    src_f16 = cute.make_rmem_tensor(src_elems, Float16)
++    src_f16_u32 = cute.recast_tensor(src_f16, Uint32)
++    # This packed conversion is faster and emits fewer SASS instructions than
++    # src.load().to(Float16).
++    for i in cutlass.range_constexpr(src_elems // 4):
++        converted = cvt.fp8x4_to_fp16x4(src_u32[i])
++        src_f16_u32[i * 2] = converted[0]
++        src_f16_u32[i * 2 + 1] = converted[1]
++    lower = cute.make_rmem_tensor(src_elems // 2, Float16)
++    upper = cute.make_rmem_tensor(src_elems // 2, Float16)
++
++    # FP8 ldmatrix gives four consecutive values along K. Split each group
++    # into the lower two and upper two values for two FP16 MMA k-fragments.
++    for i in cutlass.range_constexpr(src_elems // 2):
++        lower[i] = src_f16[(i // 2) * 4 + i % 2]
++        upper[i] = src_f16[(i // 2) * 4 + 2 + i % 2]
++    return lower, upper
++
++
++class IndexDecodeScoreKernel:
++    BLOCK_K = 128
++    BAR_MMA = 1
++    num_stages = 2
++
++    def __init__(
++        self,
++        dtype: type[cutlass.Numeric],
++        num_heads: int,
++        max_decode_query_len: int,
++        split_k: int,
++        head_dim: int = 128,
++    ):
++        self.dtype = dtype
++        self.num_heads = num_heads
++        self.max_decode_query_len = max_decode_query_len
++        self.split_k = split_k
++        self.head_dim = head_dim
++
++    @cute.jit
++    def __call__(
++        self,
++        gQ: cute.Tensor,  # [bs * runtime_decode_query_len, num_heads, head_dim]
++        gK_cache: cute.Tensor,  # [num_pages, page_size, head_dim]
++        block_table: cute.Tensor,  # [bs, max_pages]
++        score: cute.Tensor,  # [num_heads, bs * runtime_decode_query_len, max_pages]
++        seq_lens: cute.Tensor,  # [bs]
++        stream: CUstream,
++    ):
++        dtype = self.dtype
++        num_heads = self.num_heads
++        head_dim = self.head_dim
++        BLOCK_K = self.BLOCK_K
++        num_stages = self.num_stages
++        MAX_DQL = self.max_decode_query_len
++        BLOCK_Q = num_heads * MAX_DQL
++        assert BLOCK_Q <= 32
++
++        batch = seq_lens.shape[0]
++        decode_query_len = gQ.shape[0] // batch
++        grid = (batch, self.split_k, 1)
++        block = (32 * 5, 1, 1)
++
++        tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
++        swizzle_128B = cute.make_swizzle(3, 4, 3)
++        elems = 128 * 8 // dtype.width
++
++        sQ_layout = cute.make_layout(
++            (MAX_DQL, num_heads, (elems, head_dim // elems)),
++            stride=(elems, MAX_DQL * elems, (1, BLOCK_Q * elems)),
++        )
++        sQ_layout = cute.make_composed_layout(swizzle_128B, 0, sQ_layout)
++        Q_tma = cpasync.make_tiled_tma_atom(
++            tma_g2s,
++            cute.logical_divide(gQ, (None, None, elems)),
++            sQ_layout,
++            cta_tiler=(MAX_DQL, num_heads, head_dim),
++        )
++
++        sK_layout = cute.make_layout(
++            (1, BLOCK_K, (elems, head_dim // elems), num_stages),
++            stride=(0, elems, (1, BLOCK_K * elems), BLOCK_K * head_dim),
++        )
++        sK_layout = cute.make_composed_layout(swizzle_128B, 0, sK_layout)
++        K_tma = cpasync.make_tiled_tma_atom(
++            tma_g2s,
++            cute.logical_divide(gK_cache, (None, None, elems)),
++            sK_layout,
++            cta_tiler=(1, BLOCK_K, head_dim),
++        )
++
++        self.kernel(
++            Q_tma,
++            K_tma,
++            block_table,
++            score,
++            seq_lens,
++            decode_query_len,
++        ).launch(grid=grid, block=block, stream=stream, use_pdl=True)
++
++    @cute.kernel
++    def kernel(
++        self,
++        Q_tma: cpasync.TmaInfo,
++        K_tma: cpasync.TmaInfo,
++        block_table: cute.Tensor,
++        score: cute.Tensor,
++        seq_lens: cute.Tensor,
++        decode_query_len,
++    ):
++        tid, _, _ = cute.arch.thread_idx()
++        batch_id, split_id, _ = cute.arch.block_idx()
++        _, split_k, _ = cute.arch.grid_dim()
++        warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
++        lane_id = cute.arch.lane_idx()
++
++        NUM_HEADS = self.num_heads
++        MAX_DQL = self.max_decode_query_len
++        BLOCK_Q = NUM_HEADS * MAX_DQL
++        BLOCK_K = self.BLOCK_K
++        head_dim = self.head_dim
++        dtype = self.dtype
++        MMA_N = 8
++        num_stages = self.num_stages
++        Q_TILES = cute.ceil_div(BLOCK_Q, MMA_N)
++        EPI_Q = Q_TILES * MMA_N
++
++        smem = cutlass.utils.SmemAllocator()
++        sK = smem.allocate_tensor(
++            dtype,
++            K_tma.smem_layout.outer,
++            byte_alignment=128,
++            swizzle=K_tma.smem_layout.inner,
++        )[0, None, None, None]
++        # alias sQ with the 1st stage of sK
++        sQ_tma = cute.make_tensor(
++            sK[None, None, 0].iterator, layout=Q_tma.smem_layout.outer
++        )
++        # TMA sees Q as (query, head, dim), while ldmatrix consumes a
++        # flattened Q column mode. The target profile keeps the rank-2 view even
++        # for degenerate shapes like DQL1.
++        q_tma_elems = 128 * 8 // dtype.width
++        sQ = cute.coalesce(
++            cute.group_modes(sQ_tma, 0, 2),
++            target_profile=(BLOCK_Q, (q_tma_elems, head_dim // q_tma_elems)),
++        )
++        epi_buffer = smem.allocate_tensor(Float32, cute.make_layout((EPI_Q, 4)))
++
++        tma_full_mbar = smem.allocate_array(Int64, num_stages)
++        tma_empty_mbar = smem.allocate_array(Int64, num_stages)
++
++        seqlen = seq_lens[batch_id]
++        num_blocks = cute.ceil_div(seqlen, BLOCK_K)
++
++        if split_id < num_blocks:
++            if warp_id == 0:
++                with cute.arch.elect_one():
++                    for i in cutlass.range_constexpr(num_stages):
++                        cute.arch.mbarrier_init(tma_full_mbar + i, 1)
++                        cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
++                    cute.arch.mbarrier_init_fence()
++            elif warp_id == 1:
++                cpasync.prefetch_descriptor(Q_tma.atom)
++                cpasync.prefetch_descriptor(K_tma.atom)
++            cute.arch.sync_threads()
++
++            cute.arch.griddepcontrol_wait()
++            cute.arch.griddepcontrol_launch_dependents()
++
++            if warp_id == 4:
++                # TMA warp
++                tma_stage = 0
++                tma_parity = 1
++
++                gQ_tile = cute.local_tile(
++                    cute.domain_offset(
++                        (batch_id * decode_query_len, 0, 0),
++                        Q_tma.tma_tensor,
++                    ),
++                    tiler=(MAX_DQL, NUM_HEADS, head_dim),
++                    coord=(0, 0, 0),
++                )
++                cute.arch.mbarrier_wait(tma_empty_mbar, tma_parity)
++                with cute.arch.elect_one():
++                    Q_size = BLOCK_Q * head_dim * (dtype.width // 8)
++                    cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar, Q_size)
++                # TMA bounds-checks rows when runtime decode_query_len is smaller
++                # than MAX_DQL; padded Q columns are masked before global stores.
++                simple_tma_copy(Q_tma.atom, gQ_tile, sQ_tma, tma_full_mbar)
++
++                tma_stage = (tma_stage + 1) % num_stages
++                if tma_stage == 0:
++                    tma_parity ^= 1
++
++                for block_id in range(split_id, num_blocks, split_k):
++                    page_id = block_table[batch_id, block_id]
++                    gK_tile = K_tma.tma_tensor[page_id, None, None]
++                    k_mbar = tma_full_mbar + tma_stage
++
++                    cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, tma_parity)
++                    with cute.arch.elect_one():
++                        K_size = BLOCK_K * head_dim * (dtype.width // 8)
++                        cute.arch.mbarrier_arrive_and_expect_tx(k_mbar, K_size)
++                    simple_tma_copy(
++                        K_tma.atom,
++                        gK_tile,
++                        sK[None, None, tma_stage],
++                        k_mbar,
++                        cache_policy=EVICT_FIRST,
++                    )
++
++                    tma_stage = (tma_stage + 1) % num_stages
++                    if tma_stage == 0:
++                        tma_parity ^= 1
++
++            else:
++                # MMA warps
++                # each warp handles K[32, head_dim] @ Q[BLOCK_Q, head_dim].T
++                sK_warp = cute.local_tile(
++                    sK, (32, head_dim, num_stages), (warp_id, 0, 0)
++                )
++                q_start = seqlen - decode_query_len
++
++                elems = 128 // dtype.width  # 16B
++                MMA_K = 32 * 8 // dtype.width  # 32B
++
++                # Pre-compute ldmatrix address.
++                # sK loads a [16 x 16B] tile:
++                #   ((16, (16B, 2), 1), (32 / 16, head_dim / 32B, num_stages))
++                # sQ loads an [8 x 32B] tile:
++                #   ((8, (16B, 4)), (BLOCK_Q / MMA_N, head_dim / 64B))
++                sK_ldsm = cute.zipped_divide(
++                    sK_warp, (16, cute.make_layout((elems, 2)), 1)
++                )
++                sQ_ldsm = cute.zipped_divide(sQ, (MMA_N, cute.make_layout((elems, 4))))
++
++                # sK: (16B, (32 / 16, head_dim / 32B, num_stages))
++                # sQ: (16B, (BLOCK_Q / MMA_N, head_dim / 64B))
++                sK_ldsm = sK_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
++                sQ_ldsm = sQ_ldsm[(lane_id % MMA_N, (None, lane_id // 8)), None]
++
++                ldsm_op = warp.LdMatrix8x8x16bOp(num_matrices=4)
++                ldsm_atom = cute.make_copy_atom(ldsm_op, dtype)
++
++                rQ = cute.make_rmem_tensor(
++                    ((elems // 2, 2), head_dim // (MMA_K * 2), Q_TILES), dtype
++                )
++                rK = cute.make_rmem_tensor((elems, 2, head_dim // MMA_K), dtype)
++                rC = cute.make_rmem_tensor((4, 2, Q_TILES), Float32)
++
++                if warp_id == 0:
++                    cute.arch.mbarrier_wait(tma_full_mbar, 0)
++                cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
++                for q in cutlass.range_constexpr(Q_TILES):
++                    cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
++                cute.arch.mbarrier_arrive(tma_empty_mbar)
++
++                tma_stage = 1 % self.num_stages
++                tma_parity = 0
++                if tma_stage == 0:
++                    tma_parity ^= 1
++
++                # sm100 doesn't have native mma.sync.f8. ptxas lowers mma.sync.f8
++                # to F2FP.F16.E4M3 + HMMA; doing the conversion explicitly gives
++                # better codegen while keeping the two FP16 k-fragments visible.
++                if cutlass.const_expr(dtype is Float8E4M3FN):
++                    rQ_f16 = cute.make_rmem_tensor(
++                        (4, head_dim // MMA_K, Q_TILES, 2), Float16
++                    )
++                    q_lower, q_upper = _fp8_to_f16_mma_fragments(rQ)
++                    rQ_f16[None, None, None, 0].store(q_lower.load())
++                    rQ_f16[None, None, None, 1].store(q_upper.load())
++
++                for block_id in range(split_id, num_blocks, split_k):
++                    rC.fill(0.0)
++
++                    if warp_id == 0:
++                        cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, tma_parity)
++                    cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
++
++                    for k in cutlass.range_constexpr(head_dim // MMA_K):
++                        cute.copy(
++                            ldsm_atom,
++                            sK_ldsm[None, (None, k, tma_stage)],
++                            rK[None, None, k],
++                        )
++                        for m in cutlass.range_constexpr(2):
++                            if cutlass.const_expr(dtype is Float8E4M3FN):
++                                rK_lower, rK_upper = _fp8_to_f16_mma_fragments(
++                                    rK[None, m, k]
++                                )
++                                for n in cutlass.range_constexpr(Q_TILES):
++                                    rC[None, m, n] = mma_sync(
++                                        rK_lower,
++                                        rQ_f16[None, k, n, 0],
++                                        rC[None, m, n],
++                                    )
++                                    rC[None, m, n] = mma_sync(
++                                        rK_upper,
++                                        rQ_f16[None, k, n, 1],
++                                        rC[None, m, n],
++                                    )
++                            else:
++                                for n in cutlass.range_constexpr(Q_TILES):
++                                    rC[None, m, n] = mma_sync(
++                                        rK[None, m, k],
++                                        rQ[(None, k % 2), k // 2, n],
++                                        rC[None, m, n],
++                                    )
++
++                    cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
++
++                    k_start = block_id * BLOCK_K + warp_id * 32
++
++                    # causal mask
++                    for q in cutlass.range_constexpr(Q_TILES):
++                        for i in cutlass.range_constexpr(4):
++                            for j in cutlass.range_constexpr(2):
++                                col = q * 8 + (lane_id % 4) * 2 + j
++                                q_local_pos = col % MAX_DQL
++                                q_pos = q_start + q_local_pos
++                                k_pos = k_start + i * 8 + lane_id // 4
++                                rC[q * 8 + i * 2 + j] = (
++                                    rC[q * 8 + i * 2 + j]
++                                    if q_pos >= k_pos
++                                    else float("-inf")
++                                )
++
++                    for q in cutlass.range_constexpr(Q_TILES):
++                        # thread-reduction along BLOCK_K dim
++                        rScore = cute.make_rmem_tensor(2, Float32)
++                        rScore.fill(float("-inf"))
++                        for i in cutlass.range_constexpr(4):
++                            rScore[0] = cute.arch.fmax(rScore[0], rC[i * 2 + 0 + q * 8])
++                            rScore[1] = cute.arch.fmax(rScore[1], rC[i * 2 + 1 + q * 8])
++
++                        # warp-reduction among lanes 0,4,8,12,...
++                        for i in cutlass.range_constexpr(3):
++                            offset = 4 << i
++                            other0 = cute.arch.shuffle_sync_bfly(
++                                rScore[0], offset=offset, mask=-1, mask_and_clamp=31
++                            )
++                            other1 = cute.arch.shuffle_sync_bfly(
++                                rScore[1], offset=offset, mask=-1, mask_and_clamp=31
++                            )
++                            rScore[0] = cute.arch.fmax(rScore[0], other0)
++                            rScore[1] = cute.arch.fmax(rScore[1], other1)
++
++                        # store to smem for 4-warp reduction
++                        if lane_id * 2 < MMA_N:
++                            epi_buffer[q * MMA_N + lane_id * 2 + 0, warp_id] = rScore[0]
++                            epi_buffer[q * MMA_N + lane_id * 2 + 1, warp_id] = rScore[1]
++                    cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
++
++                    head_id = lane_id // MAX_DQL
++                    q_local_pos = lane_id - head_id * MAX_DQL
++                    valid_q = head_id < NUM_HEADS and q_local_pos < decode_query_len
++                    if lane_id < BLOCK_Q and valid_q:
++                        final_score = epi_buffer[lane_id, 0]
++                        for i in cutlass.range_constexpr(1, 4):
++                            final_score = cute.arch.fmax(
++                                final_score, epi_buffer[lane_id, i]
++                            )
++
++                        t = batch_id * decode_query_len + q_local_pos
++                        score[head_id, t, block_id] = final_score
++
++                    tma_stage = (tma_stage + 1) % self.num_stages
++                    if tma_stage == 0:
++                        tma_parity ^= 1
++
++    @cache
++    @staticmethod
++    def compile(
++        dtype: type[cutlass.Numeric],
++        num_heads: int,
++        max_decode_query_len: int,
++        split_k: int,
++        head_dim: int = 128,
++    ):
++        bs = cute.sym_int()
++        total_tokens = cute.sym_int()
++        BLOCK_K = IndexDecodeScoreKernel.BLOCK_K
++
++        q = make_fake_tensor(
++            dtype, (total_tokens, num_heads, head_dim), divisibility=16
++        )
++        k_cache = make_fake_tensor(
++            dtype, (cute.sym_int(), BLOCK_K, head_dim), divisibility=16
++        )
++        block_table = make_fake_tensor(Int32, (bs, cute.sym_int()), divisibility=1)
++        score = make_fake_tensor(
++            Float32, (num_heads, total_tokens, cute.sym_int()), divisibility=4
++        )
++        seq_lens = make_fake_tensor(Int32, (bs,), divisibility=1)
++        kernel = IndexDecodeScoreKernel(
++            dtype,
++            num_heads,
++            max_decode_query_len,
++            split_k,
++            head_dim,
++        )
++        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
++        return cute.compile(
++            kernel,
++            q,
++            k_cache,
++            block_table,
++            score,
++            seq_lens,
++            stream,
++            options="--enable-tvm-ffi",
++        )
++
++
++def minimax_m3_index_decode_score_cutedsl(
++    idx_q: torch.Tensor,
++    index_kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    max_seq_len: int,
++    init_blocks: int,
++    local_blocks: int,
++    num_kv_heads: int,
++    decode_query_len: int,
++    max_decode_query_len: int,
++    score_out: torch.Tensor,
++) -> torch.Tensor:
++    if idx_q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
++        raise TypeError("CuteDSL index decode score supports BF16 and FP8 E4M3 only")
++    total_tokens, num_heads, head_dim = idx_q.shape
++    batch = block_table.shape[0]
++    assert index_kv_cache.shape[1] == IndexDecodeScoreKernel.BLOCK_K
++    assert total_tokens == batch * decode_query_len
++    assert 1 <= decode_query_len <= max_decode_query_len
++    assert num_heads * max_decode_query_len <= 32
++    dtype = _TORCH_TO_CUTE_DTYPE[idx_q.dtype]
++    del max_seq_len, init_blocks, local_blocks, num_kv_heads
++    score = score_out
++    split_k = 256
++    kernel = IndexDecodeScoreKernel.compile(
++        dtype,
++        num_heads,
++        max_decode_query_len,
++        split_k,
++        head_dim,
++    )
++    kernel(idx_q, index_kv_cache, block_table, score, seq_lens)
++    return score

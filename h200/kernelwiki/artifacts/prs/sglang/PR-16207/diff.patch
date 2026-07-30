@@ -1,0 +1,234 @@
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 9fceae6fe5bc..aacd4841bbef 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -375,6 +375,9 @@ class Envs:
+     # Metrics
+     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+ 
++    # Attention
++    SGLANG_USE_PAGED_ATTENTION = EnvBool(False)
++
+     # fmt: on
+ 
+ 
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+index 539cc299bca9..81d248ad82f8 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+@@ -18,6 +18,7 @@
+ from sglang.srt.layers.radix_attention import AttentionType
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+ from sglang.srt.speculative.spec_info import SpecInput
++from sglang.srt.environ import envs
+ from sglang.srt.utils import get_bool_env_var
+ 
+ if TYPE_CHECKING:
+@@ -1086,9 +1087,42 @@ def forward_decode_graph(
+                 )
+ 
+         if not self.use_mla:
+-            num_tokens = q.shape[0]
+-            """PA will support bs<tp in the later version of CANN"""
+-            if num_tokens < get_attention_tp_size():
++            if envs.SGLANG_USE_PAGED_ATTENTION.get():
++                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
++                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
++                    layer.layer_id
++                )
++                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
++                num_tokens = query.shape[0]
++                attn_output = torch.empty(
++                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
++                    dtype=query.dtype,
++                    device=query.device,
++                )
++                if self.forward_metadata.seq_lens_cpu_int is None:
++                    actual_seq_len_kv = torch.from_numpy(
++                        np.array(self.forward_metadata.seq_lens_cpu_list).astype(
++                            np.int32
++                        )
++                    )
++                else:
++                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int
++
++                torch_npu._npu_paged_attention(
++                    query=query,
++                    key_cache=k_cache,
++                    value_cache=v_cache,
++                    num_heads=layer.tp_q_head_num,
++                    num_kv_heads=layer.tp_k_head_num,
++                    scale_value=layer.scaling,
++                    block_table=self.forward_metadata.block_tables,
++                    context_lens=actual_seq_len_kv,
++                    out=attn_output,
++                )
++                return attn_output.view(
++                    num_tokens, layer.tp_q_head_num * layer.v_head_dim
++                )
++            else:
+                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                     layer.layer_id
+                 ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+@@ -1138,41 +1172,6 @@ def forward_decode_graph(
+                     out=[output, softmax_lse],
+                 )
+                 return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+-            else:
+-                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+-                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+-                    layer.layer_id
+-                )
+-                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+-                num_tokens = query.shape[0]
+-                attn_output = torch.empty(
+-                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
+-                    dtype=query.dtype,
+-                    device=query.device,
+-                )
+-                if self.forward_metadata.seq_lens_cpu_int is None:
+-                    actual_seq_len_kv = torch.from_numpy(
+-                        np.array(self.forward_metadata.seq_lens_cpu_list).astype(
+-                            np.int32
+-                        )
+-                    )
+-                else:
+-                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int
+-
+-                torch_npu._npu_paged_attention(
+-                    query=query,
+-                    key_cache=k_cache,
+-                    value_cache=v_cache,
+-                    num_heads=layer.tp_q_head_num,
+-                    num_kv_heads=layer.tp_k_head_num,
+-                    scale_value=layer.scaling,
+-                    block_table=self.forward_metadata.block_tables,
+-                    context_lens=actual_seq_len_kv,
+-                    out=attn_output,
+-                )
+-                return attn_output.view(
+-                    num_tokens, layer.tp_q_head_num * layer.v_head_dim
+-                )
+         else:
+             c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+             if is_fia_nz():
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py b/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py
+index adca2c6c27c5..169e2cde3191 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py
+@@ -24,6 +24,7 @@
+ 
+ from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+ from sglang.srt.layers.dp_attention import get_attention_tp_size
++from sglang.srt.environ import envs
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+     EAGLEDraftCudaGraphRunner,
+@@ -78,15 +79,15 @@ def _capture_graph(self, graph, pool, stream, run_once_fn):
+             out = run_once_fn()
+         return out
+ 
+-    def _get_update_attr_name(self, model_runner):
+-        if self.bs < get_attention_tp_size():
+-            return self.attr_name[AttentionArch.MLA]
+-        return self.attr_name[model_runner.model_config.attention_arch]
++    def _get_update_attr_name(self):
++        if envs.SGLANG_USE_PAGED_ATTENTION.get():
++            return self.attr_name[AttentionArch.MHA]
++        return self.attr_name[AttentionArch.MLA]
+ 
+-    def _get_update_attr_type(self, model_runner):
+-        if self.bs < get_attention_tp_size():
+-            return self.attr_type[AttentionArch.MLA]
+-        return self.attr_type[model_runner.model_config.attention_arch]
++    def _get_update_attr_type(self):
++        if envs.SGLANG_USE_PAGED_ATTENTION.get():
++            return self.attr_type[AttentionArch.MHA]
++        return self.attr_type[AttentionArch.MLA]
+ 
+     def _replay_update(self, seq_lens):
+         if isinstance(self.update_attr_type, torch.Tensor):
+@@ -97,8 +98,8 @@ def _replay_update(self, seq_lens):
+         )
+ 
+     def _replay(self, forward_batch: ForwardBatch):
+-        self.update_attr_name = self._get_update_attr_name(self.model_runner)
+-        self.update_attr_type = self._get_update_attr_type(self.model_runner)
++        self.update_attr_name = self._get_update_attr_name()
++        self.update_attr_type = self._get_update_attr_type()
+         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
+                 self.bs - self.raw_bs
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
+index 4c425ff3537a..39d6f72b0810 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
+@@ -29,6 +29,7 @@
+ from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+ from sglang.srt.distributed.parallel_state import GroupCoordinator
+ from sglang.srt.layers.dp_attention import get_attention_tp_size
++from sglang.srt.environ import envs
+ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+ from sglang.srt.utils import (
+     empty_context,
+@@ -111,23 +112,15 @@ def _capture_graph(self, graph, pool, stream, run_once_fn):
+             out = run_once_fn()
+         return out
+ 
+-    def _get_update_attr_name(self, model_runner, forward_batch):
+-        if (
+-            self.bs < get_attention_tp_size()
+-            or forward_batch.forward_mode.is_target_verify()
+-            or self.use_fia
+-        ):
+-            return self.attr_name[AttentionArch.MLA]
+-        return self.attr_name[model_runner.model_config.attention_arch]
+-
+-    def _get_update_attr_type(self, model_runner, forward_batch):
+-        if (
+-            self.bs < get_attention_tp_size()
+-            or forward_batch.forward_mode.is_target_verify()
+-            or self.use_fia
+-        ):
+-            return self.attr_type[AttentionArch.MLA]
+-        return self.attr_type[model_runner.model_config.attention_arch]
++    def _get_update_attr_name(self):
++        if envs.SGLANG_USE_PAGED_ATTENTION.get():
++            return self.attr_name[AttentionArch.MHA]
++        return self.attr_name[AttentionArch.MLA]
++
++    def _get_update_attr_type(self):
++        if envs.SGLANG_USE_PAGED_ATTENTION.get():
++            return self.attr_type[AttentionArch.MHA]
++        return self.attr_type[AttentionArch.MLA]
+ 
+     def _update_inputs(self, seq_lens):
+         if isinstance(self.update_attr_type, torch.Tensor):
+@@ -185,12 +178,8 @@ def replay(
+             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+ 
+-        self.update_attr_name = self._get_update_attr_name(
+-            self.model_runner, forward_batch
+-        )
+-        self.update_attr_type = self._get_update_attr_type(
+-            self.model_runner, forward_batch
+-        )
++        self.update_attr_name = self._get_update_attr_name()
++        self.update_attr_type = self._get_update_attr_type()
+         # Replay
+         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+             if forward_batch.forward_mode.is_target_verify():
+diff --git a/python/sglang/srt/models/llama.py b/python/sglang/srt/models/llama.py
+index e76ff6f9c837..eb8e4487bd51 100644
+--- a/python/sglang/srt/models/llama.py
++++ b/python/sglang/srt/models/llama.py
+@@ -228,7 +228,7 @@ def forward(
+         hidden_states: torch.Tensor,
+         forward_batch: ForwardBatch,
+     ) -> torch.Tensor:
+-        if not _is_npu:
++        if not _is_npu or not hasattr(self.rotary_emb, 'get_cos_sin_with_position'):
+             q, k, v = self.forward_prepare_native(
+                 positions=positions,
+                 hidden_states=hidden_states,

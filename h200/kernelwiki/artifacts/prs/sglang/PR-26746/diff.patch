@@ -1,0 +1,207 @@
+diff --git a/python/sglang/srt/layers/moe/moe_runner/aiter.py b/python/sglang/srt/layers/moe/moe_runner/aiter.py
+index 1862d64843c7..2ea4e66ef019 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/aiter.py
++++ b/python/sglang/srt/layers/moe/moe_runner/aiter.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import functools
++import inspect
+ from dataclasses import dataclass
+ from enum import Enum
+ from typing import TYPE_CHECKING, Any, Optional, Union
+@@ -57,6 +59,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
+     hidden_pad: int = 0
+     intermediate_pad: int = 0
+     swiglu_limit: float = 0.0
++    fused_moe_kwargs: Optional[dict[str, Any]] = None
+ 
+ 
+ @dataclass
+@@ -103,6 +106,19 @@ def _aiter_quant_type(quant_type: AiterQuantType):
+     return getattr(QuantType, quant_type.value)
+ 
+ 
++@functools.cache
++def _aiter_fused_moe_supports_no_combine() -> bool:
++    """Probe whether the installed aiter.fused_moe accepts a `no_combine` kwarg.
++
++    Older wheels don't expose it, so feature-detect once and forward
++    conditionally, matching the existing `**extra` conditional-kwarg pattern
++    used for `num_local_tokens` / `dtype`.
++    """
++    from aiter.fused_moe import fused_moe
++
++    return "no_combine" in inspect.signature(fused_moe).parameters
++
++
+ class AiterRunnerCore(MoeRunnerCore):
+     def run(
+         self,
+@@ -111,9 +127,22 @@ def run(
+         running_state: dict,
+         hooks: Optional[Any] = None,
+     ) -> AiterRunnerOutput:
+-        assert not self.config.no_combine, "no_combine=True is not supported by AITER"
++        if self.config.no_combine and not _aiter_fused_moe_supports_no_combine():
++            raise NotImplementedError(
++                "no_combine=True requested but the installed aiter.fused_moe does "
++                "not accept a `no_combine` kwarg. Install an aiter build that "
++                "supports fused_moe no_combine output."
++            )
+ 
+         if runner_input.hidden_states.shape[0] == 0:
++            if self.config.no_combine:
++                topk = runner_input.topk_ids.shape[-1]
++                hidden_size = runner_input.hidden_states.shape[-1]
++                return AiterRunnerOutput(
++                    hidden_states=runner_input.hidden_states.new_empty(
++                        (0, topk, hidden_size)
++                    )
++                )
+             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
+ 
+         from aiter.fused_moe import fused_moe
+@@ -128,6 +157,8 @@ def run(
+         )
+ 
+         extra: dict = {}
++        if quant_info.fused_moe_kwargs:
++            extra.update(quant_info.fused_moe_kwargs)
+         if runner_input.num_local_tokens is not None:
+             extra["num_local_tokens"] = runner_input.num_local_tokens
+         if runner_input.output_dtype is not None:
+@@ -144,6 +175,8 @@ def run(
+                 else GateMode.SEPARATED.value
+             )
+             extra["swiglu_limit"] = quant_info.swiglu_limit
++        if self.config.no_combine:
++            extra["no_combine"] = True
+ 
+         output = fused_moe(
+             hidden_states=runner_input.hidden_states,
+diff --git a/test/registered/unit/layers/moe/test_aiter_runner.py b/test/registered/unit/layers/moe/test_aiter_runner.py
+new file mode 100644
+index 000000000000..dd749f400a4d
+--- /dev/null
++++ b/test/registered/unit/layers/moe/test_aiter_runner.py
+@@ -0,0 +1,119 @@
++import sys
++from types import ModuleType, SimpleNamespace
++
++import pytest
++import torch
++
++import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
++from sglang.srt.layers.moe.moe_runner.aiter import (
++    AiterMoeQuantInfo,
++    AiterQuantType,
++    AiterRunnerCore,
++    AiterRunnerInput,
++)
++from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=5, suite="base-b-test-cpu")
++
++
++def _runner_input():
++    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
++    return AiterRunnerInput(
++        hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
++        topk_ids=topk_ids,
++        topk_weights=torch.ones(topk_ids.shape, dtype=torch.float32),
++        quant_type=AiterQuantType.PER_1X32,
++    )
++
++
++def _quant_info(**overrides):
++    kwargs = {
++        "w13_weight": torch.empty((2, 8, 2)),
++        "w2_weight": torch.empty((2, 4, 2)),
++        "quant_type": AiterQuantType.PER_1X32,
++    }
++    kwargs.update(overrides)
++    return AiterMoeQuantInfo(**kwargs)
++
++
++def _install_fake_aiter(monkeypatch, fused_moe):
++    fake_aiter = ModuleType("aiter")
++    fake_aiter.__path__ = []
++    fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
++    fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
++
++    fake_fused_moe = ModuleType("aiter.fused_moe")
++    fake_fused_moe.fused_moe = fused_moe
++
++    fake_ops = ModuleType("aiter.ops")
++    fake_ops.__path__ = []
++    fake_flydsl = ModuleType("aiter.ops.flydsl")
++    fake_flydsl.__path__ = []
++    fake_moe_common = ModuleType("aiter.ops.flydsl.moe_common")
++    fake_moe_common.GateMode = SimpleNamespace(
++        INTERLEAVE=SimpleNamespace(value="INTERLEAVE")
++    )
++
++    monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
++    monkeypatch.setitem(sys.modules, "aiter.fused_moe", fake_fused_moe)
++    monkeypatch.setitem(sys.modules, "aiter.ops", fake_ops)
++    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", fake_flydsl)
++    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.moe_common", fake_moe_common)
++
++
++def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch):
++    captured = {}
++
++    def fused_moe(**kwargs):
++        captured.update(kwargs)
++        return kwargs["hidden_states"]
++
++    _install_fake_aiter(monkeypatch, fused_moe)
++    monkeypatch.setattr(
++        aiter_runner, "_aiter_fused_moe_supports_no_combine", lambda: True
++    )
++
++    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu", no_combine=True))
++
++    runner.run(
++        _runner_input(),
++        _quant_info(fused_moe_kwargs={"custom_fused_moe_kwarg": "enabled"}),
++        running_state={},
++    )
++
++    assert captured["activation"] == "Silu"
++    assert captured["quant_type"] == "per_1x32"
++    assert captured["no_combine"] is True
++    assert captured["custom_fused_moe_kwarg"] == "enabled"
++
++
++def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(
++    monkeypatch,
++):
++    monkeypatch.setattr(
++        aiter_runner, "_aiter_fused_moe_supports_no_combine", lambda: False
++    )
++    runner = AiterRunnerCore(MoeRunnerConfig(no_combine=True))
++
++    with pytest.raises(NotImplementedError, match="no_combine=True"):
++        runner.run(_runner_input(), _quant_info(), running_state={})
++
++
++def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
++    monkeypatch.setattr(
++        aiter_runner, "_aiter_fused_moe_supports_no_combine", lambda: True
++    )
++    runner = AiterRunnerCore(MoeRunnerConfig(no_combine=True))
++    runner_input = _runner_input()
++    runner_input.hidden_states = torch.zeros((0, 4), dtype=torch.bfloat16)
++    runner_input.topk_ids = torch.zeros((0, 2), dtype=torch.int32)
++    runner_input.topk_weights = torch.zeros((0, 2), dtype=torch.float32)
++
++    output = runner.run(runner_input, _quant_info(), running_state={})
++
++    assert output.hidden_states.shape == (0, 2, 4)
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))

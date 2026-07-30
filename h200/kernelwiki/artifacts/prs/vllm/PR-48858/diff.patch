@@ -1,0 +1,203 @@
+diff --git a/tests/models/inkling/test_fa4_rel_attention.py b/tests/models/inkling/test_fa4_rel_attention.py
+index 86cacd9da834..1a11ac220c87 100644
+--- a/tests/models/inkling/test_fa4_rel_attention.py
++++ b/tests/models/inkling/test_fa4_rel_attention.py
+@@ -13,6 +13,8 @@
+ with causal (and optionally sliding-window) masking handled by the backend.
+ """
+ 
++import importlib
++
+ import pytest
+ import torch
+ 
+@@ -21,6 +23,7 @@
+     compute_log_scaling_tau,
+ )
+ from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
++    _use_sheared_bias,
+     inkling_fa4_num_splits,
+     inkling_fa4_rel_attention,
+ )
+@@ -78,6 +81,23 @@ def test_num_splits_hopper_is_unsplit(monkeypatch):
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    ("major", "expected"),
++    [(9, False), (10, True), (11, True), (12, False)],
++)
++def test_sheared_bias_architecture_selection(monkeypatch, major, expected):
++    monkeypatch.setattr(
++        current_platform,
++        "get_device_capability",
++        lambda: DeviceCapability(major=major, minor=0),
++    )
++    _use_sheared_bias.cache_clear()
++    try:
++        assert _use_sheared_bias() is expected
++    finally:
++        _use_sheared_bias.cache_clear()
++
++
+ @pytest.fixture
+ def blackwell_platform(monkeypatch):
+     monkeypatch.setattr(
+@@ -251,6 +271,14 @@ def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0
+     window_size = (-1, -1) if window_left is None else (window_left, 0)
+ 
+     preallocated_out = torch.empty_like(q)
++    num_splits = inkling_fa4_num_splits(
++        is_local=window_left is not None,
++        batch_size=num_seqs,
++        max_query_len=max(q_lens),
++        num_heads=num_heads,
++        num_kv_heads=num_kv_heads,
++        max_kv_len=max(kv_lens),
++    )
+     out = inkling_fa4_rel_attention(
+         q,
+         key_cache,
+@@ -264,6 +292,7 @@ def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0
+         window_size=window_size,
+         rel_extent=rel_extent,
+         rel_logits=rel_logits,
++        num_splits=num_splits,
+         out=preallocated_out,
+     )
+     assert out.data_ptr() == preallocated_out.data_ptr()
+@@ -285,6 +314,24 @@ def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0
+     torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+ 
+ 
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
++@pytest.mark.skipif(
++    _cap is None or _cap.major < 9,
++    reason="FA4 score-mod requires Hopper+ (SM90+)",
++)
++@torch.inference_mode()
++def test_score_mod_relative_attention(monkeypatch):
++    module = importlib.import_module("vllm.models.inkling.nvidia.ops.fa4_rel_attention")
++    monkeypatch.setattr(module, "_use_sheared_bias", lambda: False)
++    _run_case(
++        [(64, 64), (1, 80)],
++        num_heads=4,
++        num_kv_heads=4,
++        rel_extent=128,
++        window_left=None,
++    )
++
++
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+ @pytest.mark.skipif(
+     _cap is None or _cap.major < 9,
+diff --git a/vllm/models/inkling/nvidia/ops/fa4_rel_attention.py b/vllm/models/inkling/nvidia/ops/fa4_rel_attention.py
+index 99e12beafb58..f547f6506291 100644
+--- a/vllm/models/inkling/nvidia/ops/fa4_rel_attention.py
++++ b/vllm/models/inkling/nvidia/ops/fa4_rel_attention.py
+@@ -2,6 +2,10 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from __future__ import annotations
+ 
++from collections.abc import Callable
++from functools import cache
++from typing import Any
++
+ import torch
+ 
+ from vllm.platforms import current_platform
+@@ -12,6 +16,47 @@ def bucket_max_seqlen_q(max_seqlen_q: int) -> int:
+     return 1 << max(0, max_seqlen_q - 1).bit_length()
+ 
+ 
++@cache
++def _use_sheared_bias() -> bool:
++    capability = current_platform.get_device_capability()
++    return capability is not None and capability.major in (10, 11)
++
++
++@cache
++def _get_score_mod(rel_extent: int) -> Callable:
++    """Return the score modification that adds Inkling relative bias."""
++    import cutlass.cute as cute
++    from cutlass.cute import Float32
++
++    from vllm.vllm_flash_attn.cute.seqlen_info import SeqlenInfoQK
++
++    @cute.jit
++    def score_mod_rel_bias(
++        scores: cute.TensorSSA,
++        b_idx: cute.TensorSSA,
++        h_idx: cute.TensorSSA,
++        q_idx: cute.TensorSSA,
++        kv_idx: cute.TensorSSA,
++        seqlen_info: SeqlenInfoQK,
++        aux_tensors: list[cute.Tensor],
++    ) -> cute.TensorSSA:
++        rel_logits = aux_tensors[0]
++
++        seqlen_local_offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
++        rel_dist = (q_idx + seqlen_local_offset) - kv_idx
++        global_q_idx = seqlen_info.offset_q + q_idx
++
++        rel_dist_0 = rel_dist[0]
++        rel_idx = rel_dist_0 if rel_dist_0 >= 0 else 0
++        rel_idx = rel_idx if rel_idx < rel_extent else (rel_extent - 1)
++
++        rel_bias = rel_logits[global_q_idx[0], h_idx[0], rel_idx]
++        rel_bias = Float32(rel_bias) if rel_dist_0 == rel_idx else Float32(0.0)
++        return scores + rel_bias
++
++    return score_mod_rel_bias
++
++
+ def inkling_fa4_num_splits(
+     *,
+     is_local: bool,
+@@ -21,7 +66,7 @@ def inkling_fa4_num_splits(
+     num_kv_heads: int,
+     max_kv_len: int,
+ ) -> int:
+-    """Return the split-KV cap for FA4 with sheared relative bias."""
++    """Return the split-KV cap for Inkling relative attention."""
+     capability = current_platform.get_device_capability()
+     if capability is not None and capability.major == 9:
+         return 1
+@@ -78,13 +123,25 @@ def inkling_fa4_rel_attention(
+     per-request KV lengths (``seqused_k``). ``rel_logits`` is
+     ``(num_tokens, num_heads, rel_extent)``.
+ 
+-    The bias uses tml-fa4's sheared relative-bias layout.
++    Hopper uses standard FA4's score-mod gather. Blackwell uses tml-fa4's
++    sheared relative-bias layout.
+     """
+-    from vllm.third_party.tml_fa4 import flash_attn_varlen_func
+-
+     # cute uses (None, None) to mean "no window".
+     cute_window = (None, None) if window_size == (-1, -1) else window_size
+ 
++    rel_logits = rel_logits.contiguous()
++    if _use_sheared_bias():
++        from vllm.third_party.tml_fa4 import flash_attn_varlen_func
++
++        bias_kwargs: dict[str, Any] = {"rel_bias": rel_logits}
++    else:
++        from vllm.vllm_flash_attn.cute import flash_attn_varlen_func
++
++        bias_kwargs = {
++            "score_mod": _get_score_mod(rel_extent),
++            "aux_tensors": [rel_logits],
++        }
++
+     ret = flash_attn_varlen_func(
+         q=q,
+         k=key_cache,
+@@ -99,7 +156,7 @@ def inkling_fa4_rel_attention(
+         num_splits=num_splits,
+         return_lse=False,
+         out=out,
+-        rel_bias=rel_logits.contiguous(),
++        **bias_kwargs,
+     )
+     if isinstance(ret, tuple):
+         return ret[0]

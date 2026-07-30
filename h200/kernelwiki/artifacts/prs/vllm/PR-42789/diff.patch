@@ -1,0 +1,1261 @@
+diff --git a/tests/kernels/moe/test_cpu_int4_moe.py b/tests/kernels/moe/test_cpu_int4_moe.py
+new file mode 100644
+index 000000000000..05694eb08b22
+--- /dev/null
++++ b/tests/kernels/moe/test_cpu_int4_moe.py
+@@ -0,0 +1,296 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for CPU INT4 W4A8 dynamic quantized fused MoE kernel (CPUExpertsInt4)."""
++
++import sys
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import set_random_seed
++
++if not current_platform.is_cpu():
++    pytest.skip("skipping CPU-only tests", allow_module_level=True)
++
++# Check if the dynamic_4bit_int_moe op is available
++if not hasattr(torch.ops._C, "dynamic_4bit_int_moe"):
++    pytest.skip("dynamic_4bit_int_moe op not available", allow_module_level=True)
++
++# Check if KleidiAI ops are available
++if not hasattr(torch.ops.aten, "_dyn_quant_pack_4bit_weight"):
++    pytest.skip("KleidiAI 4-bit ops not available", allow_module_level=True)
++
++
++# Tolerance for INT4 W4A8
++INT4_W4A8_ATOL = 2e-2
++INT4_W4A8_RTOL = 2e-2
++
++
++def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
++    """SwiGLU activation: SiLU(gate) * up."""
++    d = x.shape[-1] // 2
++    return F.silu(x[..., :d]) * x[..., d:]
++
++
++def _pack_int4_weight_to_kleidi(
++    int4_as_int8: torch.Tensor,
++    scales: torch.Tensor,
++    bias: torch.Tensor | None,
++    group_size: int,
++    in_features: int,
++    out_features: int,
++) -> torch.Tensor:
++    """Pack INT4 weights (stored as int8 in [-8,7]) to KleidiAI format.
++
++    Args:
++        int4_as_int8: [out, in] int8 tensor with values in [-8, 7]
++        scales: [out, in//group_size] or [out, 1] for channel-wise
++        bias: [out] optional bias
++        group_size: Quantization group size (-1 for channel-wise)
++        in_features: Input dimension
++        out_features: Output dimension
++
++    Returns:
++        Packed weight tensor in KleidiAI format
++    """
++    # Shift to unsigned nibble [0, 15]
++    tmp = int4_as_int8.add(8)
++    # Pack pairs along input dimension
++    uint8_nibbles = ((tmp[:, 1::2] << 4) | tmp[:, ::2]).to(torch.uint8)
++
++    # Determine scale dtype based on group_size
++    scale_dtype = torch.float32 if group_size == -1 else torch.bfloat16
++    scales_typed = scales.to(scale_dtype)
++    bias_typed = None if bias is None else bias.to(torch.float32)
++
++    # Pack using KleidiAI op
++    actual_group_size = in_features if group_size == -1 else group_size
++    return torch.ops.aten._dyn_quant_pack_4bit_weight(
++        uint8_nibbles,
++        scales_typed,
++        bias_typed,
++        actual_group_size,
++        in_features,
++        out_features,
++    )
++
++
++def _make_int4_moe_weights(
++    E: int,
++    N: int,
++    K: int,
++    group_size: int,
++    has_bias: bool = False,
++) -> tuple[
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor | None,
++    torch.Tensor | None,
++]:
++    """Generate random INT4 MoE weights with random scales.
++
++    Args:
++        E: Number of experts
++        N: Intermediate size
++        K: Hidden size
++        group_size: Quantization group size (-1 for channel-wise)
++        has_bias: Whether to include bias
++
++    Returns:
++        (w13_packed, w2_packed, w13_ref, w2_ref, w13_bias, w2_bias)
++        where *_ref are the dequantized float reference weights
++    """
++    # Generate INT4 weights as int8 values in [-8, 7]
++    w13_int4 = torch.randint(-8, 8, (E, 2 * N, K), dtype=torch.int8)
++    w2_int4 = torch.randint(-8, 8, (E, K, N), dtype=torch.int8)
++
++    # Determine number of scale columns
++    def _n_scale_cols(in_features: int) -> int:
++        return 1 if group_size == -1 else (in_features // group_size)
++
++    # Generate random scales
++    scale_dtype = torch.float32 if group_size == -1 else torch.bfloat16
++    w13_scales = torch.rand(E, 2 * N, _n_scale_cols(K), dtype=scale_dtype) * 0.01
++    w2_scales = torch.rand(E, K, _n_scale_cols(N), dtype=scale_dtype) * 0.01
++
++    # Generate biases if needed
++    w13_bias = None
++    w2_bias = None
++    if has_bias:
++        w13_bias = torch.randn(E, 2 * N, dtype=torch.float32) * 0.01
++        w2_bias = torch.randn(E, K, dtype=torch.float32) * 0.01
++
++    # Pack weights for each expert
++    w13_packed_list = []
++    w2_packed_list = []
++
++    for e in range(E):
++        w13_packed_list.append(
++            _pack_int4_weight_to_kleidi(
++                w13_int4[e],
++                w13_scales[e],
++                w13_bias[e] if (has_bias and w13_bias is not None) else None,
++                group_size,
++                K,
++                2 * N,
++            )
++        )
++        w2_packed_list.append(
++            _pack_int4_weight_to_kleidi(
++                w2_int4[e],
++                w2_scales[e],
++                w2_bias[e] if (has_bias and w2_bias is not None) else None,
++                group_size,
++                N,
++                K,
++            )
++        )
++
++    w13_packed = torch.stack(w13_packed_list, dim=0)
++    w2_packed = torch.stack(w2_packed_list, dim=0)
++
++    # Create reference dequantized weights
++    w13_ref = torch.zeros(E, 2 * N, K, dtype=torch.float32)
++    w2_ref = torch.zeros(E, K, N, dtype=torch.float32)
++
++    for e in range(E):
++        # Dequantize w13
++        for i in range(2 * N):
++            for j in range(K):
++                group_idx = 0 if group_size == -1 else (j // group_size)
++                w13_ref[e, i, j] = (
++                    w13_int4[e, i, j].float() * w13_scales[e, i, group_idx].float()
++                )
++                if has_bias and w13_bias is not None:
++                    w13_ref[e, i, j] += w13_bias[e, i].float()
++
++        # Dequantize w2
++        for i in range(K):
++            for j in range(N):
++                group_idx = 0 if group_size == -1 else (j // group_size)
++                w2_ref[e, i, j] = (
++                    w2_int4[e, i, j].float() * w2_scales[e, i, group_idx].float()
++                )
++                if has_bias and w2_bias is not None:
++                    w2_ref[e, i, j] += w2_bias[e, i].float()
++
++    return w13_packed, w2_packed, w13_ref, w2_ref, w13_bias, w2_bias
++
++
++def ref_int4_moe(
++    a: torch.Tensor,
++    w13_ref: torch.Tensor,
++    w2_ref: torch.Tensor,
++    topk_weight: torch.Tensor,
++    topk_ids: torch.Tensor,
++) -> torch.Tensor:
++    """Reference INT4 W4A8 fused MoE using dequantized weights.
++
++    Steps:
++      1. Use dequantized float weights
++      2. For each expert: matmul → SwiGLU → matmul
++      3. Weighted sum across top-k experts
++    """
++    B, D = a.shape
++    topk = topk_ids.size(1)
++
++    a_exp = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D).float()
++    out = torch.zeros(B * topk, w2_ref.shape[1], dtype=torch.float32)
++
++    topk_weight_flat = topk_weight.view(-1)
++    topk_ids_flat = topk_ids.view(-1)
++
++    for i in range(w13_ref.shape[0]):
++        mask = topk_ids_flat == i
++        if mask.sum():
++            # w13: [2N, K], input: [B, K] -> output: [B, 2N]
++            gate_up = torch.matmul(a_exp[mask], w13_ref[i].transpose(0, 1))
++            # SwiGLU activation
++            hidden = _silu_and_mul(gate_up)
++            # w2: [K, N], hidden: [B, N] -> output: [B, K]
++            out[mask] = torch.matmul(hidden, w2_ref[i].transpose(0, 1))
++
++    return (
++        (out.view(B, -1, w2_ref.shape[1]) * topk_weight_flat.view(B, -1, 1))
++        .sum(dim=1)
++        .to(a.dtype)
++    )
++
++
++NUM_TOKENS = [1, 2, 64, 128]
++# (intermediate_size N, hidden_size K, num_experts E, topk, group_size)
++MoE_CONFIGS = [
++    (256, 512, 8, 2, 128),
++    (256, 512, 8, 2, 64),
++    (256, 512, 8, 2, -1),  # channel-wise
++    (512, 256, 8, 4, 128),
++    (512, 512, 8, 2, 128),
++    (768, 2048, 8, 2, 128),
++    (768, 2048, 16, 4, 64),
++]
++SEEDS = [0, 42]
++
++
++@pytest.mark.parametrize("M", NUM_TOKENS)
++@pytest.mark.parametrize("N,K,E,topk,group_size", MoE_CONFIGS)
++@pytest.mark.parametrize("seed", SEEDS)
++def test_cpu_int4_moe_kernel(M, N, K, E, topk, group_size, seed):
++    """Test dynamic_4bit_int_moe kernel against dequantized torch reference."""
++    set_random_seed(seed)
++
++    # Generate input activations
++    a = torch.randn(M, K, dtype=torch.bfloat16) / (K**0.5)
++
++    # Generate INT4 weights
++    w13_packed, w2_packed, w13_ref, w2_ref, w13_bias, w2_bias = _make_int4_moe_weights(
++        E, N, K, group_size, has_bias=False
++    )
++
++    # Generate router logits and topk
++    score = torch.randn(M, E, dtype=torch.bfloat16)
++    score = torch.softmax(score, dim=-1, dtype=torch.float32)
++    topk_weight, topk_ids = torch.topk(score, topk)
++    topk_ids = topk_ids.to(torch.long)
++
++    # Reference output using dequantized weights
++    ref_out = ref_int4_moe(
++        a,
++        w13_ref,
++        w2_ref,
++        topk_weight,
++        topk_ids,
++    )
++
++    # Test dynamic_4bit_int_moe kernel
++    # Activation kind: 1 = SwiGLU_Ug (SiLU(u)*g) for OAI-style
++    activation_kind = 1
++    apply_router_weight_on_input = False
++
++    out = torch.ops._C.dynamic_4bit_int_moe(
++        a,
++        topk_ids,
++        topk_weight,
++        w13_packed,
++        w2_packed,
++        K,  # H (hidden_size / w2_out_features)
++        N,  # I (intermediate_size / w2_in_features)
++        2 * N,  # I2 (2*intermediate_size / w13_out_features)
++        group_size,
++        apply_router_weight_on_input,
++        activation_kind,
++    )
++
++    torch.testing.assert_close(
++        ref_out.bfloat16(),
++        out,
++        atol=INT4_W4A8_ATOL,
++        rtol=INT4_W4A8_RTOL,
++    )
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/vllm/model_executor/layers/fused_moe/experts/cpu_int4_moe.py b/vllm/model_executor/layers/fused_moe/experts/cpu_int4_moe.py
+new file mode 100644
+index 000000000000..c21072676ece
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/cpu_int4_moe.py
+@@ -0,0 +1,229 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU INT4 W4A8 dynamic quantized fused MoE experts."""
++
++import torch
++
++import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++from vllm.model_executor.layers.fused_moe.config import (
++    FusedMoEConfig,
++    FusedMoEParallelConfig,
++    FusedMoEQuantConfig,
++    RoutingMethodType,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    QuantKey,
++    kInt4W4A8StaticGroup32Sym,
++    kInt4W4A8StaticGroup64Sym,
++    kInt4W4A8StaticGroup128Sym,
++    kInt4W4A8StaticGroupSym,
++)
++from vllm.platforms import current_platform
++
++
++class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
++    """CPU INT4 W4A8 dynamic quantized monolithic MoE experts.
++
++    Uses the dynamic_4bit_int_moe kernel for efficient 4-bit weight,
++    8-bit activation MoE inference on CPU.
++    """
++
++    def __init__(
++        self,
++        moe_config: FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++    ):
++        super().__init__(
++            moe_config,
++            quant_config,
++        )
++
++    @property
++    def expects_unquantized_inputs(self) -> bool:
++        """Expects unquantized inputs (quantization happens in kernel)."""
++        return True
++
++    @staticmethod
++    def activation_format() -> mk.FusedMoEActivationFormat:
++        return mk.FusedMoEActivationFormat.Standard
++
++    @staticmethod
++    def _supports_current_device() -> bool:
++        return current_platform.is_cpu()
++
++    @staticmethod
++    def _supports_no_act_and_mul() -> bool:
++        """Does not support no_act_and_mul (requires SwiGLU or SiLU)."""
++        return False
++
++    @staticmethod
++    def _supports_activation(activation: MoEActivation) -> bool:
++        """Supports SiLU and SwiGLU variants."""
++        return activation in (
++            MoEActivation.SILU,
++            MoEActivation.SWIGLUOAI,
++            MoEActivation.SWIGLUSTEP,
++        )
++
++    @staticmethod
++    def _supports_parallel_config(
++        moe_parallel_config: FusedMoEParallelConfig,
++    ) -> bool:
++        """Currently does not support expert parallelism."""
++        # Based on compressed_tensors implementation check
++        return moe_parallel_config.ep_size == 1
++
++    @staticmethod
++    def _supports_quant_scheme(
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        """Supports INT4 weights with INT8 dynamic activations.
++
++        This is W4A8 with:
++        - Weights: 4-bit integer (stored as int8, packed to uint8 nibbles)
++          Can be channel-wise or group-wise quantization
++        - Activations: dynamic per-token 8-bit integer quantization
++        """
++        # group size must be multiple of 32
++        SUPPORTED_W_A = [
++            (kInt4W4A8StaticGroup128Sym, None),
++            (kInt4W4A8StaticGroup64Sym, None),
++            (kInt4W4A8StaticGroup32Sym, None),
++            (kInt4W4A8StaticGroupSym, None),
++        ]
++        return (weight_key, activation_key) in SUPPORTED_W_A
++
++    @staticmethod
++    def _supports_routing_method(
++        routing_method: RoutingMethodType,
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        """Supports standard routing methods."""
++        return routing_method in [
++            RoutingMethodType.Default,
++            RoutingMethodType.Renormalize,
++            RoutingMethodType.RenormalizeNaive,
++        ]
++
++    @staticmethod
++    def _supports_router_logits_dtype(
++        router_logits_dtype: torch.dtype | None,
++        routing_method: RoutingMethodType,
++    ) -> bool:
++        """Accepts any router logits dtype."""
++        return True
++
++    def supports_expert_map(self) -> bool:
++        """Expert parallelism not yet supported."""
++        return False
++
++    def _activation_kind(self, activation: MoEActivation) -> int:
++        """Convert MoEActivation to kernel activation kind integer.
++
++        Returns:
++            0 = SwiGLU_Gu (SiLU(g)*u)
++            1 = SwiGLU_Ug (SiLU(u)*g)
++            2 = SiLU
++        """
++        if activation == MoEActivation.SWIGLUSTEP:
++            return 0
++        if activation == MoEActivation.SWIGLUOAI:
++            return 1
++        if activation == MoEActivation.SILU:
++            return 2
++        raise ValueError(f"Unsupported activation '{activation}'")
++
++    def apply(
++        self,
++        hidden_states: torch.Tensor,
++        w1: torch.Tensor,  # w13_weight_packed
++        w2: torch.Tensor,  # w2_weight_packed
++        router_logits: torch.Tensor,
++        activation: MoEActivation,
++        global_num_experts: int,
++        expert_map: torch.Tensor | None,
++        a1q_scale: torch.Tensor | None,
++        apply_router_weight_on_input: bool,
++        # grouped topk + fused topk bias parameters
++        num_expert_group: int | None = None,
++        e_score_correction_bias: torch.Tensor | None = None,
++        routed_scaling_factor: float | None = None,
++        topk_group: int | None = None,
++    ) -> torch.Tensor:
++        """Apply the monolithic 4-bit INT MoE forward pass.
++
++        Args:
++            hidden_states: Input tensor [num_tokens, hidden_size]
++            w1: Packed w13 weights (w1+w3 gated weights)
++            w2: Packed w2 weights (down projection)
++            router_logits: Router output logits [num_tokens, num_experts]
++            activation: Activation function type
++            global_num_experts: Total number of experts
++            expert_map: Expert mapping for EP (not supported)
++            a1q_scale: Activation quantization scale (not used, dynamic)
++            apply_router_weight_on_input: Whether to apply routing on input
++            num_expert_group: For grouped topk
++            e_score_correction_bias: Bias for expert scores
++            routed_scaling_factor: Scaling factor for routing
++            topk_group: Group size for topk
++
++        Returns:
++            Output tensor after MoE computation
++        """
++        from vllm.model_executor.layers.fused_moe.cpu_fused_moe import (
++            select_experts,
++        )
++
++        renormalize = self.moe_config.routing_method in (
++            RoutingMethodType.Renormalize,
++            RoutingMethodType.RenormalizeNaive,
++        )
++
++        # TODO(bnell): this could be factored into a CPURouter class and
++        # turn this into a modular kernel
++        # Perform topk selection
++        topk_weights, topk_ids = select_experts(
++            hidden_states=hidden_states,
++            router_logits=router_logits,
++            use_grouped_topk=num_expert_group is not None,
++            top_k=self.moe_config.experts_per_token,
++            renormalize=renormalize,
++            topk_group=topk_group,
++            num_expert_group=num_expert_group,
++            scoring_func="softmax",
++            routed_scaling_factor=(
++                routed_scaling_factor if routed_scaling_factor is not None else 1.0
++            ),
++            e_score_correction_bias=e_score_correction_bias,
++        )
++
++        # Extract dimensions from weight tensors
++        # w1 is w13_packed: [num_experts, packed_data...]
++        # w2 is w2_packed: [num_experts, packed_data...]
++        # These dimensions should be available from the layer
++        # For now, we'll extract from moe_config
++        K = self.moe_config.hidden_dim
++        N = self.moe_config.intermediate_size_per_partition
++        assert self.quant_config.block_shape is not None
++        if self.quant_config.is_per_act_token:
++            group_size = -1
++        else:
++            group_size = self.quant_config.block_shape[1]
++
++        # Call the dynamic 4-bit int MoE kernel
++        return torch.ops._C.dynamic_4bit_int_moe(
++            hidden_states,
++            topk_ids.to(torch.long),
++            topk_weights,
++            w1,  # w13_weight_packed
++            w2,  # w2_weight_packed
++            K,  # hidden_size (w2_out_features)
++            N,  # intermediate_size (w2_in_features)
++            N * 2,  # 2*intermediate_size (w13_out_features)
++            group_size,
++            apply_router_weight_on_input,
++            self._activation_kind(activation),
++        )
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/w4a8_int8.py b/vllm/model_executor/layers/fused_moe/oracle/w4a8_int8.py
+new file mode 100644
+index 000000000000..7afa5ac22314
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/oracle/w4a8_int8.py
+@@ -0,0 +1,361 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from enum import Enum
++
++import torch
++
++import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.config.kernel import MoEBackend
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe.all2all_utils import (
++    maybe_make_prepare_finalize,
++)
++from vllm.model_executor.layers.fused_moe.config import (
++    FusedMoEConfig,
++    FusedMoEQuantConfig,
++    FusedMoEQuantDesc,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    GroupShape,
++    QuantKey,
++)
++from vllm.platforms import current_platform
++
++logger = init_logger(__name__)
++
++
++class W4A8Int8MoeBackend(Enum):
++    CPU_INT4 = "CPU_INT4"
++
++
++def _get_priority_backends(
++    moe_config: FusedMoEConfig,
++) -> list[W4A8Int8MoeBackend]:
++    """
++    Get available backends in priority order based on platform and config.
++
++    Currently only CPU INT4 backend is available for W4A8 INT8 MoE.
++    """
++    if current_platform.is_cpu():
++        return [W4A8Int8MoeBackend.CPU_INT4]
++    return []
++
++
++def backend_to_kernel_cls(
++    backend: W4A8Int8MoeBackend,
++) -> list[type[mk.FusedMoEExperts]]:
++    """Map W4A8Int8MoeBackend to kernel class."""
++    if backend == W4A8Int8MoeBackend.CPU_INT4:
++        from vllm.model_executor.layers.fused_moe.experts.cpu_int4_moe import (
++            CPUExpertsInt4,
++        )
++
++        return [CPUExpertsInt4]
++
++    else:
++        raise ValueError(f"Unknown W4A8 Int8 MoE backend: {backend.value}")
++
++
++def map_w4a8_int8_backend(runner_backend: MoEBackend) -> W4A8Int8MoeBackend:
++    """Map user's MoEBackend to W4A8Int8MoeBackend."""
++    mapping = {
++        "cpu": W4A8Int8MoeBackend.CPU_INT4,
++    }
++    if backend := mapping.get(runner_backend):
++        return backend
++    raise ValueError(
++        f"moe_backend='{runner_backend}' is not supported for W4A8 Int8 MoE. "
++        f"Expected one of {list(mapping.keys())}."
++    )
++
++
++def select_w4a8_int8_moe_backend(
++    config: FusedMoEConfig,
++    weight_key: QuantKey | None,
++    activation_key: QuantKey | None,
++) -> tuple[W4A8Int8MoeBackend, type[mk.FusedMoEExperts]]:
++    """
++    Select the primary W4A8 Int8 MoE backend.
++
++    Args:
++        config: MoE configuration
++        weight_key: Weight quantization key (should be one of kInt4W4A8Static*)
++        activation_key: Activation quantization key (currently unused for W4A8)
++
++    Returns:
++        Tuple of (backend, kernel_class)
++    """
++
++    AVAILABLE_BACKENDS = _get_priority_backends(config)
++
++    if not AVAILABLE_BACKENDS:
++        raise NotImplementedError("W4A8 Int8 MoE is only supported on CPU platforms")
++
++    activation_format = (
++        mk.FusedMoEActivationFormat.BatchedExperts
++        if config.moe_parallel_config.use_batched_activation_format
++        else mk.FusedMoEActivationFormat.Standard
++    )
++
++    def _make_log_backend(backend: W4A8Int8MoeBackend) -> str:
++        available_backend_strs = [b.value for b in AVAILABLE_BACKENDS]
++        return (
++            f"Using {backend.value} W4A8 Int8 MoE backend out "
++            f"of potential backends: {available_backend_strs}."
++        )
++
++    def _make_log_unsupported(backend: W4A8Int8MoeBackend, reason: str | None) -> str:
++        if reason:
++            return (
++                f"W4A8 Int8 MoE backend {backend.value} does not support the "
++                f"deployment configuration since {reason}."
++            )
++        else:
++            return (
++                f"W4A8 Int8 MoE backend '{backend.value}' does not support the "
++                "deployment configuration."
++            )
++
++    def _return_or_raise(
++        backend: W4A8Int8MoeBackend,
++    ) -> tuple[W4A8Int8MoeBackend, type[mk.FusedMoEExperts]]:
++        reason = None
++        for k_cls in backend_to_kernel_cls(backend):
++            supported, reason = k_cls.is_supported_config(
++                k_cls, config, weight_key, activation_key, activation_format
++            )
++            if supported:
++                logger.info_once(_make_log_backend(backend))
++                return backend, k_cls
++        raise ValueError(_make_log_unsupported(backend, reason))
++
++    # Handle explicit moe_backend from user.
++    runner_backend = config.moe_backend
++    if runner_backend != "auto":
++        requested_backend = map_w4a8_int8_backend(runner_backend)
++        return _return_or_raise(requested_backend)
++
++    # Select kernels in order of backend.
++    for backend in AVAILABLE_BACKENDS:
++        for k_cls in backend_to_kernel_cls(backend):
++            supported, reason = k_cls.is_supported_config(
++                k_cls,
++                config,
++                weight_key,
++                activation_key,
++                activation_format,
++            )
++            if supported:
++                logger.info_once(_make_log_backend(backend))
++                return backend, k_cls
++            else:
++                logger.debug_once(_make_log_unsupported(backend, reason))
++
++    raise NotImplementedError(
++        "No W4A8 Int8 MoE backend supports the deployment configuration."
++    )
++
++
++def make_w4a8_int8_moe_quant_config(
++    block_shape: tuple[int, int] | None = None,
++) -> FusedMoEQuantConfig:
++    """
++    Create FusedMoEQuantConfig for W4A8 Int8 MoE.
++
++    Args:
++        block_shape: Quantization block shape (row, col).
++                    For channel-wise: (-1, 1) or None
++                    For group-wise: (1, group_size)
++
++    Returns:
++        FusedMoEQuantConfig with appropriate settings for W4A8 Int8
++    """
++    # W4A8 Int8 uses static weight quantization, dynamic activation quantization
++    # Weights are 4-bit (stored as int8, packed to uint8),
++    # activations are dynamically quantized to 8-bit in kernel
++
++    group_shape = GroupShape(*block_shape) if block_shape is not None else None
++
++    return FusedMoEQuantConfig(
++        # Activations: unquantized (FP/BF16), dynamically quantized in kernel
++        _a1=FusedMoEQuantDesc(shape=group_shape),
++        _a2=FusedMoEQuantDesc(shape=group_shape),
++        # Weights: INT8 (4-bit values), pre-packed with scales
++        # dtype=None means already quantized/packed
++        _w1=FusedMoEQuantDesc(dtype=None, shape=group_shape),
++        _w2=FusedMoEQuantDesc(dtype=None, shape=group_shape),
++    )
++
++
++def pack_int4_weights_for_kleidi(
++    int4_as_int8: torch.Tensor,
++    scales: torch.Tensor,
++    bias: torch.Tensor | None,
++    in_features: int,
++    out_features: int,
++    group_size: int,
++) -> torch.Tensor:
++    """
++    Pack INT4 weights (stored as int8 in [-8,7]) to KleidiAI format.
++
++    Args:
++        int4_as_int8: [out, in] int8 tensor with values in [-8, 7]
++        scales: [out, in//group_size] or [out, 1] for channel-wise
++        bias: [out] optional bias
++        in_features: Input dimension
++        out_features: Output dimension
++        group_size: Quantization group size (-1 for channel-wise)
++
++    Returns:
++        Packed weight tensor in KleidiAI format
++    """
++    # Shift to unsigned nibble [0, 15]
++    tmp = int4_as_int8.add(8)
++    # Pack pairs along input dimension
++    uint8_nibbles = ((tmp[:, 1::2] << 4) | tmp[:, ::2]).to(torch.uint8)
++
++    # Determine scale dtype based on group_size
++    # KleidiAI groupwise kernels accept bfloat16 scales
++    # KleidiAI channelwise kernels accept float32 scales
++    scale_dtype = torch.float32 if group_size == -1 else torch.bfloat16
++    scales_typed = scales.to(scale_dtype)
++    bias_typed = None if bias is None else bias.to(torch.float32)
++
++    # Pack using KleidiAI op
++    actual_group_size = in_features if group_size == -1 else group_size
++    return torch.ops.aten._dyn_quant_pack_4bit_weight(
++        uint8_nibbles,
++        scales_typed,
++        bias_typed,
++        actual_group_size,
++        in_features,
++        out_features,
++    )
++
++
++def convert_to_w4a8_int8_moe_format(
++    w13_weight: torch.Tensor,
++    w2_weight: torch.Tensor,
++    w13_weight_scale: torch.Tensor,
++    w2_weight_scale: torch.Tensor,
++    group_size: int,
++    w13_bias: torch.Tensor | None = None,
++    w2_bias: torch.Tensor | None = None,
++) -> tuple[
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor | None,
++    torch.Tensor | None,
++]:
++    """
++    Pack INT4 MoE weights to KleidiAI format.
++
++    This function packs the INT4 weights (stored as int8 values) into
++    the format expected by the KleidiAI dynamic_4bit_int_moe kernel.
++
++    Args:
++        w13_weight: [E, 2*IN, H] int8 tensor (int4 values in [-8,7])
++        w2_weight: [E, H, IN] int8 tensor (int4 values in [-8,7])
++        w13_weight_scale: [E, 2*IN, H/g or 1] scale tensor
++        w2_weight_scale: [E, H, IN/g or 1] scale tensor
++        group_size: Quantization group size (-1 for channel-wise)
++        w13_bias: Optional [E, 2*IN] bias tensor
++        w2_bias: Optional [E, H] bias tensor
++
++    Returns:
++        Tuple of (w13_packed, w2_packed) tensors
++    """
++    # Derive dimensions from tensor shapes
++    E = w13_weight.shape[0]  # num_experts
++    I2 = w13_weight.shape[1]  # w13_out_features (2*IN)
++    H = w13_weight.shape[2]  # w13_in_features (hidden_size)
++    IN = w2_weight.shape[2]  # w2_in_features (intermediate_size)
++    w2_out_features = w2_weight.shape[1]  # Should equal H
++
++    # Pack per expert
++    w13_packed_list = []
++    w2_packed_list = []
++
++    for e in range(E):
++        w13_packed_list.append(
++            pack_int4_weights_for_kleidi(
++                w13_weight[e],  # [2I, H]
++                w13_weight_scale[e],  # [2I, H/g or 1]
++                w13_bias[e] if w13_bias is not None else None,  # [2I]
++                H,
++                I2,
++                group_size,
++            )
++        )
++        w2_packed_list.append(
++            pack_int4_weights_for_kleidi(
++                w2_weight[e],  # [H, IN]
++                w2_weight_scale[e],  # [H, IN/g or 1]
++                w2_bias[e] if w2_bias is not None else None,  # [H]
++                IN,
++                w2_out_features,  # in_features=IN, out_features=H
++                group_size,
++            )
++        )
++
++    # Stack all experts
++    w13_packed = torch.stack(w13_packed_list, dim=0)
++    w2_packed = torch.stack(w2_packed_list, dim=0)
++    empty = torch.empty(0)
++
++    return w13_packed, w2_packed, empty, empty, empty, empty
++
++
++def make_w4a8_int8_moe_kernel(
++    moe_quant_config: FusedMoEQuantConfig,
++    moe_config: FusedMoEConfig,
++    experts_cls: type[mk.FusedMoEExperts],
++    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++) -> mk.FusedMoEKernel:
++    """
++    Create FusedMoEKernel for W4A8 Int8 MoE.
++
++    Args:
++        moe_quant_config: Quantization configuration
++        moe_config: MoE configuration
++        experts_cls: Expert kernel class (should be CPUExpertsInt4)
++        routing_tables: Optional routing tables for expert parallelism
++
++    Returns:
++        Configured FusedMoEKernel instance
++    """
++    # Create Prepare/Finalize.
++    prepare_finalize = maybe_make_prepare_finalize(
++        moe=moe_config,
++        quant_config=moe_quant_config,
++        routing_tables=routing_tables,
++        allow_new_interface=True,
++        use_monolithic=issubclass(experts_cls, mk.FusedMoEExpertsMonolithic),
++    )
++    assert prepare_finalize is not None
++
++    logger.info_once("Using %s", prepare_finalize.__class__.__name__)
++
++    # Create Experts.
++    # W4A8 Int8 currently only supports monolithic interface
++    if not issubclass(experts_cls, mk.FusedMoEExpertsMonolithic):
++        raise ValueError(
++            f"W4A8 Int8 MoE only supports monolithic experts, "
++            f"but got {experts_cls.__name__}"
++        )
++
++    experts = experts_cls(
++        moe_config=moe_config,
++        quant_config=moe_quant_config,
++    )
++
++    kernel = mk.FusedMoEKernel(
++        prepare_finalize,
++        experts,
++        inplace=not moe_config.disable_inplace,
++    )
++
++    return kernel
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_int8.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_int8.py
+index 5fdda451b3b6..a64104d3ffdf 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_int8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_int8.py
+@@ -11,16 +11,26 @@
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+     RoutedExperts,
++    SharedExperts,
+ )
+-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+     FusedMoEQuantConfig,
+ )
+-from vllm.model_executor.layers.fused_moe.cpu_fused_moe import select_experts
++from vllm.model_executor.layers.fused_moe.oracle.w4a8_int8 import (
++    convert_to_w4a8_int8_moe_format,
++    make_w4a8_int8_moe_kernel,
++    make_w4a8_int8_moe_quant_config,
++    select_w4a8_int8_moe_backend,
++)
+ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
+     CompressedTensorsMoEMethod,
+ )
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    GroupShape,
++    QuantKey,
++    ScaleDesc,
++)
+ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+ from vllm.platforms import CpuArchEnum, current_platform
+ 
+@@ -48,6 +58,11 @@ def __init__(
+         self.has_bias = self.moe.has_bias
+         self.weight_quant = weight_quant
+         self.input_quant = input_quant
++        self.static_input_scales = False  # always dynamic per token
++        # Weight can be channel-wise (group_size=None) or group-wise
++        self.group_size = (
++            weight_quant.group_size if (weight_quant.group_size is not None) else -1
++        )
+ 
+         # Validate scheme: weights=W4 (channel or group),
+         # activations=dynamic TOKEN (A8)
+@@ -61,17 +76,9 @@ def __init__(
+                 "W4A8-int MoE needs dynamic per-token activation quantization."
+             )
+ 
+-        # Weight can be channel-wise (group_size=None) or group-wise
+-        self.group_size = (
+-            weight_quant.group_size if (weight_quant.group_size is not None) else -1
+-        )
+         if weight_quant.num_bits != 4:
+             raise ValueError("This method only supports 4-bit weights (num_bits=4).")
+ 
+-        # CPU only
+-        if not current_platform.is_cpu():
+-            raise ValueError("CompressedTensorsW4A8Int8MoEMethod is CPU-only.")
+-
+         # Arm: check _dyn ops availability
+         if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
+             try:
+@@ -82,7 +89,26 @@ def __init__(
+                     f"""PyTorch {torch.__version__} lacks _dyn_quant_* 4bit ops;
+                     install a newer build."""
+                 ) from err
+-        self.static_input_scales = False  # always dynamic per token
++
++        # Construct QuantKey for weights from QuantizationArgs
++        # W4A8 INT4: 4-bit weights (stored as int8), static quantization
++        if self.group_size == -1:
++            # Channel-wise quantization
++            group_shape = GroupShape(-1, 1)
++            scale_dtype = torch.float32
++        else:
++            # Group-wise quantization
++            group_shape = GroupShape(1, self.group_size)
++            scale_dtype = torch.bfloat16
++
++        weight_scale_desc = ScaleDesc(scale_dtype, static=True, group_shape=group_shape)
++        weight_key = QuantKey(torch.int8, weight_scale_desc, symmetric=True)
++
++        self.backend, self.experts_cls = select_w4a8_int8_moe_backend(
++            moe,
++            weight_key,
++            activation_key=None,  # unquantized inputs
++        )
+ 
+     # ---- parameter creation ----
+     def create_weights(
+@@ -182,72 +208,20 @@ def _n_scale_cols(in_features: int) -> int:
+ 
+     # post-load packing to dyn-4bit KleidiAI kernel's format
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+-        E = layer.w13_weight.shape[0]
+-        H = layer.w13_in_features
+-        I2 = layer.w13_out_features
+-        IN = layer.w2_in_features
+-        g = layer.group_size
+-
+-        def _pack_matrix(
+-            int4_as_int8_2d: torch.Tensor,
+-            scales_2d: torch.Tensor,
+-            bias_1d: torch.Tensor | None,
+-            in_features: int,
+-            out_features: int,
+-        ) -> torch.Tensor:
+-            # int4 values are stored as int8 in [-8,7].
+-            # Shift to unsigned nibble and pack pairs along input-dim.
+-            tmp = int4_as_int8_2d.add(8)  # [out, in]
+-            uint8_nibbles = ((tmp[:, 1::2] << 4) | tmp[:, ::2]).to(
+-                torch.uint8
+-            )  # [out, in//2]
+-
+-            # KleidiAI groupwise kernels accepts float32 scales
+-            # KleidiAI groupwise kernels accepts bfloat16 scales
+-            scale_dtype = torch.float32 if g == -1 else torch.bfloat16
+-            scales = scales_2d.to(scale_dtype)
+-            bias = None if bias_1d is None else bias_1d.to(torch.float32)
+-            return torch.ops.aten._dyn_quant_pack_4bit_weight(
+-                uint8_nibbles,
+-                scales,
+-                bias,
+-                g if g != -1 else in_features,
+-                in_features,
+-                out_features,
+-            )
+-
+-        # Pack per expert
+-        w13_packed_list = []
+-        w2_packed_list = []
+-
+-        has_w13_bias = hasattr(layer, "w13_bias") and layer.w13_bias is not None
+-        has_w2_bias = hasattr(layer, "w2_bias") and layer.w2_bias is not None
+-
+-        for e in range(E):
+-            w13_packed_list.append(
+-                _pack_matrix(
+-                    layer.w13_weight[e],  # [2I, H]
+-                    layer.w13_weight_scale[e],  # [2I, H/g or 1]
+-                    layer.w13_bias[e] if has_w13_bias else None,  # [2I]
+-                    H,
+-                    I2,
+-                )
++        # Use oracle to pack weights.
++        w13_packed, w2_packed, w13_weight_scale, w2_weight_scale, w13_bias, w2_bias = (
++            convert_to_w4a8_int8_moe_format(
++                w13_weight=layer.w13_weight,
++                w2_weight=layer.w2_weight,
++                w13_weight_scale=layer.w13_weight_scale,
++                w2_weight_scale=layer.w2_weight_scale,
++                group_size=self.group_size,
++                w13_bias=layer.w13_bias if self.has_bias else None,
++                w2_bias=layer.w2_bias if self.has_bias else None,
+             )
+-            w2_packed_list.append(
+-                _pack_matrix(
+-                    # w2 shape is [H, IN]; we need [out, in] == [H, IN].
+-                    layer.w2_weight[e],  # [H, IN]
+-                    layer.w2_weight_scale[e],  # [H, IN/g or 1]
+-                    layer.w2_bias[e] if has_w2_bias else None,  # [H]
+-                    IN,
+-                    layer.w2_out_features,  # in_features=IN, out_features=H
+-                )
+-            )
+-
+-        # each packed tensor has identical shape per expert; stack on dim 0
+-        w13_packed = torch.stack(w13_packed_list, dim=0)
+-        w2_packed = torch.stack(w2_packed_list, dim=0)
++        )
+ 
++        # Register packed weights as parameters
+         replace_parameter(
+             layer,
+             "w13_weight_packed",
+@@ -259,7 +233,6 @@ def _pack_matrix(
+             torch.nn.Parameter(w2_packed, requires_grad=False),
+         )
+ 
+-        # free raw tensors/scales/bias now that they're packed into the payload.
+         replace_parameter(
+             layer, "w13_weight", torch.nn.Parameter(torch.empty(0), requires_grad=False)
+         )
+@@ -269,36 +242,46 @@ def _pack_matrix(
+         replace_parameter(
+             layer,
+             "w13_weight_scale",
+-            torch.nn.Parameter(torch.empty(0), requires_grad=False),
++            torch.nn.Parameter(w13_weight_scale, requires_grad=False),
+         )
+         replace_parameter(
+             layer,
+             "w2_weight_scale",
+-            torch.nn.Parameter(torch.empty(0), requires_grad=False),
++            torch.nn.Parameter(w2_weight_scale, requires_grad=False),
+         )
+-        if has_w13_bias:
++
++        if self.has_bias:
+             replace_parameter(
+                 layer,
+                 "w13_bias",
+-                torch.nn.Parameter(torch.empty(0), requires_grad=False),
++                torch.nn.Parameter(w13_bias, requires_grad=False),
+             )
+-        if has_w2_bias:
++        if self.has_bias:
+             replace_parameter(
+                 layer,
+                 "w2_bias",
+-                torch.nn.Parameter(torch.empty(0), requires_grad=False),
++                torch.nn.Parameter(w2_bias, requires_grad=False),
+             )
+ 
++        quant_config = self.get_fused_moe_quant_config(layer)
++        assert quant_config is not None
++        assert self.experts_cls is not None
++        self.moe_kernel = make_w4a8_int8_moe_kernel(
++            moe_quant_config=quant_config,
++            moe_config=self.moe,
++            experts_cls=self.experts_cls,
++            routing_tables=layer._expert_routing_tables(),
++        )
++
+     def get_fused_moe_quant_config(
+         self, layer: torch.nn.Module
+     ) -> FusedMoEQuantConfig | None:
+-        # CPU dynamic 4-bit MoE path does not use modular kernels or
+-        # fused_experts; quant config is not needed.
+-        return None
++        # Determine block shape from group_size
++        # group_size=-1 means channel-wise: (-1, 1)
++        # group_size=N means group-wise: (1, N)
++        block_shape = (-1, 1) if self.group_size == -1 else (1, self.group_size)
+ 
+-    @property
+-    def is_monolithic(self) -> bool:
+-        return True
++        return make_w4a8_int8_moe_quant_config(block_shape=block_shape)
+ 
+     def apply_monolithic(
+         self,
+@@ -307,43 +290,43 @@ def apply_monolithic(
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        assert layer.activation in (
+-            MoEActivation.SILU,
+-            MoEActivation.SWIGLUOAI,
+-            MoEActivation.SWIGLUSTEP,
+-        ), "Only SiLU/SwiGLUGU/SwiGLUUG are supported."
+-        assert layer.expert_map is None, """expert_map/EP not implemented
+-        for CPU dyn-4bit MoE."""
+-
+-        def _act_kind(s: MoEActivation) -> int:
+-            # 0 = SwiGLU_Gu (SiLU(g)*u), 1 = SwiGLU_Ug (SiLU(u)*g), 2 = SiLU
+-            if s == MoEActivation.SWIGLUSTEP:
+-                return 0
+-            if s == MoEActivation.SWIGLUOAI:
+-                return 1
+-            if s == MoEActivation.SILU:
+-                return 2
+-            raise ValueError(f"Unknown activation '{s}'")
+-
+-        # Apply topk softmax on router output
+-        topk_weights, topk_ids = select_experts(
+-            hidden_states=x,
+-            router_logits=router_logits,
+-            top_k=layer.top_k,
+-            use_grouped_topk=layer.use_grouped_topk,
+-            renormalize=layer.renormalize,
++        assert self.is_monolithic
++        assert self.moe_kernel is not None
++        return self.moe_kernel.apply_monolithic(
++            x,
++            layer.w13_weight_packed,
++            layer.w2_weight_packed,
++            router_logits,
++            activation=layer.activation,
++            global_num_experts=layer.global_num_experts,
++            expert_map=layer.expert_map,
++            apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            num_expert_group=layer.num_expert_group,
++            topk_group=layer.topk_group,
++            e_score_correction_bias=layer.e_score_correction_bias,
++            routed_scaling_factor=layer.routed_scaling_factor,
+         )
+ 
+-        return torch.ops._C.dynamic_4bit_int_moe(
++    def apply(
++        self,
++        layer: RoutedExperts,
++        x: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
++        shared_experts_input: torch.Tensor | None,
++    ) -> torch.Tensor:
++        assert self.moe_kernel is not None
++        return self.moe_kernel.apply(
+             x,
+-            topk_ids.to(torch.long),
+-            topk_weights,
+             layer.w13_weight_packed,
+             layer.w2_weight_packed,
+-            layer.w2_out_features,
+-            layer.w2_in_features,
+-            layer.w13_out_features,
+-            layer.group_size,
+-            layer.apply_router_weight_on_input,
+-            int(_act_kind(layer.activation)),
++            topk_weights,
++            topk_ids,
++            activation=layer.activation,
++            global_num_experts=layer.global_num_experts,
++            expert_map=layer.expert_map,
++            apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
++            shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/quantization/utils/quant_utils.py b/vllm/model_executor/layers/quantization/utils/quant_utils.py
+index 0b1802522415..29fa8bcbacb1 100644
+--- a/vllm/model_executor/layers/quantization/utils/quant_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/quant_utils.py
+@@ -181,6 +181,31 @@ def __str__(self):
+ kInt8StaticChannelSym = QuantKey(torch.int8, kStaticChannelScale, symmetric=True)
+ kInt8DynamicTokenSym = QuantKey(torch.int8, kDynamicTokenScale, symmetric=True)
+ 
++# INT4 W4A8 quantization keys
++
++# For group-wise quantization (e.g., group_size=128)
++# Note: group_size will be specified at runtime, this is a generic group scale
++kInt4W4A8StaticGroupScale128 = ScaleDesc(torch.bfloat16, True, GroupShape(1, 128))
++kInt4W4A8StaticGroup128Sym = QuantKey(
++    torch.int8, kInt4W4A8StaticGroupScale128, symmetric=True
++)
++
++kInt4W4A8StaticGroupScale64 = ScaleDesc(torch.bfloat16, True, GroupShape(1, 64))
++kInt4W4A8StaticGroup64Sym = QuantKey(
++    torch.int8, kInt4W4A8StaticGroupScale64, symmetric=True
++)
++
++kInt4W4A8StaticGroupScale32 = ScaleDesc(torch.bfloat16, True, GroupShape(1, 32))
++kInt4W4A8StaticGroup32Sym = QuantKey(
++    torch.int8, kInt4W4A8StaticGroupScale32, symmetric=True
++)
++
++# Generic group-wise with flexible group size (per-token groups)
++kInt4W4A8StaticGroupScale = ScaleDesc(torch.bfloat16, True, GroupShape(1, -1))
++kInt4W4A8StaticGroupSym = QuantKey(
++    torch.int8, kInt4W4A8StaticGroupScale, symmetric=True
++)
++
+ 
+ def create_fp8_quant_key(
+     static: bool,

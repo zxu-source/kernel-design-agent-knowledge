@@ -1,0 +1,810 @@
+diff --git a/python/sglang/kernels/ops/speculative/cache_locs.py b/python/sglang/kernels/ops/speculative/cache_locs.py
+index d80e941c9f3f..01ee6eae9a50 100644
+--- a/python/sglang/kernels/ops/speculative/cache_locs.py
++++ b/python/sglang/kernels/ops/speculative/cache_locs.py
+@@ -258,6 +258,74 @@ def filter_finished_cache_loc_kernel(
+     )
+ 
+ 
++@triton.jit
++def rebuild_compact_draft_req_to_token(
++    draft_req_to_token,
++    target_req_to_token,
++    req_pool_indices,
++    suffix_start,
++    draft_prefix_lens,
++    verify_out_cache_loc,
++    verify_loc_stride,
++    draft_pool_len: tl.constexpr,
++    target_pool_len: tl.constexpr,
++    block_size: tl.constexpr,
++):
++    """Rebuild one request's draft-local compact req->token row in a single pass.
++
++    Row layout written: [0, prefix_len) = the committed target suffix window
++    (target_req_to_token[req, suffix_start : suffix_start + prefix_len]) and
++    [prefix_len, prefix_len + block_size) = the verify block slots. Fixed grid,
++    per-row data-dependent loop bound; no host reads, so the caller never syncs.
++    """
++    BLOCK: tl.constexpr = 256
++    pid = tl.program_id(axis=0)
++    req = tl.load(req_pool_indices + pid).to(tl.int64)
++    start = tl.load(suffix_start + pid).to(tl.int64)
++    prefix_len = tl.load(draft_prefix_lens + pid).to(tl.int64)
++    total = prefix_len + block_size
++
++    src_row = target_req_to_token + req * target_pool_len
++    dst_row = draft_req_to_token + req * draft_pool_len
++    verify_row = verify_out_cache_loc + pid * verify_loc_stride
++
++    offs = tl.arange(0, BLOCK).to(tl.int64)
++    num_loop = tl.cdiv(total, BLOCK)
++    for i in range(num_loop):
++        col = offs + i * BLOCK
++        in_prefix = col < prefix_len
++        in_block = (col >= prefix_len) & (col < total)
++        src = tl.load(src_row + start + col, mask=in_prefix, other=0)
++        blk = tl.load(verify_row + (col - prefix_len), mask=in_block, other=0)
++        val = tl.where(in_prefix, src, blk)
++        tl.store(dst_row + col, val, mask=in_prefix | in_block)
++
++
++def rebuild_compact_draft_req_to_token_func(
++    *,
++    draft_req_to_token: torch.Tensor,
++    target_req_to_token: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    suffix_start: torch.Tensor,
++    draft_prefix_lens: torch.Tensor,
++    verify_out_cache_loc_2d: torch.Tensor,
++    batch_size: int,
++    block_size: int,
++) -> None:
++    rebuild_compact_draft_req_to_token[(batch_size,)](
++        draft_req_to_token,
++        target_req_to_token,
++        req_pool_indices,
++        suffix_start,
++        draft_prefix_lens,
++        verify_out_cache_loc_2d,
++        verify_out_cache_loc_2d.stride(0),
++        draft_req_to_token.shape[1],
++        target_req_to_token.shape[1],
++        block_size,
++    )
++
++
+ @triton.jit
+ def assign_extend_cache_locs(
+     req_pool_indices,
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index a82b079cf435..bcddb9f6a4f4 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -745,6 +745,8 @@ class Envs:
+ 
+     # Spec Config
+     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
++    # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
++    SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+diff --git a/python/sglang/srt/layers/attention/hybrid_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_attn_backend.py
+index 40f775d8f9a9..8deac2d77fd6 100644
+--- a/python/sglang/srt/layers/attention/hybrid_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_attn_backend.py
+@@ -30,6 +30,12 @@ def __init__(
+         self.spec_attn_is_prefill = (
+             model_runner.server_args.speculative_attention_mode == "prefill"
+         )
++        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
++        # delegation the base-class default (True) forces a per-step seq_lens
++        # D2H + host sync even when both sub-backends opted out.
++        self.needs_cpu_seq_lens = (
++            prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
++        )
+ 
+     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
+         """
+diff --git a/python/sglang/srt/layers/attention/trtllm_mla_backend.py b/python/sglang/srt/layers/attention/trtllm_mla_backend.py
+index 6e6d6fce436c..4b16ed5ae99e 100755
+--- a/python/sglang/srt/layers/attention/trtllm_mla_backend.py
++++ b/python/sglang/srt/layers/attention/trtllm_mla_backend.py
+@@ -384,8 +384,9 @@ def _apply_cuda_graph_metadata(
+         metadata = self.decode_cuda_graph_metadata[bs]
+ 
+         if forward_mode.is_target_verify():
+-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
+-            metadata.seq_lens_k.copy_(seq_lens)
++            # Intentional int64 -> int32 same-kind out= downcast.
++            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
++            seq_lens = metadata.seq_lens_k
+         elif forward_mode.is_draft_extend_v2():
+             num_tokens_per_req = self.num_draft_tokens
+             metadata.max_seq_len_q = num_tokens_per_req
+@@ -514,11 +515,13 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+                 or forward_batch.forward_mode.is_draft_extend_v2()
+             ):
+                 self.forward_prefill_metadata = None
+-            # Get maximum sequence length.
++            # Never read max_seq from the GPU tensor (.max().item() blocks the
++            # host on the stream backlog); max_seq only sizes the block table /
++            # scheduling hint, so the static context bound is a safe fallback.
+             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
+                 max_seq = forward_batch.seq_lens_cpu.max().item()
+             else:
+-                max_seq = forward_batch.seq_lens.max().item()
++                max_seq = self.max_context_len
+ 
+             seq_lens = forward_batch.seq_lens
+ 
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 9f0ec279e83e..a8cea65ec910 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2929,6 +2929,7 @@ def filter_batch(
+             self.spec_info.filter_batch(
+                 new_indices=keep_indices_device,
+                 has_been_filtered=False,
++                new_indices_cpu=keep_indices,
+             )
+ 
+     def merge_batch(self, other: ScheduleBatch):
+diff --git a/python/sglang/srt/speculative/dflash_info_v2.py b/python/sglang/srt/speculative/dflash_info_v2.py
+index f9f689e02a84..8893a6541fd3 100644
+--- a/python/sglang/srt/speculative/dflash_info_v2.py
++++ b/python/sglang/srt/speculative/dflash_info_v2.py
+@@ -2,7 +2,7 @@
+ 
+ import contextlib
+ from dataclasses import dataclass
+-from typing import Optional
++from typing import List, Optional
+ 
+ import torch
+ 
+@@ -212,9 +212,19 @@ def prepare_for_decode(self, batch: ScheduleBatch):
+         self.reserved_seq_lens_cpu = nxt_kv_lens_cpu_t
+         self.reserved_seq_lens_sum = reserved_seq_lens_sum
+ 
+-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
++    def filter_batch(
++        self,
++        new_indices: torch.Tensor,
++        has_been_filtered: bool = True,
++        new_indices_cpu: Optional[List[int]] = None,
++    ):
+         if self.reserved_seq_lens_cpu is not None:
+-            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
++            if new_indices_cpu is not None:
++                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices_cpu]
++            else:
++                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[
++                    new_indices.cpu()
++                ]
+             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+ 
+         if self.future_indices is not None:
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index f4a5e331e448..caf2e5ea556a 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -5,7 +5,10 @@
+ 
+ import torch
+ 
+-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
++from sglang.kernels.ops.speculative.cache_locs import (
++    assign_extend_cache_locs_func,
++    rebuild_compact_draft_req_to_token_func,
++)
+ from sglang.kernels.ops.speculative.dflash import (
+     _compute_dflash_accept_bonus_triton_unchecked,
+     _prepare_dflash_draft_block_unchecked,
+@@ -13,6 +16,7 @@
+ from sglang.srt.configs.hybrid_arch import mambaish_config
+ from sglang.srt.distributed import get_tp_group
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
++from sglang.srt.environ import envs
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.managers.scheduler import GenerationBatchResult
+ from sglang.srt.managers.tp_worker import TpModelWorker
+@@ -69,20 +73,47 @@ class _DflashDraftSampler:
+     """Capture-safe greedy argmax over the target LM head, run inside the draft
+     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
+     DFLASH's draft has no head of its own; it borrows the target `lm_head`.
+-    tp=1 / no-added-vocab only; TP>1 stays eager in the worker.
++
++    tp=1: plain argmax over the local (full) vocab shard.
++    tp>1: per-rank shard (max, global id) -> all-gather -> first-max select.
++    Tie resolution is bit-exact vs a full-vocab argmax: ranks own contiguous
++    ascending vocab shards and torch.argmax returns the FIRST max index.
++    No added-vocab support (the builder bails to eager in that case).
+     """
+ 
+-    def __init__(self, *, weight, block_size, num_org, org_vocab_start, max_bs):
++    def __init__(
++        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
++    ):
+         self.weight = weight
+         self.block_size = int(block_size)
+         self.num_org = int(num_org)
+         self.org_vocab_start = int(org_vocab_start)
++        self.tp_group = tp_group
++        self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
++        max_tokens = int(max_bs) * (self.block_size - 1)
++        device = weight.device
+         # Proposed draft tokens: written in-graph, read by the worker after replay.
+-        self.out = torch.empty(
+-            (int(max_bs) * (self.block_size - 1),),
+-            dtype=torch.int64,
+-            device=weight.device,
+-        )
++        self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
++        if self.tp_size > 1:
++            # Static buffers (fixed addresses) keep the in-graph select replay-safe.
++            self.local_max = torch.empty(
++                (max_tokens,), dtype=weight.dtype, device=device
++            )
++            self.local_arg = torch.empty(
++                (max_tokens,), dtype=torch.int64, device=device
++            )
++            self.gathered_max = torch.empty(
++                (self.tp_size * max_tokens,), dtype=weight.dtype, device=device
++            )
++            self.gathered_ids = torch.empty(
++                (self.tp_size * max_tokens,), dtype=torch.int64, device=device
++            )
++            self.best_rank = torch.empty(
++                (1, max_tokens), dtype=torch.int64, device=device
++            )
++            self.selected_ids = torch.empty(
++                (1, max_tokens), dtype=torch.int64, device=device
++            )
+ 
+     def __call__(self, hidden_states, input_ids=None):
+         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
+@@ -92,11 +123,28 @@ def __call__(self, hidden_states, input_ids=None):
+         )
+         if hs.dtype != self.weight.dtype:
+             hs = hs.to(self.weight.dtype)
++        n = hs.shape[0]
+         logits = torch.matmul(hs, self.weight[: self.num_org].T)
+-        tokens = torch.argmax(logits, dim=-1).to(torch.long)
++        if self.tp_size == 1:
++            tokens = torch.argmax(logits, dim=-1).to(torch.long)
++            if self.org_vocab_start:
++                tokens += self.org_vocab_start
++            self.out[:n].copy_(tokens)
++            return
++        local_max = self.local_max[:n]
++        local_arg = self.local_arg[:n]
++        torch.max(logits, dim=-1, out=(local_max, local_arg))
+         if self.org_vocab_start:
+-            tokens += self.org_vocab_start
+-        self.out[: tokens.shape[0]].copy_(tokens)
++            local_arg.add_(self.org_vocab_start)
++        gathered_max = self.gathered_max[: self.tp_size * n]
++        gathered_ids = self.gathered_ids[: self.tp_size * n]
++        self.tp_group.all_gather_into_tensor(gathered_max, local_max)
++        self.tp_group.all_gather_into_tensor(gathered_ids, local_arg)
++        best_rank = self.best_rank[:, :n]
++        torch.argmax(gathered_max.view(self.tp_size, n), dim=0, out=best_rank[0])
++        selected = self.selected_ids[:, :n]
++        torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
++        self.out[:n].copy_(selected.view(-1))
+ 
+ 
+ class DFlashWorkerV2(BaseSpecWorker):
+@@ -223,6 +271,10 @@ def __init__(
+         supports_gpu_triton = is_cuda() or is_hip()
+         self._use_triton_prepare_block = supports_gpu_triton
+         self._use_triton_accept_bonus = supports_gpu_triton
++        # The legacy compact-rebuild path host-syncs twice per step (masked
++        # gather's implicit nonzero D2H + lengths.max().item()); keep it only
++        # for platforms without GPU triton.
++        self._use_triton_compact_rebuild = supports_gpu_triton
+         self._accept_bonus_buffer_cap: int = 0
+         self._accept_bonus_buffer_slot: int = 0
+         self._accept_len_buf: Optional[torch.Tensor] = None
+@@ -305,8 +357,8 @@ def _eager(reason):
+                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
+             return None
+ 
+-        if get_tp_group().world_size != 1:
+-            return _eager("tp>1")
++        if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
++            return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
+         if self.block_size <= 1:
+             return _eager("block_size<=1")
+         target_model = self._target_worker.model_runner.model
+@@ -316,7 +368,11 @@ def _eager(reason):
+         if not torch.is_floating_point(lm_head.weight):
+             # Quantized lm_head (FP8/INT) would break the static matmul.
+             return _eager("quantized lm_head")
++        tp_group = get_tp_group()
+         if not hasattr(lm_head, "shard_indices"):
++            if tp_group.world_size != 1:
++                # No shard metadata to recover per-rank vocab offsets from.
++                return _eager("tp>1 without shard_indices")
+             num_org = int(lm_head.weight.shape[0])
+             org_vocab_start = 0
+         else:
+@@ -326,13 +382,17 @@ def _eager(reason):
+             num_org = int(shard.num_org_elements)
+             org_vocab_start = int(shard.org_vocab_start_index)
+         if self.ps.tp_rank == 0:
+-            logger.info("DFLASH draft greedy head folded into the draft cuda graph.")
++            logger.info(
++                "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
++                tp_group.world_size,
++            )
+         return _DflashDraftSampler(
+             weight=lm_head.weight,
+             block_size=self.block_size,
+             num_org=num_org,
+             org_vocab_start=org_vocab_start,
+             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
++            tp_group=tp_group if tp_group.world_size > 1 else None,
+         )
+ 
+     def _init_fused_kv_helper(self) -> None:
+@@ -562,6 +622,24 @@ def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tenso
+         aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
+         return (seq_lens_i64 - aligned_start).to(torch.int32)
+ 
++    def _compute_compact_draft_seq_lens_host(
++        self, host_seq_lens: torch.Tensor, out: torch.Tensor
++    ) -> None:
++        """Sync-free host upper bound for _compute_compact_draft_seq_lens.
++
++        Deliberately NOT the exact page-align arithmetic: that mapping is a
++        non-monotonic sawtooth in [window, window+page), so evaluating it on an
++        over-estimated host len (the reserved overlap bound) could UNDER-shoot
++        the true device value. min(len, window+page) is its monotonic envelope
++        (always >= the exact compact len); consumers only need an upper bound.
++        """
++        assert self.draft_window_size is not None
++        bound = int(self.draft_window_size) + (
++            self.page_size if self.page_size > 1 else 0
++        )
++        lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
++        out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
++
+     def _resolve_mask_token_id(
+         self, *, mask_token: str, mask_token_id: Optional[int] = None
+     ) -> int:
+@@ -1150,8 +1228,9 @@ def _ensure_accept_bonus_buffers(self, bs: int) -> None:
+         self._commit_lens_bufs = [
+             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
+         ]
++        # int64 keeps the downstream .to(torch.int64) a no-op.
+         self._bonus_id_bufs = [
+-            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
++            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
+         ]
+         self._out_tokens_bufs = [
+             torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
+@@ -1409,36 +1488,63 @@ def forward_batch_generation(
+         if self.use_compact_draft_cache:
+             # Rebuild the draft-local sliding-window view from committed target state.
+             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+-            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
++
++            # Host planning bound without a device sync; backends consume
++            # seq_lens_cpu as a safe upper bound (same contract as below).
++            if batch.seq_lens_cpu is not None:
++                self._compute_compact_draft_seq_lens_host(
++                    batch.seq_lens_cpu, out=seq_lens_cpu
++                )
++            elif draft_input.reserved_seq_lens_cpu is not None:
++                self._compute_compact_draft_seq_lens_host(
++                    draft_input.reserved_seq_lens_cpu, out=seq_lens_cpu
++                )
++            else:
++                # Last resort: the legacy blocking D2H copy.
++                seq_lens_cpu.copy_(
++                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
++                )
+ 
+             suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                 torch.int64
+             )
+-            suffix_cache_loc = self._gather_req_to_token_segments(
+-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+-                req_pool_indices=batch.req_pool_indices,
+-                start=suffix_start,
+-                lengths=draft_prefix_lens,
+-            )
+-            assign_req_to_token_pool_func(
+-                batch.req_pool_indices,
+-                self.draft_model_runner.req_to_token_pool.req_to_token,
+-                torch.zeros_like(draft_prefix_lens),
+-                draft_prefix_lens,
+-                suffix_cache_loc,
+-                bs,
+-            )
++            if self._use_triton_compact_rebuild:
++                rebuild_compact_draft_req_to_token_func(
++                    draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
++                    target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
++                    req_pool_indices=batch.req_pool_indices,
++                    suffix_start=suffix_start,
++                    draft_prefix_lens=draft_prefix_lens,
++                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
++                    batch_size=bs,
++                    block_size=block_size,
++                )
++            else:
++                suffix_cache_loc = self._gather_req_to_token_segments(
++                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
++                    req_pool_indices=batch.req_pool_indices,
++                    start=suffix_start,
++                    lengths=draft_prefix_lens,
++                )
++                assign_req_to_token_pool_func(
++                    batch.req_pool_indices,
++                    self.draft_model_runner.req_to_token_pool.req_to_token,
++                    torch.zeros_like(draft_prefix_lens),
++                    draft_prefix_lens,
++                    suffix_cache_loc,
++                    bs,
++                )
+ 
+-            block_end = self._draft_block_end_buf[:bs]
+-            torch.add(draft_prefix_lens, block_size, out=block_end)
+-            assign_req_to_token_pool_func(
+-                batch.req_pool_indices,
+-                self.draft_model_runner.req_to_token_pool.req_to_token,
+-                draft_prefix_lens,
+-                block_end,
+-                verify_out_cache_loc,
+-                bs,
+-            )
++                block_end = self._draft_block_end_buf[:bs]
++                torch.add(draft_prefix_lens, block_size, out=block_end)
++                assign_req_to_token_pool_func(
++                    batch.req_pool_indices,
++                    self.draft_model_runner.req_to_token_pool.req_to_token,
++                    draft_prefix_lens,
++                    block_end,
++                    verify_out_cache_loc,
++                    bs,
++                )
+             draft_seq_lens = draft_prefix_lens
+             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
+         else:
+diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
+index 2059ee416f0e..6d7572a32ec6 100644
+--- a/python/sglang/srt/speculative/eagle_info.py
++++ b/python/sglang/srt/speculative/eagle_info.py
+@@ -208,7 +208,12 @@ def create_idle_input(
+             capture_hidden_mode=capture_hidden_mode,
+         )
+ 
+-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
++    def filter_batch(
++        self,
++        new_indices: torch.Tensor,
++        has_been_filtered: bool = True,
++        new_indices_cpu: Optional[List[int]] = None,
++    ):
+         if self.future_indices is not None:
+             self.future_indices = self.future_indices[new_indices]
+             return
+diff --git a/python/sglang/srt/speculative/ngram_info.py b/python/sglang/srt/speculative/ngram_info.py
+index b866aaadfbaa..719ac050b88c 100644
+--- a/python/sglang/srt/speculative/ngram_info.py
++++ b/python/sglang/srt/speculative/ngram_info.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from typing import Optional
++from typing import List, Optional
+ 
+ import torch
+ 
+@@ -116,7 +116,12 @@ def generate_attn_arg_prefill(
+ 
+         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
+ 
+-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
++    def filter_batch(
++        self,
++        new_indices: torch.Tensor,
++        has_been_filtered: bool = True,
++        new_indices_cpu: Optional[List[int]] = None,
++    ):
+         if self.future_indices is not None:
+             self.future_indices = self.future_indices[new_indices]
+         if self.new_seq_lens is not None:
+diff --git a/test/registered/unit/model_executor/model_runner_components/test_attention_backend_setup.py b/test/registered/unit/model_executor/model_runner_components/test_attention_backend_setup.py
+index 2f9f9e5dc168..6ac31c2363c3 100644
+--- a/test/registered/unit/model_executor/model_runner_components/test_attention_backend_setup.py
++++ b/test/registered/unit/model_executor/model_runner_components/test_attention_backend_setup.py
+@@ -19,6 +19,8 @@
+ class _FakeBackend:
+     def __init__(self, name):
+         self.name = name
++        # Real backends always carry this (AttentionBackend class attribute).
++        self.needs_cpu_seq_lens = True
+ 
+ 
+ def test_split_full_attention_applies_model_wrapper_once():
+diff --git a/test/registered/unit/spec/test_dflash_overlap_hostsync.py b/test/registered/unit/spec/test_dflash_overlap_hostsync.py
+new file mode 100644
+index 000000000000..099fa969a717
+--- /dev/null
++++ b/test/registered/unit/spec/test_dflash_overlap_hostsync.py
+@@ -0,0 +1,270 @@
++"""Unit tests for the DFlash spec-v2 host-sync removal: compact-rebuild
++kernel bit-exactness, vocab-parallel draft sampler select, host seq-lens
++upper bound, hybrid needs_cpu_seq_lens delegation, filter_batch host
++keep-list."""
++
++import unittest
++from types import SimpleNamespace
++
++import torch
++
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
++
++_HAS_CUDA = torch.cuda.is_available()
++
++
++def _compact_lens_exact(seq_lens, window, page):
++    fake_self = SimpleNamespace(
++        device=seq_lens.device, draft_window_size=window, page_size=page
++    )
++    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++    return DFlashWorkerV2._compute_compact_draft_seq_lens(fake_self, seq_lens)
++
++
++def _compact_lens_host(seq_lens, window, page):
++    fake_self = SimpleNamespace(draft_window_size=window, page_size=page)
++    out = torch.empty(seq_lens.numel(), dtype=torch.int32)
++    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++    DFlashWorkerV2._compute_compact_draft_seq_lens_host(fake_self, seq_lens, out)
++    return out
++
++
++class TestCompactSeqLensHostBound(CustomTestCase):
++    def test_upper_bound_of_exact(self):
++        g = torch.Generator().manual_seed(0)
++        for window, page in [(4096, 64), (4096, 1), (128, 32), (64, 1)]:
++            seq = torch.randint(1, 3 * window, (512,), generator=g)
++            exact = _compact_lens_exact(seq, window, page).to(torch.int64)
++            bound = _compact_lens_host(seq, window, page).to(torch.int64)
++            self.assertTrue(
++                bool((bound >= exact).all()),
++                f"host bound under-shoots exact at window={window} page={page}",
++            )
++
++    def test_sawtooth_counterexample(self):
++        # exact(4160) = 4096 < exact(4100) = 4100 at window=4096 page=64:
++        # a host mirror of the exact math fed the reserved over-estimate
++        # (4160 >= true 4100) would under-shoot; the envelope must not.
++        window, page = 4096, 64
++        true_len = torch.tensor([4100])
++        reserved = torch.tensor([4160])
++        exact_true = _compact_lens_exact(true_len, window, page).to(torch.int64)
++        exact_reserved = _compact_lens_exact(reserved, window, page).to(torch.int64)
++        self.assertLess(int(exact_reserved), int(exact_true))
++        bound = _compact_lens_host(reserved, window, page).to(torch.int64)
++        self.assertGreaterEqual(int(bound), int(exact_true))
++
++
++class _FakeTpGroup:
++    """Single-process stand-in for the TP GroupCoordinator: replays the
++    concatenation of all ranks' recorded all-gather inputs."""
++
++    def __init__(self, world_size):
++        self.world_size = world_size
++        self.recording = True
++        self.recorded = {}  # (rank, call_idx) -> tensor
++        self.rank = 0
++        self.call_idx = 0
++
++    def all_gather_into_tensor(self, output, input_):
++        if self.recording:
++            self.recorded[(self.rank, self.call_idx)] = input_.clone()
++        else:
++            output.copy_(
++                torch.cat(
++                    [self.recorded[(r, self.call_idx)] for r in range(self.world_size)]
++                )
++            )
++        self.call_idx += 1
++
++
++class TestDflashDraftSamplerVocabParallel(CustomTestCase):
++    def _run(self, vocab, hidden, bs, block_size, world, dtype, weight=None):
++        from sglang.srt.speculative.dflash_worker_v2 import _DflashDraftSampler
++
++        device = torch.device("cuda" if _HAS_CUDA else "cpu")
++        g = torch.Generator(device=device).manual_seed(0)
++        if weight is None:
++            weight = torch.randn(vocab, hidden, generator=g, device=device, dtype=dtype)
++        hs = torch.randn(
++            bs * block_size, hidden, generator=g, device=device, dtype=dtype
++        )
++        shard = vocab // world
++        group = _FakeTpGroup(world)
++        samplers = [
++            _DflashDraftSampler(
++                weight=weight[r * shard : (r + 1) * shard].contiguous(),
++                block_size=block_size,
++                num_org=shard,
++                org_vocab_start=r * shard,
++                max_bs=bs,
++                tp_group=group,
++            )
++            for r in range(world)
++        ]
++        for phase_recording in (True, False):
++            group.recording = phase_recording
++            for r, s in enumerate(samplers):
++                group.rank, group.call_idx = r, 0
++                s(hs)
++
++        n = bs * (block_size - 1)
++        ref_hs = hs.view(bs, block_size, -1)[:, 1:, :].reshape(-1, hidden)
++        ref = torch.argmax(torch.matmul(ref_hs.to(weight.dtype), weight.T), dim=-1).to(
++            torch.long
++        )
++        for r, s in enumerate(samplers):
++            torch.testing.assert_close(
++                s.out[:n], ref, rtol=0, atol=0, msg=f"rank {r} mismatch"
++            )
++
++    def test_matches_full_vocab_argmax(self):
++        self._run(
++            vocab=512, hidden=64, bs=3, block_size=8, world=4, dtype=torch.float32
++        )
++
++    def test_shard_boundary_tie_resolves_to_first_global_index(self):
++        # Duplicate row 10 (shard 0) at row 200 (shard 1): identical logits, so
++        # a correct fold must pick 10 (torch.argmax first-max semantics).
++        vocab, hidden = 256, 32
++        device = torch.device("cuda" if _HAS_CUDA else "cpu")
++        weight = torch.zeros(vocab, hidden, device=device)
++        weight[10] = 1.0
++        weight[200] = 1.0
++        self._run(
++            vocab=vocab,
++            hidden=hidden,
++            bs=1,
++            block_size=4,
++            world=2,
++            dtype=torch.float32,
++            weight=weight,
++        )
++
++
++@unittest.skipUnless(_HAS_CUDA, "triton kernel requires CUDA")
++class TestRebuildCompactDraftReqToToken(CustomTestCase):
++    def _legacy(self, draft, target, req_idx, start, lens, verify_2d, bs, block):
++        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
++
++        lens64 = lens.to(torch.int64)
++        max_len = int(lens64.max().item())
++        offs = torch.arange(max_len, device=lens.device).unsqueeze(0)
++        pos2d = start.to(torch.int64).unsqueeze(1) + offs
++        mask = offs < lens64.unsqueeze(1)
++        packed = target[req_idx.to(torch.int64)[:, None], pos2d.masked_fill(~mask, 0)][
++            mask
++        ].to(torch.int64)
++        assign_req_to_token_pool_func(
++            req_idx, draft, torch.zeros_like(lens), lens, packed, bs
++        )
++        assign_req_to_token_pool_func(
++            req_idx, draft, lens, lens + block, verify_2d.reshape(-1), bs
++        )
++
++    def test_bitexact_vs_legacy(self):
++        from sglang.kernels.ops.speculative.cache_locs import (
++            rebuild_compact_draft_req_to_token_func,
++        )
++
++        device = torch.device("cuda")
++        for bs, window, page, block, seed in [
++            (1, 64, 1, 8, 0),
++            (16, 64, 32, 8, 1),
++            (13, 128, 64, 8, 2),
++            (7, 512, 64, 16, 3),
++        ]:
++            g = torch.Generator(device=device).manual_seed(seed)
++            pool_rows, width = 4 * bs, 4 * window
++            seq = torch.randint(
++                1, width - block - 1, (bs,), generator=g, device=device
++            ).to(torch.int64)
++            lens = _compact_lens_exact(seq, window, page).to(device)
++            start = seq - lens.to(torch.int64)
++            req_idx = torch.randperm(pool_rows, generator=g, device=device)[:bs]
++            target = torch.randint(
++                0, 2**30, (pool_rows, width), generator=g, device=device
++            ).to(torch.int32)
++            verify_2d = torch.randint(
++                0, 2**30, (bs, block), generator=g, device=device
++            ).to(torch.int64)
++            draft_width = window + page + block + 8
++            draft_a = torch.full(
++                (pool_rows, draft_width), -1, dtype=torch.int32, device=device
++            )
++            draft_b = draft_a.clone()
++
++            self._legacy(draft_a, target, req_idx, start, lens, verify_2d, bs, block)
++            rebuild_compact_draft_req_to_token_func(
++                draft_req_to_token=draft_b,
++                target_req_to_token=target,
++                req_pool_indices=req_idx,
++                suffix_start=start,
++                draft_prefix_lens=lens,
++                verify_out_cache_loc_2d=verify_2d,
++                batch_size=bs,
++                block_size=block,
++            )
++            torch.testing.assert_close(draft_b, draft_a, rtol=0, atol=0)
++            for i in range(bs):
++                total = int(lens[i].item()) + block
++                self.assertTrue(
++                    bool((draft_b[req_idx[i], total:] == -1).all()),
++                    "kernel wrote past the verify block",
++                )
++
++
++class TestHybridNeedsCpuSeqLens(CustomTestCase):
++    def _make(self, prefill_flag, decode_flag):
++        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
++
++        def backend(flag):
++            return SimpleNamespace(needs_cpu_seq_lens=flag)
++
++        runner = SimpleNamespace(
++            server_args=SimpleNamespace(speculative_attention_mode="decode"),
++            kv_cache_dtype=torch.bfloat16,
++            token_to_kv_pool=None,
++            req_to_token_pool=None,
++        )
++        return HybridAttnBackend(runner, backend(prefill_flag), backend(decode_flag))
++
++    def test_delegation(self):
++        self.assertFalse(self._make(False, False).needs_cpu_seq_lens)
++        self.assertTrue(self._make(True, False).needs_cpu_seq_lens)
++        self.assertTrue(self._make(False, True).needs_cpu_seq_lens)
++
++
++class TestFilterBatchHostIndices(CustomTestCase):
++    def test_host_keep_list_matches_gpu_indices(self):
++        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
++
++        def make():
++            info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
++            info.reserved_seq_lens_cpu = torch.tensor(
++                [10, 20, 30, 40], dtype=torch.int32
++            )
++            info.reserved_seq_lens_sum = 100
++            info.future_indices = torch.tensor([5, 6, 7, 8])
++            return info
++
++        keep = [0, 2]
++        a, b = make(), make()
++        a.filter_batch(new_indices=torch.tensor(keep), has_been_filtered=False)
++        b.filter_batch(
++            new_indices=torch.tensor(keep),
++            has_been_filtered=False,
++            new_indices_cpu=keep,
++        )
++        torch.testing.assert_close(a.reserved_seq_lens_cpu, b.reserved_seq_lens_cpu)
++        self.assertEqual(a.reserved_seq_lens_sum, b.reserved_seq_lens_sum)
++        torch.testing.assert_close(a.future_indices, b.future_indices)
++
++
++if __name__ == "__main__":
++    unittest.main()

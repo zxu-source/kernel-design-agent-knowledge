@@ -1,0 +1,1393 @@
+diff --git a/python/sglang/jit_kernel/tests/test_minimax_m3_mxfp8.py b/python/sglang/jit_kernel/tests/test_minimax_m3_mxfp8.py
+index 1af138548476..c8822e8109f4 100644
+--- a/python/sglang/jit_kernel/tests/test_minimax_m3_mxfp8.py
++++ b/python/sglang/jit_kernel/tests/test_minimax_m3_mxfp8.py
+@@ -163,7 +163,7 @@ def _ref_moe(x, w13, w2, topk_weights, topk_ids, alpha, beta, limit):
+ )
+ @torch.inference_mode()
+ def test_mxfp8_native_moe(T, H, inter, E, top_k):
+-    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
++    from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
+         fused_moe_mxfp8_native,
+     )
+ 
+@@ -203,7 +203,7 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
+ @requires_gfx950
+ @torch.inference_mode()
+ def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
+-    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
++    from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
+         fused_moe_mxfp8_native,
+     )
+ 
+diff --git a/python/sglang/kernels/ops/moe/__init__.py b/python/sglang/kernels/ops/moe/__init__.py
+index 85012c388513..aacaed80bb86 100644
+--- a/python/sglang/kernels/ops/moe/__init__.py
++++ b/python/sglang/kernels/ops/moe/__init__.py
+@@ -133,6 +133,32 @@ def topk_softmax(
+ del _mod, _fn
+ 
+ 
++# Triton kernels migrated from srt/layers/moe (RFC #29630, Phase 2.5);
++# registered for inventory. Import them from their modules.
++_PHASE25_TRITON_KERNELS = [
++    ("ep_moe_kernels", "deepep_run_moe_deep_preprocess"),
++    ("ep_moe_kernels", "deepep_permute_triton_kernel"),
++    ("ep_moe_kernels", "deepep_post_reorder_triton_kernel"),
++    ("fused_moe_triton_kernels", "invoke_fused_moe_kernel"),
++    ("fused_moe_triton_kernels", "fused_moe_kernel"),
++    ("fused_moe_triton_kernels", "fused_moe_kernel_gptq_awq"),
++    ("mxfp8_moe_amd_gfx95", "fused_experts_mxfp8"),
++    ("rocm_moe_utils", "upscale"),
++    ("rocm_moe_utils", "upscale_mxfp4"),
++    ("router", "fused_moe_router_shim"),
++    ("deepep_waterfill_kernels", "materialize_waterfill_dispatch_fused"),
++    ("fill_padded_rows", "_fill_padded_rows"),
++]
++for _mod, _fn in _PHASE25_TRITON_KERNELS:
++    register_kernel(
++        KernelSpec(
++            op=f"moe.{_fn.lstrip('_')}",
++            backend=KernelBackend.TRITON,
++            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
++        )
++    )
++del _mod, _fn
++
+ # Packed (topk_id << 16 | bf16-weight) kernel migrated from
+ # srt/layers/quantization/mxfp4_flashinfer_trtllm_moe (RFC #29630, Phase 2.5).
+ register_kernel(
+diff --git a/python/sglang/kernels/ops/moe/deepep_waterfill_kernels.py b/python/sglang/kernels/ops/moe/deepep_waterfill_kernels.py
+new file mode 100644
+index 000000000000..0be319cfca10
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/deepep_waterfill_kernels.py
+@@ -0,0 +1,322 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""DeepEP Waterfill dispatch kernels (RFC #29630, Phase 2.5).
++
++Triton kernels and the fused dispatch materializer migrated from
++``sglang.srt.layers.moe.deepep_waterfill``; the balancer policy stays in srt.
++"""
++
++from typing import NamedTuple, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++
++LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
++_LOCAL_PREF_NUMER = 11  # local-rank preference = 11/10
++_LOCAL_PREF_DENOM = 10
++
++
++class WaterfillDispatchPlan(NamedTuple):
++    """Inputs needed by the fused DeepEP Waterfill expansion path."""
++
++    # Effective rank load consumed by the fused kernel.
++    rank_load: Tensor
++    allow_all_ranks: bool
++    target_total: int
++
++
++def _empty_expanded(topk_ids: Tensor, topk_weights: Tensor):
++    """Return empty expanded tensors for zero-token batches."""
++    topk, d = topk_ids.shape[1], topk_ids.device
++    return (
++        torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=d),
++        torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=d),
++    )
++
++
++@triton.jit
++def _count_routed_per_rank_kernel(
++    topk_ids_ptr,  # [num_tokens, topk]
++    counts_ptr,  # [world_size] output (atomic add)
++    num_tokens,
++    topk: tl.constexpr,
++    experts_per_rank,
++    world_size: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    """Count routed tokens per rank using block-level histogram."""
++    pid = tl.program_id(0)
++    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = token_idx < num_tokens
++
++    for r in range(world_size):
++        rank_count = tl.zeros([BLOCK_SIZE], dtype=tl.int64)
++
++        for k in range(topk):
++            expert_id = tl.load(
++                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
++            ).to(tl.int64)
++            valid = expert_id >= 0
++            target_rank = expert_id // experts_per_rank
++            target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
++            rank_count += tl.where(
++                mask & valid & (target_rank == r),
++                tl.full([BLOCK_SIZE], 1, dtype=tl.int64),
++                tl.zeros([BLOCK_SIZE], dtype=tl.int64),
++            )
++
++        block_total = tl.sum(rank_count)
++        if block_total > 0:
++            tl.atomic_add(counts_ptr + r, block_total)
++
++
++@triton.jit
++def _waterfill_expand_kernel(
++    topk_ids_ptr,
++    topk_weights_ptr,
++    rank_load_ptr,
++    expanded_ids_ptr,
++    expanded_weights_ptr,
++    num_tokens,
++    topk: tl.constexpr,
++    old_experts_per_rank,
++    new_experts_per_rank,
++    world_size: tl.constexpr,
++    source_rank,
++    shared_weight,
++    local_marker,
++    local_pref_numer,
++    local_pref_denom,
++    precomputed_target_total,
++    ALLOW_ALL_RANKS: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    """Fused waterfill + expand. ID remap: old_id -> old_id + old_id // old_epr."""
++    pid = tl.program_id(0)
++    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = token_idx < num_tokens
++
++    r_idx = tl.arange(0, world_size)
++    rank_load_vec = tl.load(rank_load_ptr + r_idx, mask=r_idx < world_size, other=0).to(
++        tl.int64
++    )
++    total_effective_k = tl.sum(rank_load_vec)
++    total_tokens_global_k = total_effective_k // topk
++    derived_target_total = (
++        total_effective_k + total_tokens_global_k + world_size - 1
++    ) // world_size
++    target_total = tl.where(
++        precomputed_target_total > 0,
++        precomputed_target_total,
++        derived_target_total,
++    )
++
++    # Step 1: Select destination rank for shared expert (waterfill sampling).
++    source_count = tl.load(rank_load_ptr + source_rank)
++    best_count = tl.where(mask, source_count, 2**30)
++    best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
++    has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
++    src_rank_i32 = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int32)
++
++    if ALLOW_ALL_RANKS:
++        candidate_mask = tl.full([BLOCK_SIZE], (1 << world_size) - 1, dtype=tl.int32)
++        for r in range(world_size):
++            target_count = tl.load(rank_load_ptr + r).to(tl.int64)
++            better = (
++                target_count * local_pref_numer < best_count * local_pref_denom
++            ) & mask
++            best_count = tl.where(better, target_count, best_count)
++            best_rank = tl.where(
++                better, tl.full([BLOCK_SIZE], r, dtype=tl.int64), best_rank
++            )
++    else:
++        candidate_mask = (tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << src_rank_i32).to(
++            tl.int32
++        )
++
++    for k in range(topk):
++        expert_id = tl.load(
++            topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
++        ).to(tl.int64)
++        valid = expert_id >= 0
++        has_valid = has_valid | valid
++
++        if not ALLOW_ALL_RANKS:
++            target_rank = expert_id // old_experts_per_rank
++            target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
++            target_rank_i32 = target_rank.to(tl.int32)
++            shift_amt = tl.where(valid, target_rank_i32, 0)
++            bit = tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << shift_amt
++            candidate_mask = tl.where(
++                valid & mask, candidate_mask | bit, candidate_mask
++            )
++
++            target_count = tl.load(
++                rank_load_ptr + target_rank, mask=mask & valid, other=2**30
++            )
++
++            better = (
++                (target_count * local_pref_numer < best_count * local_pref_denom)
++                & valid
++                & mask
++            )
++            best_count = tl.where(better, target_count, best_count)
++            best_rank = tl.where(better, target_rank, best_rank)
++
++    total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
++    for r in range(world_size):
++        present = ((candidate_mask >> r) & 1) == 1
++        rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
++        w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
++            tl.int32
++        )
++        w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
++        w_vec = tl.where(
++            src_rank_i32 == r,
++            w_vec,
++            (w_vec * local_pref_denom) // local_pref_numer,
++        )
++        total_w += tl.where(present, w_vec, 0)
++
++    token_seed = token_idx.to(tl.uint32) ^ (
++        src_rank_i32.to(tl.uint32) * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
++    )
++    token_seed = token_seed * tl.full([BLOCK_SIZE], 1664525, dtype=tl.uint32) + tl.full(
++        [BLOCK_SIZE], 1013904223, dtype=tl.uint32
++    )
++    u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
++
++    chosen = src_rank_i32
++    cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
++    for r in range(world_size):
++        present = ((candidate_mask >> r) & 1) == 1
++        rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
++        w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
++            tl.int32
++        )
++        w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
++        w_vec = tl.where(
++            src_rank_i32 == r,
++            w_vec,
++            (w_vec * local_pref_denom) // local_pref_numer,
++        )
++        w_vec = tl.where(present, w_vec, 0)
++        pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
++        chosen = tl.where(pick, r, chosen)
++        cum += w_vec
++
++    best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
++
++    # Step 2: Compute shared expert ID and local mask.
++    is_local = best_rank == source_rank
++    local_shared_id = source_rank * new_experts_per_rank + old_experts_per_rank
++    remote_shared_id = best_rank * new_experts_per_rank + old_experts_per_rank
++    shared_expert_id = tl.where(
++        is_local,
++        tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64),
++        remote_shared_id,
++    ).to(tl.int64)
++    shared_expert_id = tl.where(
++        has_valid,
++        shared_expert_id,
++        tl.full([BLOCK_SIZE], local_marker, dtype=tl.int64),
++    )
++
++    # Step 3: Copy and remap topk_ids, copy weights.
++    for k in range(topk):
++        old_id = tl.load(topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1).to(
++            tl.int64
++        )
++        valid_id = old_id >= 0
++        new_id = tl.where(valid_id, old_id + (old_id // old_experts_per_rank), old_id)
++        tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
++
++    for k in range(topk):
++        val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
++        expert_id = tl.load(
++            topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
++        ).to(tl.int64)
++        val = tl.where(expert_id >= 0, val, 0.0)
++        tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
++
++    # Step 4: Write shared expert column.
++    tl.store(
++        expanded_ids_ptr + token_idx * (topk + 1) + topk,
++        shared_expert_id,
++        mask=mask,
++    )
++    tl.store(
++        expanded_weights_ptr + token_idx * (topk + 1) + topk,
++        tl.where(has_valid, shared_weight, 0.0),
++        mask=mask,
++    )
++
++
++def materialize_waterfill_dispatch_fused(
++    topk_ids: Tensor,
++    topk_weights: Tensor,
++    rank_load: Tensor,
++    num_routed_experts: int,
++    world_size: int,
++    source_rank: int,
++    shared_weight: float,
++    allow_all_ranks: bool = False,
++    target_total: int = 0,
++) -> Tuple[Tensor, Tensor]:
++    """Run fused Waterfill rank selection and DeepEP TopK expansion.
++
++    The Triton kernel intentionally selects each token's shared-expert rank and
++    writes the expanded DeepEP TopK layout in one pass.
++    """
++    num_tokens = topk_ids.shape[0]
++    topk = topk_ids.shape[1]
++    old_experts_per_rank = num_routed_experts // world_size
++    new_experts_per_rank = old_experts_per_rank + 1
++    device = topk_ids.device
++
++    if num_tokens == 0:
++        return _empty_expanded(topk_ids, topk_weights)
++
++    expanded_topk_ids = torch.empty(
++        num_tokens, topk + 1, dtype=topk_ids.dtype, device=device
++    )
++    expanded_topk_weights = torch.empty(
++        num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
++    )
++    BLOCK_SIZE = 256
++    grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
++    _waterfill_expand_kernel[grid](
++        topk_ids,
++        topk_weights,
++        rank_load,
++        expanded_topk_ids,
++        expanded_topk_weights,
++        num_tokens,
++        topk,
++        old_experts_per_rank,
++        new_experts_per_rank,
++        world_size,
++        source_rank,
++        shared_weight,
++        LOCAL_SHARED_MARKER,
++        _LOCAL_PREF_NUMER,
++        _LOCAL_PREF_DENOM,
++        target_total,
++        allow_all_ranks,
++        BLOCK_SIZE,
++    )
++
++    return expanded_topk_ids, expanded_topk_weights
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/kernels/ops/moe/ep_moe_kernels.py
+similarity index 100%
+rename from python/sglang/srt/layers/moe/ep_moe/kernels.py
+rename to python/sglang/kernels/ops/moe/ep_moe_kernels.py
+diff --git a/python/sglang/kernels/ops/moe/fill_padded_rows.py b/python/sglang/kernels/ops/moe/fill_padded_rows.py
+new file mode 100644
+index 000000000000..35a65416b2e2
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/fill_padded_rows.py
+@@ -0,0 +1,78 @@
++"""Fused padded-row fill for MoE top-k outputs.
++
++Migrated from ``sglang.srt.layers.moe.topk`` (RFC #29630, Phase 2.5), where two
++near-identical copies had accumulated; this keeps the later, runtime-winning
++copy (explicit raises instead of asserts).
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _fill_padded_rows_kernel(
++    out_ptr,
++    num_token_non_padded_ptr,
++    n_cols,
++    fill_value,
++    stride_row,
++    BLOCK_COLS: tl.constexpr,
++):
++    row = tl.program_id(0)
++    n_valid = tl.load(num_token_non_padded_ptr)
++    if row >= n_valid:
++        cols = tl.arange(0, BLOCK_COLS)
++        mask = cols < n_cols
++        ptrs = out_ptr + row * stride_row + cols
++        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
++        tl.store(ptrs, fill, mask=mask)
++
++
++def _can_fuse_padded_region(x: torch.Tensor) -> bool:
++    # The fused kernel uses one program per row and assumes a row-major 2D
++    # tensor (columns contiguous); fall back to eager for anything else.
++    return x.dim() == 2 and x.stride(1) == 1
++
++
++def _fill_padded_rows(
++    x: torch.Tensor,
++    num_token_non_padded: torch.Tensor,
++    fill_value,
++) -> None:
++    """Set ``x[row, :] = fill_value`` for every padded row (row index
++    ``>= num_token_non_padded``) using a single Triton launch.
++
++    Replaces the eager ``arange + (>=) + boolean index_put_`` sequence, which
++    issues several launch-latency-bound kernels per call. The grid is static
++    (one program per row) and the pad count is read from device memory inside
++    the kernel, so this is safe to capture inside a CUDA/HIP graph.
++    """
++    # Metadata-only checks (no device sync): the kernel reads a single scalar
++    # routing count from device memory, so it must be a 1-element integer tensor
++    # on the same device as ``x``. Use explicit raises (not asserts) so the
++    # checks survive ``python -O`` and invalid inputs fail loudly instead of
++    # turning into opaque Triton/memory errors.
++    if not isinstance(num_token_non_padded, torch.Tensor):
++        raise TypeError("num_token_non_padded must be a torch.Tensor")
++    if num_token_non_padded.numel() != 1:
++        raise ValueError(
++            "num_token_non_padded must be a single-element tensor, got shape "
++            f"{tuple(num_token_non_padded.shape)}"
++        )
++    if num_token_non_padded.dtype.is_floating_point:
++        raise TypeError(
++            "num_token_non_padded must be an integer tensor, got "
++            f"{num_token_non_padded.dtype}"
++        )
++    if num_token_non_padded.device != x.device:
++        raise ValueError("num_token_non_padded and x must be on the same device")
++    n_rows, n_cols = x.shape
++    _fill_padded_rows_kernel[(n_rows,)](
++        x,
++        num_token_non_padded,
++        n_cols,
++        fill_value,
++        x.stride(0),
++        BLOCK_COLS=triton.next_power_of_2(n_cols),
++    )
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py b/python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py
+similarity index 100%
+rename from python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py
+rename to python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/mxfp8_moe_amd_gfx95.py b/python/sglang/kernels/ops/moe/mxfp8_moe_amd_gfx95.py
+similarity index 100%
+rename from python/sglang/srt/layers/moe/moe_runner/triton_utils/mxfp8_moe_amd_gfx95.py
+rename to python/sglang/kernels/ops/moe/mxfp8_moe_amd_gfx95.py
+diff --git a/python/sglang/srt/layers/moe/rocm_moe_utils.py b/python/sglang/kernels/ops/moe/rocm_moe_utils.py
+similarity index 100%
+rename from python/sglang/srt/layers/moe/rocm_moe_utils.py
+rename to python/sglang/kernels/ops/moe/rocm_moe_utils.py
+diff --git a/python/sglang/srt/layers/moe/router.py b/python/sglang/kernels/ops/moe/router.py
+similarity index 100%
+rename from python/sglang/srt/layers/moe/router.py
+rename to python/sglang/kernels/ops/moe/router.py
+diff --git a/python/sglang/kernels/ops/moe/trtllm_lora_temp/virtual_experts.py b/python/sglang/kernels/ops/moe/trtllm_lora_temp/virtual_experts.py
+index 6b26f3dd409a..ce43a3bc4693 100644
+--- a/python/sglang/kernels/ops/moe/trtllm_lora_temp/virtual_experts.py
++++ b/python/sglang/kernels/ops/moe/trtllm_lora_temp/virtual_experts.py
+@@ -864,7 +864,7 @@ def _get_routing(
+ 
+         return result
+ 
+-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
++    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+         invoke_fused_moe_kernel,
+     )
+ 
+diff --git a/python/sglang/kernels/ops/moe/virtual_experts.py b/python/sglang/kernels/ops/moe/virtual_experts.py
+index 4781dfe504eb..23fc8355b6dc 100644
+--- a/python/sglang/kernels/ops/moe/virtual_experts.py
++++ b/python/sglang/kernels/ops/moe/virtual_experts.py
+@@ -637,7 +637,7 @@ def _get_routing(
+ 
+         return result
+ 
+-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
++    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+         invoke_fused_moe_kernel,
+     )
+ 
+diff --git a/python/sglang/kernels/ops/quantization/fp8_kernel.py b/python/sglang/kernels/ops/quantization/fp8_kernel.py
+index ee766400a9ff..e6b5793ad313 100644
+--- a/python/sglang/kernels/ops/quantization/fp8_kernel.py
++++ b/python/sglang/kernels/ops/quantization/fp8_kernel.py
+@@ -381,7 +381,7 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
+ 
+     from deep_gemm import transform_sf_into_required_layout
+ 
+-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
++    from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
+ 
+     assert column_major_scales
+     assert scale_tma_aligned
+diff --git a/python/sglang/srt/layers/moe/cutlass_w4a8_moe.py b/python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
+index 82b1c239cba7..4209ca094bac 100644
+--- a/python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
++++ b/python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
+@@ -23,7 +23,7 @@
+     from sgl_kernel import silu_and_mul
+ 
+ from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+-from sglang.srt.layers.moe.ep_moe.kernels import (
++from sglang.kernels.ops.moe.ep_moe_kernels import (
+     cutlass_w4_run_moe_ep_preproess,
+     deepep_ll_get_cutlass_w4a8_moe_mm_data,
+     deepep_permute_triton_kernel,
+diff --git a/python/sglang/srt/layers/moe/moe_runner/aiter.py b/python/sglang/srt/layers/moe/moe_runner/aiter.py
+index 3e5c9722aa2a..c67d0aa9ee5e 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/aiter.py
++++ b/python/sglang/srt/layers/moe/moe_runner/aiter.py
+@@ -300,7 +300,7 @@ def _pre_permute_deepep_to_aiter(
+     quant_type = quant_info.quant_type
+ 
+     if is_mori:
+-        from sglang.srt.layers.moe.rocm_moe_utils import upscale, upscale_mxfp4
++        from sglang.kernels.ops.moe.rocm_moe_utils import upscale, upscale_mxfp4
+ 
+         a1_scale = dispatch_output.hidden_states_scale
+         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
+diff --git a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+index f75ee5ebf992..fd265665402d 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
++++ b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+@@ -179,10 +179,10 @@ def _run_contiguous_gemm(
+         running_state: dict,
+     ) -> torch.Tensor:
+         from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
++        from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
+         from sglang.kernels.ops.quantization.fp8_kernel import (
+             create_per_token_group_quant_fp8_output_scale,
+         )
+-        from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
+ 
+         hidden_states = runner_input.hidden_states
+         hidden_states_scale = runner_input.hidden_states_scale
+@@ -565,8 +565,8 @@ def _run_masked_bf16_gemm(
+         quant_info: DeepGemmMoeQuantInfo,
+         running_state: dict,
+     ) -> torch.Tensor:
++        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_fwd
+         from sglang.srt.layers import deep_gemm_wrapper
+-        from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_fwd
+ 
+         hidden_states = runner_input.hidden_states
+         masked_m = runner_input.masked_m
+@@ -635,7 +635,7 @@ def pre_permute_standard_to_deep_gemm(
+     runner_config: MoeRunnerConfig,
+     running_state: dict,
+ ) -> DeepGemmRunnerInput:
+-    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
++    from sglang.kernels.ops.moe.ep_moe_kernels import moe_ep_deepgemm_preprocess
+ 
+     hidden_states, topk_output = (
+         dispatch_output.hidden_states,
+@@ -696,7 +696,7 @@ def post_permute_deep_gemm_to_standard(
+     runner_config: MoeRunnerConfig,
+     running_state: dict,
+ ) -> StandardCombineInput:
+-    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_deepgemm
++    from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
+     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+ 
+     hidden_states_shape = running_state["hidden_states_shape"]
+@@ -782,7 +782,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
+     runner_config: MoeRunnerConfig,
+     running_state: dict,
+ ) -> DeepGemmRunnerInput:
+-    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
++    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
+ 
+     (
+         hidden_states,
+@@ -875,7 +875,7 @@ def post_permute_deep_gemm_to_deepep_normal(
+     runner_config: MoeRunnerConfig,
+     running_state: dict,
+ ) -> DeepEPNormalCombineInput:
+-    from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
++    from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
+     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+ 
+     hidden_states = runner_output.hidden_states
+@@ -908,10 +908,10 @@ def _varlen_deep_gemm_silu_mul_quant(
+     gemm1_clamp_limit: Optional[float] = None,
+     num_real_tokens: Optional[int] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
++    from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
+     from sglang.kernels.ops.quantization.fp8_kernel import (
+         sglang_per_token_group_quant_8bit,
+     )
+-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
+ 
+     if _MASKED_GEMM_FAST_ACT:
+         assert (
+@@ -951,7 +951,7 @@ def _varlen_deep_gemm_silu_mul_quant(
+         and G % 4 == 0
+         and D % (group_size * 4) == 0
+     ):
+-        from sglang.srt.layers.moe.ep_moe.kernels import (
++        from sglang.kernels.ops.moe.ep_moe_kernels import (
+             silu_and_mul_masked_post_quant_packed_fwd,
+         )
+ 
+diff --git a/python/sglang/srt/layers/moe/moe_runner/humming.py b/python/sglang/srt/layers/moe/moe_runner/humming.py
+index 27170fd8b602..b72debc1be57 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/humming.py
++++ b/python/sglang/srt/layers/moe/moe_runner/humming.py
+@@ -9,8 +9,8 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
+ from sglang.srt.environ import envs
+-from sglang.srt.layers.moe.ep_moe.kernels import moe_permute, moe_unpermute
+ from sglang.srt.layers.moe.fused_moe_triton.moe_fused_mul_sum import moe_fused_mul_sum
+ from sglang.srt.layers.moe.moe_runner.base import (
+     MoeQuantInfo,
+@@ -371,7 +371,7 @@ def prepare_buffers(
+ 
+     def apply_activation(self, inputs: torch.Tensor, outputs: torch.Tensor):
+         if self.activation == "silu" and self.swiglu_limit is not None:
+-            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
++            from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+                 act_and_mul_triton,
+             )
+ 
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton.py b/python/sglang/srt/layers/moe/moe_runner/triton.py
+index 84a9a7910200..45ef2705cfd6 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/triton.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
+@@ -84,7 +84,7 @@ def run(
+         hooks: Optional[Any] = None,
+     ) -> TritonRunnerOutput:
+         if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
+-            from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
++            from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
+                 fused_experts_mxfp8,
+             )
+ 
+@@ -181,7 +181,7 @@ def fused_experts_none_to_triton(
+     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+ 
+     if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
+-        from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe_amd_gfx95 import (
++        from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
+             fused_experts_mxfp8,
+         )
+ 
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+index 30d1f1debce9..62da1a50c87b 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+@@ -13,6 +13,12 @@
+ import torch.nn.functional as F
+ import triton.language as tl
+ 
++from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
++    act_and_mul_triton,
++    invoke_fused_moe_kernel,
++    moe_sum_reduce_triton,
++    support_tensor_descriptor,
++)
+ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+@@ -31,12 +37,6 @@
+ from sglang.srt.utils.custom_op import register_custom_op
+ 
+ from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
+-from .fused_moe_triton_kernels import (
+-    act_and_mul_triton,
+-    invoke_fused_moe_kernel,
+-    moe_sum_reduce_triton,
+-    support_tensor_descriptor,
+-)
+ from .moe_align_block_size import moe_align_block_size
+ 
+ if TYPE_CHECKING:
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 910ed38fcac8..5a73dcda9448 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -31,8 +31,6 @@
+ 
+ import torch
+ import torch.nn.functional as F
+-import triton
+-import triton.language as tl
+ 
+ from sglang.srt.runtime_context import get_parallel
+ 
+@@ -1209,73 +1207,14 @@ def biased_grouped_topk_impl(
+     return topk_weights, topk_ids
+ 
+ 
+-def is_power_of_two(n):
+-    return n > 0 and math.log2(n).is_integer()
+-
++from sglang.kernels.ops.moe.fill_padded_rows import (
++    _can_fuse_padded_region,
++    _fill_padded_rows,
++)
+ 
+-@triton.jit
+-def _fill_padded_rows_kernel(
+-    out_ptr,
+-    num_token_non_padded_ptr,
+-    n_cols,
+-    fill_value,
+-    stride_row,
+-    BLOCK_COLS: tl.constexpr,
+-):
+-    row = tl.program_id(0)
+-    n_valid = tl.load(num_token_non_padded_ptr)
+-    if row >= n_valid:
+-        cols = tl.arange(0, BLOCK_COLS)
+-        mask = cols < n_cols
+-        ptrs = out_ptr + row * stride_row + cols
+-        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
+-        tl.store(ptrs, fill, mask=mask)
+-
+-
+-def _can_fuse_padded_region(x: torch.Tensor) -> bool:
+-    # The fused kernel uses one program per row and assumes a row-major 2D
+-    # tensor (columns contiguous); fall back to eager for anything else.
+-    return x.dim() == 2 and x.stride(1) == 1
+-
+-
+-def _fill_padded_rows(
+-    x: torch.Tensor,
+-    num_token_non_padded: torch.Tensor,
+-    fill_value,
+-) -> None:
+-    """Set ``x[row, :] = fill_value`` for every padded row (row index
+-    ``>= num_token_non_padded``) using a single Triton launch.
+ 
+-    Replaces the eager ``arange + (>=) + boolean index_put_`` sequence, which
+-    issues several launch-latency-bound kernels per call. The grid is static
+-    (one program per row) and the pad count is read from device memory inside
+-    the kernel, so this is safe to capture inside a CUDA/HIP graph.
+-    """
+-    # Metadata-only checks (no device sync): the kernel reads a single scalar
+-    # routing count from device memory, so it must be a 1-element integer tensor
+-    # on the same device as ``x``.
+-    assert isinstance(
+-        num_token_non_padded, torch.Tensor
+-    ), "num_token_non_padded must be a torch.Tensor"
+-    assert num_token_non_padded.numel() == 1, (
+-        "num_token_non_padded must be a single-element tensor, got shape "
+-        f"{tuple(num_token_non_padded.shape)}"
+-    )
+-    assert (
+-        not num_token_non_padded.dtype.is_floating_point
+-    ), f"num_token_non_padded must be an integer tensor, got {num_token_non_padded.dtype}"
+-    assert (
+-        num_token_non_padded.device == x.device
+-    ), "num_token_non_padded and x must be on the same device"
+-    n_rows, n_cols = x.shape
+-    _fill_padded_rows_kernel[(n_rows,)](
+-        x,
+-        num_token_non_padded,
+-        n_cols,
+-        fill_value,
+-        x.stride(0),
+-        BLOCK_COLS=triton.next_power_of_2(n_cols),
+-    )
++def is_power_of_two(n):
++    return n > 0 and math.log2(n).is_integer()
+ 
+ 
+ def _eplb_remap_enabled() -> bool:
+@@ -1299,74 +1238,6 @@ def _eplb_remap_enabled() -> bool:
+     )
+ 
+ 
+-@triton.jit
+-def _fill_padded_rows_kernel(
+-    out_ptr,
+-    num_token_non_padded_ptr,
+-    n_cols,
+-    fill_value,
+-    stride_row,
+-    BLOCK_COLS: tl.constexpr,
+-):
+-    row = tl.program_id(0)
+-    n_valid = tl.load(num_token_non_padded_ptr)
+-    if row >= n_valid:
+-        cols = tl.arange(0, BLOCK_COLS)
+-        mask = cols < n_cols
+-        ptrs = out_ptr + row * stride_row + cols
+-        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
+-        tl.store(ptrs, fill, mask=mask)
+-
+-
+-def _can_fuse_padded_region(x: torch.Tensor) -> bool:
+-    # The fused kernel uses one program per row and assumes a row-major 2D
+-    # tensor (columns contiguous); fall back to eager for anything else.
+-    return x.dim() == 2 and x.stride(1) == 1
+-
+-
+-def _fill_padded_rows(
+-    x: torch.Tensor,
+-    num_token_non_padded: torch.Tensor,
+-    fill_value,
+-) -> None:
+-    """Set ``x[row, :] = fill_value`` for every padded row (row index
+-    ``>= num_token_non_padded``) using a single Triton launch.
+-
+-    Replaces the eager ``arange + (>=) + boolean index_put_`` sequence, which
+-    issues several launch-latency-bound kernels per call. The grid is static
+-    (one program per row) and the pad count is read from device memory inside
+-    the kernel, so this is safe to capture inside a CUDA/HIP graph.
+-    """
+-    # Metadata-only checks (no device sync): the kernel reads a single scalar
+-    # routing count from device memory, so it must be a 1-element integer tensor
+-    # on the same device as ``x``. Use explicit raises (not asserts) so the
+-    # checks survive ``python -O`` and invalid inputs fail loudly instead of
+-    # turning into opaque Triton/memory errors.
+-    if not isinstance(num_token_non_padded, torch.Tensor):
+-        raise TypeError("num_token_non_padded must be a torch.Tensor")
+-    if num_token_non_padded.numel() != 1:
+-        raise ValueError(
+-            "num_token_non_padded must be a single-element tensor, got shape "
+-            f"{tuple(num_token_non_padded.shape)}"
+-        )
+-    if num_token_non_padded.dtype.is_floating_point:
+-        raise TypeError(
+-            "num_token_non_padded must be an integer tensor, got "
+-            f"{num_token_non_padded.dtype}"
+-        )
+-    if num_token_non_padded.device != x.device:
+-        raise ValueError("num_token_non_padded and x must be on the same device")
+-    n_rows, n_cols = x.shape
+-    _fill_padded_rows_kernel[(n_rows,)](
+-        x,
+-        num_token_non_padded,
+-        n_cols,
+-        fill_value,
+-        x.stride(0),
+-        BLOCK_COLS=triton.next_power_of_2(n_cols),
+-    )
+-
+-
+ def _mask_topk_ids_padded_region(
+     topk_ids: torch.Tensor,
+     num_token_non_padded: Optional[torch.Tensor] = None,
+@@ -1917,7 +1788,7 @@ def _post_process_topk_ids(
+         shared_id_base = ep_rank * num_local_experts + num_local_routed
+ 
+         # Lazy import to avoid circular-import issues
+-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
++        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+             fused_append_remap_shared_experts_deepep,
+         )
+ 
+@@ -1938,7 +1809,7 @@ def _post_process_topk_ids(
+         )
+ 
+         # Lazy import to avoid circular-import issues
+-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
++        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+             fused_append_shared_experts,
+         )
+ 
+diff --git a/python/sglang/srt/layers/moe/waterfill.py b/python/sglang/srt/layers/moe/waterfill.py
+index 82592f44d816..66e61e397caa 100644
+--- a/python/sglang/srt/layers/moe/waterfill.py
++++ b/python/sglang/srt/layers/moe/waterfill.py
+@@ -13,313 +13,21 @@
+ # ==============================================================================
+ """Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
+ 
+-from typing import NamedTuple, Optional, Tuple
++from typing import Optional, Tuple
+ 
+ import torch
+-import triton
+-import triton.language as tl
+ from torch import Tensor
+ 
++from sglang.kernels.ops.moe.deepep_waterfill_kernels import (
++    LOCAL_SHARED_MARKER,
++    WaterfillDispatchPlan,
++    _count_routed_per_rank_kernel,
++    _empty_expanded,
++    materialize_waterfill_dispatch_fused,
++)
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.moe.topk import StandardTopKOutput
+ 
+-LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
+-_LOCAL_PREF_NUMER = 11  # local-rank preference = 11/10
+-_LOCAL_PREF_DENOM = 10
+-
+-
+-class WaterfillDispatchPlan(NamedTuple):
+-    """Inputs needed by the fused Waterfill expansion path."""
+-
+-    # Effective rank load consumed by the fused kernel.
+-    rank_load: Tensor
+-    allow_all_ranks: bool
+-    target_total: int
+-
+-
+-def _empty_expanded(topk_ids: Tensor, topk_weights: Tensor):
+-    """Return empty expanded tensors for zero-token batches."""
+-    topk, d = topk_ids.shape[1], topk_ids.device
+-    return (
+-        torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=d),
+-        torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=d),
+-    )
+-
+-
+-@triton.jit
+-def _count_routed_per_rank_kernel(
+-    topk_ids_ptr,  # [num_tokens, topk]
+-    counts_ptr,  # [world_size] output (atomic add)
+-    num_tokens,
+-    topk: tl.constexpr,
+-    experts_per_rank,
+-    world_size: tl.constexpr,
+-    BLOCK_SIZE: tl.constexpr,
+-):
+-    """Count routed tokens per rank using block-level histogram."""
+-    pid = tl.program_id(0)
+-    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+-    mask = token_idx < num_tokens
+-
+-    for r in range(world_size):
+-        rank_count = tl.zeros([BLOCK_SIZE], dtype=tl.int64)
+-
+-        for k in range(topk):
+-            expert_id = tl.load(
+-                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+-            ).to(tl.int64)
+-            valid = expert_id >= 0
+-            target_rank = expert_id // experts_per_rank
+-            target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
+-            rank_count += tl.where(
+-                mask & valid & (target_rank == r),
+-                tl.full([BLOCK_SIZE], 1, dtype=tl.int64),
+-                tl.zeros([BLOCK_SIZE], dtype=tl.int64),
+-            )
+-
+-        block_total = tl.sum(rank_count)
+-        if block_total > 0:
+-            tl.atomic_add(counts_ptr + r, block_total)
+-
+-
+-@triton.jit
+-def _waterfill_expand_kernel(
+-    topk_ids_ptr,
+-    topk_weights_ptr,
+-    rank_load_ptr,
+-    expanded_ids_ptr,
+-    expanded_weights_ptr,
+-    num_tokens,
+-    topk: tl.constexpr,
+-    old_experts_per_rank,
+-    new_experts_per_rank,
+-    world_size: tl.constexpr,
+-    source_rank,
+-    shared_weight,
+-    local_marker,
+-    local_pref_numer,
+-    local_pref_denom,
+-    precomputed_target_total,
+-    ALLOW_ALL_RANKS: tl.constexpr,
+-    BLOCK_SIZE: tl.constexpr,
+-):
+-    """Fused waterfill + expand. ID remap: old_id -> old_id + old_id // old_epr."""
+-    pid = tl.program_id(0)
+-    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+-    mask = token_idx < num_tokens
+-
+-    r_idx = tl.arange(0, world_size)
+-    rank_load_vec = tl.load(rank_load_ptr + r_idx, mask=r_idx < world_size, other=0).to(
+-        tl.int64
+-    )
+-    total_effective_k = tl.sum(rank_load_vec)
+-    total_tokens_global_k = total_effective_k // topk
+-    derived_target_total = (
+-        total_effective_k + total_tokens_global_k + world_size - 1
+-    ) // world_size
+-    target_total = tl.where(
+-        precomputed_target_total > 0,
+-        precomputed_target_total,
+-        derived_target_total,
+-    )
+-
+-    # Step 1: Select destination rank for shared expert (waterfill sampling).
+-    source_count = tl.load(rank_load_ptr + source_rank)
+-    best_count = tl.where(mask, source_count, 2**30)
+-    best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
+-    has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
+-    src_rank_i32 = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int32)
+-
+-    if ALLOW_ALL_RANKS:
+-        candidate_mask = tl.full([BLOCK_SIZE], (1 << world_size) - 1, dtype=tl.int32)
+-        for r in range(world_size):
+-            target_count = tl.load(rank_load_ptr + r).to(tl.int64)
+-            better = (
+-                target_count * local_pref_numer < best_count * local_pref_denom
+-            ) & mask
+-            best_count = tl.where(better, target_count, best_count)
+-            best_rank = tl.where(
+-                better, tl.full([BLOCK_SIZE], r, dtype=tl.int64), best_rank
+-            )
+-    else:
+-        candidate_mask = (tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << src_rank_i32).to(
+-            tl.int32
+-        )
+-
+-    for k in range(topk):
+-        expert_id = tl.load(
+-            topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+-        ).to(tl.int64)
+-        valid = expert_id >= 0
+-        has_valid = has_valid | valid
+-
+-        if not ALLOW_ALL_RANKS:
+-            target_rank = expert_id // old_experts_per_rank
+-            target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
+-            target_rank_i32 = target_rank.to(tl.int32)
+-            shift_amt = tl.where(valid, target_rank_i32, 0)
+-            bit = tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << shift_amt
+-            candidate_mask = tl.where(
+-                valid & mask, candidate_mask | bit, candidate_mask
+-            )
+-
+-            target_count = tl.load(
+-                rank_load_ptr + target_rank, mask=mask & valid, other=2**30
+-            )
+-
+-            better = (
+-                (target_count * local_pref_numer < best_count * local_pref_denom)
+-                & valid
+-                & mask
+-            )
+-            best_count = tl.where(better, target_count, best_count)
+-            best_rank = tl.where(better, target_rank, best_rank)
+-
+-    total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+-    for r in range(world_size):
+-        present = ((candidate_mask >> r) & 1) == 1
+-        rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
+-        w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
+-            tl.int32
+-        )
+-        w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+-        w_vec = tl.where(
+-            src_rank_i32 == r,
+-            w_vec,
+-            (w_vec * local_pref_denom) // local_pref_numer,
+-        )
+-        total_w += tl.where(present, w_vec, 0)
+-
+-    token_seed = token_idx.to(tl.uint32) ^ (
+-        src_rank_i32.to(tl.uint32) * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
+-    )
+-    token_seed = token_seed * tl.full([BLOCK_SIZE], 1664525, dtype=tl.uint32) + tl.full(
+-        [BLOCK_SIZE], 1013904223, dtype=tl.uint32
+-    )
+-    u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
+-
+-    chosen = src_rank_i32
+-    cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+-    for r in range(world_size):
+-        present = ((candidate_mask >> r) & 1) == 1
+-        rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
+-        w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
+-            tl.int32
+-        )
+-        w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+-        w_vec = tl.where(
+-            src_rank_i32 == r,
+-            w_vec,
+-            (w_vec * local_pref_denom) // local_pref_numer,
+-        )
+-        w_vec = tl.where(present, w_vec, 0)
+-        pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
+-        chosen = tl.where(pick, r, chosen)
+-        cum += w_vec
+-
+-    best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
+-
+-    # Step 2: Compute shared expert ID and local mask.
+-    is_local = best_rank == source_rank
+-    local_shared_id = source_rank * new_experts_per_rank + old_experts_per_rank
+-    remote_shared_id = best_rank * new_experts_per_rank + old_experts_per_rank
+-    shared_expert_id = tl.where(
+-        is_local,
+-        tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64),
+-        remote_shared_id,
+-    ).to(tl.int64)
+-    shared_expert_id = tl.where(
+-        has_valid,
+-        shared_expert_id,
+-        tl.full([BLOCK_SIZE], local_marker, dtype=tl.int64),
+-    )
+-
+-    # Step 3: Copy and remap topk_ids, copy weights.
+-    for k in range(topk):
+-        old_id = tl.load(topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1).to(
+-            tl.int64
+-        )
+-        valid_id = old_id >= 0
+-        new_id = tl.where(valid_id, old_id + (old_id // old_experts_per_rank), old_id)
+-        tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
+-
+-    for k in range(topk):
+-        val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
+-        expert_id = tl.load(
+-            topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+-        ).to(tl.int64)
+-        val = tl.where(expert_id >= 0, val, 0.0)
+-        tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
+-
+-    # Step 4: Write shared expert column.
+-    tl.store(
+-        expanded_ids_ptr + token_idx * (topk + 1) + topk,
+-        shared_expert_id,
+-        mask=mask,
+-    )
+-    tl.store(
+-        expanded_weights_ptr + token_idx * (topk + 1) + topk,
+-        tl.where(has_valid, shared_weight, 0.0),
+-        mask=mask,
+-    )
+-
+-
+-def materialize_waterfill_dispatch_fused(
+-    topk_ids: Tensor,
+-    topk_weights: Tensor,
+-    rank_load: Tensor,
+-    num_routed_experts: int,
+-    world_size: int,
+-    source_rank: int,
+-    shared_weight: float,
+-    allow_all_ranks: bool = False,
+-    target_total: int = 0,
+-) -> Tuple[Tensor, Tensor]:
+-    """Run fused Waterfill rank selection and TopK expansion.
+-
+-    The Triton kernel intentionally selects each token's shared-expert rank and
+-    writes the expanded TopK layout in one pass.
+-    """
+-    num_tokens = topk_ids.shape[0]
+-    topk = topk_ids.shape[1]
+-    old_experts_per_rank = num_routed_experts // world_size
+-    new_experts_per_rank = old_experts_per_rank + 1
+-    device = topk_ids.device
+-
+-    if num_tokens == 0:
+-        return _empty_expanded(topk_ids, topk_weights)
+-
+-    expanded_topk_ids = torch.empty(
+-        num_tokens, topk + 1, dtype=topk_ids.dtype, device=device
+-    )
+-    expanded_topk_weights = torch.empty(
+-        num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
+-    )
+-    BLOCK_SIZE = 256
+-    grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+-    _waterfill_expand_kernel[grid](
+-        topk_ids,
+-        topk_weights,
+-        rank_load,
+-        expanded_topk_ids,
+-        expanded_topk_weights,
+-        num_tokens,
+-        topk,
+-        old_experts_per_rank,
+-        new_experts_per_rank,
+-        world_size,
+-        source_rank,
+-        shared_weight,
+-        LOCAL_SHARED_MARKER,
+-        _LOCAL_PREF_NUMER,
+-        _LOCAL_PREF_DENOM,
+-        target_total,
+-        allow_all_ranks,
+-        BLOCK_SIZE,
+-    )
+-
+-    return expanded_topk_ids, expanded_topk_weights
+-
+ 
+ @torch.compile(dynamic=True)
+ def expand_topk_with_shared_expert(
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w8a8_fp8_moe.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w8a8_fp8_moe.py
+index 2735e0bbb139..4583e3dab954 100644
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w8a8_fp8_moe.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w8a8_fp8_moe.py
+@@ -31,7 +31,7 @@
+ if _use_aiter:
+     from aiter.ops.shuffle import shuffle_weight
+ 
+-    from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
++    from sglang.kernels.ops.moe.rocm_moe_utils import rocm_fused_experts_tkw1
+ 
+ 
+ class QuarkW8A8FP8MoE(QuarkMoEScheme):
+diff --git a/python/sglang/srt/lora/lora_moe_runner_marlin.py b/python/sglang/srt/lora/lora_moe_runner_marlin.py
+index 447846f44bca..65d0d76452d7 100644
+--- a/python/sglang/srt/lora/lora_moe_runner_marlin.py
++++ b/python/sglang/srt/lora/lora_moe_runner_marlin.py
+@@ -25,15 +25,15 @@
+ if _is_cuda:
+     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+     from sglang.kernels.ops.activation import silu_and_mul
++    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
++        moe_sum_reduce_triton,
++    )
+     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+         get_scalar_type,
+     )
+     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+         moe_align_block_size,
+     )
+-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+-        moe_sum_reduce_triton,
+-    )
+     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+ 
+ 
+diff --git a/python/sglang/srt/models/grok.py b/python/sglang/srt/models/grok.py
+index ae2f156efe87..8d583afbc686 100644
+--- a/python/sglang/srt/models/grok.py
++++ b/python/sglang/srt/models/grok.py
+@@ -22,6 +22,7 @@
+ from torch import nn
+ from transformers import PretrainedConfig
+ 
++from sglang.kernels.ops.moe.router import fused_moe_router_shim
+ from sglang.srt.distributed import (
+     tensor_model_parallel_all_reduce,
+ )
+@@ -40,7 +41,6 @@
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+-from sglang.srt.layers.moe.router import fused_moe_router_shim
+ from sglang.srt.layers.moe.topk import TopK
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.radix_attention import RadixAttention
+diff --git a/python/sglang/srt/models/longcat_flash.py b/python/sglang/srt/models/longcat_flash.py
+index a22ea9e8593d..079a9348a62c 100644
+--- a/python/sglang/srt/models/longcat_flash.py
++++ b/python/sglang/srt/models/longcat_flash.py
+@@ -37,6 +37,7 @@
+ import torch
+ from torch import nn
+ 
++from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
+ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+ from sglang.srt.configs import LongcatFlashConfig
+ from sglang.srt.distributed import (
+@@ -57,7 +58,6 @@
+     RowParallelLinear,
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+-from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
+ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
+ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index 7a77bc7be955..0ce5b00ada02 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -392,7 +392,7 @@ def _append_shared_to_topk_output(
+             return topk_output
+         shared_weights, shared_scale = shared
+ 
+-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
++        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+             fused_append_shared_experts_with_weights,
+         )
+ 
+diff --git a/sgl-kernel/benchmark/bench_moe_ep_post_reorder.py b/sgl-kernel/benchmark/bench_moe_ep_post_reorder.py
+index c3d9415a43d1..1aa5177aaa51 100644
+--- a/sgl-kernel/benchmark/bench_moe_ep_post_reorder.py
++++ b/sgl-kernel/benchmark/bench_moe_ep_post_reorder.py
+@@ -1,7 +1,7 @@
+ import torch
+ import triton
+ 
+-from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
++from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_triton_kernel
+ from sglang.utils import is_in_ci
+ 
+ IS_CI = is_in_ci()
+diff --git a/test/registered/jit/benchmark/bench_post_reorder_deepgemm.py b/test/registered/jit/benchmark/bench_post_reorder_deepgemm.py
+index 874ab4b41e70..185bf5c19979 100644
+--- a/test/registered/jit/benchmark/bench_post_reorder_deepgemm.py
++++ b/test/registered/jit/benchmark/bench_post_reorder_deepgemm.py
+@@ -1,7 +1,7 @@
+ import torch
+ 
+ from sglang.jit_kernel.benchmark import marker
+-from sglang.srt.layers.moe.ep_moe.kernels import (
++from sglang.kernels.ops.moe.ep_moe_kernels import (
+     post_reorder_deepgemm,
+     post_reorder_triton_kernel,
+ )
+diff --git a/test/registered/jit/minimax/test_minimax_quant_scatter.py b/test/registered/jit/minimax/test_minimax_quant_scatter.py
+index 3e4ea6b07061..222aaf2dc93e 100644
+--- a/test/registered/jit/minimax/test_minimax_quant_scatter.py
++++ b/test/registered/jit/minimax/test_minimax_quant_scatter.py
+@@ -8,7 +8,7 @@
+     per_token_quant_fp8_ue8m0,
+     per_token_quant_fp8_ue8m0_scatter,
+ )
+-from sglang.srt.layers.moe.ep_moe.kernels import fill_gateup_input_triton_kernel
++from sglang.kernels.ops.moe.ep_moe_kernels import fill_gateup_input_triton_kernel
+ from sglang.test.ci.ci_register import register_cuda_ci
+ 
+ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+diff --git a/test/registered/jit/test_post_reorder_deepgemm.py b/test/registered/jit/test_post_reorder_deepgemm.py
+index 181e315e4012..ef01918ce5dd 100644
+--- a/test/registered/jit/test_post_reorder_deepgemm.py
++++ b/test/registered/jit/test_post_reorder_deepgemm.py
+@@ -1,7 +1,7 @@
+ import pytest
+ import torch
+ 
+-from sglang.srt.layers.moe.ep_moe.kernels import (
++from sglang.kernels.ops.moe.ep_moe_kernels import (
+     post_reorder_deepgemm,
+     post_reorder_triton_kernel,
+ )
+diff --git a/test/registered/moe/test_fused_append_remap_per_rank_shared_slots.py b/test/registered/moe/test_fused_append_remap_per_rank_shared_slots.py
+index e3a7c3472cb1..b419cccbd306 100644
+--- a/test/registered/moe/test_fused_append_remap_per_rank_shared_slots.py
++++ b/test/registered/moe/test_fused_append_remap_per_rank_shared_slots.py
+@@ -11,7 +11,7 @@
+ 
+ import torch
+ 
+-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
++from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+     fused_append_remap_shared_experts_deepep,
+     fused_append_shared_experts,
+ )
+diff --git a/test/registered/moe/test_zero_experts.py b/test/registered/moe/test_zero_experts.py
+index b487bb021ad5..0754baa59480 100644
+--- a/test/registered/moe/test_zero_experts.py
++++ b/test/registered/moe/test_zero_experts.py
+@@ -2,7 +2,7 @@
+ 
+ import torch
+ 
+-from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
++from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
+ from sglang.test.ci.ci_register import register_cuda_ci
+ from sglang.test.test_utils import CustomTestCase
+ 

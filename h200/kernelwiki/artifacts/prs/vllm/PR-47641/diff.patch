@@ -1,0 +1,1721 @@
+diff --git a/.buildkite/hardware_tests/cpu.yaml b/.buildkite/hardware_tests/cpu.yaml
+index ebfd1c7524ad..fd2d45be5a06 100644
+--- a/.buildkite/hardware_tests/cpu.yaml
++++ b/.buildkite/hardware_tests/cpu.yaml
+@@ -18,6 +18,8 @@ steps:
+   - tests/kernels/quantization/test_cpu_fp8_scaled_mm.py
+   - tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
+   - tests/kernels/mamba/test_cpu_short_conv.py
++  - tests/kernels/mamba/test_causal_conv1d.py
++  - tests/kernels/mamba/test_mamba_ssm.py
+   commands:
+     - |
+       bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 30m "
+@@ -28,7 +30,9 @@ steps:
+       pytest -x -v -s tests/kernels/test_onednn.py
+       pytest -x -v -s tests/kernels/test_awq_int4_to_int8.py
+       pytest -x -v -s tests/kernels/quantization/test_cpu_fp8_scaled_mm.py
+-      pytest -x -v -s tests/kernels/mamba/cpu/test_cpu_gdn_ops.py"
++      pytest -x -v -s tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
++      pytest -x -v -s tests/kernels/mamba/test_causal_conv1d.py
++      pytest -x -v -s tests/kernels/mamba/test_mamba_ssm.py"
+ 
+ # Note: SDE can't be downloaded from CI host because of AWS WAF
+ # - label: CPU-Compatibility Tests
+diff --git a/.buildkite/scripts/hardware_ci/run-cpu-test-arm.sh b/.buildkite/scripts/hardware_ci/run-cpu-test-arm.sh
+index 2d11dd477eac..09396a9697a2 100755
+--- a/.buildkite/scripts/hardware_ci/run-cpu-test-arm.sh
++++ b/.buildkite/scripts/hardware_ci/run-cpu-test-arm.sh
+@@ -40,7 +40,9 @@ function cpu_tests() {
+     pytest -x -v -s tests/kernels/moe/test_cpu_fused_moe.py
+     pytest -x -v -s tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
+     pytest -x -v -s tests/kernels/moe/test_cpu_int4_moe.py
+-    pytest -x -v -s tests/kernels/mamba/test_cpu_short_conv.py"
++    pytest -x -v -s tests/kernels/mamba/test_cpu_short_conv.py
++    pytest -x -v -s tests/kernels/mamba/test_causal_conv1d.py
++    pytest -x -v -s tests/kernels/mamba/test_mamba_ssm.py"
+ 
+   # skip tests requiring model downloads if HF_TOKEN is not set
+   # due to rate-limits
+@@ -97,3 +99,4 @@ function cpu_tests() {
+ # All of CPU tests are expected to be finished less than 40 mins.
+ export -f cpu_tests
+ timeout 2h bash -c cpu_tests
++
+diff --git a/cmake/cpu_extension.cmake b/cmake/cpu_extension.cmake
+index 3aca9bcea91d..4e7837df0d78 100644
+--- a/cmake/cpu_extension.cmake
++++ b/cmake/cpu_extension.cmake
+@@ -430,6 +430,7 @@ set(VLLM_EXT_SRC
+     "csrc/cpu/layernorm.cpp"
+     "csrc/cpu/mla_decode.cpp"
+     "csrc/cpu/pos_encoding.cpp"
++    "csrc/cpu/mamba_cpu.cpp"
+     "csrc/moe/dynamic_4bit_int_moe_cpu.cpp"
+     "csrc/cpu/cpu_attn.cpp"
+     "csrc/cpu/torch_bindings.cpp")
+@@ -489,6 +490,7 @@ if (ENABLE_X86_ISA)
+         "csrc/cpu/spec_decode_utils.cpp"
+         "csrc/cpu/cpu_attn.cpp"
+         "csrc/cpu/dnnl_kernels.cpp"
++        "csrc/cpu/mamba_cpu.cpp"
+         "csrc/cpu/torch_bindings.cpp"
+         # TODO: Remove these files
+         "csrc/cpu/activation.cpp"
+@@ -502,6 +504,7 @@ if (ENABLE_X86_ISA)
+         "csrc/cpu/utils.cpp"
+         "csrc/cpu/spec_decode_utils.cpp"
+         "csrc/cpu/cpu_attn.cpp"
++        "csrc/cpu/mamba_cpu.cpp"
+         "csrc/cpu/dnnl_kernels.cpp"
+         "csrc/cpu/torch_bindings.cpp"
+         # TODO: Remove these files
+diff --git a/csrc/cpu/cpu_types_vsx.hpp b/csrc/cpu/cpu_types_vsx.hpp
+index 250c870dbe4b..64fe961da220 100644
+--- a/csrc/cpu/cpu_types_vsx.hpp
++++ b/csrc/cpu/cpu_types_vsx.hpp
+@@ -336,13 +336,14 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
+     reg.val[1] = fp16_to_fp32_bits(raw_lo);
+   }
+   float reduce_sum() const {
+-    AliasReg ar;
+-    ar.reg = reg;
+-    float result = 0;
+-    unroll_loop<int, VEC_ELEM_NUM>(
+-        [&result, &ar](int i) { result += ar.values[i]; });
+-
+-    return result;
++    // VSX horizontal reduction: 3 vector ops instead of 8 scalar adds.
++    // Step 1: pairwise sum of the two 4-wide halves
++    __vector float s = vec_add(reg.val[0], reg.val[1]);
++    // Step 2: rotate by 8 bytes (2 floats) and add
++    s = vec_add(s, vec_sld(s, s, 8));
++    // Step 3: rotate by 4 bytes (1 float) and add  => all lanes hold total
++    s = vec_add(s, vec_sld(s, s, 4));
++    return vec_extract(s, 0);
+   }
+   FP32Vec8 exp() const {
+     f32x4x2_t out;
+diff --git a/csrc/cpu/mamba_cpu.cpp b/csrc/cpu/mamba_cpu.cpp
+new file mode 100644
+index 000000000000..54e4f99c2d6e
+--- /dev/null
++++ b/csrc/cpu/mamba_cpu.cpp
+@@ -0,0 +1,285 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// CPU at::Tensor wrappers for Mamba decode-step kernels defined in
++// mamba_kernels.hpp.
++
++#include "cpu/mamba_kernels.hpp"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++#include <c10/util/Optional.h>
++
++#include "cpu_types.hpp"
++
++// ---------------------------------------------------------------------------
++// causal_conv1d_update
++// ---------------------------------------------------------------------------
++at::Tensor causal_conv1d_update_cpu_impl(
++    at::Tensor& x, at::Tensor& conv_state, const at::Tensor& weight,
++    const c10::optional<at::Tensor>& bias,
++    const c10::optional<std::string>& activation,
++    const c10::optional<at::Tensor>& conv_state_indices,
++    const c10::optional<at::Tensor>& query_start_loc, int64_t pad_slot_id) {
++  bool do_silu = false;
++  if (activation.has_value()) {
++    const std::string& act = activation.value();
++    do_silu = (act == "silu" || act == "swish");
++  }
++
++  at::ScalarType dtype = x.scalar_type();
++
++  // Input x: contiguous in native dtype.
++  at::Tensor x_c = x.is_contiguous() ? x : x.contiguous();
++
++  // conv_state: NEVER copy the full paged tensor just for layout reasons.
++  // If the dtype matches we work directly on conv_state (contiguous or not)
++  // by extracting strides and passing them to the kernel.
++  // Only a dtype-conversion copy is made when types differ (rare for BF16).
++  bool state_type_ok = (conv_state.scalar_type() == dtype);
++  at::Tensor state_c = state_type_ok ? conv_state : conv_state.to(dtype);
++  // state_c and conv_state may be non-contiguous — that is intentional.
++
++  // Weight: coerce to same dtype if needed (should match in practice)
++  at::Tensor w_c =
++      (weight.scalar_type() != dtype)
++          ? weight.to(dtype).contiguous()
++          : (weight.is_contiguous() ? weight : weight.contiguous());
++
++  // Bias stays float32 (small scalar, used only for fp32 accumulation)
++  at::Tensor bias_f32;
++  if (bias.has_value() && bias.value().defined())
++    bias_f32 = bias.value().to(at::kFloat).contiguous();
++
++  int64_t batch = x_c.size(0);
++  int64_t dim = x_c.size(1);
++  int64_t seqlen = (x_c.dim() == 3) ? x_c.size(2) : 1;
++  int64_t width = w_c.size(1);
++  int64_t state_len = state_c.size(2);
++
++  // Extract strides — works for contiguous AND non-contiguous (transposed)
++  // state. stride(0): between cache slots (e.g. num_slots × dim × width-1 in
++  // contiguous) stride(1): between conv channels (dim stride) stride(2):
++  // between state elements (=1 when contiguous, =dim when transposed)
++  int64_t stride_s_slot = state_c.stride(0);
++  int64_t stride_s_dim = state_c.stride(1);
++  int64_t stride_s_state = state_c.stride(2);
++
++  at::Tensor out = x_c.clone();  // native dtype, no float32 alloc
++
++  const int32_t* cache_idx_ptr = nullptr;
++  at::Tensor cache_idx_int;
++  if (conv_state_indices.has_value()) {
++    cache_idx_int = conv_state_indices.value().to(at::kInt).contiguous();
++    cache_idx_ptr = cache_idx_int.data_ptr<int32_t>();
++  }
++
++  VLLM_DISPATCH_FLOATING_TYPES(dtype, "causal_conv1d_update", [&] {
++    mamba_cpu::causal_conv1d_update_kernel<scalar_t>(
++        x_c.data_ptr<scalar_t>(), state_c.data_ptr<scalar_t>(), stride_s_slot,
++        stride_s_dim, stride_s_state, w_c.data_ptr<scalar_t>(),
++        bias_f32.defined() ? bias_f32.data_ptr<float>() : nullptr,
++        out.data_ptr<scalar_t>(), cache_idx_ptr,
++        static_cast<int32_t>(pad_slot_id), batch, dim, seqlen, width, state_len,
++        do_silu);
++  });
++
++  // Write back only when a type-conversion copy was made.
++  // Layout-only non-contiguity is handled via strides above — no copy needed.
++  if (!state_type_ok) conv_state.copy_(state_c);
++
++  return out;
++}
++
++// ---------------------------------------------------------------------------
++// selective_state_update
++// ---------------------------------------------------------------------------
++void selective_state_update_cpu_impl(
++    at::Tensor& state,    // (nstates, nheads, dim, dstate)
++    const at::Tensor& x,  // (N, nheads, dim)
++    const at::Tensor& dt, const at::Tensor& A, const at::Tensor& B,
++    const at::Tensor& C, const c10::optional<at::Tensor>& D,
++    const c10::optional<at::Tensor>& z,
++    const c10::optional<at::Tensor>& dt_bias, bool dt_softplus,
++    const c10::optional<at::Tensor>& state_batch_indices,
++    const c10::optional<at::Tensor>& dst_state_batch_indices,
++    int64_t null_block_id, at::Tensor& out,
++    const c10::optional<at::Tensor>& num_accepted_tokens,
++    const c10::optional<at::Tensor>& cu_seqlens) {
++  at::ScalarType state_type = state.scalar_type();
++  at::ScalarType input_type = x.scalar_type();
++
++  // x, B, C must be contiguous and match input_type
++  auto ensure_input = [input_type](const at::Tensor& t) -> at::Tensor {
++    at::Tensor r = (t.scalar_type() != input_type) ? t.to(input_type) : t;
++    return r.is_contiguous() ? r : r.contiguous();
++  };
++  at::Tensor x_in = ensure_input(x);
++  at::Tensor B_in = ensure_input(B);
++  at::Tensor C_in = ensure_input(C);
++  at::Tensor z_in;
++  if (z.has_value() && z.value().defined()) z_in = ensure_input(z.value());
++
++  // A, D, dt_bias are float32 model parameters that arrive here as expanded
++  // tensors, e.g. A is (nheads, head_dim, dstate) with strides (1, 0, 0).
++  // We need just the scalar value per head as a (nheads,) 1-D array so that
++  // A_ptr[h] in the kernel correctly reads head h's value.
++  //
++  // Strategy: peel trailing expanded (stride=0) dims via .select(), which is
++  // a zero-copy view.  For A: (nheads, head_dim, dstate) strides (1,0,0)
++  //   → .select(2,0) → (nheads, head_dim) strides (1,0)
++  //   → .select(1,0) → (nheads,)          stride  (1,)   ← contiguous, free.
++  // No allocation, no type conversion (A is already float32).
++  auto to_per_head_1d_f32 = [](const at::Tensor& t) -> at::Tensor {
++    at::Tensor r = t;
++    // Peel trailing dimensions that are broadcast (stride=0 or size=1)
++    while (r.dim() > 1) r = r.select(r.dim() - 1, 0);
++    if (r.scalar_type() != at::kFloat) r = r.to(at::kFloat);
++    return r.is_contiguous() ? r : r.contiguous();
++  };
++
++  at::Tensor A_f32 = to_per_head_1d_f32(A);  // (nheads,) float32
++  at::Tensor D_f32, dt_bias_f32;
++  if (D.has_value() && D.value().defined())
++    D_f32 = to_per_head_1d_f32(D.value());
++  if (dt_bias.has_value() && dt_bias.value().defined())
++    dt_bias_f32 = to_per_head_1d_f32(dt_bias.value());
++
++  // dt: reduce (N, nheads, head_dim) expanded tensor → (N, nheads) BEFORE
++  // the type conversion so we convert head_dim x fewer elements.
++  at::Tensor dt_f32;
++  {
++    // If dt was expanded to (N, nheads, head_dim) with stride-0 in dim 2,
++    // take a zero-copy view of index 0 along that dim first.
++    at::Tensor t2 = (dt.dim() == 3) ? dt.select(2, 0) : dt;  // (N, nheads)
++    at::Tensor t3 = (t2.scalar_type() != at::kFloat) ? t2.to(at::kFloat) : t2;
++    dt_f32 = t3.is_contiguous() ? t3 : t3.contiguous();
++  }
++
++  int64_t nheads = state.size(1);
++  int64_t dim = state.size(2);
++  int64_t dstate = state.size(3);
++  int64_t N = (cu_seqlens.has_value() && cu_seqlens.value().defined())
++                  ? cu_seqlens.value().size(0) - 1
++                  : x_in.size(0);
++  int64_t ngroups = B_in.size(1);
++
++  // Strides
++  int64_t stride_state_n = state.stride(0);
++  int64_t stride_state_h = state.stride(1);
++  int64_t stride_state_d = state.stride(2);
++  int64_t stride_x_n = x_in.stride(0);
++  int64_t stride_x_h = x_in.stride(1);
++  int64_t stride_dt_n = dt_f32.stride(0);  // dt is (N, nheads)
++  int64_t stride_BC_n = B_in.stride(0);
++  int64_t stride_BC_g = B_in.stride(1);
++  int64_t stride_out_n = out.stride(0);
++  int64_t stride_out_h = out.stride(1);
++
++  // Optional index pointers
++  auto get_int32_ptr =
++      [](const c10::optional<at::Tensor>& opt) -> const int32_t* {
++    return (opt.has_value() && opt.value().defined())
++               ? opt.value().data_ptr<int32_t>()
++               : nullptr;
++  };
++  const int32_t* sbi_ptr = get_int32_ptr(state_batch_indices);
++  const int32_t* dsbi_ptr = get_int32_ptr(dst_state_batch_indices);
++  const int32_t* nat_ptr = get_int32_ptr(num_accepted_tokens);
++  const int32_t* csl_ptr = get_int32_ptr(cu_seqlens);
++
++  // Dispatch on (state_t, input_t, out_t): write directly into `out`
++  // without any intermediate float32 buffer.
++  VLLM_DISPATCH_FLOATING_TYPES(state_type, "ssu_state", [&] {
++    using state_t = scalar_t;
++    VLLM_DISPATCH_FLOATING_TYPES(input_type, "ssu_input", [&] {
++      using input_t = scalar_t;
++      VLLM_DISPATCH_FLOATING_TYPES(out.scalar_type(), "ssu_out", [&] {
++        using out_t = scalar_t;
++        mamba_cpu::selective_state_update_kernel<state_t, input_t, out_t>(
++            state.data_ptr<state_t>(), stride_state_n, stride_state_h,
++            stride_state_d, x_in.data_ptr<input_t>(), stride_x_n, stride_x_h,
++            dt_f32.data_ptr<float>(), stride_dt_n, A_f32.data_ptr<float>(),
++            B_in.data_ptr<input_t>(), C_in.data_ptr<input_t>(), stride_BC_n,
++            stride_BC_g, D_f32.defined() ? D_f32.data_ptr<float>() : nullptr,
++            z_in.defined() ? z_in.data_ptr<input_t>() : nullptr,
++            dt_bias_f32.defined() ? dt_bias_f32.data_ptr<float>() : nullptr,
++            out.data_ptr<out_t>(), stride_out_n, stride_out_h, sbi_ptr,
++            dsbi_ptr, static_cast<int32_t>(null_block_id), nat_ptr, csl_ptr, N,
++            nheads, ngroups, dim, dstate, dt_softplus);
++      });
++    });
++  });
++}
++
++// ---------------------------------------------------------------------------
++// mamba_chunk_scan_fwd_cpu
++// ---------------------------------------------------------------------------
++void mamba_chunk_scan_fwd_cpu_impl(
++    at::Tensor& out,  // [seqlen, nheads, headdim] — pre-allocated by caller
++    at::Tensor&
++        final_states,     // [batch, nheads, headdim, dstate] float32 contiguous
++    const at::Tensor& x,  // [seqlen, nheads, headdim]
++    const at::Tensor&
++        dt,  // [seqlen, nheads] float32 (preprocessed: bias+softplus+clamp)
++    const at::Tensor& A,                 // [nheads] float32
++    const at::Tensor& B,                 // [seqlen, ngroups, dstate]
++    const at::Tensor& C,                 // [seqlen, ngroups, dstate]
++    const c10::optional<at::Tensor>& D,  // [nheads] float32 (optional)
++    const c10::optional<at::Tensor>& z,  // [seqlen, nheads, headdim] (optional)
++    const at::Tensor& cu_seqlens         // [batch+1] int32
++) {
++  const at::ScalarType input_type = x.scalar_type();
++
++  auto ensure_contig = [input_type](const at::Tensor& t) -> at::Tensor {
++    at::Tensor r = (t.scalar_type() != input_type) ? t.to(input_type) : t;
++    return r.is_contiguous() ? r : r.contiguous();
++  };
++  at::Tensor x_in = ensure_contig(x);
++  at::Tensor B_in = ensure_contig(B);
++  at::Tensor C_in = ensure_contig(C);
++  at::Tensor z_in;
++  if (z.has_value() && z.value().defined()) z_in = ensure_contig(z.value());
++
++  // A and D are float32 model parameters, potentially broadcast-expanded.
++  // Strip trailing broadcast dims to get a contiguous (nheads,) array.
++  auto to_per_head_f32 = [](const at::Tensor& t) -> at::Tensor {
++    at::Tensor r = t;
++    while (r.dim() > 1) r = r.select(r.dim() - 1, 0);
++    if (r.scalar_type() != at::kFloat) r = r.to(at::kFloat);
++    return r.is_contiguous() ? r : r.contiguous();
++  };
++  at::Tensor A_f32 = to_per_head_f32(A);
++  at::Tensor D_f32;
++  if (D.has_value() && D.value().defined()) D_f32 = to_per_head_f32(D.value());
++
++  // dt: [seqlen, nheads] float32 — caller has applied bias+softplus+clamp in
++  // Python.
++  at::Tensor dt_c = dt.is_contiguous() ? dt : dt.contiguous();
++  if (dt_c.scalar_type() != at::kFloat) dt_c = dt_c.to(at::kFloat);
++
++  at::Tensor cu_int = cu_seqlens.to(at::kInt).contiguous();
++
++  const int64_t batch = final_states.size(0);
++  const int64_t nheads = final_states.size(1);
++  const int64_t headdim = final_states.size(2);
++  const int64_t dstate = final_states.size(3);
++  const int64_t ngroups = B_in.size(1);
++
++  TORCH_CHECK(final_states.is_contiguous(),
++              "mamba_chunk_scan_fwd_cpu: final_states must be contiguous");
++  TORCH_CHECK(out.is_contiguous(),
++              "mamba_chunk_scan_fwd_cpu: out must be contiguous (writes via "
++              "raw data_ptr)");
++
++  VLLM_DISPATCH_FLOATING_TYPES(input_type, "mamba_chunk_scan_fwd_cpu", [&] {
++    mamba_cpu::mamba_chunk_scan_fwd_kernel<scalar_t>(
++        final_states.data_ptr<float>(), x_in.data_ptr<scalar_t>(),
++        dt_c.data_ptr<float>(), A_f32.data_ptr<float>(),
++        B_in.data_ptr<scalar_t>(), C_in.data_ptr<scalar_t>(),
++        D_f32.defined() ? D_f32.data_ptr<float>() : nullptr,
++        z_in.defined() ? z_in.data_ptr<scalar_t>() : nullptr,
++        out.data_ptr<scalar_t>(), cu_int.data_ptr<int32_t>(), batch, nheads,
++        ngroups, headdim, dstate);
++  });
++}
+diff --git a/csrc/cpu/mamba_kernels.hpp b/csrc/cpu/mamba_kernels.hpp
+new file mode 100644
+index 000000000000..722dad97e3ca
+--- /dev/null
++++ b/csrc/cpu/mamba_kernels.hpp
+@@ -0,0 +1,382 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// Fused CPU vector kernels for Mamba decode-step hotspots:
++//   - causal_conv1d_update  (depthwise 1-D conv state roll + compute)
++//   - selective_state_update (SSM recurrence, single-step)
++
++#pragma once
++
++#include "cpu_types.hpp"
++#include <cmath>
++#include <cstring>
++#include <cstdint>
++#include <algorithm>
++
++namespace mamba_cpu {
++
++// ---------------------------------------------------------------------------
++// causal_conv1d_update — templated for native BF16/FP32
++//
++// state_ptr may point to a NON-CONTIGUOUS paged KV cache tensor.
++// Explicit strides are passed so the kernel writes directly into the
++// correct memory locations without making a contiguous copy of the full
++// paged tensor (which was the source of the 34-41% direct_copy_kernel).
++//
++//   stride_s_slot  = state.stride(0)  — between cache slots
++//   stride_s_dim   = state.stride(1)  — between conv_dim channels
++//   stride_s_state = state.stride(2)  — between state elements
++//
++// When stride_s_state == 1 (contiguous), the memmove fast path is used.
++// ---------------------------------------------------------------------------
++template <typename scalar_t>
++inline void causal_conv1d_update_kernel(
++    const scalar_t* __restrict__ x_ptr, scalar_t* __restrict__ state_ptr,
++    int64_t stride_s_slot, int64_t stride_s_dim, int64_t stride_s_state,
++    const scalar_t* __restrict__ weight_ptr, const float* __restrict__ bias_ptr,
++    scalar_t* __restrict__ out_ptr, const int32_t* __restrict__ cache_idxs,
++    int32_t pad_slot_id, int64_t batch, int64_t dim, int64_t seqlen,
++    int64_t width, int64_t state_len, bool do_silu) {
++#pragma omp parallel for
++  for (int64_t b = 0; b < batch; ++b) {
++    int64_t cache_idx = (cache_idxs != nullptr) ? cache_idxs[b] : b;
++    if (cache_idx == pad_slot_id) continue;
++
++    for (int64_t t = 0; t < seqlen; ++t) {
++      const scalar_t* x_b = x_ptr + (b * dim * seqlen + t);
++      scalar_t* out_b = out_ptr + (b * dim * seqlen + t);
++      // Base of this slot in the (possibly non-contiguous) paged state
++      scalar_t* s_base = state_ptr + cache_idx * stride_s_slot;
++
++      for (int64_t d = 0; d < dim; ++d) {
++        float x_val = static_cast<float>(x_b[d * seqlen]);
++        scalar_t* sd = s_base + d * stride_s_dim;  // start of this dim's state
++        const scalar_t* w = weight_ptr + d * width;
++
++        // Accumulate in float32 for precision
++        float acc = (bias_ptr != nullptr) ? bias_ptr[d] : 0.0f;
++        for (int64_t k = 0; k < state_len; ++k) {
++          acc += static_cast<float>(w[k]) *
++                 static_cast<float>(sd[k * stride_s_state]);
++        }
++        acc += static_cast<float>(w[state_len]) * x_val;
++
++        // Shift state left and append new input.
++        // Use memmove when contiguous (stride==1); element loop otherwise.
++        if (stride_s_state == 1) {
++          if (state_len > 1)
++            std::memmove(sd, sd + 1, (state_len - 1) * sizeof(scalar_t));
++          if (state_len > 0) sd[state_len - 1] = static_cast<scalar_t>(x_val);
++        } else {
++          for (int64_t k = 0; k < state_len - 1; ++k)
++            sd[k * stride_s_state] = sd[(k + 1) * stride_s_state];
++          if (state_len > 0)
++            sd[(state_len - 1) * stride_s_state] = static_cast<scalar_t>(x_val);
++        }
++
++        if (do_silu) {
++          float sigmoid = (acc >= 0) ? 1.0f / (1.0f + std::exp(-acc))
++                                     : std::exp(acc) / (1.0f + std::exp(acc));
++          acc *= sigmoid;
++        }
++        out_b[d * seqlen] = static_cast<scalar_t>(acc);
++      }
++    }
++  }
++}
++
++// ---------------------------------------------------------------------------
++// selective_state_update
++//
++// Template parameters:
++//   state_t  - dtype of ssm_state cache (typically BFloat16)
++//   input_t  - dtype of x, B, C (typically BFloat16)
++//   out_t    - dtype of output tensor (typically BFloat16)
++//              Write directly — no float32 intermediate buffer needed.
++//
++// A, D, dt_bias are accepted as const float* (they are always float32
++// model parameters in Mamba2).  This eliminates the per-call float32→BF16
++// conversion and the .contiguous() materialisation of the broadcast-expand.
++//
++// dt is accepted as a (N, nheads) scalar-per-head tensor, not as the
++// (N, nheads, head_dim) expansion, so no .contiguous() copy is needed.
++// ---------------------------------------------------------------------------
++template <typename state_t, typename input_t, typename out_t = float>
++inline void selective_state_update_kernel(
++    state_t* __restrict__ state_ptr, int64_t stride_state_n,
++    int64_t stride_state_h, int64_t stride_state_d,
++    const input_t* __restrict__ x_ptr, int64_t stride_x_n, int64_t stride_x_h,
++    // dt: (N, nheads) — scalar per head, NOT expanded to head_dim
++    const float* __restrict__ dt_ptr, int64_t stride_dt_n,
++    // A: (nheads,) float32 — scalar per head
++    const float* __restrict__ A_ptr, const input_t* __restrict__ B_ptr,
++    const input_t* __restrict__ C_ptr, int64_t stride_BC_n, int64_t stride_BC_g,
++    // D: (nheads,) float32 — scalar per head (nullptr if not used)
++    const float* __restrict__ D_ptr,
++    // z: same shape as x (optional)
++    const input_t* __restrict__ z_ptr,
++    // dt_bias: (nheads,) float32 — scalar per head (nullptr if not used)
++    const float* __restrict__ dt_bias_ptr, out_t* __restrict__ out_ptr,
++    int64_t stride_out_n, int64_t stride_out_h,
++    const int32_t* __restrict__ state_batch_indices,
++    const int32_t* __restrict__ dst_state_batch_indices, int32_t null_block_id,
++    const int32_t* __restrict__ num_accepted_tokens,
++    const int32_t* __restrict__ cu_seqlens, int64_t N, int64_t nheads,
++    int64_t ngroups, int64_t dim, int64_t dstate, bool dt_softplus) {
++  using state_vec_t = vec_op::vec_t<state_t>;
++  using input_vec_t = vec_op::vec_t<input_t>;
++  constexpr int VEC_ELEM_NUM = 8;
++
++  int64_t nheads_per_group = nheads / ngroups;
++
++  for (int64_t seq_idx = 0; seq_idx < N; ++seq_idx) {
++    int64_t bos, seq_len;
++    if (cu_seqlens != nullptr) {
++      bos = cu_seqlens[seq_idx];
++      seq_len = cu_seqlens[seq_idx + 1] - bos;
++    } else {
++      bos = seq_idx;
++      seq_len = 1;
++    }
++
++    int64_t state_read_idx = (state_batch_indices != nullptr)
++                                 ? state_batch_indices[seq_idx]
++                                 : seq_idx;
++    if (state_read_idx == null_block_id) continue;
++
++    int64_t state_write_idx = (num_accepted_tokens == nullptr)
++                                  ? ((dst_state_batch_indices != nullptr)
++                                         ? dst_state_batch_indices[seq_idx]
++                                         : state_read_idx)
++                                  : -1;
++
++    state_t* s = state_ptr + state_read_idx * stride_state_n;
++
++    for (int64_t t = 0; t < seq_len; ++t) {
++      int64_t token_idx = bos + t;
++      const input_t* x_tok = x_ptr + token_idx * stride_x_n;
++      // dt: (N, nheads) — one float per head per token
++      const float* dt_tok = dt_ptr + token_idx * stride_dt_n;
++      const input_t* B_tok = B_ptr + token_idx * stride_BC_n;
++      const input_t* C_tok = C_ptr + token_idx * stride_BC_n;
++      out_t* out_tok = out_ptr + token_idx * stride_out_n;
++
++#pragma omp parallel for
++      for (int64_t h = 0; h < nheads; ++h) {
++        int64_t g = h / nheads_per_group;
++        const input_t* x_h = x_tok + h * stride_x_h;
++        const input_t* B_g = B_tok + g * stride_BC_g;
++        const input_t* C_g = C_tok + g * stride_BC_g;
++        out_t* out_h = out_tok + h * stride_out_h;
++        state_t* s_h = s + h * stride_state_h;
++
++        // Read scalars-per-head (A, dt, dt_bias, D) — no per-dim indexing
++        float dt_val = dt_tok[h];
++        if (dt_bias_ptr != nullptr) dt_val += dt_bias_ptr[h];
++        if (dt_softplus) {
++          dt_val = (dt_val <= 20.0f) ? std::log1p(std::exp(dt_val)) : dt_val;
++        }
++        const float A_val = A_ptr[h];  // scalar: same for all dim, dstate
++        const float D_val = (D_ptr != nullptr) ? D_ptr[h] : 0.0f;
++
++        const input_t* z_h =
++            (z_ptr != nullptr) ? z_ptr + token_idx * stride_x_n + h * stride_x_h
++                               : nullptr;
++
++        vec_op::FP32Vec8 dt_vec(dt_val);
++        // dA = exp(A * dt): A and dt are SCALARS per head, so compute once
++        // and broadcast.  This saves 7 redundant std::exp() calls that
++        // FP32Vec8::exp() would otherwise make on the broadcast vector.
++        const float dA_scalar = std::exp(A_val * dt_val);
++        vec_op::FP32Vec8 dA(dA_scalar);  // broadcast
++
++        for (int64_t d = 0; d < dim; ++d) {
++          float x_val = static_cast<float>(x_h[d]);
++
++          vec_op::FP32Vec8 out_vec(0.0f);
++          state_t* s_hd = s_h + d * stride_state_d;
++          const input_t* B_g_base = B_g;
++          const input_t* C_g_base = C_g;
++
++          vec_op::FP32Vec8 x_vec(x_val);
++          // dBx = B * x * dt — same dA for all dstate (A is scalar)
++          // s_new = s * dA + B * x * dt
++
++          int64_t n = 0;
++          for (; n <= dstate - VEC_ELEM_NUM; n += VEC_ELEM_NUM) {
++            vec_op::FP32Vec8 B_v((input_vec_t(B_g_base + n)));
++            vec_op::FP32Vec8 C_v((input_vec_t(C_g_base + n)));
++            vec_op::FP32Vec8 s_v((state_vec_t(s_hd + n)));
++
++            vec_op::FP32Vec8 dBx = B_v * x_vec * dt_vec;
++            vec_op::FP32Vec8 s_new = s_v * dA + dBx;
++
++            state_vec_t(s_new).save(s_hd + n);
++            out_vec = out_vec + s_new * C_v;
++          }
++
++          float out_val = out_vec.reduce_sum();
++          for (; n < dstate; ++n) {
++            // Reuse dA_scalar computed once per head — no exp() re-call
++            float dBx = static_cast<float>(B_g[n]) * x_val * dt_val;
++            float s_new = static_cast<float>(s_hd[n]) * dA_scalar + dBx;
++            s_hd[n] = static_cast<state_t>(s_new);
++            out_val += s_new * static_cast<float>(C_g[n]);
++          }
++
++          if (D_ptr != nullptr) out_val += x_val * D_val;
++          if (z_h != nullptr) {
++            float z_val = static_cast<float>(z_h[d]);
++            float sigmoid = (z_val >= 0)
++                                ? 1.0f / (1.0f + std::exp(-z_val))
++                                : std::exp(z_val) / (1.0f + std::exp(z_val));
++            out_val *= z_val * sigmoid;
++          }
++          out_h[d] = static_cast<out_t>(out_val);
++        }
++      }
++
++      if (num_accepted_tokens != nullptr &&
++          dst_state_batch_indices != nullptr) {
++        int64_t token_dst_idx = dst_state_batch_indices[seq_idx * seq_len + t];
++        if (token_dst_idx != null_block_id && token_dst_idx != state_read_idx) {
++          state_t* dst_s = state_ptr + token_dst_idx * stride_state_n;
++          std::memmove(dst_s, s, nheads * stride_state_h * sizeof(state_t));
++        }
++      }
++    }
++
++    if (num_accepted_tokens == nullptr && state_write_idx != null_block_id &&
++        state_write_idx != state_read_idx) {
++      state_t* dst_s = state_ptr + state_write_idx * stride_state_n;
++      std::memmove(dst_s, s, nheads * stride_state_h * sizeof(state_t));
++    }
++  }
++}
++
++// ---------------------------------------------------------------------------
++// mamba_chunk_scan_fwd
++//
++// Prefill SSM recurrence for Mamba2 / SSD models.
++//
++// Key difference from selective_state_update_kernel (decode path):
++//   - #pragma omp parallel for collapse(2) is OUTSIDE the time loop.
++//     Each thread owns a (batch, head) slice and runs the entire token
++//     sequence without any per-token OpenMP synchronisation overhead.
++//     For seqlen=256, this eliminates 256 thread-barrier launches per batch.
++//
++// `dt` arrives already processed (float32, after bias + softplus + clamp)
++// to keep this kernel simple. Preprocessing is done in the Python wrapper.
++//
++// `states_ptr` points to the [batch, nheads, headdim, dstate] float32 output
++// tensor, pre-initialised by the caller (zero or from initial_states).
++// Each (b, h) slice is private to exactly one thread via collapse(2), so
++// there are no write conflicts.
++//
++// D is treated as a scalar per head ([nheads] float32).
++// ---------------------------------------------------------------------------
++template <typename input_t>
++inline void mamba_chunk_scan_fwd_kernel(
++    float* __restrict__ states_ptr,     // [batch, nheads, headdim, dstate] f32
++    const input_t* __restrict__ x_ptr,  // [seqlen, nheads, headdim]
++    const float* __restrict__ dt_ptr,   // [seqlen, nheads] f32 (preprocessed)
++    const float* __restrict__ A_ptr,    // [nheads] f32
++    const input_t* __restrict__ B_ptr,  // [seqlen, ngroups, dstate]
++    const input_t* __restrict__ C_ptr,  // [seqlen, ngroups, dstate]
++    const float* __restrict__ D_ptr,    // [nheads] f32 (nullable)
++    const input_t* __restrict__ z_ptr,  // [seqlen, nheads, headdim] (nullable)
++    input_t* __restrict__ out_ptr,      // [seqlen, nheads, headdim]
++    const int32_t* __restrict__ cu_seqlens,  // [batch+1] int32
++    int64_t batch, int64_t nheads, int64_t ngroups, int64_t headdim,
++    int64_t dstate) {
++  using input_vec_t = vec_op::vec_t<input_t>;
++  constexpr int VEC_ELEM_NUM = 8;
++
++  const int64_t nheads_per_group = nheads / ngroups;
++  // states layout: [batch, nheads, headdim, dstate] contiguous (caller
++  // guarantee)
++  const int64_t stride_s_b = nheads * headdim * dstate;
++  const int64_t stride_s_h = headdim * dstate;
++  // stride_s_d = dstate, stride_s_n = 1
++
++#pragma omp parallel for collapse(2) schedule(static)
++  for (int64_t b = 0; b < batch; ++b) {
++    for (int64_t h = 0; h < nheads; ++h) {
++      const int64_t seq_start = cu_seqlens[b];
++      const int64_t seq_end = cu_seqlens[b + 1];
++      const int64_t g = h / nheads_per_group;
++
++      const float A_val = A_ptr[h];
++      const float D_val = (D_ptr != nullptr) ? D_ptr[h] : 0.0f;
++
++      // Working state slice: states[b, h, :, :] — float32, headdim * dstate.
++      // Fits in L1/L2 for typical dims (e.g. 64*128*4 = 32 KB).
++      float* s_bh = states_ptr + b * stride_s_b + h * stride_s_h;
++
++      for (int64_t t = seq_start; t < seq_end; ++t) {
++        const input_t* x_h = x_ptr + t * nheads * headdim + h * headdim;
++        const float* dt_h = dt_ptr + t * nheads + h;
++        const input_t* B_g = B_ptr + t * ngroups * dstate + g * dstate;
++        const input_t* C_g = C_ptr + t * ngroups * dstate + g * dstate;
++        const input_t* z_h = (z_ptr != nullptr)
++                                 ? z_ptr + t * nheads * headdim + h * headdim
++                                 : nullptr;
++        input_t* out_h = out_ptr + t * nheads * headdim + h * headdim;
++
++        const float dt_val = *dt_h;
++        const float dA_val = std::exp(A_val * dt_val);
++        const vec_op::FP32Vec8 dA_vec(dA_val);  // broadcast scalar
++        const vec_op::FP32Vec8 dt_vec(dt_val);
++
++        for (int64_t d = 0; d < headdim; ++d) {
++          const float x_val = static_cast<float>(x_h[d]);
++          float* s_bhd = s_bh + d * dstate;  // [dstate] contiguous float32
++
++          // Vectorised SSM update + readout over dstate:
++          //   s_new = s * dA + x * dt * B
++          //   y    += s_new * C
++          int64_t n = 0;
++          vec_op::FP32Vec8 y_vec(0.0f);
++          const vec_op::FP32Vec8 x_vec(x_val);
++
++          for (; n <= dstate - VEC_ELEM_NUM; n += VEC_ELEM_NUM) {
++            const vec_op::FP32Vec8 B_v((input_vec_t(B_g + n)));
++            const vec_op::FP32Vec8 C_v((input_vec_t(C_g + n)));
++            const vec_op::FP32Vec8 s_v(s_bhd + n);
++
++            const vec_op::FP32Vec8 s_new = s_v * dA_vec + x_vec * dt_vec * B_v;
++            s_new.save(s_bhd + n);
++            y_vec = y_vec + s_new * C_v;
++          }
++
++          float y_val = y_vec.reduce_sum();
++
++          // Scalar tail for remaining dstate elements
++          for (; n < dstate; ++n) {
++            const float B_n = static_cast<float>(B_g[n]);
++            const float C_n = static_cast<float>(C_g[n]);
++            const float s_new = s_bhd[n] * dA_val + x_val * dt_val * B_n;
++            s_bhd[n] = s_new;
++            y_val += s_new * C_n;
++          }
++
++          // D skip connection (scalar per head)
++          if (D_ptr != nullptr) y_val += x_val * D_val;
++
++          // z gating: out = y * z * sigmoid(z)  (SiLU)
++          if (z_h != nullptr) {
++            const float z_val = static_cast<float>(z_h[d]);
++            const float sigmoid =
++                (z_val >= 0.0f) ? 1.0f / (1.0f + std::exp(-z_val))
++                                : std::exp(z_val) / (1.0f + std::exp(z_val));
++            y_val *= z_val * sigmoid;
++          }
++
++          out_h[d] = static_cast<input_t>(y_val);
++        }
++      }
++    }
++  }
++}
++
++}  // namespace mamba_cpu
+diff --git a/csrc/cpu/torch_bindings.cpp b/csrc/cpu/torch_bindings.cpp
+index 88a593725eeb..8b7d924dace2 100644
+--- a/csrc/cpu/torch_bindings.cpp
++++ b/csrc/cpu/torch_bindings.cpp
+@@ -213,6 +213,32 @@ void compute_slot_mapping_kernel_impl(const torch::Tensor query_start_loc,
+                                       torch::Tensor slot_mapping,
+                                       const int64_t block_size);
+ 
++at::Tensor causal_conv1d_update_cpu_impl(
++    at::Tensor& x, at::Tensor& conv_state, const at::Tensor& weight,
++    const c10::optional<at::Tensor>& bias,
++    const c10::optional<std::string>& activation,
++    const c10::optional<at::Tensor>& conv_state_indices,
++    const c10::optional<at::Tensor>& query_start_loc, int64_t pad_slot_id);
++
++void selective_state_update_cpu_impl(
++    at::Tensor& state, const at::Tensor& x, const at::Tensor& dt,
++    const at::Tensor& A, const at::Tensor& B, const at::Tensor& C,
++    const c10::optional<at::Tensor>& D, const c10::optional<at::Tensor>& z,
++    const c10::optional<at::Tensor>& dt_bias, bool dt_softplus,
++    const c10::optional<at::Tensor>& state_batch_indices,
++    const c10::optional<at::Tensor>& dst_state_batch_indices,
++    int64_t null_block_id, at::Tensor& out,
++    const c10::optional<at::Tensor>& num_accepted_tokens,
++    const c10::optional<at::Tensor>& cu_seqlens);
++
++void mamba_chunk_scan_fwd_cpu_impl(at::Tensor& out, at::Tensor& final_states,
++                                   const at::Tensor& x, const at::Tensor& dt,
++                                   const at::Tensor& A, const at::Tensor& B,
++                                   const at::Tensor& C,
++                                   const c10::optional<at::Tensor>& D,
++                                   const c10::optional<at::Tensor>& z,
++                                   const at::Tensor& cu_seqlens);
++
+ void init_cpu_memory_env(std::vector<int64_t> node_ids);
+ 
+ namespace cpu_utils {
+@@ -595,6 +621,30 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "block_size) -> ()",
+       &compute_slot_mapping_kernel_impl);
+ 
++  // Mamba CPU kernels
++  ops.def(
++      "causal_conv1d_update_cpu_vec("
++      "Tensor(a0!) x, Tensor(a1!) conv_state, Tensor weight, "
++      "Tensor? bias, str? activation, Tensor? conv_state_indices, "
++      "Tensor? query_start_loc, SymInt pad_slot_id) -> Tensor",
++      &causal_conv1d_update_cpu_impl);
++
++  ops.def(
++      "selective_state_update_cpu("
++      "Tensor(a0!) state, Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, "
++      "Tensor? D, Tensor? z, Tensor? dt_bias, bool dt_softplus, "
++      "Tensor? state_batch_indices, Tensor? dst_state_batch_indices, "
++      "SymInt null_block_id, Tensor(a13!) out, "
++      "Tensor? num_accepted_tokens, Tensor? cu_seqlens) -> ()",
++      &selective_state_update_cpu_impl);
++
++  ops.def(
++      "mamba_chunk_scan_fwd_cpu("
++      "Tensor(a0!) out, Tensor(a1!) final_states, "
++      "Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, "
++      "Tensor? D, Tensor? z, Tensor cu_seqlens) -> ()",
++      &mamba_chunk_scan_fwd_cpu_impl);
++
+   ops.def("init_cpu_memory_env(SymInt[] node_ids) -> ()", &init_cpu_memory_env);
+ 
+   // Speculative decoding kernels
+diff --git a/tests/kernels/mamba/cpu/test_cpu_gdn_ops.py b/tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
+index bd30bc4f1ce0..083e9ff22aae 100644
+--- a/tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
++++ b/tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
+@@ -425,7 +425,7 @@ def test_causal_conv1d_torch_two_call_split(total_tokens: int, split: int) -> No
+     match the single-call result.
+     """
+     from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
+-        causal_conv1d_torch,
++        causal_conv1d_fn_cpu as causal_conv1d_torch,
+     )
+ 
+     x, weight, bias = _conv_inputs(total_tokens)
+diff --git a/tests/kernels/mamba/test_causal_conv1d.py b/tests/kernels/mamba/test_causal_conv1d.py
+index c6554f131fed..d2a2981edf2c 100644
+--- a/tests/kernels/mamba/test_causal_conv1d.py
++++ b/tests/kernels/mamba/test_causal_conv1d.py
+@@ -18,8 +18,12 @@
+ DEVICE = current_platform.device_type
+ 
+ pytestmark = pytest.mark.skipif(
+-    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+-    reason="causal_conv1d Triton kernels require CUDA-alike or XPU",
++    not (
++        current_platform.is_cuda_alike()
++        or current_platform.is_xpu()
++        or current_platform.is_cpu()
++    ),
++    reason="causal_conv1d Triton kernels require CUDA-alike, XPU, or CPU",
+ )
+ 
+ 
+@@ -284,7 +288,8 @@ def test_causal_conv1d_varlen(
+     batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
+ ):
+     device = DEVICE
+-    torch.accelerator.empty_cache()
++    if not current_platform.is_cpu():
++        torch.accelerator.empty_cache()
+     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+     if itype == torch.bfloat16:
+         rtol, atol = 1e-2, 5e-2
+diff --git a/tests/kernels/mamba/test_mamba_ssm.py b/tests/kernels/mamba/test_mamba_ssm.py
+index 81b57d4b16bd..f8af3db56be6 100644
+--- a/tests/kernels/mamba/test_mamba_ssm.py
++++ b/tests/kernels/mamba/test_mamba_ssm.py
+@@ -20,8 +20,12 @@
+ DEVICE = current_platform.device_type
+ 
+ pytestmark = pytest.mark.skipif(
+-    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+-    reason="mamba_ssm kernels require CUDA-alike or XPU",
++    not (
++        current_platform.is_cuda_alike()
++        or current_platform.is_xpu()
++        or current_platform.is_cpu()
++    ),
++    reason="mamba_ssm kernels require CUDA-alike, XPU, or CPU",
+ )
+ 
+ # selective_scan_fn is backed by the CUDA-only `ops.selective_scan_fwd` C++ op,
+@@ -342,6 +346,13 @@ def test_selective_scan(
+ @pytest.mark.parametrize("has_z", [False, True])
+ @pytest.mark.parametrize("dstate", [16, 64])
+ @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
++@pytest.mark.skipif(
++    current_platform.is_cpu(),
++    reason=(
++        "CPU kernel for selective_state_update only supports "
++        "Mamba 2 (scalar A/dt), not Mamba 1."
++    ),
++)
+ def test_selective_state_update(dim, dstate, has_z, itype):
+     device = DEVICE
+     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
+@@ -436,6 +447,13 @@ def test_selective_state_update_stochastic_rounding(dim, dstate, has_z, philox_r
+ @pytest.mark.parametrize("dstate", [16, 64])
+ @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
+ @pytest.mark.parametrize("max_seq_len", [1, 2, 4])
++@pytest.mark.skipif(
++    current_platform.is_cpu(),
++    reason=(
++        "CPU kernel for selective_state_update only supports "
++        "Mamba 2 (scalar A/dt), not Mamba 1."
++    ),
++)
+ def test_selective_state_update_varlen(dim, dstate, has_z, itype, max_seq_len):
+     device = DEVICE
+     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
+@@ -697,6 +715,13 @@ def test_selective_scan_varlen(
+ @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
+ # tests correctness in case subset of the sequences are padded
+ @pytest.mark.parametrize("with_padding", [True, False])
++@pytest.mark.skipif(
++    current_platform.is_cpu(),
++    reason=(
++        "CPU kernel for selective_state_update only supports "
++        "Mamba 2 (scalar A/dt), not Mamba 1."
++    ),
++)
+ def test_selective_state_update_with_batch_indices(
+     with_padding, dim, dstate, has_z, itype
+ ):
+@@ -789,6 +814,13 @@ def test_selective_state_update_with_batch_indices(
+ @pytest.mark.parametrize("ngroups", [1, 4])
+ @pytest.mark.parametrize("dstate", [16, 64])
+ @pytest.mark.parametrize("dim", [2048, 4096])
++@pytest.mark.skipif(
++    current_platform.is_cpu(),
++    reason=(
++        "CPU kernel for selective_state_update only supports "
++        "Mamba 2 (scalar A/dt), not Mamba 1."
++    ),
++)
+ def test_selective_state_update_with_heads_with_batch_indices(
+     dim, dstate, ngroups, has_z, tie_hdim, itype
+ ):
+@@ -862,6 +894,13 @@ def test_selective_state_update_with_heads_with_batch_indices(
+ @pytest.mark.parametrize("dstate", [16, 64])
+ @pytest.mark.parametrize("dim", [2048, 4096])
+ @pytest.mark.parametrize("max_seq_len", [2, 4])
++@pytest.mark.skipif(
++    current_platform.is_cpu(),
++    reason=(
++        "CPU kernel for selective_state_update only supports "
++        "Mamba 2 (scalar A/dt), not Mamba 1."
++    ),
++)
+ def test_selective_state_update_with_num_accepted_tokens(
+     dim, dstate, has_z, itype, max_seq_len
+ ):
+@@ -988,6 +1027,13 @@ def test_selective_state_update_with_num_accepted_tokens(
+ @pytest.mark.parametrize("dstate", [16, 64])
+ @pytest.mark.parametrize("dim", [2048, 4096])
+ @pytest.mark.parametrize("max_seq_len", [2, 4])
++@pytest.mark.skipif(
++    current_platform.is_cpu(),
++    reason=(
++        "CPU kernel for selective_state_update only supports "
++        "Mamba 2 (scalar A/dt), not Mamba 1."
++    ),
++)
+ def test_selective_state_update_varlen_with_num_accepted(
+     dim, dstate, has_z, itype, max_seq_len
+ ):
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 599cac0ed6f2..588e0fc654f2 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2070,6 +2070,93 @@ def selective_scan_fwd(
+     )
+ 
+ 
++def causal_conv1d_update_cpu_vec(
++    x: torch.Tensor,
++    conv_state: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    activation: str | None = None,
++    conv_state_indices: torch.Tensor | None = None,
++    query_start_loc: torch.Tensor | None = None,
++    pad_slot_id: int = 0,
++) -> torch.Tensor:
++    return torch.ops._C.causal_conv1d_update_cpu_vec(
++        x,
++        conv_state,
++        weight,
++        bias,
++        activation,
++        conv_state_indices,
++        query_start_loc,
++        pad_slot_id,
++    )
++
++
++def selective_state_update_cpu(
++    state: torch.Tensor,
++    x: torch.Tensor,
++    dt: torch.Tensor,
++    A: torch.Tensor,
++    B: torch.Tensor,
++    C: torch.Tensor,
++    D: torch.Tensor | None,
++    z: torch.Tensor | None,
++    dt_bias: torch.Tensor | None,
++    dt_softplus: bool,
++    state_batch_indices: torch.Tensor | None,
++    dst_state_batch_indices: torch.Tensor | None,
++    null_block_id: int,
++    out: torch.Tensor,
++    num_accepted_tokens: torch.Tensor | None,
++    cu_seqlens: torch.Tensor | None,
++):
++    torch.ops._C.selective_state_update_cpu(
++        state,
++        x,
++        dt,
++        A,
++        B,
++        C,
++        D,
++        z,
++        dt_bias,
++        dt_softplus,
++        state_batch_indices,
++        dst_state_batch_indices,
++        null_block_id,
++        out,
++        num_accepted_tokens,
++        cu_seqlens,
++    )
++
++
++def mamba_chunk_scan_fwd_cpu(
++    out: torch.Tensor,
++    final_states: torch.Tensor,
++    x: torch.Tensor,
++    dt: torch.Tensor,
++    A: torch.Tensor,
++    B: torch.Tensor,
++    C: torch.Tensor,
++    D: torch.Tensor | None,
++    z: torch.Tensor | None,
++    cu_seqlens: torch.Tensor,
++) -> None:
++    """Prefill SSM scan kernel. out and final_states are written in-place."""
++    torch.ops._C.mamba_chunk_scan_fwd_cpu(
++        out,
++        final_states,
++        x,
++        dt,
++        A,
++        B,
++        C,
++        D,
++        z,
++        cu_seqlens,
++    )
++
++
+ # ROCm skinny gemms
+ def LLMM1(a: torch.Tensor, b: torch.Tensor, rows_per_block: int) -> torch.Tensor:
+     return torch.ops._rocm_C.LLMM1(a, b, rows_per_block)
+diff --git a/vllm/config/mamba.py b/vllm/config/mamba.py
+index 996478c36760..a68842f4bfee 100644
+--- a/vllm/config/mamba.py
++++ b/vllm/config/mamba.py
+@@ -27,6 +27,7 @@ class MambaBackendEnum(Enum, metaclass=_MambaBackendEnumMeta):
+ 
+     TRITON = "triton"
+     FLASHINFER = "flashinfer"
++    CPU = "cpu"
+ 
+ 
+ @config
+diff --git a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+index f7c237ca2db0..15f08f265504 100644
+--- a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
++++ b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+@@ -1237,3 +1237,15 @@ def grid(META):
+     if unsqueeze:
+         out = out.squeeze(-1)
+     return out.to(original_x_dtype)
++
++
++from vllm.platforms import current_platform  # noqa: E402
++
++if current_platform.is_cpu():
++    from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
++        causal_conv1d_fn_cpu,
++        causal_conv1d_update_cpu,
++    )
++
++    causal_conv1d_fn = causal_conv1d_fn_cpu  # type: ignore
++    causal_conv1d_update = causal_conv1d_update_cpu  # type: ignore
+diff --git a/vllm/model_executor/layers/mamba/ops/cpu/causal_conv1d.py b/vllm/model_executor/layers/mamba/ops/cpu/causal_conv1d.py
+index b047ca6d6169..c552d93445e6 100644
+--- a/vllm/model_executor/layers/mamba/ops/cpu/causal_conv1d.py
++++ b/vllm/model_executor/layers/mamba/ops/cpu/causal_conv1d.py
+@@ -6,18 +6,31 @@
+ import torch
+ import torch.nn.functional as F
+ 
++from vllm._custom_ops import causal_conv1d_update_cpu_vec
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+ 
+-# for prefill
+-def causal_conv1d_torch(
++
++def causal_conv1d_fn_cpu(
+     x: torch.Tensor,
+     weight: torch.Tensor,
+     bias: torch.Tensor | None,
+     conv_states: torch.Tensor,
+     query_start_loc: torch.Tensor,
+-    cache_indices: torch.Tensor,
+-    has_initial_state: torch.Tensor,
++    cache_indices: torch.Tensor | None = None,
++    has_initial_state: torch.Tensor | None = None,
+     activation: str | None = "silu",
++    pad_slot_id: int = PAD_SLOT_ID,
++    **kwargs,
+ ) -> torch.Tensor:
++    """CPU implementation for causal_conv1d_fwd."""
++    if isinstance(activation, bool) and activation:
++        activation = "silu"
++    elif isinstance(activation, bool):
++        activation = None
++
++    original_x_dtype = x.dtype
++    x = x.to(conv_states.dtype)
++
+     out = torch.empty_like(x)
+     state_len = weight.shape[1] - 1
+     assert activation in {None, "silu", "swish"}
+@@ -27,11 +40,21 @@ def causal_conv1d_torch(
+         for idx in range(query_start_loc.shape[0] - 1)
+     ]
+     weight = weight.unsqueeze(1)
++
+     for seq_idx, (bos, eos) in enumerate(seq_begin_end_idx):
+-        slot = int(cache_indices[seq_idx].item())
++        if bos == eos:
++            continue
++
++        slot = (
++            int(cache_indices[seq_idx].item()) if cache_indices is not None else seq_idx
++        )
++
++        if slot == pad_slot_id:
++            continue
+ 
+         seq_x = x[:, bos:eos].unsqueeze(0)
+-        if bool(has_initial_state[seq_idx].item()):
++
++        if has_initial_state is not None and bool(has_initial_state[seq_idx].item()):
+             initial_state = conv_states[slot, :, :state_len].unsqueeze(0)
+         else:
+             initial_state = torch.zeros(
+@@ -51,16 +74,48 @@ def causal_conv1d_torch(
+             groups=weight.shape[0],
+         )
+         seq_out = seq_out[..., -seq_x.shape[-1] :].to(dtype=x.dtype)
++
+         if activation in ("silu", "swish"):
+             seq_out = F.silu(seq_out)
+ 
+         out[:, bos:eos] = seq_out.squeeze(0)
+         conv_states[slot, :, :state_len].copy_(conv_input[..., -state_len:].squeeze(0))
+ 
+-    return out
++    return out.to(original_x_dtype)
++
++
++def causal_conv1d_update_cpu(
++    x: torch.Tensor,
++    conv_state: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    activation: bool | str | None = None,
++    conv_state_indices: torch.Tensor | None = None,
++    query_start_loc: torch.Tensor | None = None,
++    pad_slot_id: int | None = None,
++    **kwargs,
++) -> torch.Tensor:
++    """CPU implementation for causal_conv1d_update."""
++    if isinstance(activation, bool):
++        activation = "silu" if activation else None
++
++    if pad_slot_id is None:
++        pad_slot_id = kwargs.get("null_block_id", NULL_BLOCK_ID)
++        if pad_slot_id is None:
++            pad_slot_id = NULL_BLOCK_ID
++
++    return causal_conv1d_update_cpu_vec(
++        x,
++        conv_state,
++        weight,
++        bias,
++        activation,
++        conv_state_indices,
++        query_start_loc,
++        pad_slot_id,
++    )
+ 
+ 
+-# for decode
+ def causal_conv1d_update_torch(
+     x: torch.Tensor,
+     conv_state: torch.Tensor,
+@@ -68,6 +123,11 @@ def causal_conv1d_update_torch(
+     bias: torch.Tensor | None = None,
+     activation: str | None = None,
+ ) -> torch.Tensor:
++    """
++    Pure PyTorch fallback for causal_conv1d_update.
++    Currently used as a fallback for Arm (aarch64) to leverage
++    oneDNN/ACL F.conv1d kernels for batched decoding.
++    """
+     assert activation in {None, "silu", "swish"}
+ 
+     _, dim, seq_len = x.shape
+diff --git a/vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py b/vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py
+index 9f3aa12c8d17..f93d2e18db62 100644
+--- a/vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py
++++ b/vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py
+@@ -10,9 +10,13 @@
+ from vllm.forward_context import ForwardContext, get_forward_context
+ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+ from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
+-    causal_conv1d_torch,
++    causal_conv1d_fn_cpu as causal_conv1d_torch,
++)
++from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
++    causal_conv1d_update_cpu,
+     causal_conv1d_update_torch,
+ )
++from vllm.platforms import CpuArchEnum, current_platform
+ from vllm.utils.torch_utils import (
+     LayerNameType,
+     _resolve_layer_name,
+@@ -140,21 +144,30 @@ def _cpu_gdn_attention_nonspec(
+                 conv_states=conv_state,
+                 weight=layer.conv1d.weight,
+                 bias=layer.conv1d.bias,
+-                silu_activation=layer.activation == "silu",
++                silu_activation=(layer.activation == "silu"),
+                 conv_state_indices=decode_state_indices,
+                 is_vnni=True,
+             )
+         else:
+-            decode_conv_state = conv_state[decode_state_indices].contiguous()
+-            decode_mixed_qkv = causal_conv1d_update_torch(
+-                # [B, dim] -> [B, dim, 1]
+-                x=decode_mixed_qkv.unsqueeze(-1),
+-                conv_state=decode_conv_state,
+-                weight=conv_weights,
+-                bias=layer.conv1d.bias,
+-                activation=layer.activation,
+-            ).squeeze(-1)
+-            conv_state[decode_state_indices] = decode_conv_state
++            if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
++                decode_conv_state = conv_state[decode_state_indices].contiguous()
++                decode_mixed_qkv = causal_conv1d_update_torch(
++                    x=decode_mixed_qkv.unsqueeze(-1),
++                    conv_state=decode_conv_state,
++                    weight=conv_weights,
++                    bias=layer.conv1d.bias,
++                    activation=layer.activation,
++                ).squeeze(-1)
++                conv_state[decode_state_indices] = decode_conv_state
++            else:
++                decode_mixed_qkv = causal_conv1d_update_cpu(
++                    x=decode_mixed_qkv,
++                    conv_state=conv_state,
++                    weight=conv_weights,
++                    bias=layer.conv1d.bias,
++                    activation=layer.activation,
++                    conv_state_indices=decode_state_indices,
++                )
+ 
+         query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
+ 
+@@ -495,17 +508,26 @@ def _spec_aware_nonspec(
+         decode_a = a[:num_decode_tokens]
+         decode_state_indices = state_indices_tensor[:num_decodes]
+         # Only the first ``width-1`` columns hold the real conv state.
+-        decode_conv_state = conv_buf[decode_state_indices][
+-            :, :, : width - 1
+-        ].contiguous()
+-        decode_mixed_qkv = causal_conv1d_update_torch(
+-            x=decode_mixed_qkv.unsqueeze(-1),
+-            conv_state=decode_conv_state,
+-            weight=conv_weights,
+-            bias=layer.conv1d.bias,
+-            activation=layer.activation,
+-        ).squeeze(-1)
+-        conv_buf[decode_state_indices, :, : width - 1] = decode_conv_state
++        if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
++            conv_state_view = conv_buf[:, :, : width - 1]
++            decode_conv_state = conv_state_view[decode_state_indices].contiguous()
++            decode_mixed_qkv = causal_conv1d_update_torch(
++                x=decode_mixed_qkv.unsqueeze(-1),
++                conv_state=decode_conv_state,
++                weight=conv_weights,
++                bias=layer.conv1d.bias,
++                activation=layer.activation,
++            ).squeeze(-1)
++            conv_state_view[decode_state_indices] = decode_conv_state
++        else:
++            decode_mixed_qkv = causal_conv1d_update_cpu(
++                x=decode_mixed_qkv,
++                conv_state=conv_buf[:, :, : width - 1],
++                weight=conv_weights,
++                bias=layer.conv1d.bias,
++                activation=layer.activation,
++                conv_state_indices=decode_state_indices,
++            )
+ 
+         query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
+         # rearrange_mixed_qkv can return views whose last dim is not
+diff --git a/vllm/model_executor/layers/mamba/ops/cpu/mamba_ssm.py b/vllm/model_executor/layers/mamba/ops/cpu/mamba_ssm.py
+new file mode 100644
+index 000000000000..a65793d79245
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/cpu/mamba_ssm.py
+@@ -0,0 +1,144 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++
++import vllm._custom_ops as ops
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++
++def _mamba_chunk_scan_combined_fwd_cpu(
++    x,
++    dt,
++    A,
++    B,
++    C,
++    chunk_size,
++    out,
++    D=None,
++    z=None,
++    dt_bias=None,
++    initial_states=None,
++    return_intermediate_states=False,
++    seq_idx=None,
++    cu_seqlens=None,
++    cu_chunk_seqlens=None,
++    last_chunk_indices=None,
++    dt_softplus=False,
++    dt_limit=(0.0, float("inf")),
++    state_dtype=None,
++    **kwargs,
++):
++    seqlen, nheads, headdim = x.shape
++    _, ngroups, dstate = B.shape
++
++    assert cu_seqlens is not None
++    batch = cu_seqlens.size(0) - 1
++
++    dt_f = dt.float()
++    if dt_bias is not None:
++        dt_f = dt_f + dt_bias.float().unsqueeze(0)
++    if dt_softplus:
++        dt_f = torch.nn.functional.softplus(dt_f)
++    if dt_limit[0] > 0.0 or dt_limit[1] < float("inf"):
++        dt_f = dt_f.clamp(min=dt_limit[0], max=dt_limit[1])
++
++    all_states = torch.zeros(
++        batch, nheads, headdim, dstate, dtype=torch.float32, device=x.device
++    )
++    if initial_states is not None:
++        all_states.copy_(initial_states.float())
++
++    assert out.is_contiguous(), (
++        "_mamba_chunk_scan_combined_fwd_cpu: `out` must be "
++        "pre-allocated as a contiguous tensor"
++    )
++
++    D_1d = None
++    if D is not None:
++        d = D.float()
++        while d.dim() > 1 and d.stride(-1) == 0:
++            d = d.squeeze(-1)
++        D_1d = d.contiguous()
++
++    ops.mamba_chunk_scan_fwd_cpu(
++        out,
++        all_states,
++        x,
++        dt_f,
++        A,
++        B,
++        C,
++        D_1d,
++        z,
++        cu_seqlens.to(torch.int32),
++    )
++
++    out_dtype = state_dtype if state_dtype is not None else x.dtype
++    all_states = all_states.to(out_dtype)
++
++    return all_states
++
++
++def selective_state_update(
++    state,
++    x,
++    dt,
++    A,
++    B,
++    C,
++    D=None,
++    z=None,
++    dt_bias=None,
++    dt_softplus=False,
++    state_batch_indices=None,
++    dst_state_batch_indices=None,
++    null_block_id=NULL_BLOCK_ID,
++    out=None,
++    num_accepted_tokens=None,
++    cu_seqlens=None,
++    is_blackwell=False,
++    enable_stochastic_rounding=False,
++    cache_philox_rounds=0,
++):
++    """CPU implementation for selective_state_update."""
++    # Ensure out tensor exists
++    if out is None:
++        out = torch.empty_like(x if x.dim() == 2 else x)
++
++    _state = state.unsqueeze(1) if state.dim() == 3 else state
++    _x = x.unsqueeze(1) if x.dim() == 2 else x
++    _dt = dt.unsqueeze(1) if dt.dim() == 2 else dt
++    _A = A.unsqueeze(0) if A.dim() == 2 else A
++    _B = B.unsqueeze(1) if B.dim() == 2 else B
++    _C = C.unsqueeze(1) if C.dim() == 2 else C
++    _D = D.unsqueeze(0) if (D is not None and D.dim() == 1) else D
++    _z = z.unsqueeze(1) if (z is not None and z.dim() == 2) else z
++    _dt_bias = (
++        dt_bias.unsqueeze(0)
++        if (dt_bias is not None and dt_bias.dim() == 1)
++        else dt_bias
++    )
++    _out = out.unsqueeze(1) if out.dim() == 2 else out
++
++    _sbi = state_batch_indices
++    _dsbi = dst_state_batch_indices
++    ops.selective_state_update_cpu(
++        _state,
++        _x,
++        _dt,
++        _A,
++        _B,
++        _C,
++        _D,
++        _z,
++        _dt_bias,
++        dt_softplus,
++        _sbi,
++        _dsbi,
++        null_block_id,
++        _out,
++        num_accepted_tokens,
++        cu_seqlens,
++    )
++    return _out.squeeze(1) if out.dim() == 2 else _out
+diff --git a/vllm/model_executor/layers/mamba/ops/mamba_ssm.py b/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+index d348defcc768..af45467886ea 100644
+--- a/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
++++ b/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+@@ -845,3 +845,13 @@ def selective_scan_fn(
+         return delta  # output written inplace to delta
+     else:
+         return z  # output written inplace to z
++
++
++from vllm.platforms import current_platform  # noqa: E402
++
++if current_platform.is_cpu():
++    from vllm.model_executor.layers.mamba.ops.cpu.mamba_ssm import (
++        selective_state_update as selective_state_update_cpu,
++    )
++
++    selective_state_update = selective_state_update_cpu  # type: ignore
+diff --git a/vllm/model_executor/layers/mamba/ops/ssd_combined.py b/vllm/model_executor/layers/mamba/ops/ssd_combined.py
+index 4c93a768b629..8c645574b9e7 100644
+--- a/vllm/model_executor/layers/mamba/ops/ssd_combined.py
++++ b/vllm/model_executor/layers/mamba/ops/ssd_combined.py
+@@ -225,3 +225,11 @@ def mamba_chunk_scan_combined_varlen(
+     )
+ 
+     return varlen_states
++
++
++from vllm.platforms import current_platform  # noqa: E402
++
++if current_platform.is_cpu():
++    import vllm.model_executor.layers.mamba.ops.cpu.mamba_ssm as cpu_mamba_ssm
++
++    _mamba_chunk_scan_combined_fwd = cpu_mamba_ssm._mamba_chunk_scan_combined_fwd_cpu  # type: ignore
+diff --git a/vllm/model_executor/layers/mamba/ops/ssu_dispatch.py b/vllm/model_executor/layers/mamba/ops/ssu_dispatch.py
+index 92258ef204bd..1795a036b124 100644
+--- a/vllm/model_executor/layers/mamba/ops/ssu_dispatch.py
++++ b/vllm/model_executor/layers/mamba/ops/ssu_dispatch.py
+@@ -4,8 +4,9 @@
+ Dispatch module for Mamba selective state update (SSU) backends.
+ 
+ Provides a unified `selective_state_update` function that dispatches to
+-either the Triton or FlashInfer backend based on the configured
+-`MambaBackendEnum`. Follows SGLang's dispatch pattern adapted for vLLM.
++the Triton, FlashInfer, or CPU backend based on the configured
++`MambaBackendEnum`. On CPU-only platforms (PowerPC, x86 without CUDA)
++the backend defaults to 'cpu'.
+ """
+ 
+ from abc import ABC, abstractmethod
+@@ -182,9 +183,75 @@ def __call__(
+         )
+ 
+ 
++class CPUSSUBackend(MambaSSUBackend):
++    """CPU SSU backend using the compiled C++ VSX/scalar kernel.
++
++    On CPU-only platforms (PowerPC, x86 without CUDA) this dispatches to
++    the vectorized C++ kernel registered as ``torch.ops._C.selective_state_update_cpu``.
++    That kernel uses vec_op SIMD intrinsics (VSX on ppc64le, AVX2 on x86,
++    scalar fallback elsewhere) and is parallelised with OpenMP across heads.
++
++    Falls back to the pure-PyTorch implementation only if the C++ op is
++    unavailable (e.g. a CPU-less build).
++    """
++
++    def __init__(self, mamba_config: MambaConfig):
++        super().__init__(mamba_config)
++        from vllm import _custom_ops as ops
++
++        self._cpp_kernel = ops.selective_state_update_cpu
++        logger.info("CPUSSUBackend: using compiled C++ selective_state_update kernel.")
++
++    @property
++    def name(self) -> str:
++        return "cpu"
++
++    def __call__(
++        self,
++        state: torch.Tensor,
++        x: torch.Tensor,
++        dt: torch.Tensor,
++        A: torch.Tensor,
++        B: torch.Tensor,
++        C: torch.Tensor,
++        D: torch.Tensor,
++        dt_bias: torch.Tensor,
++        z: torch.Tensor | None = None,
++        dt_softplus: bool = False,
++        state_batch_indices: torch.Tensor | None = None,
++        dst_state_batch_indices: torch.Tensor | None = None,
++        null_block_id: int = NULL_BLOCK_ID,
++        out: torch.Tensor | None = None,
++        num_accepted_tokens: torch.Tensor | None = None,
++        cu_seqlens: torch.Tensor | None = None,
++        is_blackwell: bool = False,
++    ) -> None:
++        # C++ kernel: state shape expected as (nstates, nheads, dim, dstate)
++        # The kernel writes in-place into `out` and updates `state`.
++        self._cpp_kernel(
++            state,
++            x,
++            dt,
++            A,
++            B,
++            C,
++            D,
++            z,
++            dt_bias,
++            dt_softplus,
++            state_batch_indices,
++            dst_state_batch_indices,
++            null_block_id,
++            out,
++            num_accepted_tokens,
++            cu_seqlens,
++        )
++
++
+ _BACKEND_REGISTRY: dict[MambaBackendEnum, type[MambaSSUBackend]] = {
+     MambaBackendEnum.TRITON: TritonSSUBackend,
+     MambaBackendEnum.FLASHINFER: FlashInferSSUBackend,
++    MambaBackendEnum.CPU: CPUSSUBackend,
+ }
+ 
+ _mamba_ssu_backend: MambaSSUBackend | None = None
+@@ -210,6 +277,20 @@ def initialize_mamba_ssu_backend(
+     global _mamba_ssu_backend
+ 
+     backend = mamba_config.backend
++
++    # On CPU-only platforms (PowerPC, x86 without CUDA) Triton JIT is
++    # unstable or unavailable.  Silently fall back to the CPU
++    # backend unless the user explicitly chose something other than "triton".
++    if backend == MambaBackendEnum.TRITON:
++        from vllm.platforms import current_platform
++
++        if current_platform.is_cpu():
++            logger.info(
++                "CPU platform detected: overriding Mamba SSU backend "
++                "from 'triton' to 'cpu'."
++            )
++            backend = MambaBackendEnum.CPU
++
+     if backend not in _BACKEND_REGISTRY:
+         raise ValueError(
+             f"Unknown Mamba SSU backend: {backend}. "
+diff --git a/vllm/model_executor/layers/mamba/short_conv.py b/vllm/model_executor/layers/mamba/short_conv.py
+index e7e36f2fc538..7a11a4f54752 100644
+--- a/vllm/model_executor/layers/mamba/short_conv.py
++++ b/vllm/model_executor/layers/mamba/short_conv.py
+@@ -94,9 +94,13 @@ def forward_native(
+         # Reference torch causal conv1d; runs on all CPU platforms. AMX kernels
+         # for causal conv can be plugged in here later.
+         from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
+-            causal_conv1d_torch,
++            causal_conv1d_fn_cpu as causal_conv1d_torch,
++        )
++        from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
++            causal_conv1d_update_cpu,
+             causal_conv1d_update_torch,
+         )
++        from vllm.platforms import CpuArchEnum, current_platform
+ 
+         forward_context = get_forward_context()
+         attn_metadata_raw = forward_context.attn_metadata
+@@ -164,17 +168,26 @@ def forward_native(
+         if has_decode:
+             assert attn_metadata.state_indices_tensor_d is not None
+             state_indices_d = attn_metadata.state_indices_tensor_d.flatten()
+-            Bx_d = (B_d * x_d).unsqueeze(-1)  # (num_decodes, dim, 1)
+-            # Advanced indexing returns a copy; update in-place then scatter back
+-            gathered = conv_state[state_indices_d]  # (num_decodes, dim, state_len)
+-            out_d = causal_conv1d_update_torch(
+-                Bx_d,
+-                gathered,
+-                conv_weights,
+-                self.conv.bias,
+-                activation=None,
+-            ).squeeze(-1)  # (num_decodes, dim)
+-            conv_state[state_indices_d] = gathered
++            Bx_d = B_d * x_d  # (num_decodes, dim)
++            if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
++                conv_state_view = conv_state[state_indices_d].contiguous()
++                out_d = causal_conv1d_update_torch(
++                    Bx_d.unsqueeze(-1),
++                    conv_state_view,
++                    conv_weights,
++                    self.conv.bias,
++                    activation=None,
++                ).squeeze(-1)
++                conv_state[state_indices_d] = conv_state_view
++            else:
++                out_d = causal_conv1d_update_cpu(
++                    Bx_d,
++                    conv_state,
++                    conv_weights,
++                    self.conv.bias,
++                    activation=None,
++                    conv_state_indices=state_indices_d,
++                )
+             conv_output_list.insert(0, C_d * out_d)
+ 
+         hidden_states_out = torch.vstack(conv_output_list)
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index 4d2e50420f42..2b19b3d3c4e3 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -234,10 +234,14 @@ def dispatch_cpu_unquantized_gemm(
+         layer.cpu_linear = torch.nn.functional.linear
+         return
+ 
++    # Skip CPU GEMM dispatch for non-2D weights (e.g. MoE 3D expert weights).
++    # These layers are handled by their own specialized methods.
+     if layer.weight.ndim != 2:
+         # this is not a linear layer
+-        # For now it should be a causal_conv1d op
+-        if torch.cpu._is_amx_tile_supported():
++        # For now it should be a causal_conv1d op or MoE 3D expert weights
++        if torch.cpu._is_amx_tile_supported() and hasattr(
++            ops, "causal_conv1d_weight_pack"
++        ):
+             # prepack conv weight
+             unpacked = (
+                 layer.weight.view(

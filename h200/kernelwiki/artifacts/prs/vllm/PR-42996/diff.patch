@@ -1,0 +1,160 @@
+diff --git a/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu b/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu
+index 316a7d37522f..0b6df02c7ef8 100644
+--- a/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu
++++ b/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu
+@@ -304,9 +304,17 @@ __global__ void per_token_group_quant_8bit_packed_register_kernel(
+   const int sf_k_idx = blockIdx.x * kGroupsPerBlockX + sf_k_local;
+   const int mn_idx = blockIdx.y * kRowsPerBlock + row_local;
+ 
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++  asm volatile("griddepcontrol.wait;");
++#endif
++
+   if (mn_idx >= tma_aligned_mn) {
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++    asm volatile("griddepcontrol.launch_dependents;");
++#endif
+     return;
+   }
++
+   const bool is_valid_group = (mn_idx < mn) && (sf_k_idx < groups_per_row);
+ 
+   // Load 16 input elements (32 B) into registers as two adjacent uint4
+@@ -417,6 +425,10 @@ __global__ void per_token_group_quant_8bit_packed_register_kernel(
+       static_cast<int64_t>(mn_idx) * groups_per_row * GROUP_SIZE +
+       sf_k_idx * GROUP_SIZE + lane_id * VEC_SIZE;
+   *reinterpret_cast<uint4*>(group_output) = packed_out;
++
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++  asm volatile("griddepcontrol.launch_dependents;");
++#endif
+ }
+ 
+ // Public entry point: register-resident packed quant kernel.
+@@ -497,20 +509,29 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
+ 
+ #define LAUNCH_REG_KERNEL_INST(T, DST_DTYPE, KX, RY)                         \
+   do {                                                                       \
+-    dim3 grid(static_cast<unsigned int>(blocks_x),                           \
+-              static_cast<unsigned int>(blocks_y));                          \
+-    dim3 block(num_threads);                                                 \
+-    per_token_group_quant_8bit_packed_register_kernel<T, DST_DTYPE, 128, KX, \
+-                                                      RY>                    \
+-        <<<grid, block, 0, stream>>>(                                        \
+-            static_cast<const T*>(input.data_ptr()), output_q.data_ptr(),    \
+-            reinterpret_cast<unsigned int*>(output_s_packed.data_ptr()),     \
+-            static_cast<int>(padded_groups_per_row),                         \
+-            static_cast<int>(groups_per_row), static_cast<int>(mn),          \
+-            static_cast<int>(output_q_mn_extent),                            \
+-            static_cast<int>(tma_aligned_mn), num_scale_elems,               \
+-            static_cast<float>(eps), static_cast<float>(min_8bit),           \
+-            static_cast<float>(max_8bit));                                   \
++    cudaLaunchConfig_t config = {};                                          \
++    config.gridDim = dim3(static_cast<unsigned int>(blocks_x),               \
++                          static_cast<unsigned int>(blocks_y));              \
++    config.blockDim = dim3(num_threads);                                     \
++    config.dynamicSmemBytes = 0;                                             \
++    config.stream = stream;                                                  \
++    cudaLaunchAttribute attrs[1];                                            \
++    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;        \
++    attrs[0].val.programmaticStreamSerializationAllowed = 1;                 \
++    config.numAttrs = 1;                                                     \
++    config.attrs = attrs;                                                    \
++    cudaLaunchKernelEx(                                                      \
++        &config,                                                             \
++        per_token_group_quant_8bit_packed_register_kernel<T, DST_DTYPE, 128, \
++                                                          KX, RY>,           \
++        static_cast<const T*>(input.data_ptr()), output_q.data_ptr(),        \
++        reinterpret_cast<unsigned int*>(output_s_packed.data_ptr()),         \
++        static_cast<int>(padded_groups_per_row),                             \
++        static_cast<int>(groups_per_row), static_cast<int>(mn),              \
++        static_cast<int>(output_q_mn_extent),                                \
++        static_cast<int>(tma_aligned_mn), num_scale_elems,                   \
++        static_cast<float>(eps), static_cast<float>(min_8bit),               \
++        static_cast<float>(max_8bit));                                       \
+   } while (0)
+ 
+ #define LAUNCH_REG_KERNEL(T, DST_DTYPE)                    \
+diff --git a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
+index 97fc0962c2b4..000bb51b20f8 100644
+--- a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
+@@ -37,6 +37,8 @@ def _fused_inv_rope_fp8_quant_per_head(
+     ROPE_START: tl.constexpr,
+     HALF_ROPE: tl.constexpr,
+     TMA_ALIGNED_SCALES: tl.constexpr,
++    USE_GDC: tl.constexpr,
++    launch_pdl: tl.constexpr,  # triton metadata
+ ):
+     # int64: stride multiply overflows int32 past num_tokens=32768 (IMA).
+     pid_token = tl.program_id(0).to(tl.int64)
+@@ -46,7 +48,9 @@ def _fused_inv_rope_fp8_quant_per_head(
+     head_in_group = pid_gh % heads_per_group
+     global_head = pid_gh
+     qb_start = head_in_group * CHUNKS_PER_HEAD
+-
++    if USE_GDC:
++        tl.extra.cuda.gdc_launch_dependents()
++        tl.extra.cuda.gdc_wait()
+     # Padding rows in the TMA-aligned scale buffer: fill with zero and skip quant.
+     if pid_token >= num_tokens:
+         if TMA_ALIGNED_SCALES:
+@@ -243,11 +247,8 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
+         (scale_inner * tma_aligned_T, 1, tma_aligned_T),
+     )
+     grid = (tma_aligned_T, n_groups * heads_per_group)
+-    pdl_kwargs = (
+-        {}
+-        if current_platform.is_rocm() or current_platform.is_xpu()
+-        else {"launch_pdl": False}
+-    )
++    use_gdc = current_platform.is_arch_support_pdl()
++    pdl_kwargs = {"launch_pdl": True} if use_gdc else {}
+     _fused_inv_rope_fp8_quant_per_head[grid](
+         o,
+         positions,
+@@ -270,6 +271,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
+         ROPE_START=rope_start,
+         HALF_ROPE=half_rope,
+         TMA_ALIGNED_SCALES=tma_aligned_scales,
++        USE_GDC=use_gdc,
+         num_stages=1,
+         **pdl_kwargs,
+         num_warps=1,
+diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
+index 4252ce87754d..d7637fabe3ad 100644
+--- a/vllm/utils/deep_gemm.py
++++ b/vllm/utils/deep_gemm.py
+@@ -176,6 +176,22 @@ def _import_deep_gemm():
+     return None
+ 
+ 
++def _apply_pdl(mod, enable: bool = True) -> None:
++    mod_name = getattr(mod, "__name__", str(mod))
++    try:
++        set_pdl_fn = getattr(mod, "set_pdl", None)
++        if set_pdl_fn is None:
++            return
++        set_pdl_fn(enable)
++        logger.info_once(
++            "DeepGEMM PDL %s on %s.",
++            "enabled" if enable else "disabled",
++            mod_name,
++        )
++    except Exception as e:  # noqa: BLE001
++        logger.warning_once("Failed to set DeepGEMM PDL on %s: %s", mod_name, e)
++
++
+ def _lazy_init() -> None:
+     """Import deep_gemm and resolve symbols on first use."""
+     global _cublaslt_gemm_nt_impl
+@@ -218,6 +234,9 @@ def _lazy_init() -> None:
+     if _dg is None:
+         return
+ 
++    # Enable PDL for DeepGEMM on architectures that support it (SM90+).
++    if current_platform.is_arch_support_pdl():
++        _apply_pdl(_dg, True)
+     _cublaslt_gemm_nt_impl = getattr(_dg, "cublaslt_gemm_nt", None)
+     _fp8_gemm_nt_impl = getattr(_dg, "fp8_gemm_nt", None)
+     _fp8_einsum_impl = getattr(_dg, "fp8_einsum", None)

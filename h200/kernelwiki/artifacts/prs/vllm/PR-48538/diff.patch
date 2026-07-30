@@ -1,0 +1,484 @@
+diff --git a/tests/quantization/test_online.py b/tests/quantization/test_online.py
+index 995df7946008..3c21441ed65b 100644
+--- a/tests/quantization/test_online.py
++++ b/tests/quantization/test_online.py
+@@ -16,7 +16,11 @@
+     Fp8PerTensorOnlineLinearMethod,
+     Fp8PerTensorOnlineMoEMethod,
+ )
++from vllm.model_executor.layers.quantization.online.nvfp4 import (
++    Nvfp4OnlineMoEMethod,
++)
+ from vllm.platforms import current_platform
++from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
+ 
+ 
+ @pytest.mark.skipif(
+@@ -145,6 +149,38 @@ def check_model(model):
+         print(outputs[0][1])
+ 
+ 
++@pytest.mark.skipif(
++    not (
++        current_platform.is_cuda()
++        and current_platform.is_device_capability_family(100)
++        and has_flashinfer_trtllm_fused_moe()
++    ),
++    reason="nvfp4_per_token needs a Blackwell (SM100) GPU + FlashInfer TRTLLM MoE.",
++)
++def test_online_nvfp4_per_token_moe(vllm_runner, monkeypatch) -> None:
++    """Online NVFP4 quantizes the MoE and leaves dense layers unquantized."""
++    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
++
++    with vllm_runner(
++        "ibm-granite/granite-3.0-1b-a400m-base",
++        quantization="nvfp4_per_token",
++        enforce_eager=True,
++    ) as llm:
++
++        def check_model(model):
++            layer = model.model.layers[0]
++            assert isinstance(
++                layer.block_sparse_moe.experts._quant_method, Nvfp4OnlineMoEMethod
++            )
++            assert isinstance(
++                layer.self_attn.o_proj.quant_method, UnquantizedLinearMethod
++            )
++
++        llm.apply_model(check_model)
++        outputs = llm.generate_greedy(["Hello my name is"], max_tokens=4)
++        print(outputs[0][1])
++
++
+ @pytest.mark.skipif(
+     not is_quant_method_supported("fp8"),
+     reason="FP8 is not supported on this GPU type.",
+diff --git a/vllm/config/quantization.py b/vllm/config/quantization.py
+index 34d7fa5d6364..370fbaf2731f 100644
+--- a/vllm/config/quantization.py
++++ b/vllm/config/quantization.py
+@@ -18,6 +18,7 @@
+     kInt8StaticChannelSym,
+     kMxfp4Dynamic,
+     kMxfp8Dynamic,
++    kNvfp4Static,
+ )
+ 
+ # User-facing names addressable from quantization_config.
+@@ -134,6 +135,11 @@ def _coerce_spec(cls, v: Any, info: ValidationInfo) -> Any:
+     "int8_per_channel_weight_only": QuantizationConfigArgs(
+         moe=QuantSpec(weight=kInt8StaticChannelSym),
+     ),
++    # Online NVFP4 on MoE with per-token dynamic activation scales (Blackwell +
++    # FlashInfer TRTLLM only); linear stays unquantized (no `linear` field).
++    "nvfp4_per_token": QuantizationConfigArgs(
++        moe=QuantSpec(weight=kNvfp4Static),
++    ),
+ }
+ 
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py b/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
+index f046dfeaf26c..2a1443417328 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
+@@ -33,6 +33,10 @@
+ 
+ logger = init_logger(__name__)
+ 
++# Base scale for per-token NVFP4 activation quant; the kernel folds the
++# per-token global scale (from the activation amax) on top of it.
++_PER_TOKEN_BASE_GLOBAL_SCALE = 1.0 / (448.0 * 6.0)
++
+ 
+ class TrtLlmNvFp4ExpertsBase:
+     """
+@@ -43,9 +47,13 @@ def __init__(
+         self,
+         moe_config: FusedMoEConfig,
+         quant_config: FusedMoEQuantConfig,
++        per_token_activation: bool = False,
+     ):
+         self.moe_config = moe_config
+         self.quant_config = quant_config
++        # Quantize the input here (deferred from prepare) to capture a per-token
++        # global scale, instead of a static one.
++        self.per_token_activation = per_token_activation
+ 
+         self.routing_method_type = self.moe_config.routing_method
+         self.topk = moe_config.experts_per_token
+@@ -211,6 +219,27 @@ def _supports_shape(hidden_dim: int) -> bool:
+     def activation_format() -> mk.FusedMoEActivationFormat:
+         return mk.FusedMoEActivationFormat.Standard
+ 
++    @property
++    def expects_unquantized_inputs(self) -> bool:
++        return self.per_token_activation
++
++    def _quantize_per_token_input(
++        self, hidden_states: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """NVFP4-quantize activations with a per-token global scale.
++
++        Returns ``(packed_fp4, block_scale, per_token_scale)``.
++        """
++        from flashinfer import SfLayout, nvfp4_quantize
++
++        hs_fp4, hs_block_scale, per_token_scale = nvfp4_quantize(
++            hidden_states,
++            _PER_TOKEN_BASE_GLOBAL_SCALE,
++            sfLayout=SfLayout.layout_linear,
++            per_token_activation=True,
++        )
++        return hs_fp4, hs_block_scale, per_token_scale
++
+     def _get_chunk_size(self) -> int:
+         MAX_GRID_Y = 65535
+         MAX_TILE_TOKENS_DIM = 128
+@@ -255,6 +284,15 @@ def workspace_shapes(
+         expert_tokens_meta: mk.ExpertTokensMetadata | None,
+         activation: MoEActivation,
+     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
++        if self.per_token_activation:
++            # Deferred input quant leaves K unpacked here, breaking the
++            # workspace assumptions below. Per-token NVFP4 is only supported on
++            # the monolithic (non-EP) path for now.
++            raise NotImplementedError(
++                "NVFP4 per-token activation is only supported on the monolithic "
++                "(non-EP) FlashInfer TRTLLM MoE path."
++            )
++
+         # The workspaces for this implementation are managed by flashinfer.
+         workspace1 = (0,)
+         workspace2 = (0,)
+@@ -286,6 +324,15 @@ def _invoke_kernel(
+         assert self.quant_config.w1_scale is not None
+         assert self.quant_config.w2_scale is not None
+ 
++        # Per-token: input is unquantized, quantize it here. Otherwise it was
++        # already quantized in prepare() with the static global scale.
++        if self.per_token_activation:
++            hidden_states, block_scale, per_token_scale = (
++                self._quantize_per_token_input(hidden_states)
++            )
++        else:
++            block_scale, per_token_scale = a1q_scale, None
++
+         # Pack topk ids and weights into format expected by the kernel.
+         packed_tensor = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
+         output1_scale_gate_scalar = self.quant_config.g1_alphas
+@@ -295,7 +342,7 @@ def _invoke_kernel(
+             topk_ids=packed_tensor,
+             routing_bias=None,
+             hidden_states=hidden_states,
+-            hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
++            hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
+                 *hidden_states.shape[:-1], -1
+             ),
+             gemm1_weights=w1,
+@@ -321,6 +368,7 @@ def _invoke_kernel(
+             routing_method_type=1,  # not used
+             do_finalize=True,
+             activation_type=activation_to_flashinfer_int(activation),
++            per_token_scale=per_token_scale,
+             output=output,
+             tune_max_num_tokens=min(
+                 fi_moe_largest_bucket(self.moe_config), self._get_chunk_size()
+@@ -346,7 +394,8 @@ def apply(
+         apply_router_weight_on_input: bool,
+     ):
+         assert self._supports_activation(activation)
+-        assert a1q_scale is not None
++        # Per-token defers input quant to _invoke_kernel, so a1q_scale is None.
++        assert a1q_scale is not None or self.per_token_activation
+ 
+         M = hidden_states.shape[0]
+         chunk_size = self._get_chunk_size()
+@@ -375,7 +424,7 @@ def apply(
+                     topk_ids[start:end],
+                     activation,
+                     global_num_experts,
+-                    a1q_scale[start:end],
++                    None if a1q_scale is None else a1q_scale[start:end],
+                 )
+ 
+ 
+@@ -439,7 +488,7 @@ def apply(
+         import flashinfer
+ 
+         assert self._supports_activation(activation)
+-        assert a1q_scale is not None
++        assert a1q_scale is not None or self.per_token_activation
+         assert self.quant_config.w1_scale is not None
+         assert self.quant_config.w2_scale is not None
+         assert (
+@@ -450,6 +499,14 @@ def apply(
+             and self.routing_method_type != RoutingMethodType.Llama4
+         )
+ 
++        # Per-token: input is unquantized, quantize it here (see modular apply).
++        if self.per_token_activation:
++            hidden_states, block_scale, per_token_scale = (
++                self._quantize_per_token_input(hidden_states)
++            )
++        else:
++            block_scale, per_token_scale = a1q_scale, None
++
+         output1_scale_gate_scalar = self.quant_config.g1_alphas
+ 
+         # Invoke kernel.
+@@ -459,7 +516,7 @@ def apply(
+             routing_logits=router_logits,
+             routing_bias=e_score_correction_bias,
+             hidden_states=hidden_states,
+-            hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
++            hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
+                 *hidden_states.shape[:-1], -1
+             ),
+             gemm1_weights=w1,
+@@ -485,5 +542,6 @@ def apply(
+             routing_method_type=self.routing_method_type,
+             do_finalize=True,
+             activation_type=activation_to_flashinfer_int(activation),
++            per_token_scale=per_token_scale,
+             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+         )[0]
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+index f295163568d6..7852b4db8474 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+@@ -529,6 +529,7 @@ def make_nvfp4_moe_kernel(
+     backend: NvFp4MoeBackend,
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+     layer: torch.nn.Module | None = None,
++    per_token_activation: bool = False,
+ ) -> mk.FusedMoEKernel:
+     # Create Prepare/Finalize.
+     prepare_finalize = maybe_make_prepare_finalize(
+@@ -546,6 +547,8 @@ def make_nvfp4_moe_kernel(
+     if backend == NvFp4MoeBackend.HUMMING:
+         assert layer is not None
+         extra_kwargs = {"layer": layer}
++    if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM and per_token_activation:
++        extra_kwargs["per_token_activation"] = True
+ 
+     # Create Experts.
+     if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+diff --git a/vllm/model_executor/layers/quantization/__init__.py b/vllm/model_executor/layers/quantization/__init__.py
+index 866bc30a151a..55e815b2a90e 100644
+--- a/vllm/model_executor/layers/quantization/__init__.py
++++ b/vllm/model_executor/layers/quantization/__init__.py
+@@ -42,6 +42,7 @@
+     "fp8_per_block",
+     "fp8_per_channel",
+     "int8_per_channel_weight_only",
++    "nvfp4_per_token",
+     "mxfp8",
+ ]
+ QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
+diff --git a/vllm/model_executor/layers/quantization/online/base.py b/vllm/model_executor/layers/quantization/online/base.py
+index b0a70e102420..3f8a741d357d 100644
+--- a/vllm/model_executor/layers/quantization/online/base.py
++++ b/vllm/model_executor/layers/quantization/online/base.py
+@@ -40,6 +40,9 @@
+     Mxfp8OnlineLinearMethod,
+     Mxfp8OnlineMoEMethod,
+ )
++from vllm.model_executor.layers.quantization.online.nvfp4 import (
++    Nvfp4OnlineMoEMethod,
++)
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
+     kFp8Static128BlockSym,
+@@ -47,6 +50,7 @@
+     kFp8StaticTensorSym,
+     kInt8StaticChannelSym,
+     kMxfp8Dynamic,
++    kNvfp4Static,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -68,6 +72,7 @@
+     kFp8StaticChannelSym: Fp8PtpcOnlineMoEMethod,
+     kMxfp8Dynamic: Mxfp8OnlineMoEMethod,
+     kInt8StaticChannelSym: Int8OnlineMoEMethod,
++    kNvfp4Static: Nvfp4OnlineMoEMethod,
+ }
+ 
+ 
+diff --git a/vllm/model_executor/layers/quantization/online/nvfp4.py b/vllm/model_executor/layers/quantization/online/nvfp4.py
+new file mode 100644
+index 000000000000..872643ba2666
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/online/nvfp4.py
+@@ -0,0 +1,171 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++from torch.nn import Module
++
++from vllm._custom_ops import scaled_fp4_quant
++from vllm.model_executor.layers.fused_moe import RoutedExperts
++from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
++from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
++    convert_to_nvfp4_moe_kernel_format,
++    make_nvfp4_moe_kernel,
++    make_nvfp4_moe_quant_config,
++    select_nvfp4_moe_backend,
++)
++from vllm.model_executor.layers.quantization.online.moe_base import (
++    OnlineMoEMethodBase,
++)
++from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
++    FLOAT4_E2M1_MAX,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    kNvfp4Dynamic,
++    kNvfp4Static,
++)
++from vllm.model_executor.utils import replace_parameter
++from vllm.platforms import current_platform
++
++FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
++
++
++def _quantize_moe_weight_to_nvfp4(
++    weight: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Quantize stacked MoE expert weights ``(E, N, K)`` to NVFP4.
++
++    One FP32 global scale per expert plus per-block (group-16) FP8 scales,
++    matching the ModelOpt NVFP4 checkpoint layout. Returns packed FP4 weights
++    ``(E, N, K // 2)``, block scales ``(E, N, K // 16)``, and the per-expert
++    global scale ``(E,)`` stored as ``amax / (fp4_max * fp8_max)``.
++    """
++    assert weight.dim() == 3, f"expected 3D expert weights, got {weight.shape}"
++    num_experts, n, k = weight.shape
++    assert k % 16 == 0, f"last dim must be a multiple of 16, got {k}"
++
++    amax = weight.abs().amax(dim=(1, 2)).to(torch.float32).clamp_min(1e-8)
++    global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
++    weight_scale_2 = (1.0 / global_scale).to(torch.float32)
++
++    # scaled_fp4_quant(w, g) == scaled_fp4_quant(w * g, 1), so fold each
++    # expert's scale in and quantize all experts in one call (fp32 to keep the
++    # large scale precise), rather than looping per expert.
++    scaled = (weight.float() * global_scale[:, None, None]).to(weight.dtype)
++    scaled = scaled.reshape(-1, k)
++    one = torch.ones((), device=weight.device, dtype=torch.float32)
++    qweight, block_scale = scaled_fp4_quant(scaled, one, is_sf_swizzled_layout=False)
++    return (
++        qweight.reshape(num_experts, n, k // 2),
++        block_scale.reshape(num_experts, n, k // 16),
++        weight_scale_2,
++    )
++
++
++class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
++    """Online NVFP4 MoE quantization with per-token activation scales.
++
++    Quantizes fp16/bf16 expert weights to NVFP4 at load time; the FlashInfer
++    TRTLLM kernel computes per-token activation scales at runtime. Blackwell
++    (SM100) only.
++    """
++
++    def __init__(
++        self,
++        *,
++        layer: torch.nn.Module,
++    ):
++        if not current_platform.is_device_capability_family(100):
++            raise ValueError(
++                "nvfp4_per_token online quantization requires a Blackwell (SM100) GPU."
++            )
++        super().__init__(layer.moe_config)
++        self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
++            config=self.moe,
++            weight_key=kNvfp4Static,
++            activation_key=kNvfp4Dynamic,
++        )
++
++    def process_weights_after_loading(self, layer: Module) -> None:
++        if getattr(layer, "_already_called_process_weights_after_loading", False):
++            return
++
++        self._quantize_weights(layer)
++        self._setup_kernel(layer)
++
++        layer._already_called_process_weights_after_loading = True
++
++    def _quantize_weights(self, layer: Module) -> None:
++        w13, w13_scale, w13_scale_2 = _quantize_moe_weight_to_nvfp4(layer.w13_weight)
++        w2, w2_scale, w2_scale_2 = _quantize_moe_weight_to_nvfp4(layer.w2_weight)
++
++        replace_parameter(layer, "w13_weight", w13)
++        replace_parameter(layer, "w13_weight_scale", w13_scale)
++        replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
++        replace_parameter(layer, "w2_weight", w2)
++        replace_parameter(layer, "w2_weight_scale", w2_scale)
++        replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
++
++        # Neutral (1.0) activation global scales: the kernel derives per-token
++        # scales at runtime, so the output scalars reduce to the weight scales.
++        ones = torch.ones(layer.num_experts, device=w13.device, dtype=torch.float32)
++        replace_parameter(layer, "w13_input_scale", ones)
++        replace_parameter(layer, "w2_input_scale", ones.clone())
++
++    def _setup_kernel(self, layer: RoutedExperts) -> None:
++        (
++            w13,
++            w13_scale,
++            w13_scale_2,
++            a13_scale,
++            w2,
++            w2_scale,
++            w2_scale_2,
++            a2_scale,
++        ) = convert_to_nvfp4_moe_kernel_format(
++            nvfp4_backend=self.nvfp4_backend,
++            layer=layer,
++            w13=layer.w13_weight,
++            w13_scale=layer.w13_weight_scale,
++            w13_scale_2=layer.w13_weight_scale_2,
++            a13_scale=layer.w13_input_scale,
++            w2=layer.w2_weight,
++            w2_scale=layer.w2_weight_scale,
++            w2_scale_2=layer.w2_weight_scale_2,
++            a2_scale=layer.w2_input_scale,
++            is_act_and_mul=self.moe.is_act_and_mul,
++        )
++
++        replace_parameter(layer, "w13_weight", w13)
++        replace_parameter(layer, "w13_weight_scale", w13_scale)
++        replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
++        replace_parameter(layer, "w13_input_scale", a13_scale)
++        replace_parameter(layer, "w2_weight", w2)
++        replace_parameter(layer, "w2_weight_scale", w2_scale)
++        replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
++        replace_parameter(layer, "w2_input_scale", a2_scale)
++
++        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
++        assert self.experts_cls is not None
++        self.moe_kernel = make_nvfp4_moe_kernel(
++            moe_quant_config=self.moe_quant_config,
++            moe_config=self.moe,
++            experts_cls=self.experts_cls,
++            backend=self.nvfp4_backend,
++            routing_tables=layer._expert_routing_tables(),
++            layer=layer,
++            per_token_activation=True,
++        )
++        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
++
++    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
++        return make_nvfp4_moe_quant_config(
++            backend=self.nvfp4_backend,
++            w13_scale=layer.w13_weight_scale,
++            w2_scale=layer.w2_weight_scale,
++            w13_scale_2=layer.w13_weight_scale_2,
++            w2_scale_2=layer.w2_weight_scale_2,
++            a13_scale=layer.w13_input_scale,
++            a2_scale=layer.w2_input_scale,
++            swiglu_limit=getattr(layer, "swiglu_limit", None),
++            layer=layer,
++        )

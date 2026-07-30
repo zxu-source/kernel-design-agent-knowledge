@@ -1,0 +1,1098 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+index d48c7f675f9a..adf2e653d908 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+@@ -53,6 +53,18 @@ def swiglu_limit_func(
+     output.copy_(F.silu(gate) * up)
+ 
+ 
++def swiglu_gpt_oss_sigmoid_alpha_contiguous(
++    output: torch.Tensor,
++    input: torch.Tensor,  # first half is gate, second half is up
++    gemm1_alpha: float,
++    gemm1_limit: float,
++) -> None:
++    d = input.shape[1] // 2
++    gate = input[:, :d].clamp(max=gemm1_limit)
++    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
++    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
++
++
+ @register_custom_op(out_shape="hidden_states")
+ def fused_marlin_moe(
+     hidden_states: torch.Tensor,
+@@ -73,12 +85,15 @@ def fused_marlin_moe(
+     w2_zeros: Optional[torch.Tensor] = None,
+     w1_global_scale: Optional[torch.Tensor] = None,
+     w2_global_scale: Optional[torch.Tensor] = None,
++    w1_bias: Optional[torch.Tensor] = None,
++    w2_bias: Optional[torch.Tensor] = None,
+     workspace: Optional[torch.Tensor] = None,
+     num_bits: int = 8,
+     is_k_full: bool = True,
+     inplace: bool = False,
+     routed_scaling_factor: Optional[float] = None,
+     clamp_limit: Optional[float] = None,
++    gemm1_alpha: Optional[float] = None,
+     activation: str = "silu",
+     is_gated: bool = True,
+ ) -> torch.Tensor:
+@@ -208,7 +223,7 @@ def fused_marlin_moe(
+         hidden_states,
+         intermediate_cache1,
+         w1,
+-        None,  # b_bias_or_none
++        w1_bias,
+         w1_scale,
+         w1_global_scale,
+         w1_zeros,
+@@ -233,7 +248,16 @@ def fused_marlin_moe(
+         is_zp_float=False,
+     )
+ 
+-    if activation == "silu" and is_gated and clamp_limit is not None:
++    if activation == "silu" and is_gated and gemm1_alpha is not None:
++        if clamp_limit is None:
++            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
++        swiglu_gpt_oss_sigmoid_alpha_contiguous(
++            intermediate_cache2,
++            intermediate_cache1.view(-1, gemm1_n),
++            gemm1_alpha,
++            clamp_limit,
++        )
++    elif activation == "silu" and is_gated and clamp_limit is not None:
+         swiglu_limit_func(
+             intermediate_cache2,
+             intermediate_cache1.view(-1, gemm1_n),
+@@ -255,7 +279,7 @@ def fused_marlin_moe(
+         intermediate_cache2,
+         intermediate_cache3,
+         w2,
+-        None,  # b_bias_or_none
++        w2_bias,
+         w2_scale,
+         w2_global_scale,
+         w2_zeros,
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/mxfp4_moe_sm120_triton.py b/python/sglang/srt/layers/moe/fused_moe_triton/mxfp4_moe_sm120_triton.py
+deleted file mode 100644
+index 95d303f0a8fb..000000000000
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/mxfp4_moe_sm120_triton.py
++++ /dev/null
+@@ -1,454 +0,0 @@
+-"""SM120-optimized Triton MXFP4 MoE kernel — CUDA graph compatible.
+-
+-Replaces the PyTorch fallback (per-expert for-loop + full dequant + matmul)
+-with fused Triton kernels that:
+-1. Fuse FP4 dequant + GEMV (no intermediate BF16 weight materialization)
+-2. Process each (token, expert) slot independently — no data-dependent routing
+-3. Respect SM120 shared memory constraint (99 KB/block)
+-
+-CUDA graph compatibility:
+-- No .unique(), .item(), .nonzero() — all routing is tensor-level
+-- Fixed grid dimensions (M*topk, N_blocks) per captured batch size
+-- All control flow is static or within Triton kernels
+-
+-SM120 constraints:
+-- SMEM: 99 KB/block (vs SM100 228 KB)
+-- No TMEM/tcgen05 — uses mma.sync.aligned via Triton
+-- Max warps: 48/SM
+-- Registers: ~128/thread practical limit
+-"""
+-
+-import logging
+-from typing import Optional
+-
+-import torch
+-import triton
+-import triton.language as tl
+-
+-logger = logging.getLogger(__name__)
+-
+-
+-@triton.jit
+-def _dequant_fp4_lut(nibble):
+-    """Decode a 4-bit FP4 E2M1 nibble to float32 using arithmetic."""
+-    sign_bit = (nibble >> 3) & 1
+-    exp_bits = (nibble >> 1) & 3
+-    man_bit = nibble & 1
+-
+-    is_subnormal = exp_bits == 0
+-    mantissa = 1.0 + man_bit.to(tl.float32) * 0.5
+-    exponent = tl.math.exp2((exp_bits - 1).to(tl.float32))
+-    val = tl.where(is_subnormal, man_bit.to(tl.float32) * 0.5, mantissa * exponent)
+-    val = tl.where(sign_bit != 0, -val, val)
+-    return val
+-
+-
+-# ── Per-slot GEMV kernel: processes one (token, expert) pair ──
+-
+-
+-@triton.autotune(
+-    configs=[
+-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+-        triton.Config({"BLOCK_N": 32, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+-        triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+-    ],
+-    key=["N", "K"],
+-)
+-@triton.jit
+-def _mxfp4_slot_gemv_kernel(
+-    # Pointers
+-    A_ptr,  # [M_total, K] bf16 — source rows
+-    B_packed_ptr,  # [E, N, K//2] uint8 — packed FP4 expert weights
+-    B_scale_ptr,  # [E, N, K//32] float32 — weight scales
+-    C_ptr,  # [num_slots, N] bf16 — output
+-    token_ids_ptr,  # [num_slots] int32 — which A row for each slot
+-    expert_ids_ptr,  # [num_slots] int32 — which expert's B for each slot
+-    # Dimensions
+-    N: tl.int32,
+-    K: tl.int32,
+-    # A strides
+-    stride_am: tl.int32,
+-    # B strides (within an expert)
+-    stride_bn: tl.int32,
+-    stride_bk2: tl.int32,
+-    # B_scale strides (within an expert)
+-    stride_bsn: tl.int32,
+-    stride_bsk32: tl.int32,
+-    # Expert strides (between experts)
+-    expert_b_stride: tl.int64,
+-    expert_s_stride: tl.int64,
+-    # C strides
+-    stride_cm: tl.int32,
+-    # Block sizes
+-    BLOCK_N: tl.constexpr,
+-    BLOCK_K: tl.constexpr,
+-):
+-    """Per-slot fused MXFP4 dequant + GEMV.
+-
+-    Grid: (num_slots, cdiv(N, BLOCK_N))
+-    Each program computes one (token, expert) pair for a BLOCK_N slice of output.
+-    """
+-    slot_id = tl.program_id(0)
+-    n_block = tl.program_id(1)
+-
+-    token_id = tl.load(token_ids_ptr + slot_id).to(tl.int64)
+-    expert_id = tl.load(expert_ids_ptr + slot_id).to(tl.int64)
+-
+-    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+-    n_mask = offs_n < N
+-
+-    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+-
+-    # Expert weight base pointers
+-    b_base = expert_id * expert_b_stride
+-    s_base = expert_id * expert_s_stride
+-    a_base = token_id * stride_am
+-
+-    for k_start in range(0, K, BLOCK_K):
+-        # ── Load packed B: [BLOCK_N, BLOCK_K//2] ──
+-        offs_k2 = k_start // 2 + tl.arange(0, BLOCK_K // 2)
+-        b_mask = n_mask[:, None] & (offs_k2[None, :] < K // 2)
+-        b_packed = tl.load(
+-            B_packed_ptr
+-            + b_base
+-            + offs_n[:, None] * stride_bn
+-            + offs_k2[None, :] * stride_bk2,
+-            mask=b_mask,
+-            other=0,
+-        )
+-
+-        # ── FP4 dequant ──
+-        b_u8 = b_packed.to(tl.int32)
+-        val_lo = _dequant_fp4_lut(b_u8 & 0x0F)  # even K indices
+-        val_hi = _dequant_fp4_lut((b_u8 >> 4) & 0x0F)  # odd K indices
+-
+-        # ── Load and apply scales: [BLOCK_N, BLOCK_K//2] ──
+-        group_ids = tl.arange(0, BLOCK_K // 2) // 16  # 32 values per group, 2 per byte
+-        s_mask = n_mask[:, None] & ((k_start // 32 + group_ids[None, :]) < K // 32)
+-        scales = tl.load(
+-            B_scale_ptr
+-            + s_base
+-            + offs_n[:, None] * stride_bsn
+-            + (k_start // 32 + group_ids[None, :]) * stride_bsk32,
+-            mask=s_mask,
+-            other=1.0,
+-        )
+-        val_lo = val_lo * scales
+-        val_hi = val_hi * scales
+-
+-        # ── Load A even/odd: [BLOCK_K//2] each ──
+-        offs_k_even = k_start + tl.arange(0, BLOCK_K // 2) * 2
+-        offs_k_odd = offs_k_even + 1
+-
+-        a_even = tl.load(
+-            A_ptr + a_base + offs_k_even,
+-            mask=offs_k_even < K,
+-            other=0.0,
+-        ).to(tl.float32)
+-        a_odd = tl.load(
+-            A_ptr + a_base + offs_k_odd,
+-            mask=offs_k_odd < K,
+-            other=0.0,
+-        ).to(tl.float32)
+-
+-        # ── Dot product: acc[n] += sum_k(a_even[k]*B_lo[n,k] + a_odd[k]*B_hi[n,k]) ──
+-        acc += tl.sum(a_even[None, :] * val_lo, axis=1)
+-        acc += tl.sum(a_odd[None, :] * val_hi, axis=1)
+-
+-    # ── Store output ──
+-    tl.store(
+-        C_ptr + slot_id * stride_cm + offs_n,
+-        acc.to(tl.bfloat16),
+-        mask=n_mask,
+-    )
+-
+-
+-# ── Legacy per-expert GEMM kernel (kept for benchmarking) ──
+-
+-
+-@triton.autotune(
+-    configs=[
+-        triton.Config(
+-            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2
+-        ),
+-        triton.Config(
+-            {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64}, num_warps=4, num_stages=2
+-        ),
+-        triton.Config(
+-            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64}, num_warps=4, num_stages=2
+-        ),
+-        triton.Config(
+-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=8, num_stages=2
+-        ),
+-        triton.Config(
+-            {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2
+-        ),
+-    ],
+-    key=["M", "N", "K"],
+-)
+-@triton.jit
+-def _mxfp4_gemm_kernel(
+-    # Pointers
+-    A_ptr,  # [M, K] bf16 activation
+-    B_packed_ptr,  # [N, K//2] uint8 packed FP4
+-    B_scale_ptr,  # [N, K//32] float32 scales
+-    C_ptr,  # [M, N] bf16 output
+-    # Dimensions
+-    M,
+-    N,
+-    K,
+-    # Strides
+-    stride_am,
+-    stride_ak,
+-    stride_bn,
+-    stride_bk2,
+-    stride_bsn,
+-    stride_bsk32,
+-    stride_cm,
+-    stride_cn,
+-    # Constexprs
+-    BLOCK_M: tl.constexpr,
+-    BLOCK_N: tl.constexpr,
+-    BLOCK_K: tl.constexpr,
+-):
+-    """Fused MXFP4 dequant + GEMM: C = A @ dequant(B_packed, B_scale).T"""
+-    pid_m = tl.program_id(0)
+-    pid_n = tl.program_id(1)
+-
+-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-
+-    for k_start in range(0, K, BLOCK_K):
+-        offs_k2 = k_start // 2 + tl.arange(0, BLOCK_K // 2)
+-        b_mask = (offs_n[:, None] < N) & (offs_k2[None, :] < K // 2)
+-        b_packed = tl.load(
+-            B_packed_ptr + offs_n[:, None] * stride_bn + offs_k2[None, :] * stride_bk2,
+-            mask=b_mask,
+-            other=0,
+-        )
+-
+-        b_u8 = b_packed.to(tl.int32)
+-        val_lo = _dequant_fp4_lut(b_u8 & 0x0F)
+-        val_hi = _dequant_fp4_lut((b_u8 >> 4) & 0x0F)
+-
+-        group_ids = tl.arange(0, BLOCK_K // 2) // 16
+-        scales_per_byte = tl.load(
+-            B_scale_ptr
+-            + offs_n[:, None] * stride_bsn
+-            + (k_start // 32 + group_ids[None, :]) * stride_bsk32,
+-            mask=(offs_n[:, None] < N)
+-            & ((k_start // 32 + group_ids[None, :]) < K // 32),
+-            other=1.0,
+-        )
+-        val_lo = val_lo * scales_per_byte
+-        val_hi = val_hi * scales_per_byte
+-
+-        offs_k_even = k_start + tl.arange(0, BLOCK_K // 2) * 2
+-        offs_k_odd = offs_k_even + 1
+-
+-        a_even_mask = (offs_m[:, None] < M) & (offs_k_even[None, :] < K)
+-        a_even = tl.load(
+-            A_ptr + offs_m[:, None] * stride_am + offs_k_even[None, :] * stride_ak,
+-            mask=a_even_mask,
+-            other=0.0,
+-        ).to(tl.float32)
+-
+-        a_odd_mask = (offs_m[:, None] < M) & (offs_k_odd[None, :] < K)
+-        a_odd = tl.load(
+-            A_ptr + offs_m[:, None] * stride_am + offs_k_odd[None, :] * stride_ak,
+-            mask=a_odd_mask,
+-            other=0.0,
+-        ).to(tl.float32)
+-
+-        acc += tl.dot(a_even, tl.trans(val_lo))
+-        acc += tl.dot(a_odd, tl.trans(val_hi))
+-
+-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+-    tl.store(
+-        C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+-        acc.to(tl.bfloat16),
+-        mask=c_mask,
+-    )
+-
+-
+-def mxfp4_gemm_triton(
+-    A: torch.Tensor,
+-    B_packed: torch.Tensor,
+-    B_scale: torch.Tensor,
+-    K_full: int,
+-) -> torch.Tensor:
+-    """Triton fused MXFP4 dequant + GEMM: output = A @ dequant(B).T
+-
+-    Kept for standalone benchmarking. The MoE forward uses the slot kernel.
+-    """
+-    M = A.shape[0]
+-    N = B_packed.shape[0]
+-    K = K_full
+-
+-    if B_scale.dtype == torch.float8_e8m0fnu:
+-        B_scale = B_scale.to(torch.float32)
+-    elif B_scale.dtype != torch.float32:
+-        B_scale = B_scale.float()
+-
+-    C = torch.empty(M, N, dtype=torch.bfloat16, device=A.device)
+-    A = A.contiguous()
+-    B_packed = B_packed.contiguous()
+-    B_scale = B_scale.contiguous()
+-
+-    grid = lambda meta: (
+-        triton.cdiv(M, meta["BLOCK_M"]),
+-        triton.cdiv(N, meta["BLOCK_N"]),
+-    )
+-    B_u8 = B_packed.view(torch.uint8)
+-
+-    _mxfp4_gemm_kernel[grid](
+-        A,
+-        B_u8,
+-        B_scale,
+-        C,
+-        M,
+-        N,
+-        K,
+-        A.stride(0),
+-        A.stride(1),
+-        B_u8.stride(0),
+-        B_u8.stride(1),
+-        B_scale.stride(0),
+-        B_scale.stride(1),
+-        C.stride(0),
+-        C.stride(1),
+-    )
+-    return C
+-
+-
+-def mxfp4_moe_forward_triton(
+-    hidden_states: torch.Tensor,
+-    w13_packed: torch.Tensor,
+-    w2_packed: torch.Tensor,
+-    w13_scale: torch.Tensor,
+-    w2_scale: torch.Tensor,
+-    topk_ids: torch.Tensor,
+-    topk_weights: torch.Tensor,
+-    hidden_size: int,
+-    intermediate_size: int,
+-    inplace: bool = False,
+-    routed_scaling_factor: Optional[float] = None,
+-    clamp_limit: Optional[float] = None,
+-) -> torch.Tensor:
+-    """SM120-optimized MXFP4 MoE forward — CUDA graph compatible.
+-
+-    Uses per-slot GEMV kernels instead of per-expert Python loops.
+-    Each (token, expert) slot is processed independently with a fixed grid,
+-    eliminating .unique()/.item()/.nonzero() that break CUDA graph capture.
+-    """
+-    import torch.nn.functional as F
+-
+-    M, K = hidden_states.shape
+-    topk = topk_ids.shape[1]
+-    I = intermediate_size
+-    num_slots = M * topk
+-    device = hidden_states.device
+-    dtype = hidden_states.dtype
+-
+-    # ── Graph-safe routing: flatten topk assignments ──
+-    # token_ids[slot] = which row of A (original token index)
+-    # expert_ids[slot] = which expert's weights to use
+-    # topk_ids may contain -1 for padded/filtered tokens; clamp to 0 for safe
+-    # Triton loads, then zero out invalid slots' output after GEMM.
+-    flat_expert_ids_raw = topk_ids.reshape(-1).contiguous()  # [M*topk]
+-    invalid_slot_mask = flat_expert_ids_raw < 0  # [M*topk]
+-    flat_expert_ids = flat_expert_ids_raw.clamp(min=0)  # safe for indexing
+-    token_ids = (
+-        torch.arange(M, device=device, dtype=torch.int32)
+-        .unsqueeze(1)
+-        .expand(M, topk)
+-        .reshape(-1)
+-        .contiguous()
+-    )  # [M*topk]
+-
+-    # ── Ensure scales are float32 ──
+-    if w13_scale.dtype != torch.float32:
+-        w13_scale = w13_scale.to(torch.float32)
+-    if w2_scale.dtype != torch.float32:
+-        w2_scale = w2_scale.to(torch.float32)
+-
+-    # ── GEMM1: gate_up projection ──
+-    # hidden_states[token] @ w13[expert].T → [num_slots, 2*I]
+-    intermediate = torch.empty(num_slots, 2 * I, dtype=dtype, device=device)
+-
+-    w13_u8 = w13_packed.view(torch.uint8)  # [E, 2*I, K//2]
+-    grid1 = lambda meta: (num_slots, triton.cdiv(2 * I, meta["BLOCK_N"]))
+-
+-    _mxfp4_slot_gemv_kernel[grid1](
+-        hidden_states,
+-        w13_u8,
+-        w13_scale,
+-        intermediate,
+-        token_ids,
+-        flat_expert_ids,
+-        2 * I,
+-        K,
+-        hidden_states.stride(0),
+-        w13_u8.stride(1),
+-        w13_u8.stride(2),
+-        w13_scale.stride(1),
+-        w13_scale.stride(2),
+-        w13_u8.stride(0),
+-        w13_scale.stride(0),
+-        intermediate.stride(0),
+-    )
+-
+-    # ── SiLU activation (graph-safe vectorized ops) ──
+-    gate = intermediate[:, :I].float()
+-    up = intermediate[:, I:].float()
+-    if clamp_limit is not None and clamp_limit > 0:
+-        gate = torch.clamp(gate, max=clamp_limit)
+-        up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+-    activated = (F.silu(gate) * up).to(dtype)
+-
+-    # ── GEMM2: down projection ──
+-    # activated[slot] @ w2[expert].T → [num_slots, K]
+-    down = torch.empty(num_slots, K, dtype=dtype, device=device)
+-
+-    # For GEMM2, A is the activated buffer — each slot reads its own row
+-    slot_ids = torch.arange(num_slots, device=device, dtype=torch.int32)
+-
+-    w2_u8 = w2_packed.view(torch.uint8)  # [E, K, I//2]
+-    grid2 = lambda meta: (num_slots, triton.cdiv(K, meta["BLOCK_N"]))
+-
+-    _mxfp4_slot_gemv_kernel[grid2](
+-        activated,
+-        w2_u8,
+-        w2_scale,
+-        down,
+-        slot_ids,
+-        flat_expert_ids,
+-        K,
+-        I,
+-        activated.stride(0),
+-        w2_u8.stride(1),
+-        w2_u8.stride(2),
+-        w2_scale.stride(1),
+-        w2_scale.stride(2),
+-        w2_u8.stride(0),
+-        w2_scale.stride(0),
+-        down.stride(0),
+-    )
+-
+-    # ── Zero out invalid slots (padded/filtered tokens with topk_ids == -1) ──
+-    # Use multiplication instead of boolean indexing to stay CUDA-graph-safe
+-    # (no GPU→CPU sync). valid_mask is 1.0 for valid slots, 0.0 for invalid.
+-    valid_mask = (~invalid_slot_mask).unsqueeze(1).to(dtype)  # [M*topk, 1]
+-    down = down * valid_mask
+-
+-    # ── Weighted sum across topk slots (graph-safe) ──
+-    flat_weights = topk_weights.reshape(-1).unsqueeze(1).to(dtype)  # [M*topk, 1]
+-    output = (down * flat_weights).view(M, topk, K).sum(dim=1)
+-
+-    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+-        output.mul_(routed_scaling_factor)
+-
+-    return output
+diff --git a/python/sglang/srt/layers/moe/moe_runner/marlin.py b/python/sglang/srt/layers/moe/moe_runner/marlin.py
+index bedf48ffbb8c..23b5272e2cf5 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/marlin.py
++++ b/python/sglang/srt/layers/moe/moe_runner/marlin.py
+@@ -74,6 +74,8 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
+     global_num_experts: int = -1
+     w13_global_scale: Optional[torch.Tensor] = None
+     w2_global_scale: Optional[torch.Tensor] = None
++    w13_bias: Optional[torch.Tensor] = None
++    w2_bias: Optional[torch.Tensor] = None
+ 
+ 
+ @register_fused_func("none", "marlin")
+@@ -142,12 +144,19 @@ def fused_experts_none_to_marlin(
+         w2_zeros=quant_info.w2_qzeros,
+         w1_global_scale=quant_info.w13_global_scale,
+         w2_global_scale=quant_info.w2_global_scale,
++        w1_bias=quant_info.w13_bias,
++        w2_bias=quant_info.w2_bias,
+         workspace=MARLIN_MOE_WORKSPACE,
+         num_bits=quant_info.weight_bits,
+         is_k_full=quant_info.is_k_full,
+         inplace=marlin_inplace,
+         routed_scaling_factor=runner_config.routed_scaling_factor,
+-        clamp_limit=runner_config.swiglu_limit,
++        clamp_limit=(
++            runner_config.gemm1_clamp_limit
++            if runner_config.gemm1_alpha is not None
++            else runner_config.swiglu_limit
++        ),
++        gemm1_alpha=runner_config.gemm1_alpha,
+         activation=runner_config.activation,
+         is_gated=runner_config.is_gated,
+     ).to(hidden_states.dtype)
+diff --git a/python/sglang/srt/layers/quantization/marlin_utils.py b/python/sglang/srt/layers/quantization/marlin_utils.py
+index 2e77d4f93a20..134a897cfa55 100644
+--- a/python/sglang/srt/layers/quantization/marlin_utils.py
++++ b/python/sglang/srt/layers/quantization/marlin_utils.py
+@@ -242,7 +242,9 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+     )[0]
+ 
+ 
+-def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
++def check_moe_marlin_supports_layer(
++    layer: FusedMoE, group_size: int, allow_tile_padding: bool = False
++) -> bool:
+     hidden_size = layer.hidden_size
+     intermediate_size_per_partition = layer.intermediate_size_per_partition
+     # apply_router_weight_on_input is not supported for moe marlin
+@@ -255,13 +257,21 @@ def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
+             "relu2",
+         }
+ 
+-    # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
+-    # down: (n, k) = (hidden_size, intermediate_size_per_partition)
+-    # moe marlin requires n % 128 == 0 and k % 64 == 0
+-    supports_shape = (
+-        hidden_size % 128 == 0
+-        and intermediate_size_per_partition % max(64, group_size) == 0
+-    )
++    if allow_tile_padding:
++        # Thread-tile misalignment can be fixed by zero-padding the expert
++        # intermediate dimension before Marlin repack. The original K still
++        # needs to fit a Marlin tile family, and quant groups must stay whole.
++        supports_shape = (
++            hidden_size % 64 == 0 and intermediate_size_per_partition % group_size == 0
++        )
++    else:
++        # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
++        # down: (n, k) = (hidden_size, intermediate_size_per_partition)
++        # moe marlin requires n % 128 == 0 and k % 64 == 0
++        supports_shape = (
++            hidden_size % 128 == 0
++            and intermediate_size_per_partition % max(64, group_size) == 0
++        )
+     supports_group_size = group_size in [-1, 32, 64, 128]
+     return (
+         supports_shape
+diff --git a/python/sglang/srt/layers/quantization/marlin_utils_fp4.py b/python/sglang/srt/layers/quantization/marlin_utils_fp4.py
+index c0adbb49ffa0..44cd5181e334 100644
+--- a/python/sglang/srt/layers/quantization/marlin_utils_fp4.py
++++ b/python/sglang/srt/layers/quantization/marlin_utils_fp4.py
+@@ -225,6 +225,45 @@ def _get_optional_param(layer: torch.nn.Module, *names: str) -> torch.Tensor | N
+     return None
+ 
+ 
++def deinterleave_moe_mxfp4_w13_for_marlin(layer: torch.nn.Module) -> None:
++    """Convert GPT-OSS interleaved w13 rows to Marlin's contiguous halves.
++
++    GPT-OSS stores gate/up rows as [gate0, up0, gate1, up1, ...]. The Marlin
++    fused activation consumes [all_gate_rows, all_up_rows].
++    """
++
++    w13 = layer.w13_weight.data
++    w13_scale = _get_optional_param(layer, "w13_weight_scale", "w13_weight_scale_inv")
++    w13_bias = _get_optional_param(layer, "w13_weight_bias", "w13_bias")
++
++    if w13.shape[1] % 2 != 0:
++        raise ValueError(f"Expected even w13 row dimension, got {w13.shape}.")
++
++    e, n, k = w13.shape
++    layer.w13_weight.data = (
++        w13.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
++    )
++
++    if w13_scale is not None:
++        scale = w13_scale.data
++        if scale.shape[1] != n:
++            raise ValueError(
++                f"Expected w13 scale row dimension {n}, got {scale.shape}."
++            )
++        w13_scale.data = (
++            scale.view(e, n // 2, 2, scale.shape[-1])
++            .permute(0, 2, 1, 3)
++            .contiguous()
++            .view(e, n, scale.shape[-1])
++        )
++
++    if w13_bias is not None:
++        bias = w13_bias.data
++        if bias.shape[1] != n:
++            raise ValueError(f"Expected w13 bias row dimension {n}, got {bias.shape}.")
++        w13_bias.data = bias.view(e, n // 2, 2).permute(0, 2, 1).contiguous().view(e, n)
++
++
+ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+     group_size = 32
+     w13 = layer.w13_weight.data
+@@ -245,6 +284,15 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+     num_experts = w13.shape[0]
+     intermediate_size = w13.shape[1] // 2
+     hidden_size = w13.shape[2] * 2
++    if hidden_size % 128 == 0:
++        padded_intermediate_size = ((intermediate_size + 63) // 64) * 64
++    else:
++        if hidden_size % 64 != 0:
++            raise ValueError(
++                f"MXFP4 Marlin requires hidden_size to be divisible by 64, "
++                f"got {hidden_size}."
++            )
++        padded_intermediate_size = ((intermediate_size + 127) // 128) * 128
+     param_dtype = getattr(
+         layer,
+         "orig_dtype",
+@@ -255,11 +303,37 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+     layer.workspace = marlin_make_workspace(device, 4)
+     perm = torch.empty(0, dtype=torch.int, device=device)
+ 
++    def _pad_w13(x: torch.Tensor) -> torch.Tensor:
++        if padded_intermediate_size == intermediate_size:
++            return x
++        x = x.view(num_experts, 2, intermediate_size, x.shape[-1])
++        x = torch.nn.functional.pad(
++            x, (0, 0, 0, padded_intermediate_size - intermediate_size)
++        )
++        return x.reshape(num_experts, 2 * padded_intermediate_size, -1)
++
++    def _pad_w2(x: torch.Tensor, packing: int) -> torch.Tensor:
++        if padded_intermediate_size == intermediate_size:
++            return x
++        return torch.nn.functional.pad(
++            x, (0, (padded_intermediate_size - intermediate_size) // packing)
++        )
++
++    w13 = _pad_w13(w13)
++    w2 = _pad_w2(w2, packing=2)
++    w13_scale_data = _pad_w13(_normalize_scale_tensor(w13_scale_data, param_dtype))
++    w2_scale_data = _pad_w2(
++        _normalize_scale_tensor(w2_scale_data, param_dtype),
++        packing=group_size,
++    )
++    if w13_bias_data is not None:
++        w13_bias_data = _pad_w13(w13_bias_data.unsqueeze(-1)).squeeze(-1)
++
+     def _repack_weight(weight: torch.Tensor, is_w13: bool) -> torch.Tensor:
+         if is_w13:
+-            size_n, size_k = intermediate_size * 2, hidden_size
++            size_n, size_k = padded_intermediate_size * 2, hidden_size
+         else:
+-            size_n, size_k = hidden_size, intermediate_size
++            size_n, size_k = hidden_size, padded_intermediate_size
+         assert weight.shape == (num_experts, size_n, size_k // 2)
+ 
+         tensor_list = []
+@@ -276,12 +350,10 @@ def _repack_weight(weight: torch.Tensor, is_w13: bool) -> torch.Tensor:
+         return torch.stack(tensor_list)
+ 
+     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
+-        scales = _normalize_scale_tensor(scales, param_dtype)
+-
+         if is_w13:
+-            size_n, size_k = intermediate_size * 2, hidden_size
++            size_n, size_k = padded_intermediate_size * 2, hidden_size
+         else:
+-            size_n, size_k = hidden_size, intermediate_size
++            size_n, size_k = hidden_size, padded_intermediate_size
+ 
+         tensor_list = []
+         for i in range(num_experts):
+diff --git a/python/sglang/srt/layers/quantization/mxfp4.py b/python/sglang/srt/layers/quantization/mxfp4.py
+index 3a555b87c34b..023fa49981d7 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4.py
++++ b/python/sglang/srt/layers/quantization/mxfp4.py
+@@ -148,7 +148,6 @@ def _get_flashinfer_mxfp4_device_permute_indices(
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+ _is_cpu_amx_available = cpu_has_amx_support()
+-_sm120_mxfp4_min_warps_patched = False
+ 
+ if _is_hip:
+     # import aiter
+@@ -165,49 +164,6 @@ def _get_flashinfer_mxfp4_device_permute_indices(
+         dynamic_mxfp4_quant = e8m0_shuffle = err
+ 
+ 
+-def _patch_sm120_mxfp4_min_warps():
+-    global _sm120_mxfp4_min_warps_patched
+-    if _sm120_mxfp4_min_warps_patched:
+-        return
+-
+-    import inspect
+-
+-    from triton_kernels.matmul_ogs_details.opt_flags_details import opt_flags_nvidia
+-    from triton_kernels.tensor import get_layout
+-    from triton_kernels.tensor_details.layout import StridedLayout
+-
+-    compute_num_warps = opt_flags_nvidia.compute_num_warps
+-    params = inspect.signature(compute_num_warps).parameters
+-
+-    if "is_persistent" in params and not getattr(
+-        compute_num_warps, "_sglang_sm120_mxfp4_patch", False
+-    ):
+-
+-        def _compute_num_warps_sm120_mxfp4(
+-            block_m, block_n, is_persistent, precision_config
+-        ):
+-            selected_num_warps = compute_num_warps(
+-                block_m, block_n, is_persistent, precision_config
+-            )
+-            weight_scale = getattr(precision_config, "weight_scale", None)
+-            weight_scale_layout = get_layout(weight_scale)
+-            if (
+-                not is_persistent
+-                and weight_scale is not None
+-                and (
+-                    weight_scale_layout is StridedLayout
+-                    or isinstance(weight_scale_layout, StridedLayout)
+-                )
+-            ):
+-                return max(selected_num_warps, 4)
+-            return selected_num_warps
+-
+-        _compute_num_warps_sm120_mxfp4._sglang_sm120_mxfp4_patch = True
+-        opt_flags_nvidia.compute_num_warps = _compute_num_warps_sm120_mxfp4
+-
+-    _sm120_mxfp4_min_warps_patched = True
+-
+-
+ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
+     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+@@ -215,41 +171,23 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+     from triton_kernels.tensor_details import layout
+ 
+-    if is_sm120_supported():
+-        # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
+-        # This MXFP4 path uses StridedLayout and the non-persistent kernel.
+-        _patch_sm120_mxfp4_min_warps()
+-        from triton_kernels.tensor_details.layout import StridedLayout
+-
+-        value_layout = StridedLayout
+-        value_layout_opts = {}
+-        scale_layout = StridedLayout
+-        scale_layout_opts = {}
++    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
++        mx_axis=1
++    )
++    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
++        mx_axis=1, num_warps=num_warps
++    )
++    if is_sm100_supported():
+         constraints = {
+-            "is_persistent": False,
+-            "num_stages": 1,
++            "is_persistent": True,
++            "epilogue_subtile": 1,
++        }
++        opt_flags.update_opt_flags_constraints(constraints)
++    elif is_sm90_supported():
++        constraints = {
++            "split_k": 1,
+         }
+         opt_flags.update_opt_flags_constraints(constraints)
+-    else:
+-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
+-            mx_axis=1
+-        )
+-        scale_layout, scale_layout_opts = (
+-            layout.make_default_matmul_mxfp4_w_scale_layout(
+-                mx_axis=1, num_warps=num_warps
+-            )
+-        )
+-        if is_sm100_supported():
+-            constraints = {
+-                "is_persistent": True,
+-                "epilogue_subtile": 1,
+-            }
+-            opt_flags.update_opt_flags_constraints(constraints)
+-        elif is_sm90_supported():
+-            constraints = {
+-                "split_k": 1,
+-            }
+-            opt_flags.update_opt_flags_constraints(constraints)
+     # transpose the tensor so that the quantization axis is on dim1
+     quant_tensor = quant_tensor.transpose(-2, -1)
+     scale = scale.transpose(-2, -1)
+@@ -441,7 +379,17 @@ def create_weights(
+         # pad the intermediate size to be a multiple of 2 * mxfp4_block
+         # for to hold non-uniform sharded tensor as well as swizzling
+         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
+-        if is_sm100_supported():
++        if self.use_marlin:
++            intermediate_size_per_partition_after_pad = round_up(
++                intermediate_size_per_partition, 128
++            )
++            hidden_size = round_up(hidden_size, 256)
++            self.hidden_pad = hidden_size - layer.hidden_size
++            self.intermediate_pad = (
++                intermediate_size_per_partition_after_pad
++                - layer.intermediate_size_per_partition
++            )
++        elif is_sm100_supported():
+             if self.use_flashinfer:
+                 intermediate_size_per_partition_after_pad = round_up(
+                     intermediate_size_per_partition, 256
+@@ -565,16 +513,19 @@ def process_weights_after_loading(self, layer):
+                 check_moe_marlin_supports_layer,
+             )
+             from sglang.srt.layers.quantization.marlin_utils_fp4 import (
++                deinterleave_moe_mxfp4_w13_for_marlin,
+                 prepare_moe_mxfp4_layer_for_marlin,
+             )
+ 
+-            if not is_sm90_supported():
+-                raise RuntimeError("MXFP4 Marlin requires Hopper/SM90 or above.")
+-            if not check_moe_marlin_supports_layer(layer, 32):
++            if not is_sm90_supported() and not is_sm120_supported():
++                raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
++            if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
+                 raise RuntimeError(
+                     "Current MXFP4 MoE layer is not supported by Marlin."
+                 )
+ 
++            if self.moe_runner_config.gemm1_alpha is not None:
++                deinterleave_moe_mxfp4_w13_for_marlin(layer)
+             prepare_moe_mxfp4_layer_for_marlin(layer)
+             layer._mxfp4_backend = "marlin"
+             return
+@@ -1164,6 +1115,12 @@ def apply(
+ 
+         if self.use_marlin:
+             assert TopKOutputChecker.format_is_standard(topk_output)
++            if x.shape[-1] == self.hidden_size:
++                x_padded = x
++            else:
++                x_padded = torch.nn.functional.pad(
++                    x, (0, self.hidden_pad), mode="constant", value=0.0
++                )
+             quant_info = MarlinMoeQuantInfo(
+                 w13_qweight=layer.w13_weight,
+                 w2_qweight=layer.w2_weight,
+@@ -1173,8 +1130,12 @@ def apply(
+                 w2_g_idx_sort_indices=None,
+                 weight_bits=4,
+                 is_k_full=True,
++                w13_bias=getattr(layer, "w13_weight_bias", None),
++                w2_bias=getattr(layer, "w2_weight_bias", None),
++            )
++            return self.runner.run(
++                dispatch_output._replace(hidden_states=x_padded), quant_info
+             )
+-            return self.runner.run(dispatch_output, quant_info)
+ 
+         if self._fi_kernel == "cutlass_sm90":
+             return self._apply_sm90_cutlass(layer, dispatch_output)
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
+index f96c087af9ee..b0391fd271b4 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
+@@ -8,7 +8,7 @@
+ 
+ from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+ from sglang.srt.layers.moe.utils import MoeRunnerBackend
+-from sglang.srt.utils import log_info_on_rank0, set_weight_attrs
++from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
+ from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
+ 
+ if TYPE_CHECKING:
+@@ -44,6 +44,9 @@ def create_weights(
+ 
+         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
+         fp4_block_k = 32
++        intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
++        hidden_size = round_up(hidden_size, 256)
++        self.hidden_pad = hidden_size - layer.hidden_size
+ 
+         w13_weight = torch.nn.Parameter(
+             torch.empty(
+@@ -100,6 +103,7 @@ def process_weights_after_loading(self, layer: Module) -> None:
+             check_moe_marlin_supports_layer,
+         )
+         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
++            deinterleave_moe_mxfp4_w13_for_marlin,
+             prepare_moe_mxfp4_layer_for_marlin,
+         )
+ 
+@@ -110,44 +114,11 @@ def process_weights_after_loading(self, layer: Module) -> None:
+             return
+ 
+         if not is_sm90_supported() and not is_sm120_supported():
+-            raise RuntimeError(
+-                "DeepSeekV4 MXFP4 Marlin fallback requires Hopper/SM90 or above."
+-            )
+-
+-        # SM120: Skip Marlin repacking, keep original weight format
+-        # for Triton dequant kernel (Marlin kernel produces NaN on SM120)
+-        if is_sm120_supported():
+-            from torch.nn import Parameter
+-
+-            log_info_on_rank0(
+-                logger,
+-                f"SM120 detected: using PyTorch MXFP4 MoE fallback "
+-                f"(layer: {self.prefix})...",
+-            )
+-            # Keep weights in original packed int8 format
+-            # Normalize scales to float32 for direct use in dequant
+-            w13_s = layer.w13_weight_scale_inv.data
+-            w2_s = layer.w2_weight_scale_inv.data
+-            if w13_s.dtype == torch.float8_e8m0fnu:
+-                pass  # already in e8m0 format, will convert at runtime
+-            elif w13_s.dtype in (torch.uint8, torch.int8):
+-                layer.w13_weight_scale_inv = Parameter(
+-                    w13_s.view(torch.uint8)
+-                    .view(torch.float8_e8m0fnu)
+-                    .to(torch.float32),
+-                    requires_grad=False,
+-                )
+-                layer.w2_weight_scale_inv = Parameter(
+-                    w2_s.view(torch.uint8).view(torch.float8_e8m0fnu).to(torch.float32),
+-                    requires_grad=False,
+-                )
+-            # else: float32 scales are already usable directly
+-            layer._dsv4_mxfp4_backend = "sm120_triton"
+-            return
++            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+ 
+-        if not check_moe_marlin_supports_layer(layer, 32):
++        if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
+             raise RuntimeError(
+-                "Current DeepSeekV4 MoE layer does not satisfy Marlin constraints."
++                "Current MXFP4 MoE layer does not satisfy Marlin constraints."
+             )
+ 
+         # NOTE: the Marlin MoE runner consumes w13 in the checkpoint's
+@@ -159,9 +130,10 @@ def process_weights_after_loading(self, layer: Module) -> None:
+ 
+         log_info_on_rank0(
+             logger,
+-            f"Preparing DeepSeekV4 MXFP4 experts for Marlin backend "
+-            f"(layer: {self.prefix})...",
++            f"Preparing MXFP4 experts for Marlin backend " f"(layer: {self.prefix})...",
+         )
++        if self.runner.config.gemm1_alpha is not None:
++            deinterleave_moe_mxfp4_w13_for_marlin(layer)
+         prepare_moe_mxfp4_layer_for_marlin(layer)
+         layer._dsv4_mxfp4_backend = "marlin"
+ 
+@@ -176,44 +148,18 @@ def apply(
+         topk_output = dispatch_output.topk_output
+         if not TopKOutputChecker.format_is_standard(topk_output):
+             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+-
+-        # SM120: use Triton fused dequant+GEMM (Marlin kernel produces NaN on SM120)
+-        if layer._dsv4_mxfp4_backend == "sm120_triton":
+-            from sglang.srt.layers.moe.fused_moe_triton.mxfp4_moe_sm120_triton import (
+-                mxfp4_moe_forward_triton,
++        hidden_states = dispatch_output.hidden_states
++        target_hidden_size = layer.w13_weight.shape[1] * 16
++        if hidden_states.shape[-1] == target_hidden_size:
++            hidden_states_padded = hidden_states
++        else:
++            hidden_states_padded = torch.nn.functional.pad(
++                hidden_states,
++                (0, target_hidden_size - hidden_states.shape[-1]),
++                mode="constant",
++                value=0.0,
+             )
+ 
+-            hidden_states = dispatch_output.hidden_states
+-            w13 = layer.w13_weight.data
+-            w2 = layer.w2_weight.data
+-            w13_scale = layer.w13_weight_scale_inv.data
+-            w2_scale = layer.w2_weight_scale_inv.data
+-            intermediate_size = w13.shape[1] // 2
+-            hidden_size = w13.shape[2] * 2
+-
+-            output = mxfp4_moe_forward_triton(
+-                hidden_states=hidden_states,
+-                w13_packed=w13,
+-                w2_packed=w2,
+-                w13_scale=w13_scale,
+-                w2_scale=w2_scale,
+-                topk_ids=topk_output.topk_ids,
+-                topk_weights=topk_output.topk_weights,
+-                hidden_size=hidden_size,
+-                intermediate_size=intermediate_size,
+-                routed_scaling_factor=(
+-                    self.runner.config.routed_scaling_factor
+-                    if hasattr(self.runner, "config")
+-                    else None
+-                ),
+-                clamp_limit=(
+-                    self.runner.config.swiglu_limit
+-                    if hasattr(self.runner, "config")
+-                    else None
+-                ),
+-            )
+-            return StandardCombineInput(hidden_states=output)
+-
+         quant_info = MarlinMoeQuantInfo(
+             w13_qweight=layer.w13_weight,
+             w2_qweight=layer.w2_weight,
+@@ -223,7 +169,12 @@ def apply(
+             w2_g_idx_sort_indices=None,
+             weight_bits=4,
+             is_k_full=True,
++            w13_bias=getattr(layer, "w13_weight_bias", None),
++            w2_bias=getattr(layer, "w2_weight_bias", None),
++        )
++        runner_output = self.runner.run(
++            dispatch_output._replace(hidden_states=hidden_states_padded),
++            quant_info=quant_info,
+         )
+-        runner_output = self.runner.run(dispatch_output, quant_info=quant_info)
+ 
+         return StandardCombineInput(hidden_states=runner_output.hidden_states)
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 20d9e427de66..0b182461eab1 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2327,9 +2327,9 @@ def _handle_model_specific_adjustments(self):
+                     )
+                 elif is_sm120_supported() and is_mxfp4_quant_format:
+                     # trtllm-gen only supports SM100
+-                    self.moe_runner_backend = "triton_kernel"
++                    self.moe_runner_backend = "marlin"
+                     logger.warning(
+-                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
++                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
+                     )
+                 elif (
+                     is_hip() and envs.SGLANG_USE_AITER.get()

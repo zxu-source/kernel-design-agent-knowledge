@@ -1,0 +1,2252 @@
+diff --git a/python/sglang/srt/configs/mamba_utils.py b/python/sglang/srt/configs/mamba_utils.py
+index 96b2bca68ce8..702fabd31b21 100644
+--- a/python/sglang/srt/configs/mamba_utils.py
++++ b/python/sglang/srt/configs/mamba_utils.py
+@@ -124,6 +124,13 @@ def mamba_cache_per_req(self) -> int:
+             + ssm_numel * self.dtype.temporal.itemsize
+         ) * len(self.layers)
+ 
++    @property
++    def is_kda(self) -> bool:
++        """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
++        the ReplaySSM ring ``g_cache`` layout ([.., L] scalar vs [.., L, K]
++        per-K) and the gate-generic decode kernel's ``IS_KDA`` path."""
++        return False
++
+ 
+ @dataclass(kw_only=True, frozen=True)
+ class Mamba2StateShape:
+@@ -137,6 +144,10 @@ class Mamba2StateShape:
+     head_dim: int
+     state_size: int
+     conv_kernel: int
++    # Number of key/group heads after TP sharding (== runtime `H` the packed
++    # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
++    # buffer (k_cache) to size/stride exactly like the kernel expects.
++    num_k_heads_per_tp: int = 1
+ 
+     @staticmethod
+     def create(
+@@ -149,6 +160,16 @@ def create(
+         state_size: int,
+         conv_kernel: int,
+     ) -> "Mamba2StateShape":
++        # The q/k projections are sharded by `num_k_heads // tp` heads (the
++        # ORIGINAL n_groups, before the conv head-shard extension below), so the
++        # runtime `H` the packed kernels see equals divide(n_groups, tp). Only
++        # meaningful (and only consumed) for the GDN ReplaySSM path, which
++        # requires evenly divisible heads; fall back to ceil-div otherwise.
++        num_k_heads_per_tp = (
++            divide(n_groups, tp_world_size)
++            if n_groups % tp_world_size == 0
++            else -(-n_groups // tp_world_size)
++        )
+         # if n_groups is not divisible by world_size, need to extend the shards
+         # to ensure all groups needed by a head is sharded along with it
+         if n_groups % tp_world_size != 0:
+@@ -174,6 +195,7 @@ def create(
+             head_dim=head_dim,
+             state_size=state_size,
+             conv_kernel=conv_kernel,
++            num_k_heads_per_tp=num_k_heads_per_tp,
+         )
+ 
+ 
+@@ -193,6 +215,10 @@ class KimiLinearStateShape:
+     head_k_dim: int
+     conv_kernel: int
+     num_spec: int
++    # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
++    # kernels infer from ``mixed_qkv``). Mirrors Mamba2StateShape; consumed by
++    # the ReplaySSM ring (k_cache) to size/stride exactly like the kernel.
++    num_k_heads_per_tp: int = 1
+ 
+     @staticmethod
+     def create(
+@@ -209,6 +235,11 @@ def create(
+             num_k_heads = num_heads
+         if head_k_dim is None:
+             head_k_dim = head_dim
++        num_k_heads_per_tp = (
++            divide(num_k_heads, tp_world_size)
++            if num_k_heads % tp_world_size == 0
++            else -(-num_k_heads // tp_world_size)
++        )
+ 
+         proj_size = num_heads * head_dim
+         proj_k_size = num_k_heads * head_k_dim
+@@ -231,9 +262,14 @@ def create(
+             head_k_dim=head_k_dim,
+             conv_kernel=conv_kernel_size,
+             num_spec=num_spec,
++            num_k_heads_per_tp=num_k_heads_per_tp,
+         )
+ 
+ 
+ @dataclass(kw_only=True, frozen=True)
+ class KimiLinearCacheParams(BaseLinearStateParams):
+     shape: KimiLinearStateShape
++
++    @property
++    def is_kda(self) -> bool:
++        return True
+diff --git a/python/sglang/srt/layers/attention/fla/bench_gdn_replayssm_decode.py b/python/sglang/srt/layers/attention/fla/bench_gdn_replayssm_decode.py
+new file mode 100644
+index 000000000000..47e5f3227988
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/fla/bench_gdn_replayssm_decode.py
+@@ -0,0 +1,166 @@
++"""Microbenchmark: buffered output-only GDN decode (ReplaySSM Part A) vs. the
++existing packed GDN decode kernel.
++
++Compares per-step decode latency of
++``fused_recurrent_gated_delta_rule_packed_decode`` (writes the full recurrent
++state S every step) against ``fused_recurrent_gdn_replayssm_decode`` at
++L in {1, 8, 16} (writes the full state only every L steps) across batch sizes
++{1, 16, 64, 256} for a realistic GDN config (HV=32, K=V=128).
++
++The win is per-step HBM *state* traffic: the packed kernel reads + writes S
++(~2 * num_slots * HV * V * K * 4 bytes / step for an fp32 state), while the
++ReplaySSM kernel reads S every step but writes it only 1-in-L steps, plus a
++small ring append (d:[HV,V], k:[H,K], g:[HV] per step). The amortized state
++traffic ratio is reported per L.
++
++Run::
++
++    python -m sglang.srt.layers.attention.fla.bench_gdn_replayssm_decode
++
++Requires a GPU (Triton).
++"""
++
++from __future__ import annotations
++
++import argparse
++
++import torch
++import triton
++
++from sglang.srt.layers.attention.fla.fused_recurrent import (
++    fused_recurrent_gated_delta_rule_packed_decode,
++)
++from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
++    fused_recurrent_gdn_replayssm_decode,
++)
++
++
++def _make_static(B, H, HV, K, V, dtype, device):
++    qk_dim = 2 * H * K
++    v_dim = HV * V
++    mixed_qkv = torch.randn(B, qk_dim + v_dim, device=device, dtype=dtype)
++    a = torch.randn(B, HV, device=device, dtype=dtype) * 0.5
++    b = torch.randn(B, HV, device=device, dtype=dtype)
++    A_log = (torch.randn(HV, device=device, dtype=torch.float32) * 0.3).contiguous()
++    dt_bias = (torch.randn(HV, device=device, dtype=torch.float32) * 0.1).contiguous()
++    return mixed_qkv, a, b, A_log, dt_bias
++
++
++def _state_bytes_per_step(B, HV, K, V, L, dtype):
++    """Amortized per-step HBM *state* traffic (bytes), state in fp32.
++
++    packed: read S + write S every step.
++    replay: read S every step; write S once per L steps; append ring records
++            (d:[HV,V] in `dtype`, k:[H,K] in `dtype` shared across HV//H, g:[HV]
++            fp32) every step. We report the dominant fp32-state terms; ring
++            appends are tiny by comparison and shown separately.
++    """
++    fp32 = 4
++    state_elems = B * HV * V * K  # one record per active request slot
++    packed = (state_elems * fp32) * 2  # read + write
++    replay = (state_elems * fp32) * (1 + 1.0 / L)  # read every step + write 1/L
++    return packed, replay
++
++
++def _bench_cfg(B, H, HV, K, V, Ls, dtype, device, num_slots=None, warmup=25, rep=100):
++    num_slots = num_slots or B
++    mixed_qkv, a, b, A_log, dt_bias = _make_static(B, H, HV, K, V, dtype, device)
++    scale = K**-0.5
++    cache_indices = torch.arange(B, device=device, dtype=torch.int32)
++
++    # packed decode
++    state = torch.randn(num_slots, HV, V, K, device=device, dtype=torch.float32)
++    out = mixed_qkv.new_empty(B, 1, HV, V)
++
++    def run_packed():
++        fused_recurrent_gated_delta_rule_packed_decode(
++            mixed_qkv=mixed_qkv,
++            a=a,
++            b=b,
++            A_log=A_log,
++            dt_bias=dt_bias,
++            scale=scale,
++            initial_state=state,
++            out=out,
++            ssm_state_indices=cache_indices,
++            use_qk_l2norm_in_kernel=True,
++        )
++
++    t_packed = triton.testing.do_bench(run_packed, warmup=warmup, rep=rep)
++
++    rows = []
++    for L in Ls:
++        rstate = torch.randn(num_slots, HV, V, K, device=device, dtype=torch.float32)
++        d_cache = torch.zeros(num_slots, HV, L, V, device=device, dtype=dtype)
++        k_cache = torch.zeros(num_slots, H, L, K, device=device, dtype=dtype)
++        g_cache = torch.zeros(num_slots, HV, L, device=device, dtype=torch.float32)
++        write_pos = torch.zeros(B, device=device, dtype=torch.int32)
++        rout = mixed_qkv.new_empty(B, 1, HV, V)
++        nk = 1 if L == 1 else 2
++
++        def run_replay():
++            fused_recurrent_gdn_replayssm_decode(
++                mixed_qkv=mixed_qkv,
++                a=a,
++                b=b,
++                A_log=A_log,
++                dt_bias=dt_bias,
++                scale=scale,
++                initial_state=rstate,
++                d_cache=d_cache,
++                k_cache=k_cache,
++                g_cache=g_cache,
++                out=rout,
++                ssm_state_indices=cache_indices,
++                write_pos=write_pos,
++                use_qk_l2norm_in_kernel=True,
++                nk=nk,
++            )
++
++        t_replay = triton.testing.do_bench(run_replay, warmup=warmup, rep=rep)
++        packed_bytes, replay_bytes = _state_bytes_per_step(B, HV, K, V, L, dtype)
++        rows.append((L, t_replay, t_packed / t_replay, replay_bytes / packed_bytes))
++    return t_packed, rows
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--hv", type=int, default=32, help="num value heads")
++    parser.add_argument("--h", type=int, default=16, help="num key/query heads")
++    parser.add_argument("--k", type=int, default=128)
++    parser.add_argument("--v", type=int, default=128)
++    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 16, 64, 256])
++    parser.add_argument("--ls", type=int, nargs="+", default=[1, 8, 16])
++    parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
++    args = parser.parse_args()
++
++    if not torch.cuda.is_available():
++        raise SystemExit("CUDA / Triton required for this microbenchmark.")
++    device = "cuda"
++    dtype = {
++        "bf16": torch.bfloat16,
++        "fp16": torch.float16,
++        "fp32": torch.float32,
++    }[args.dtype]
++
++    print(
++        f"GDN ReplaySSM decode microbench  HV={args.hv} H={args.h} "
++        f"K={args.k} V={args.v} dtype={args.dtype}\n"
++        "per-step latency (ms); speedup = packed/replay; "
++        "state-traffic = replay/packed (lower is better)"
++    )
++    for B in args.batch_sizes:
++        t_packed, rows = _bench_cfg(
++            B, args.h, args.hv, args.k, args.v, args.ls, dtype, device
++        )
++        print(f"\nB={B:<4d}  packed={t_packed:.4f} ms")
++        for L, t_replay, speedup, traffic_ratio in rows:
++            print(
++                f"    L={L:<3d} replay={t_replay:.4f} ms  "
++                f"speedup={speedup:5.2f}x  "
++                f"state-traffic={traffic_ratio:5.2f}x"
++            )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/sglang/srt/layers/attention/fla/fused_recurrent_linear_replayssm.py b/python/sglang/srt/layers/attention/fla/fused_recurrent_linear_replayssm.py
+new file mode 100644
+index 000000000000..f43fdd22dcc1
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/fla/fused_recurrent_linear_replayssm.py
+@@ -0,0 +1,628 @@
++# Buffered output-only linear-attention decode (ReplaySSM Part A), ported to
++# SGLang. Covers BOTH gate granularities with one kernel:
++#   * GDN  (``IS_KDA=False``): per-head SCALAR gate ``alpha = exp(g)``.
++#   * KDA  (``IS_KDA=True``):  per-K-channel gate ``alpha[k] = exp(g[k])`` —
++#     the state decays column-wise, ``S' = S . Diag(alpha) + d k^T``.
++# GDN is the special case of KDA with all per-K decays equal; a single
++# ``IS_KDA`` constexpr selects the gate path and the GDN path is bit-for-bit
++# the original (no regression to the validated GDN kernel).
++#
++# This is a STANDALONE increment: kernel + wrapper only. It is NOT yet wired
++# into the memory pool / radix cache / scheduler / backend dispatch. The caller
++# (currently the correctness test and the microbenchmark) owns the ring tensors.
++#
++# Idea (vs. ``fused_recurrent_gated_delta_rule_packed_decode`` / ``..._kda_...``):
++#   The plain packed decode reads the full recurrent state S [HV, V, K] from
++#   HBM and writes it back *every* decode step (~8*d*n bytes/step of state
++#   traffic for an fp32 state, read+write).  ReplaySSM keeps a small per-slot
++#   ring buffer of the last L steps' (d, k, g) and only WRITES the full state
++#   every L steps (a "flush"); on non-flush steps it appends a tiny
++#   (d, k, g) record and reconstructs the readout from the checkpoint S0 plus
++#   the buffer.  S0 is still READ every step, so per-step state traffic drops
++#   from read+write (~8*d*n) to read-only (~4*d*n) -> roughly halved.
++#
++# Math (single head, single step; matches the packed decode kernels exactly).
++# Let ``a = exp(g)`` be the decay (scalar for GDN, per-K vector for KDA) and
++# ``S`` the state *before* this token:
++#   d_cur = beta * (v - (S . Diag(a)) . k) = beta * (v - S . (a (.) k))
++#   o     = (S . Diag(a)) . q + d_cur*(k^T q) = S . (a (.) q) + d_cur*(k^T q)
++#   S_new = S . Diag(a) + d_cur k^T          # only persisted on flush
++# where ``(.)`` is elementwise over K.  For GDN ``a`` is scalar so
++# ``S . (a (.) q) = a * (S . q)`` (the cheap scalar post-multiply); for KDA the
++# per-K ``a`` folds into q/k before the matvec.  k^T q uses the RAW current
++# k/q (the rank-1 term), so it is identical for both gate types.
++#
++# Buffered reconstruction: with buffered steps j=0..m-1 holding (d_j, k_j, g_j),
++# the state *before* the current token is
++#   S = Diag(A) . S0 + sum_j d_j (W_j (.) k_j)^T          (per-K form)
++# with A[c]   = exp(sum_j g_j[c])                  (total decay, per-K)
++#      W_j[c] = exp(sum_i g_i[c] - cumsum_inclusive_j[c]) = prod_{i>j} a_i[c].
++# For GDN A and W_j are scalars (g is K-independent) and W_j folds onto d_j
++# instead of k_j (either factor works for a scalar). S is reconstructed in
++# K-tiles and immediately read with q (and k) -> the [V,K] state tile is never
++# fully materialized to HBM on a non-flush step.
++#
++# At L=1 the ring is always empty and ``write_pos == L-1`` every step, so the
++# reconstruction term is zero, the total decay is 1, and this kernel reduces
++# *algebraically* to the corresponding packed-decode kernel.
++#
++# SPDX-License-Identifier: Apache-2.0
++# Ported from vllm/model_executor/layers/fla/ops/fused_recurrent_replayssm.py
++# (ReplaySSM, commit 3c85112) and adapted to SGLang's packed GDN/KDA decode
++# layout.
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def fused_recurrent_linear_replayssm_decode_kernel(
++    mixed_qkv,  # [B, 2*H*K + HV*V] packed (q | k | v) after conv1d
++    a,  # GDN: [B, HV] gate input ; KDA: [B, HV, K] per-K gate input
++    b,  # [B, HV] beta input b
++    A_log,  # [HV] log-space decay parameter (per-head scalar, both gate types)
++    dt_bias,  # GDN: [HV] ; KDA: [HV, K] time-step bias
++    o,  # [B, HV, V] output (written every step)
++    h0,  # [num_slots, HV, V, K] checkpoint state (read every step)
++    ht,  # [num_slots, HV, V, K] checkpoint state (written only on flush; == h0)
++    d_cache,  # [num_slots, HV, L, V] ring: corrected delta vectors
++    k_cache,  # [num_slots, H,  L, K] ring: (normed/scaled) keys
++    g_cache,  # GDN: [num_slots, HV, L] ; KDA: [num_slots, HV, L, K] log-decay gates (fp32)
++    ssm_state_indices,  # [B] physical state slot per decode row
++    write_pos,  # [B] int32 per-row ring cursor (0..L-1)
++    force_flush,  # [B] int32: !=0 forces a flush this step (radix track boundary)
++    scale,
++    stride_mixed_qkv_tok: tl.constexpr,
++    stride_a_tok: tl.constexpr,
++    stride_b_tok: tl.constexpr,
++    stride_init_state_token: tl.constexpr,
++    stride_final_state_token: tl.constexpr,
++    stride_indices_seq: tl.constexpr,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    BC: tl.constexpr,
++    NK: tl.constexpr,
++    BKT: tl.constexpr,
++    MAX_CACHE_LEN: tl.constexpr,
++    SOFTPLUS_THRESHOLD: tl.constexpr,
++    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++    HAS_FORCE_FLUSH: tl.constexpr,
++    IS_KDA: tl.constexpr,
++):
++    i_v = tl.program_id(0)
++    i_n = tl.program_id(1)
++    i_hv = tl.program_id(2)
++    i_h = i_hv // (HV // H)
++
++    o_v = i_v * BV + tl.arange(0, BV)
++    o_c = tl.arange(0, BC)
++    mask_v = o_v < V
++
++    # Resolve the physical state slot; zero the output and bail for padded rows.
++    state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
++    p_o = o + (i_n * HV + i_hv) * V + o_v
++    if state_idx < 0:
++        tl.store(
++            p_o,
++            tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty),
++            mask=mask_v,
++        )
++        return
++
++    # Per-row buffer cursor and flush flag (device-side branch, no host branch),
++    # plus the set of valid (already committed) cache positions.
++    b_write_pos = tl.load(write_pos + i_n).to(tl.int64)
++    b_is_flush = b_write_pos == MAX_CACHE_LEN - 1
++    if HAS_FORCE_FLUSH:
++        # A radix track-boundary (or any caller-forced) flush folds the partial
++        # ring (the real `write_pos` entries, NOT L-1) + current token into the
++        # checkpoint so an external snapshot reads an up-to-date state. cache_valid
++        # below still uses the true write_pos, so only committed entries are read.
++        b_is_flush = b_is_flush | (tl.load(force_flush + i_n) != 0)
++    cache_valid = o_c < b_write_pos
++
++    # Gate for the current token.  beta is a per-head scalar for both gate
++    # types; A_log is a per-head scalar for both.  The decay g/alpha is a
++    # per-head scalar for GDN (computed here) and a per-K vector for KDA
++    # (computed per K-tile inside the loop, since it is K-indexed).
++    #   g = -exp(A_log) * softplus(a + dt_bias);  alpha = exp(g);  beta = sigmoid(b)
++    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
++    b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
++    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
++    if not IS_KDA:
++        a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
++        dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
++        x = a_val + dt_bias_val
++        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
++        g_val = -tl.exp(A_log_val) * softplus_x
++        alpha_val = tl.exp(g_val)
++
++        # Replay decay over the committed cache, from the cached per-step gates.
++        # b_replay_decay[j] = exp(sum_i g_i - cumsum_inclusive_j) = prod_{i>j} alpha_i
++        p_g_main = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c
++        b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
++        b_g_prefix = tl.cumsum(b_g_all, axis=0)
++        b_g_total = tl.sum(b_g_all, axis=0)
++        b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
++        b_total_decay = tl.exp(b_g_total)
++
++    # Cached corrected-delta vectors d (K-independent).  Layout
++    # d_cache[slot, hv, L, V] -> index [V, BC] tile.
++    p_d_main = d_cache + (
++        ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None]
++    )
++    b_d_all = tl.load(
++        p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0
++    ).to(tl.float32)
++    # Cast the (d, k) reconstruction-dot operands to the I/O dtype so tl.dot
++    # runs on TENSOR CORES (bf16 tensor cores for bf16, TF32 for fp32). This is
++    # the ReplaySSM reference path and is performance-critical: the L-deep
++    # reconstruction is L x the baseline's rank-1 compute, which only stays
++    # hidden under the (reduced) memory traffic if it runs on tensor cores. An
++    # IEEE fp32 dot here disables tensor cores and makes the kernel ~10-20x
++    # slower. Tensor-core precision (~4e-4 TF32 / ~1e-3 bf16) is benign
++    # end-to-end (ReplaySSM bf16 GSM8K parity); the unit test uses
++    # tensor-core-realistic tolerances. At L=1 the buffer is empty so this dot
++    # is identically zero and the path stays bit-exact regardless of precision.
++    # GDN folds the (scalar) replay decay onto d here; KDA folds the (per-K)
++    # replay decay onto the cached keys inside the K-tile loop instead.
++    if not IS_KDA:
++        b_d_tc = (b_d_all * b_replay_decay[None, :]).to(
++            p_o.dtype.element_ty
++        )  # [BV, BC]
++    else:
++        b_d_tc = b_d_all.to(p_o.dtype.element_ty)  # [BV, BC]
++
++    # Current token value (for the delta-rule update).
++    v_off = (2 * H * K) + i_hv * V + o_v
++    b_v = tl.load(
++        mixed_qkv + i_n * stride_mixed_qkv_tok + v_off, mask=mask_v, other=0
++    ).to(tl.float32)
++
++    # Optional q/k L2 norm: full-vector reciprocal norms (computed, not kept).
++    if USE_QK_L2NORM_IN_KERNEL:
++        o_kf = tl.arange(0, BK)
++        mask_kf = o_kf < K
++        p_mix = mixed_qkv + i_n * stride_mixed_qkv_tok
++        qf = tl.load(p_mix + i_h * K + o_kf, mask=mask_kf, other=0).to(tl.float32)
++        kf = tl.load(p_mix + H * K + i_h * K + o_kf, mask=mask_kf, other=0).to(
++            tl.float32
++        )
++        q_rnorm = 1.0 / tl.sqrt(tl.sum(qf * qf) + 1e-6)
++        k_rnorm = 1.0 / tl.sqrt(tl.sum(kf * kf) + 1e-6)
++    else:
++        q_rnorm = 1.0
++        k_rnorm = 1.0
++
++    # Reconstruct S from the checkpoint + cached (d, k) in K-tiles and read it
++    # with the current (scaled) q and k.  K-tiling keeps the per-program tile
++    # small so the full [V, K] state is never materialized.  Also append the
++    # current key chunk to the ring cache (non-flush only).
++    b_state_q = tl.zeros([BV], dtype=tl.float32)
++    b_state_k = tl.zeros([BV], dtype=tl.float32)
++    cur_kq = tl.zeros([1], dtype=tl.float32)
++    write_k = (not b_is_flush) and (i_v == 0) and (i_hv == i_h * (HV // H))
++    write_g_kda = IS_KDA and (not b_is_flush) and (i_v == 0)
++    for kk in range(NK):
++        o_kt = kk * BKT + tl.arange(0, BKT)
++        mask_kt = o_kt < K
++        p_mix = mixed_qkv + i_n * stride_mixed_qkv_tok
++        q_c = (
++            tl.load(p_mix + i_h * K + o_kt, mask=mask_kt, other=0).to(tl.float32)
++            * q_rnorm
++        )
++        k_c = (
++            tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(
++                tl.float32
++            )
++            * k_rnorm
++        )
++        q_cs = q_c * scale
++        # Rank-1 output term uses the RAW current k/q (gate-independent).
++        cur_kq += tl.sum(k_c * q_cs)
++
++        # This K-tile of the state: S_tile = Diag(A_tile) S0_tile + d (.) (W (.) k_cache).
++        p_h0_c = (
++            h0
++            + state_idx * stride_init_state_token
++            + i_hv * V * K
++            + o_v[:, None] * K
++            + o_kt[None, :]
++        )
++        b_h0_c = tl.load(p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0).to(
++            tl.float32
++        )
++        p_k_c = (
++            k_cache
++            + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
++            + o_kt[None, :]
++        )
++
++        if not IS_KDA:
++            b_k_all_c = tl.load(
++                p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0
++            ).to(p_o.dtype.element_ty)
++            b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_tc, b_k_all_c).to(tl.float32)
++            # GDN: scalar current-token decay applied after the loop.
++            q_eff = q_cs
++            k_eff = k_c
++        else:
++            # KDA per-K decay: load this tile's cached gates [BC, BKT], form the
++            # per-K total / replay decay, fold the replay decay onto the cached
++            # keys and the total decay onto S0.
++            p_g_c = (
++                g_cache
++                + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[:, None]) * K
++                + o_kt[None, :]
++            )
++            b_g_all_c = tl.load(
++                p_g_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
++            ).to(tl.float32)
++            b_g_prefix_c = tl.cumsum(b_g_all_c, axis=0)  # [BC, BKT]
++            b_g_total_c = tl.sum(b_g_all_c, axis=0)  # [BKT]
++            b_replay_decay_c = tl.where(
++                cache_valid[:, None],
++                tl.exp(b_g_total_c[None, :] - b_g_prefix_c),
++                0.0,
++            )  # [BC, BKT]
++            b_total_decay_c = tl.exp(b_g_total_c)  # [BKT]
++            b_k_all_c = tl.load(
++                p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
++            ).to(tl.float32)
++            b_k_scaled = (b_k_all_c * b_replay_decay_c).to(p_o.dtype.element_ty)
++            b_h_c = b_h0_c * b_total_decay_c[None, :] + tl.dot(b_d_tc, b_k_scaled).to(
++                tl.float32
++            )
++            # KDA: current-token per-K decay folds into q/k for the readout.
++            p_a_c = a + i_n * stride_a_tok + i_hv * K + o_kt
++            p_dt_c = dt_bias + i_hv * K + o_kt
++            b_a_c = tl.load(p_a_c, mask=mask_kt, other=0.0).to(tl.float32)
++            b_dt_c = tl.load(p_dt_c, mask=mask_kt, other=0.0).to(tl.float32)
++            x_c = b_a_c + b_dt_c
++            softplus_c = tl.where(
++                x_c <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_c)), x_c
++            )
++            g_cur_c = -tl.exp(A_log_val) * softplus_c  # [BKT]
++            alpha_cur_c = tl.exp(g_cur_c)
++            q_eff = q_cs * alpha_cur_c
++            k_eff = k_c * alpha_cur_c
++
++            # Append this tile of the current gate to the ring (non-flush only).
++            if write_g_kda:
++                p_cur_g = (
++                    g_cache
++                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * K
++                    + o_kt
++                )
++                tl.store(p_cur_g, g_cur_c, mask=mask_kt & (b_write_pos < MAX_CACHE_LEN))
++
++        # Read the state with the (gate-folded) q and k, accumulated across tiles.
++        b_state_q += tl.sum(b_h_c * q_eff[None, :], axis=1)
++        b_state_k += tl.sum(b_h_c * k_eff[None, :], axis=1)
++
++        if write_k:
++            p_cur_k = (
++                k_cache
++                + ((state_idx * H + i_h) * MAX_CACHE_LEN + b_write_pos) * K
++                + o_kt
++            )
++            tl.store(
++                p_cur_k,
++                k_c.to(p_o.dtype.element_ty),
++                mask=mask_kt & (b_write_pos < MAX_CACHE_LEN),
++            )
++
++    # Current-token output: (S . Diag(a)) q + d_cur*(k . q), with the new
++    # corrected delta-rule vector d_cur = beta * (v - (S . Diag(a)) k).
++    # For GDN the per-head scalar decay is applied here; for KDA it was already
++    # folded into q/k above.
++    if not IS_KDA:
++        b_state_q *= alpha_val
++        b_state_k *= alpha_val
++    b_d_cur = beta_val * (b_v - b_state_k)
++    b_o = b_state_q + b_d_cur * tl.sum(cur_kq)
++    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
++
++    if b_is_flush:
++        # Flush: fold the current token into the checkpoint, S_new = S.Diag(a) +
++        # d_cur k^T, and persist it.  Re-walk K chunks to rebuild S, then apply
++        # the update.  After this the ring is logically cleared (the caller
++        # resets write_pos to 0 on the next step).
++        for kk in range(NK):
++            o_kt = kk * BKT + tl.arange(0, BKT)
++            mask_kt = o_kt < K
++            p_mix = mixed_qkv + i_n * stride_mixed_qkv_tok
++            k_c = (
++                tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(
++                    tl.float32
++                )
++                * k_rnorm
++            )
++            p_h0_c = (
++                h0
++                + state_idx * stride_init_state_token
++                + i_hv * V * K
++                + o_v[:, None] * K
++                + o_kt[None, :]
++            )
++            b_h0_c = tl.load(
++                p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0
++            ).to(tl.float32)
++            p_k_c = (
++                k_cache
++                + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
++                + o_kt[None, :]
++            )
++            if not IS_KDA:
++                b_k_all_c = tl.load(
++                    p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0
++                ).to(p_o.dtype.element_ty)
++                b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_tc, b_k_all_c).to(
++                    tl.float32
++                )
++                b_h_new_c = alpha_val * b_h_c + b_d_cur[:, None] * k_c[None, :]
++            else:
++                p_g_c = (
++                    g_cache
++                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[:, None]) * K
++                    + o_kt[None, :]
++                )
++                b_g_all_c = tl.load(
++                    p_g_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
++                ).to(tl.float32)
++                b_g_prefix_c = tl.cumsum(b_g_all_c, axis=0)
++                b_g_total_c = tl.sum(b_g_all_c, axis=0)
++                b_replay_decay_c = tl.where(
++                    cache_valid[:, None],
++                    tl.exp(b_g_total_c[None, :] - b_g_prefix_c),
++                    0.0,
++                )
++                b_total_decay_c = tl.exp(b_g_total_c)
++                b_k_all_c = tl.load(
++                    p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
++                ).to(tl.float32)
++                b_k_scaled = (b_k_all_c * b_replay_decay_c).to(p_o.dtype.element_ty)
++                b_h_c = b_h0_c * b_total_decay_c[None, :] + tl.dot(
++                    b_d_tc, b_k_scaled
++                ).to(tl.float32)
++                p_a_c = a + i_n * stride_a_tok + i_hv * K + o_kt
++                p_dt_c = dt_bias + i_hv * K + o_kt
++                b_a_c = tl.load(p_a_c, mask=mask_kt, other=0.0).to(tl.float32)
++                b_dt_c = tl.load(p_dt_c, mask=mask_kt, other=0.0).to(tl.float32)
++                x_c = b_a_c + b_dt_c
++                softplus_c = tl.where(
++                    x_c <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_c)), x_c
++                )
++                alpha_cur_c = tl.exp(-tl.exp(A_log_val) * softplus_c)  # [BKT]
++                b_h_new_c = (
++                    b_h_c * alpha_cur_c[None, :] + b_d_cur[:, None] * k_c[None, :]
++                )
++            p_ht_c = (
++                ht
++                + state_idx * stride_final_state_token
++                + i_hv * V * K
++                + o_v[:, None] * K
++                + o_kt[None, :]
++            )
++            tl.store(
++                p_ht_c,
++                b_h_new_c.to(p_ht_c.dtype.element_ty),
++                mask=mask_v[:, None] & mask_kt[None, :],
++            )
++    else:
++        # Non-flush: append the current token's corrected delta d to the cache
++        # (k chunks were written inside the loop; KDA's g chunks too).  GDN's
++        # scalar g is appended here.
++        p_cur_d = (
++            d_cache + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * V + o_v
++        )
++        tl.store(
++            p_cur_d,
++            b_d_cur.to(p_cur_d.dtype.element_ty),
++            mask=mask_v & (b_write_pos < MAX_CACHE_LEN),
++        )
++        if (not IS_KDA) and (i_v == 0):
++            p_cur_g = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos
++            tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
++
++
++def fused_recurrent_linear_replayssm_decode(
++    mixed_qkv: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    scale: float,
++    initial_state: torch.Tensor,
++    d_cache: torch.Tensor,
++    k_cache: torch.Tensor,
++    g_cache: torch.Tensor,
++    out: torch.Tensor,
++    ssm_state_indices: torch.Tensor,
++    write_pos: torch.Tensor,
++    force_flush: torch.Tensor | None = None,
++    use_qk_l2norm_in_kernel: bool = False,
++    is_kda: bool = False,
++    block_v: int | None = None,
++    num_warps: int = 1,
++    num_stages: int = 3,
++    nk: int = 2,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Buffered output-only linear-attention autoregressive decode (1 token/seq).
++
++    One kernel for both gate granularities, selected by ``is_kda``:
++      * ``is_kda=False`` (GDN): per-head SCALAR gate.  ``a``=[B, HV],
++        ``dt_bias``=[HV], ``g_cache``=[num_slots, HV, L].
++      * ``is_kda=True`` (KDA): per-K-channel gate.  ``a``=[B, HV, K],
++        ``dt_bias``=[HV, K], ``g_cache``=[num_slots, HV, L, K].
++    ``A_log`` is [HV] (per-head scalar) for both.
++
++    Same call surface as the packed decode plus the three ring caches
++    (``d_cache`` / ``k_cache`` / ``g_cache``) and the per-decode-row
++    ``write_pos`` cursor.  ``initial_state`` is both the checkpoint read (h0)
++    and the (flush-only) checkpoint write (ht), in place.
++
++    Allocates nothing persistent: the caller owns the ring tensors and is
++    responsible for advancing / resetting ``write_pos`` (e.g. ``(write_pos+1) %
++    L`` after each step).  This is a STANDALONE kernel; the memory-pool / cache
++    integration is a later phase.
++    """
++    if mixed_qkv.ndim != 2:
++        raise ValueError(f"`mixed_qkv` must be 2D (got ndim={mixed_qkv.ndim}).")
++    if mixed_qkv.stride(-1) != 1:
++        raise ValueError("`mixed_qkv` must be contiguous in the last dim.")
++    if b.ndim != 2:
++        raise ValueError(f"`b` must be 2D (got b.ndim={b.ndim}).")
++    if A_log.ndim != 1:
++        raise ValueError("`A_log` must be a 1D tensor.")
++    if initial_state.ndim != 4:
++        raise ValueError(f"`initial_state` must be 4D (got ndim={initial_state.ndim}).")
++    if not out.is_contiguous():
++        raise ValueError("`out` must be contiguous.")
++    if write_pos.ndim != 1 or write_pos.dtype != torch.int32:
++        raise ValueError("`write_pos` must be a 1D int32 tensor.")
++    if force_flush is not None and (
++        force_flush.ndim != 1 or force_flush.dtype != torch.int32
++    ):
++        raise ValueError("`force_flush` must be a 1D int32 tensor or None.")
++
++    B = mixed_qkv.shape[0]
++    num_state_slots, HV, V, K = initial_state.shape
++    qkv_dim = mixed_qkv.shape[1]
++    q_dim = (qkv_dim - HV * V) // 2
++    if q_dim <= 0 or q_dim % K != 0:
++        raise ValueError(
++            f"Invalid packed `mixed_qkv` last dim={qkv_dim} for HV={HV}, V={V}, K={K}."
++        )
++    H = q_dim // K
++    if H <= 0 or HV % H != 0:
++        raise ValueError(
++            f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
++        )
++    max_cache_len = d_cache.shape[2]
++
++    # Gate-shape sanity: GDN scalar gate vs KDA per-K gate.
++    if is_kda:
++        if a.ndim != 3 or tuple(a.shape) != (B, HV, K):
++            raise ValueError(
++                f"KDA `a` must have shape {(B, HV, K)} (got {tuple(a.shape)})."
++            )
++        if dt_bias.ndim != 2 or tuple(dt_bias.shape) != (HV, K):
++            raise ValueError(
++                f"KDA `dt_bias` must have shape {(HV, K)} (got {tuple(dt_bias.shape)})."
++            )
++        if not a.is_contiguous() or not dt_bias.is_contiguous():
++            raise ValueError("KDA `a`/`dt_bias` must be contiguous.")
++        g_expect = (HV, max_cache_len, K)
++    else:
++        if a.ndim != 2 or tuple(a.shape) != (B, HV):
++            raise ValueError(
++                f"GDN `a` must have shape {(B, HV)} (got {tuple(a.shape)})."
++            )
++        if dt_bias.ndim != 1 or dt_bias.shape[0] != HV:
++            raise ValueError(
++                f"GDN `dt_bias` must have shape {(HV,)} (got {tuple(dt_bias.shape)})."
++            )
++        g_expect = (HV, max_cache_len)
++
++    # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K).
++    if tuple(d_cache.shape[1:]) != (HV, max_cache_len, V):
++        raise ValueError(
++            f"`d_cache` per-slot shape must be {(HV, max_cache_len, V)} "
++            f"(got {tuple(d_cache.shape[1:])})."
++        )
++    if tuple(k_cache.shape[1:]) != (H, max_cache_len, K):
++        raise ValueError(
++            f"`k_cache` per-slot shape must be {(H, max_cache_len, K)} "
++            f"(got {tuple(k_cache.shape[1:])})."
++        )
++    if tuple(g_cache.shape[1:]) != g_expect:
++        raise ValueError(
++            f"`g_cache` per-slot shape must be {g_expect} "
++            f"(got {tuple(g_cache.shape[1:])})."
++        )
++    if g_cache.dtype != torch.float32:
++        raise ValueError(f"`g_cache` must be float32 (got {g_cache.dtype}).")
++    if out.shape != (B, 1, HV, V):
++        raise ValueError(
++            f"`out` must have shape {(B, 1, HV, V)} (got {tuple(out.shape)})."
++        )
++    if write_pos.shape[0] != B or ssm_state_indices.shape[0] != B:
++        raise ValueError(
++            "`write_pos` and `ssm_state_indices` must both have length B="
++            f"{B} (got {write_pos.shape[0]}, {ssm_state_indices.shape[0]})."
++        )
++
++    BK = triton.next_power_of_2(K)
++    if triton.cdiv(K, BK) != 1:
++        raise ValueError(
++            f"Cached decode kernel only supports NK_global=1 (got K={K}, BK={BK})."
++        )
++    if BK % nk != 0:
++        raise ValueError(f"nk={nk} must divide BK={BK}.")
++    BKT = BK // nk
++    if BKT < 16:
++        raise ValueError(f"BKT={BKT} must be >=16 for tl.dot (nk={nk}, BK={BK}).")
++    # K-tiling keeps the per-program tile small enough that a larger BV fits
++    # without register spilling -> NV=1 -> half the grid -> fewer redundant
++    # cache / metadata loads.
++    BV = block_v if block_v is not None else min(triton.next_power_of_2(V), 64)
++    BC = max(16, triton.next_power_of_2(max_cache_len))
++
++    grid = (triton.cdiv(V, BV), B, HV)
++    fused_recurrent_linear_replayssm_decode_kernel[grid](
++        mixed_qkv=mixed_qkv,
++        a=a,
++        b=b,
++        A_log=A_log,
++        dt_bias=dt_bias,
++        o=out,
++        h0=initial_state,
++        ht=initial_state,
++        d_cache=d_cache,
++        k_cache=k_cache,
++        g_cache=g_cache,
++        ssm_state_indices=ssm_state_indices,
++        write_pos=write_pos,
++        force_flush=force_flush if force_flush is not None else write_pos,
++        scale=scale,
++        stride_mixed_qkv_tok=mixed_qkv.stride(0),
++        stride_a_tok=a.stride(0),
++        stride_b_tok=b.stride(0),
++        stride_init_state_token=initial_state.stride(0),
++        stride_final_state_token=initial_state.stride(0),
++        stride_indices_seq=ssm_state_indices.stride(0),
++        H=H,
++        HV=HV,
++        K=K,
++        V=V,
++        BK=BK,
++        BV=BV,
++        BC=BC,
++        NK=nk,
++        BKT=BKT,
++        MAX_CACHE_LEN=max_cache_len,
++        SOFTPLUS_THRESHOLD=20.0,
++        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
++        HAS_FORCE_FLUSH=force_flush is not None,
++        IS_KDA=is_kda,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++    return out, initial_state
++
++
++# Backwards-compatible aliases: the original GDN-only names. Existing callers
++# (backend dispatch, tests, microbench) keep working; ``is_kda`` defaults to
++# False so these are the GDN path unchanged.
++fused_recurrent_gdn_replayssm_decode_kernel = (
++    fused_recurrent_linear_replayssm_decode_kernel
++)
++fused_recurrent_gdn_replayssm_decode = fused_recurrent_linear_replayssm_decode
+diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index bae807611133..57100a9b9dd9 100644
+--- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -37,6 +37,14 @@ def __init__(self, model_runner: ModelRunner):
+         self.token_to_kv_pool = model_runner.token_to_kv_pool
+         self.forward_metadata: ForwardMetadata = None
+         self.state_indices_list = []
++        # GDN ReplaySSM (slice 1b): per-bs STATIC per-row write-cursor buffers
++        # for cuda-graph. Allocated lazily in init_cuda_graph_state only when
++        # --enable-linear-replayssm is set; stays None otherwise.
++        self.replayssm_write_pos_list = None
++        # GDN ReplaySSM (slice 2b): per-bs STATIC per-row force-flush buffers
++        # for cuda-graph, parallel to replayssm_write_pos_list. Same lifetime
++        # (None unless the flag is on).
++        self.replayssm_force_flush_list = None
+         self.query_start_loc_list = []
+         self.retrieve_next_token_list = []
+         self.retrieve_next_sibling_list = []
+@@ -103,10 +111,83 @@ def _forward_metadata(self, forward_batch: ForwardBatch):
+             mamba_cache_indices = mamba_cache_indices.clone()
+             mamba_cache_indices[_real_bs:] = -1
+ 
++        replayssm_write_pos = None
++        replayssm_force_flush = None
+         if forward_batch.forward_mode.is_decode_or_idle():
+             query_start_loc = torch.arange(
+                 0, bs + 1, dtype=torch.int32, device=self.device
+             )
++            # GDN ReplaySSM (slice 1a): the ring cursor is a per-slot
++            # decode-position counter shared by ALL GDN layers in this forward.
++            # Manage it exactly ONCE here (not per-layer): snapshot this step's
++            # value for the batch's slots, hand it to the layers, then advance
++            # the persistent buffer mod L for the next step.
++            mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
++            write_pos_buf = (
++                getattr(mamba_pool, "replayssm_write_pos", None)
++                if mamba_pool is not None
++                else None
++            )
++            if write_pos_buf is not None:
++                slots = mamba_cache_indices.to(torch.long)
++                # Padded rows carry slot == -1; clamp so the per-row gather stays
++                # in-bounds (the kernel zeroes padded rows via state_idx < 0).
++                safe_slots = slots.clamp(min=0)
++                replayssm_write_pos = write_pos_buf[safe_slots].clone()
++                L = mamba_pool.linear_replayssm_cache_len
++                # KDA (per-K gate) ships without radix coordination for now: no
++                # track-boundary force-flush, so the ring flushes only at the
++                # natural write_pos == L-1 wrap. GDN keeps the radix-aligned
++                # force-flush (slice 2b). Gate on the pool's recorded gate type.
++                is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
++                # GDN ReplaySSM (slice 2b): per-row force-flush at the radix
++                # track boundary. THE alignment: the radix mamba track snapshots
++                # temporal[slot] when seq_lens_cpu % mamba_track_interval == 0
++                # (extra_buffer: schedule_batch.prepare_for_decode builds
++                # `mamba_track_mask = (seq_lens_cpu % mamba_track_interval == 0)`
++                # off the SAME post-increment seq_lens_cpu used here). We source
++                # the flush from the identical seq_lens + condition so the kernel
++                # folds the ring into temporal[slot] on EXACTLY the steps the
++                # snapshot reads it. seq_lens_cpu is the committed length AFTER
++                # this decode token (incremented in prepare_for_decode before the
++                # forward), matching the track. int32, one entry per batch row.
++                if not is_kda:
++                    force_flush_bool = self._replayssm_track_flush_mask(
++                        forward_batch.seq_lens_cpu, bs
++                    )
++                    replayssm_force_flush = force_flush_bool.to(
++                        device=self.device, dtype=torch.int32
++                    )
++                # Advance only the VALID (non-padded) slots. Scatter over the
++                # unique valid slots to avoid duplicate-index races (padded rows
++                # all clamp to slot 0, which a real row may also occupy). A
++                # forced flush empties the ring -> next write_pos is 0 (same as
++                # the natural wrap at write_pos == L-1).
++                valid_mask = slots >= 0
++                valid_slots = slots[valid_mask]
++                if valid_slots.numel() > 0:
++                    # Per-row "did this step flush?": natural wrap OR forced.
++                    # (KDA has no forced flush -> force_flush is None -> pure wrap.)
++                    flushed = replayssm_write_pos == (L - 1)
++                    if replayssm_force_flush is not None:
++                        flushed = flushed | (replayssm_force_flush != 0)
++                    next_pos = torch.where(
++                        flushed,
++                        torch.zeros_like(replayssm_write_pos),
++                        (replayssm_write_pos + 1) % L,
++                    )
++                    # Dedup valid slots; for duplicates a scatter picks one
++                    # arbitrary row, but all rows of a given slot share the same
++                    # write_pos/flush, so the value is identical regardless.
++                    uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
++                    next_for_valid = next_pos[valid_mask]
++                    new_vals = torch.empty(
++                        uniq_slots.shape[0],
++                        dtype=write_pos_buf.dtype,
++                        device=write_pos_buf.device,
++                    )
++                    new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
++                    write_pos_buf[uniq_slots] = new_vals
+         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+             if forward_batch.forward_mode.is_draft_extend_v2():
+                 # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
+@@ -173,6 +254,8 @@ def _forward_metadata(self, forward_batch: ForwardBatch):
+             track_ssm_final_src=track_ssm_final_src,
+             track_ssm_final_dst=track_ssm_final_dst,
+             has_mamba_track_mask=has_mamba_track_mask,
++            replayssm_write_pos=replayssm_write_pos,
++            replayssm_force_flush=replayssm_force_flush,
+         )
+ 
+     def init_forward_metadata_out_graph(
+@@ -191,6 +274,7 @@ def init_forward_metadata_out_graph(
+             num_padding=(
+                 0 if in_capture else getattr(forward_batch, "num_padding", None)
+             ),
++            in_capture=in_capture,
+         )
+ 
+     def init_forward_metadata(self, forward_batch: ForwardBatch):
+@@ -342,17 +426,72 @@ def init_forward_metadata_capture_cpu_graph(
+             bs, req_pool_indices, forward_mode, spec_info
+         )
+ 
++    def _replayssm_enabled(self) -> bool:
++        """True iff --enable-linear-replayssm allocated the persistent ring cursor.
++
++        The per-slot ``replayssm_write_pos`` buffer on MambaPool is None unless
++        the flag is set, so it doubles as the on/off gate (same signal that
++        ``_forward_metadata`` / ``GDNAttnBackend.forward_decode`` already use).
++        """
++        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
++        if mamba_pool is None:
++            return False
++        return getattr(mamba_pool, "replayssm_write_pos", None) is not None
++
++    def _replayssm_track_flush_mask(
++        self, seq_lens_cpu: torch.Tensor, bs: int
++    ) -> torch.Tensor:
++        """Per-row bool flush mask == the radix mamba-track snapshot condition.
++
++        THE alignment (slice 2b): the radix mamba track snapshots temporal[slot]
++        exactly when ``seq_lens_cpu % mamba_track_interval == 0`` (the same mask
++        ``schedule_batch.prepare_for_decode`` builds for extra_buffer at
++        ``mamba_track_mask = (seq_lens_cpu % mamba_track_interval == 0)``). Both
++        read the SAME post-increment ``seq_lens_cpu`` (committed length AFTER
++        this decode token), so the kernel force-flush fires on EXACTLY the steps
++        the snapshot reads the checkpoint -- no off-by-one. Returns a CPU bool
++        tensor of length ``bs`` (caller moves it to device as int32).
++        """
++        interval = get_global_server_args().mamba_track_interval
++        if seq_lens_cpu is None:
++            # Decode without a CPU seq-len mirror should not happen for the
++            # supported (no_buffer, radix-on) config, but stay safe: never flush.
++            return torch.zeros((bs,), dtype=torch.bool)
++        mask = (seq_lens_cpu[:bs].to(torch.int64) % interval) == 0
++        if mask.shape[0] < bs:
++            pad = torch.zeros((bs - mask.shape[0],), dtype=torch.bool)
++            mask = torch.cat([mask, pad])
++        return mask.cpu()
++
+     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+         assert (
+             max_num_tokens % max_bs == 0
+         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+         draft_token_num = max_num_tokens // max_bs
++        # GDN ReplaySSM (slice 1b): per-batch-size STATIC per-row write-cursor
++        # buffers the kernel reads. Captured into the graph by pointer, so they
++        # must be the SAME tensor objects refreshed in-place each replay. Sized
++        # and indexed like state_indices_list ((i+1,), indexed [bs - 1]). Left
++        # None when the flag is off so the dispatch falls through unchanged.
++        self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
++        # GDN ReplaySSM (slice 2b): static per-bs force-flush buffers, captured
++        # by pointer and refreshed in-place per replay just like the write-pos
++        # buffers. None when the flag is off.
++        self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
+         for i in range(max_bs):
+             self.state_indices_list.append(
+                 torch.full(
+                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                 )
+             )
++            if self.replayssm_write_pos_list is not None:
++                self.replayssm_write_pos_list.append(
++                    torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
++                )
++            if self.replayssm_force_flush_list is not None:
++                self.replayssm_force_flush_list.append(
++                    torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
++                )
+             self.query_start_loc_list.append(
+                 torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
+             )
+@@ -419,6 +558,25 @@ def _capture_metadata(
+         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+ 
++        # GDN ReplaySSM (slice 1b): point at the STATIC per-bs write-cursor
++        # buffer (no advance, no snapshot — capture records the pointer; its
++        # zeros are overwritten in-place by _replay_metadata before each
++        # replay). None when the flag is off. Same per-bs tensor object that
++        # _replay_metadata refreshes, so the captured pointer stays valid.
++        replayssm_write_pos = (
++            self.replayssm_write_pos_list[bs - 1]
++            if self.replayssm_write_pos_list is not None
++            else None
++        )
++        # GDN ReplaySSM (slice 2b): point at the STATIC per-bs force-flush
++        # buffer (same capture-by-pointer contract as write_pos; refreshed
++        # in-place by _replay_metadata before each replay). None when off.
++        replayssm_force_flush = (
++            self.replayssm_force_flush_list[bs - 1]
++            if self.replayssm_force_flush_list is not None
++            else None
++        )
++
+         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
+         if forward_mode.is_target_verify() and self.topk > 1:
+             # They are None during cuda graph capture so skip the copy_...
+@@ -430,11 +588,15 @@ def _capture_metadata(
+                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
+                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
+                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
++                replayssm_write_pos=replayssm_write_pos,
++                replayssm_force_flush=replayssm_force_flush,
+             )
+         else:
+             return ForwardMetadata(
+                 query_start_loc=self.query_start_loc_list[bs - 1],
+                 mamba_cache_indices=self.state_indices_list[bs - 1],
++                replayssm_write_pos=replayssm_write_pos,
++                replayssm_force_flush=replayssm_force_flush,
+             )
+ 
+     def _replay_metadata(
+@@ -445,6 +607,7 @@ def _replay_metadata(
+         spec_info: Optional[SpecInput],
+         seq_lens_cpu: Optional[torch.Tensor],
+         num_padding: Optional[int] = None,
++        in_capture: bool = False,
+     ):
+         if num_padding is None:
+             if seq_lens_cpu is None:
+@@ -458,6 +621,84 @@ def _replay_metadata(
+         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+         mamba_indices[bs - num_padding :] = -1
+         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
++        # GDN ReplaySSM (slice 1b): refresh the STATIC per-row write cursor the
++        # kernel reads, mirroring the eager snapshot-then-advance in
++        # _forward_metadata but writing in-place into the captured per-bs buffer
++        # so the graph's recorded pointer stays valid across replays. Done once
++        # per forward here (out_graph host op), not per layer. Skipped during
++        # capture (in_capture): capture runs on dummy slots, so advancing the
++        # persistent counter then would corrupt real per-slot ring positions;
++        # the captured buffer's contents are irrelevant at capture time anyway.
++        replayssm_write_pos = None
++        replayssm_force_flush = None
++        if self.replayssm_write_pos_list is not None:
++            mamba_pool = self.req_to_token_pool.mamba_pool
++            write_pos_buf = mamba_pool.replayssm_write_pos
++            static_wp = self.replayssm_write_pos_list[bs - 1]
++            static_ff = self.replayssm_force_flush_list[bs - 1]
++            # Hand the full captured per-bs buffers to the kernel, mirroring how
++            # mamba_cache_indices = self.state_indices_list[bs - 1] is the full
++            # (bs,) tensor; the kernel indexes them per decode row.
++            replayssm_write_pos = static_wp
++            replayssm_force_flush = static_ff
++            if write_pos_buf is not None:
++                # mamba_indices: this replay's per-row physical slots (padded
++                # rows == -1, same tensor fed to state_indices_list above).
++                slots = mamba_indices.to(torch.long)
++                safe_slots = slots.clamp(min=0)
++                # Snapshot THIS step's per-slot cursor into the captured buffer
++                # the kernel reads (in-place copy_, never reassign the object).
++                static_wp[: len(mamba_indices)].copy_(write_pos_buf[safe_slots])
++                # GDN ReplaySSM (slice 2b): refresh the captured force-flush
++                # buffer in-place from THIS step's seq_lens. THE alignment: same
++                # `seq_lens_cpu % mamba_track_interval == 0` the radix track uses
++                # (see _replayssm_track_flush_mask / schedule_batch). During
++                # capture (seq_lens_cpu is None) leave it zeroed: capture content
++                # is irrelevant and decode replays overwrite it below.
++                force_flush_dev = None
++                # KDA: no radix coordination -> leave static_ff zeroed and
++                # force_flush_dev None so the advance below is a pure wrap,
++                # matching the kernel (a zeroed force_flush flushes nothing).
++                is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
++                if (
++                    not is_kda
++                    and forward_mode.is_decode_or_idle()
++                    and seq_lens_cpu is not None
++                ):
++                    ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
++                    force_flush_dev = ff_mask.to(device=self.device, dtype=torch.int32)
++                    static_ff.copy_(force_flush_dev)
++                else:
++                    static_ff.zero_()
++                if not in_capture:
++                    L = mamba_pool.linear_replayssm_cache_len
++                    # Advance only VALID (non-padded) slots. A forced flush
++                    # empties the ring -> next write_pos is 0 (same as the
++                    # natural wrap at write_pos == L-1). Use this step's snapshot
++                    # cursor (write_pos_buf[safe_slots]) + the flush flag.
++                    valid_mask = slots >= 0
++                    valid_slots = slots[valid_mask]
++                    if valid_slots.numel() > 0:
++                        cur_pos = write_pos_buf[safe_slots]
++                        flushed = cur_pos == (L - 1)
++                        if force_flush_dev is not None:
++                            flushed = flushed | (force_flush_dev != 0)
++                        next_pos = torch.where(
++                            flushed,
++                            torch.zeros_like(cur_pos),
++                            (cur_pos + 1) % L,
++                        )
++                        # Dedup; rows sharing a slot share write_pos+flush, so
++                        # the scattered value is identical for either row.
++                        uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
++                        next_for_valid = next_pos[valid_mask]
++                        new_vals = torch.empty(
++                            uniq_slots.shape[0],
++                            dtype=write_pos_buf.dtype,
++                            device=write_pos_buf.device,
++                        )
++                        new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
++                        write_pos_buf[uniq_slots] = new_vals
+         if forward_mode.is_decode_or_idle():
+             if num_padding == 0:
+                 self.query_start_loc_list[bs - 1].copy_(
+@@ -504,11 +745,15 @@ def _replay_metadata(
+                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
+                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
+                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
++                replayssm_write_pos=replayssm_write_pos,
++                replayssm_force_flush=replayssm_force_flush,
+             )
+         else:
+             return ForwardMetadata(
+                 query_start_loc=self.query_start_loc_list[bs - 1],
+                 mamba_cache_indices=self.state_indices_list[bs - 1],
++                replayssm_write_pos=replayssm_write_pos,
++                replayssm_force_flush=replayssm_force_flush,
+             )
+ 
+     def get_cuda_graph_seq_len_fill_value(self):
+@@ -615,6 +860,7 @@ def init_forward_metadata_out_graph(
+             num_padding=(
+                 0 if in_capture else getattr(forward_batch, "num_padding", None)
+             ),
++            in_capture=in_capture,
+         )
+         spec_info = forward_batch.spec_info
+         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+index d97c0988087d..1c69cd5d439b 100644
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+@@ -314,6 +314,17 @@ def forward_decode(
+         ssm_states = layer_cache.temporal
+         query_start_loc = self.forward_metadata.query_start_loc
+         cache_indices = self.forward_metadata.mamba_cache_indices
++        # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
++        # per-row write cursor. All None unless --enable-linear-replayssm, so the
++        # legacy dispatch below is byte-identical when the flag is off.
++        replayssm_write_pos = self.forward_metadata.replayssm_write_pos
++        # GDN ReplaySSM (slice 2b): per-row force-flush at radix track
++        # boundaries (None unless --enable-linear-replayssm). When present the
++        # kernel folds the ring into temporal[slot] on the snapshot steps.
++        replayssm_force_flush = self.forward_metadata.replayssm_force_flush
++        replayssm_d = layer_cache.replayssm_d
++        replayssm_k = layer_cache.replayssm_k
++        replayssm_g = layer_cache.replayssm_g
+ 
+         assert isinstance(mixed_qkv, torch.Tensor)
+         mixed_qkv = causal_conv1d_update(
+@@ -339,6 +350,11 @@ def forward_decode(
+                 cache_indices=cache_indices,
+                 num_v_heads=layer.num_v_heads,
+                 head_v_dim=layer.head_v_dim,
++                replayssm_d=replayssm_d,
++                replayssm_k=replayssm_k,
++                replayssm_g=replayssm_g,
++                replayssm_write_pos=replayssm_write_pos,
++                replayssm_force_flush=replayssm_force_flush,
+             )
+             self._track_mamba_state_decode(
+                 forward_batch, conv_states, ssm_states, cache_indices
+diff --git a/python/sglang/srt/layers/attention/linear/kda_backend.py b/python/sglang/srt/layers/attention/linear/kda_backend.py
+index 065dc1110038..d2168c3d2db4 100644
+--- a/python/sglang/srt/layers/attention/linear/kda_backend.py
++++ b/python/sglang/srt/layers/attention/linear/kda_backend.py
+@@ -205,6 +205,28 @@ def forward_decode(
+         query_start_loc = self.forward_metadata.query_start_loc
+         cache_indices = self.forward_metadata.mamba_cache_indices
+ 
++        # ReplaySSM ring: per-layer ring slices + the once-per-forward per-row
++        # write cursor. All None unless --enable-linear-replayssm, so packed_decode
++        # falls through to the byte-identical legacy KDA path. KDA ships WITHOUT
++        # radix coordination for now, so force_flush is None/zeroed (the ring
++        # flushes only at the natural write_pos == L-1 wrap; set in the shared
++        # HybridLinearAttn metadata, which zeroes force_flush for KDA models).
++        # NOTE: ReplaySSM decode is a GDN (scalar-gate) bandwidth win; on KDA the
++        # per-K g_cache is K x larger and the reconstruction refolds the per-K
++        # decay every step, so it is correct but SLOWER than packed (a measured
++        # decode regression). Kept wired for correctness + the spec-decode path;
++        # not recommended for KDA decode. Revisit on Blackwell (more tensor-core
++        # throughput may flip the compute/bandwidth tradeoff).
++        replayssm_write_pos = getattr(
++            self.forward_metadata, "replayssm_write_pos", None
++        )
++        replayssm_force_flush = getattr(
++            self.forward_metadata, "replayssm_force_flush", None
++        )
++        replayssm_d = layer_cache.replayssm_d
++        replayssm_k = layer_cache.replayssm_k
++        replayssm_g = layer_cache.replayssm_g
++
+         qkv = causal_conv1d_update(
+             mixed_qkv,
+             conv_states.transpose(-1, -2),
+@@ -240,6 +262,11 @@ def forward_decode(
+                 cache_indices=cache_indices,
+                 num_v_heads=layer.num_v_heads,
+                 head_v_dim=layer.head_v_dim,
++                replayssm_d=replayssm_d,
++                replayssm_k=replayssm_k,
++                replayssm_g=replayssm_g,
++                replayssm_write_pos=replayssm_write_pos,
++                replayssm_force_flush=replayssm_force_flush,
+             )
+ 
+         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+index 0daf8f4e2571..a560b4680a04 100644
+--- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
++++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+@@ -10,6 +10,9 @@
+     from sglang.srt.layers.attention.fla.fused_recurrent import (
+         fused_recurrent_gated_delta_rule_packed_decode,
+     )
++    from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
++        fused_recurrent_gdn_replayssm_decode,
++    )
+     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+         fused_sigmoid_gating_delta_rule_update,
+     )
+@@ -78,6 +81,43 @@ def packed_decode(
+         # Packed kernel expects output shape [B, 1, HV, V]
+         out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
+ 
++        # GDN ReplaySSM buffered decode (slice 1a). Drop-in for the packed
++        # decode: same args plus the three per-layer ring caches and the
++        # per-row write cursor. When any ring tensor / cursor is None (flag
++        # off) we fall through to the byte-identical legacy path below.
++        replayssm_d = kwargs.get("replayssm_d")
++        replayssm_k = kwargs.get("replayssm_k")
++        replayssm_g = kwargs.get("replayssm_g")
++        replayssm_write_pos = kwargs.get("replayssm_write_pos")
++        # GDN ReplaySSM (slice 2b): optional per-row force-flush (radix track
++        # boundary). None when radix tracking is off / flag off; the kernel
++        # treats None as "no forced flush" (byte-identical to slice 1a/1b).
++        replayssm_force_flush = kwargs.get("replayssm_force_flush")
++        if (
++            replayssm_d is not None
++            and replayssm_k is not None
++            and replayssm_g is not None
++            and replayssm_write_pos is not None
++        ):
++            fused_recurrent_gdn_replayssm_decode(
++                mixed_qkv=mixed_qkv,
++                a=a,
++                b=b,
++                A_log=A_log,
++                dt_bias=dt_bias,
++                scale=scale,
++                initial_state=ssm_states,
++                d_cache=replayssm_d,
++                k_cache=replayssm_k,
++                g_cache=replayssm_g,
++                out=out,
++                ssm_state_indices=cache_indices,
++                write_pos=replayssm_write_pos,
++                force_flush=replayssm_force_flush,
++                use_qk_l2norm_in_kernel=True,
++            )
++            return out.transpose(0, 1)
++
+         fused_recurrent_gated_delta_rule_packed_decode(
+             mixed_qkv=mixed_qkv,
+             a=a,
+diff --git a/python/sglang/srt/layers/attention/linear/kernels/kda_triton.py b/python/sglang/srt/layers/attention/linear/kernels/kda_triton.py
+index c5c79779108d..e8f0fc4055d2 100644
+--- a/python/sglang/srt/layers/attention/linear/kernels/kda_triton.py
++++ b/python/sglang/srt/layers/attention/linear/kernels/kda_triton.py
+@@ -11,6 +11,9 @@
+     from sglang.srt.layers.attention.fla.fused_recurrent import (
+         fused_recurrent_kda_packed_decode,
+     )
++    from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
++        fused_recurrent_linear_replayssm_decode,
++    )
+     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+         fused_sigmoid_gating_delta_rule_update,
+     )
+@@ -45,13 +48,52 @@ def packed_decode(
+         decode kernel output layout.
+         """
+         B = mixed_qkv.shape[0]
++        out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
++
++        # KDA ReplaySSM buffered decode: drop-in for the packed decode, same
++        # args plus the three per-layer ring caches + the per-row write cursor
++        # (and optional radix-track force-flush). Uses the gate-generic kernel
++        # with is_kda=True (per-K gate); g_cache is [num_slots, HV, L, K].
++        # When any ring tensor / cursor is None (flag off) we fall through to
++        # the byte-identical legacy path below.
++        replayssm_d = kwargs.get("replayssm_d")
++        replayssm_k = kwargs.get("replayssm_k")
++        replayssm_g = kwargs.get("replayssm_g")
++        replayssm_write_pos = kwargs.get("replayssm_write_pos")
++        replayssm_force_flush = kwargs.get("replayssm_force_flush")
++        if (
++            replayssm_d is not None
++            and replayssm_k is not None
++            and replayssm_g is not None
++            and replayssm_write_pos is not None
++        ):
++            K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
++            fused_recurrent_linear_replayssm_decode(
++                mixed_qkv=mixed_qkv,
++                a=a.reshape(B, num_v_heads, K).contiguous(),
++                b=b.reshape(B, num_v_heads).contiguous(),
++                A_log=A_log.reshape(-1),
++                dt_bias=dt_bias.reshape(num_v_heads, K).contiguous(),
++                scale=scale,
++                initial_state=ssm_states,
++                d_cache=replayssm_d,
++                k_cache=replayssm_k,
++                g_cache=replayssm_g,
++                out=out,
++                ssm_state_indices=cache_indices,
++                write_pos=replayssm_write_pos,
++                force_flush=replayssm_force_flush,
++                use_qk_l2norm_in_kernel=True,
++                is_kda=True,
++            )
++            return out.transpose(0, 1)
++
+         # a may come in as [B, HV, K] (or [B, 1, HV*K]); b may come in as
+         # [B, 1, HV]. Flatten both to the 2D shapes the kernel expects.
+         if a.dim() != 2:
+             a = a.reshape(B, -1)
+         if b.dim() != 2:
+             b = b.reshape(B, -1)
+-        out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
+         fused_recurrent_kda_packed_decode(
+             mixed_qkv=mixed_qkv,
+             a=a,
+diff --git a/python/sglang/srt/layers/attention/mamba/mamba2_metadata.py b/python/sglang/srt/layers/attention/mamba/mamba2_metadata.py
+index 612ad9bb1d88..77cd81ce2958 100644
+--- a/python/sglang/srt/layers/attention/mamba/mamba2_metadata.py
++++ b/python/sglang/srt/layers/attention/mamba/mamba2_metadata.py
+@@ -30,6 +30,16 @@ class ForwardMetadata:
+     query_start_loc: torch.Tensor
+     mamba_cache_indices: torch.Tensor
+     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
++    # GDN ReplaySSM (slice 1a): per-decode-row snapshot of the ring write
++    # cursor for THIS decode step (gathered from the persistent per-slot
++    # buffer, then advanced once for the next step). int32, length == batch.
++    replayssm_write_pos: Optional[torch.Tensor] = None
++    # GDN ReplaySSM (slice 2b): per-decode-row int32 flush flag for THIS decode
++    # step. !=0 forces the kernel to fold the partial ring + current token into
++    # the checkpoint (temporal[slot]) so the radix cache reads an up-to-date
++    # state. Fires on EXACTLY the rows the radix track snapshots, i.e. the same
++    # condition the track uses: seq_lens_cpu % mamba_track_interval == 0.
++    replayssm_force_flush: Optional[torch.Tensor] = None
+     # For topk > 1 eagle
+     retrieve_next_token: Optional[torch.Tensor] = None
+     retrieve_next_sibling: Optional[torch.Tensor] = None
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index e01c41446ed1..1d2f3744bdf0 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -530,11 +530,19 @@ def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+         ]
+ 
+         if is_insert:
+-            cache_len = (
+-                req.mamba_last_track_seqlen
+-                if self.enable_mamba_extra_buffer
+-                else len(token_ids)
+-            )
++            if self.enable_mamba_extra_buffer:
++                cache_len = req.mamba_last_track_seqlen
++            else:
++                cache_len = len(token_ids)
++                # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by
++                # the slot's unflushed ring depth (`write_pos`), so cap the
++                # donate to the last flush boundary (where temporal is current)
++                # and reset the cursor, keeping the donated checkpoint consistent
++                # with its key length. page_size is asserted == 1, so no realign.
++                write_pos_buf = self.req_to_token_pool.mamba_pool.replayssm_write_pos
++                if write_pos_buf is not None:
++                    cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
++                    write_pos_buf[req.mamba_pool_idx] = 0
+             if cache_len is None:
+                 cache_len = 0
+             if cache_len != len(token_ids):
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 2c2297e11427..b2bcec3561e7 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -302,6 +302,15 @@ class MambaPool:
+     class State:
+         conv: List[torch.Tensor]
+         temporal: torch.Tensor
++        # GDN ReplaySSM ring buffers (slice 1a). Only allocated when
++        # `--enable-linear-replayssm` is set; otherwise None so the legacy path is
++        # byte-identical. Per-layer layout: [num_layers, num_slots, ...].
++        #   replayssm_d: [num_layers, num_slots, HV, L, V]
++        #   replayssm_k: [num_layers, num_slots, H,  L, K]
++        #   replayssm_g: [num_layers, num_slots, HV, L]  (fp32)
++        replayssm_d: Optional[torch.Tensor] = None
++        replayssm_k: Optional[torch.Tensor] = None
++        replayssm_g: Optional[torch.Tensor] = None
+ 
+         def at_layer_idx(self, layer: int):
+             kwargs = {}
+@@ -309,7 +318,9 @@ def at_layer_idx(self, layer: int):
+             for f in fields(self):
+                 name = f.name
+                 v = getattr(self, name)
+-                if name in ("conv", "intermediate_conv_window"):
++                if v is None:
++                    kwargs[name] = None
++                elif name in ("conv", "intermediate_conv_window"):
+                     kwargs[name] = [conv[layer] for conv in v]
+                 else:
+                     kwargs[name] = v[layer]
+@@ -320,6 +331,7 @@ def mem_usage_bytes(self):
+             return sum(
+                 get_tensor_size_bytes(getattr(self, f.name))
+                 for f in dataclasses.fields(self)
++                if getattr(self, f.name) is not None
+             )
+ 
+     @dataclass(frozen=True, kw_only=True)
+@@ -338,6 +350,8 @@ def __init__(
+         enable_memory_saver: bool = False,
+         speculative_num_draft_tokens: Optional[int] = None,
+         speculative_eagle_topk: Optional[int] = None,
++        enable_linear_replayssm: bool = False,
++        linear_replayssm_cache_len: int = 16,
+     ):
+         conv_state_shape = cache_params.shape.conv
+         temporal_state_shape = cache_params.shape.temporal
+@@ -350,6 +364,8 @@ def __init__(
+ 
+         self.size = size
+         self.device = device
++        self.enable_linear_replayssm = enable_linear_replayssm
++        self.linear_replayssm_cache_len = linear_replayssm_cache_len
+ 
+         # for disagg with nvlink
+         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+@@ -393,6 +409,41 @@ def __init__(
+                 dtype=ssm_dtype,
+                 device=device,
+             )
++
++            # GDN ReplaySSM ring buffers (slice 1a). Allocated only when the
++            # flag is on; otherwise left as None so the legacy State is
++            # byte-identical. temporal_state_shape == (HV, V, K).
++            replayssm_d = replayssm_k = replayssm_g = None
++            if enable_linear_replayssm:
++                hv, v_dim, k_dim = temporal_state_shape
++                h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
++                L = linear_replayssm_cache_len
++                num_slots = size + 1
++                # Ring records live in the SSM dtype (bf16/fp32) except g (fp32).
++                replayssm_d = torch.zeros(
++                    size=(num_mamba_layers, num_slots, hv, L, v_dim),
++                    dtype=ssm_dtype,
++                    device=device,
++                )
++                replayssm_k = torch.zeros(
++                    size=(num_mamba_layers, num_slots, h_k, L, k_dim),
++                    dtype=ssm_dtype,
++                    device=device,
++                )
++                # The log-decay gate ring (fp32): per-head SCALAR for the GDN
++                # gate -> [.., L]; per-K VECTOR for the KDA gate -> [.., L, K]
++                # (k_dim == temporal_state_shape[-1] for both).
++                g_shape = (
++                    (num_mamba_layers, num_slots, hv, L, k_dim)
++                    if cache_params.is_kda
++                    else (num_mamba_layers, num_slots, hv, L)
++                )
++                replayssm_g = torch.zeros(
++                    size=g_shape,
++                    dtype=torch.float32,
++                    device=device,
++                )
++
+             if speculative_num_draft_tokens is not None:
+                 if _is_npu:
+                     temporal_state = temporal_state.transpose(-1, -2)
+@@ -500,6 +551,9 @@ def __init__(
+                     temporal=temporal_state,
+                     intermediate_ssm=intermediate_ssm_state_cache,
+                     intermediate_conv_window=intermediate_conv_window_cache,
++                    replayssm_d=replayssm_d,
++                    replayssm_k=replayssm_k,
++                    replayssm_g=replayssm_g,
+                 )
+                 logger.info(
+                     f"Mamba Cache is allocated. "
+@@ -512,13 +566,41 @@ def __init__(
+                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
+                 )
+             else:
+-                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
++                self.mamba_cache = self.State(
++                    conv=conv_state,
++                    temporal=temporal_state,
++                    replayssm_d=replayssm_d,
++                    replayssm_k=replayssm_k,
++                    replayssm_g=replayssm_g,
++                )
+                 logger.info(
+                     f"Mamba Cache is allocated. "
+                     f"max_mamba_cache_size: {size}, "
+                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                 )
++            if enable_linear_replayssm:
++                logger.info(
++                    f"GDN ReplaySSM ring buffers allocated (L="
++                    f"{linear_replayssm_cache_len}): "
++                    f"d={get_tensor_size_bytes(replayssm_d) / GB:.3f}GB, "
++                    f"k={get_tensor_size_bytes(replayssm_k) / GB:.3f}GB, "
++                    f"g={get_tensor_size_bytes(replayssm_g) / GB:.3f}GB "
++                )
++            # Gate granularity of the linear-attn layers (drives the kernel's
++            # IS_KDA path + the g_cache layout). Read by the backend metadata to
++            # decide the per-K (KDA) vs scalar (GDN) flush/advance handling.
++            self.replayssm_is_kda = bool(
++                enable_linear_replayssm and cache_params.is_kda
++            )
++            # Persistent per-slot decode-position cursor for ReplaySSM. Shared
++            # across all linear-attn layers; advanced once per decode forward by
++            # the backend metadata build. Index 0..size; reset on slot (re)alloc.
++            self.replayssm_write_pos = (
++                torch.zeros((size + 1,), dtype=torch.int32, device=device)
++                if enable_linear_replayssm
++                else None
++            )
+             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
+             if isinstance(self.mamba_cache, self.SpeculativeState):
+                 # `intermediate_conv_window` is an as_strided view whose logical
+@@ -557,6 +639,24 @@ def clear_slots(self, indices: torch.Tensor):
+         t[:, indices] = z
+ 
+     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
++        """Clone mamba state (conv + temporal) from src slots into dst slots.
++
++        ReplaySSM invariant: the SOURCE must be a fully-flushed checkpoint
++        (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
++        an un-flushed source would drop its last ``write_pos`` updates. Callers
++        comply: COW copies radix checkpoints; ``cache_unfinished_req`` copies an
++        active slot only during prefill (ring empty); ``cache_finished_req``
++        caps the donate to the last flush boundary. The dst cursor is reset to 0
++        (the copied checkpoint has no pending ring entries).
++        """
++        if self.replayssm_write_pos is not None and envs.SGLANG_DEBUG_MEMORY_POOL.get():
++            # Debug-only (syncs): catch any copy of an active, un-flushed slot.
++            src_wp = self.replayssm_write_pos[src_indices]
++            assert bool((src_wp == 0).all().item()), (
++                "copy_from requires a fully-flushed ReplaySSM source "
++                f"(write_pos==0), got {src_wp.tolist()} for src "
++                f"{src_indices.tolist()}"
++            )
+         for i in range(len(self.mamba_cache.conv)):
+             self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
+                 :, src_indices
+@@ -564,6 +664,8 @@ def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+         self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+             :, src_indices
+         ]
++        if self.replayssm_write_pos is not None:
++            self.replayssm_write_pos[dst_indices] = 0
+ 
+     def get_cpu_copy(self, indices):
+         current_platform.synchronize()
+@@ -599,7 +701,13 @@ def get_contiguous_buf_infos(self):
+             # These buffers have different size (spec_state_size + 1) and should not be transferred
+             if field in ("intermediate_ssm", "intermediate_conv_window"):
+                 continue
++            # Skip GDN ReplaySSM ring buffers: they are derived/transient decode
++            # scratch, not part of the persistent transferable state.
++            if field in ("replayssm_d", "replayssm_k", "replayssm_g"):
++                continue
+             value = getattr(self.mamba_cache, field)
++            if value is None:
++                continue
+             if isinstance(value, list):
+                 state_tensors.extend(value)
+             else:
+@@ -628,7 +736,19 @@ def get_state_dim_per_tensor(self):
+         """
+         state_tensors = []
+         for field in vars(self.mamba_cache):
++            # Mirror the exclusions in get_contiguous_buf_infos so the returned
++            # dims line up element-wise with the RDMA buffer list.
++            if field in (
++                "intermediate_ssm",
++                "intermediate_conv_window",
++                "replayssm_d",
++                "replayssm_k",
++                "replayssm_g",
++            ):
++                continue
+             value = getattr(self.mamba_cache, field)
++            if value is None:
++                continue
+             if isinstance(value, list):
+                 state_tensors.extend(value)
+             else:
+@@ -664,6 +784,8 @@ def __init__(
+         speculative_eagle_topk: Optional[int] = None,
+         enable_overlap_schedule: bool = True,
+         start_layer: Optional[int] = None,
++        enable_linear_replayssm: bool = False,
++        linear_replayssm_cache_len: int = 16,
+     ):
+         super().__init__(
+             size=size,
+@@ -687,6 +809,8 @@ def __init__(
+             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+             speculative_num_draft_tokens=speculative_num_draft_tokens,
+             speculative_eagle_topk=speculative_eagle_topk,
++            enable_linear_replayssm=enable_linear_replayssm,
++            linear_replayssm_cache_len=linear_replayssm_cache_len,
+         )
+ 
+     def _init_mamba_pool(
+@@ -699,6 +823,8 @@ def _init_mamba_pool(
+         enable_mamba_extra_buffer: bool,
+         speculative_num_draft_tokens: int = None,
+         speculative_eagle_topk: Optional[int] = None,
++        enable_linear_replayssm: bool = False,
++        linear_replayssm_cache_len: int = 16,
+     ):
+         self.mamba_pool = MambaPool(
+             size=mamba_size,
+@@ -709,6 +835,8 @@ def _init_mamba_pool(
+             enable_memory_saver=self.enable_memory_saver,
+             speculative_num_draft_tokens=speculative_num_draft_tokens,
+             speculative_eagle_topk=speculative_eagle_topk,
++            enable_linear_replayssm=enable_linear_replayssm,
++            linear_replayssm_cache_len=linear_replayssm_cache_len,
+         )
+         self.mamba_allocator = MambaSlotAllocator(
+             size=mamba_size,
+@@ -766,6 +894,12 @@ def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
+                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                 req.mamba_pool_idx = mid[0]
+                 req.mamba_needs_clear = True
++                # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
++                # ring. write_pos=0 means "ring empty", so the decode kernel
++                # ignores ring contents and reads only the checkpoint state
++                # (the post-prefill state that prefill wrote into this slot).
++                if self.mamba_pool.replayssm_write_pos is not None:
++                    self.mamba_pool.replayssm_write_pos[req.mamba_pool_idx] = 0
+             mamba_indices.append(req.mamba_pool_idx)
+             if self.enable_mamba_extra_buffer:
+                 if req.mamba_ping_pong_track_buffer is None:
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index a02ae240fd96..9c8ca0cfd82e 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -402,6 +402,8 @@ def _init_pools(self: ModelRunner):
+                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                     start_layer=self.start_layer,
++                    enable_linear_replayssm=self.server_args.enable_linear_replayssm,
++                    linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
+                 )
+             else:
+                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index ce2e57b00a5c..6fb0c96ba1f8 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1829,6 +1829,23 @@ class ServerArgs:
+             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+         ),
+     ] = None
++    # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
++    # ring + periodic flush to cut per-step HBM state traffic.
++    enable_linear_replayssm: A[
++        bool,
++        "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
++        "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
++        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
++        "is numerically correct, but KDA decode is SLOWER than the packed "
++        "baseline (the per-K g_cache is K x larger and the reconstruction "
++        "refolds the per-K decay every step), so it is not recommended for KDA "
++        "models. Requires the Triton linear-attn decode backend and "
++        "--mamba-scheduler-strategy no_buffer (the default).",
++    ] = False
++    linear_replayssm_cache_len: A[
++        int,
++        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
++    ] = 16
+ 
+     # -------------------------------------------------------------------------
+     # Hierarchical cache
+@@ -5041,6 +5058,50 @@ def _handle_linear_attn_backend(self):
+                 f"got CUDA {cuda_version or 'unknown'}"
+             )
+ 
++        # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
++        # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static
++        # write-cursor buffers). The RADIX prefix cache is now supported (slice
++        # 2b: the decode kernel force-flushes the ring into temporal[slot] on
++        # the radix track boundary `seq_lens % mamba_track_interval == 0`, and
++        # the COW copy-into-slot path resets the ring cursor) -- so the
++        # --disable-radix-cache requirement is dropped.
++        #
++        # Slice 2b only wires the no_buffer mamba scheduler strategy (the
++        # default). The extra_buffer strategy donates the track snapshot via
++        # `donate_mamba_ping_pong_slot` with a separate ping-pong slot swap that
++        # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
++        # cursor of the donated/kept slot would not be reset there. Handling
++        # that donation path is a follow-up; for now require no_buffer.
++        if self.enable_linear_replayssm:
++            if decode != "triton":
++                raise ValueError(
++                    "--enable-linear-replayssm requires the Triton "
++                    "linear-attn decode backend, got "
++                    f"--linear-attn-decode-backend={decode!r}."
++                )
++            if self.enable_mamba_extra_buffer():
++                raise ValueError(
++                    "--enable-linear-replayssm requires --mamba-scheduler-strategy "
++                    "no_buffer (the default); the extra_buffer ping-pong "
++                    "donation path is not yet supported (follow-up). Got "
++                    f"--mamba-scheduler-strategy={self.mamba_scheduler_strategy!r}."
++                )
++            if self.disaggregation_mode != "null":
++                # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
++                # is not wired for the ReplaySSM ring, so the flag would silently
++                # no-op there; disagg also runs a different cache/coordination
++                # flow that is not yet validated for ReplaySSM (follow-up).
++                raise ValueError(
++                    "--enable-linear-replayssm is not supported under PD "
++                    "disaggregation yet (follow-up). Got "
++                    f"--disaggregation-mode={self.disaggregation_mode!r}."
++                )
++            if self.linear_replayssm_cache_len < 1:
++                raise ValueError(
++                    "--linear-replayssm-cache-len must be >= 1, got "
++                    f"{self.linear_replayssm_cache_len}."
++                )
++
+     def _handle_legacy_cp_arguments(self):
+         legacy_mode_to_strategy = {
+             "in-seq-split": "zigzag",
+diff --git a/test/registered/attention/unittests/gdn/test_linear_replayssm_decode.py b/test/registered/attention/unittests/gdn/test_linear_replayssm_decode.py
+new file mode 100644
+index 000000000000..754bc95c92d1
+--- /dev/null
++++ b/test/registered/attention/unittests/gdn/test_linear_replayssm_decode.py
+@@ -0,0 +1,344 @@
++"""Correctness test for the buffered output-only linear-attention decode kernel
++(ReplaySSM Part A), implemented in
++``python/sglang/srt/layers/attention/fla/fused_recurrent_linear_replayssm.py``.
++
++One kernel, two gate granularities (selected by ``is_kda``):
++  * GDN (``is_kda=False``): per-head SCALAR gate. Ground truth =
++    ``fused_recurrent_gated_delta_rule_packed_decode`` (fused_recurrent.py:186).
++  * KDA (``is_kda=True``):  per-K-channel gate. Ground truth =
++    ``fused_recurrent_kda_packed_decode`` (fused_recurrent.py:406). The KDA
++    baseline takes the per-K gate flattened (``a``=[B, HV*K], ``dt_bias``=[HV*K]);
++    the ReplaySSM kernel takes it as [B, HV, K] / [HV, K]. Same memory layout,
++    so we build [B, HV, K] / [HV, K] and reshape for the baseline.
++
++We run a multi-step decode through BOTH kernels and assert:
++  * per-step outputs ``y`` match, AND
++  * the ground-truth full state matches the ReplaySSM checkpoint *after a flush*
++    (folding the ring buffer into S0). At a non-flush step the ReplaySSM
++    checkpoint legitimately lags (the update lives in the ring), so we only
++    compare state at flush boundaries / after a forced flush.
++
++L sweep:
++  * L=1 (flush every step): the ring is always empty and ``write_pos == L-1``
++    every step, so the reconstruction term is zero, the total decay is 1, and
++    the kernel reduces to the packed decode. For GDN the only fp difference is a
++    scalar ``alpha*(sum x)`` vs ``sum(alpha*x)`` reorder, so we assert ~bit-exact
++    (atol 2e-6). For KDA the analogous reorder is per-K (``alpha[k]`` folded into
++    q/k vs into S0), bounded by ~K*eps, so KDA uses the same (tighter-than-L>1)
++    tensor-core tolerances rather than 2e-6.
++  * L in {4,8,16}: algebraically equivalent but floating-point reordered (cumsum
++    of gates, replay-decay scaling, the d@k reconstruction dot on tensor cores
++    vs. the materialized recurrence). Tight fp tolerance, see ``_tols``.
++
++Runnable as ``pytest`` and as ``__main__``.
++"""
++
++import sys
++import unittest
++from pathlib import Path
++
++import torch
++
++from sglang.test.test_utils import CustomTestCase
++
++# Mirror sibling GDN unittests: register for CUDA/AMD CI. This is a kernel-math
++# unit test; it lives with the other linear-attention kernel correctness tests.
++# The registry calls MUST be module-level (the CI collector / check-registered-
++# tests hook parses them statically via AST and only scans top-level statements
++# -- a try/except wrapper hides them and fails the hook).
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
++
++register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
++register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
++
++
++def _build_inputs(B, H, HV, K, V, dtype, device, seed=0, is_kda=False):
++    """Random packed-decode inputs for one step.
++
++    Returns a packed ``mixed_qkv`` [B, 2*H*K + HV*V] plus the per-row gate
++    inputs. ``b`` (beta) is [B, HV] for both gate types. ``a`` is [B, HV] for
++    the GDN scalar gate and [B, HV, K] for the KDA per-K gate.
++    """
++    g = torch.Generator(device=device).manual_seed(seed)
++    qk_dim = 2 * H * K
++    v_dim = HV * V
++    mixed_qkv = torch.randn(B, qk_dim + v_dim, generator=g, device=device, dtype=dtype)
++    # Keep gate input `a` modest so softplus / decay stay in a stable range.
++    if is_kda:
++        a = (
++            torch.randn(B, HV, K, generator=g, device=device, dtype=dtype) * 0.5
++        ).contiguous()
++    else:
++        a = torch.randn(B, HV, generator=g, device=device, dtype=dtype) * 0.5
++    b = torch.randn(B, HV, generator=g, device=device, dtype=dtype)
++    return mixed_qkv, a, b
++
++
++def _tols(dtype):
++    # L>1 reconstructs the state via a tensor-core tl.dot (TF32 for fp32 inputs,
++    # bf16 tensor cores for bf16) -- the performance-critical path that keeps the
++    # L-deep reconstruction hidden under the reduced memory traffic. TF32 carries
++    # ~4e-4 error, bf16 ~1e-3, both benign end-to-end (ReplaySSM GSM8K parity);
++    # vLLM's own ReplaySSM test uses fp32 atol 1e-4. GDN L=1 has an empty buffer
++    # (dot == 0) and is asserted bit-exact separately.
++    if dtype == torch.float32:
++        return dict(atol=1e-4, rtol=1e-3)
++    return dict(atol=1e-3, rtol=1e-2)  # bf16
++
++
++@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
++class TestLinearReplaySSMDecode(CustomTestCase):
++    # Small config: HV=8 or 16 heads, K=V=128, batch B=4.
++    CONFIGS = (
++        dict(B=4, H=4, HV=8, K=128, V=128),
++        dict(B=4, H=8, HV=16, K=128, V=128),
++    )
++    NUM_STEPS = 40  # > 16 -> multiple flush cycles for L in {4,8,16}
++    L_SWEEP = (1, 4, 8, 16)
++
++    def _run_one(self, cfg, L, dtype, force_flush_steps=(), is_kda=False):
++        from sglang.srt.layers.attention.fla.fused_recurrent import (
++            fused_recurrent_gated_delta_rule_packed_decode,
++            fused_recurrent_kda_packed_decode,
++        )
++        from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
++            fused_recurrent_linear_replayssm_decode,
++        )
++
++        device = "cuda"
++        B, H, HV, K, V = (cfg[x] for x in ("B", "H", "HV", "K", "V"))
++        scale = K**-0.5
++
++        # Shared static params across steps. A_log is per-head [HV] for both
++        # gate types; dt_bias is per-head [HV] (GDN) or per-K [HV, K] (KDA).
++        A_log = (torch.randn(HV, device=device, dtype=torch.float32) * 0.3).contiguous()
++        if is_kda:
++            dt_bias = (
++                torch.randn(HV, K, device=device, dtype=torch.float32) * 0.1
++            ).contiguous()
++        else:
++            dt_bias = (
++                torch.randn(HV, device=device, dtype=torch.float32) * 0.1
++            ).contiguous()
++
++        # Two independent state pools (same init), one per kernel. One slot/req.
++        num_slots = B
++        # Seed the state init so the marginal bf16 flush-state element is
++        # reproducible run-to-run (otherwise the pass/fail at the tolerance
++        # boundary flickers with the global RNG).
++        sg = torch.Generator(device=device).manual_seed(2024)
++        ref_state = torch.randn(
++            num_slots, HV, V, K, generator=sg, device=device, dtype=torch.float32
++        )
++        rep_state = ref_state.clone()
++        cache_indices = torch.arange(B, device=device, dtype=torch.int32)
++
++        # ReplaySSM ring tensors (caller-owned; this increment's caller == test).
++        # g_cache is per-step scalar [HV, L] for GDN, per-K [HV, L, K] for KDA.
++        d_cache = torch.zeros(num_slots, HV, L, V, device=device, dtype=dtype)
++        k_cache = torch.zeros(num_slots, H, L, K, device=device, dtype=dtype)
++        if is_kda:
++            g_cache = torch.zeros(
++                num_slots, HV, L, K, device=device, dtype=torch.float32
++            )
++        else:
++            g_cache = torch.zeros(num_slots, HV, L, device=device, dtype=torch.float32)
++        write_pos = torch.zeros(B, device=device, dtype=torch.int32)
++
++        tols = _tols(dtype)
++        flush_step_seen = False
++
++        for step in range(self.NUM_STEPS):
++            mixed_qkv, a, b = _build_inputs(
++                B, H, HV, K, V, dtype, device, seed=1000 + step, is_kda=is_kda
++            )
++
++            # ---- ground truth: packed decode, full-state write every step ----
++            ref_out = mixed_qkv.new_empty(B, 1, HV, V)
++            if is_kda:
++                # KDA baseline takes the per-K gate flattened: a=[B, HV*K],
++                # dt_bias=[HV*K] (same memory as our [B, HV, K] / [HV, K]).
++                fused_recurrent_kda_packed_decode(
++                    mixed_qkv=mixed_qkv,
++                    a=a.reshape(B, HV * K).contiguous(),
++                    b=b,
++                    A_log=A_log,
++                    dt_bias=dt_bias.reshape(HV * K).contiguous(),
++                    scale=scale,
++                    initial_state=ref_state,
++                    out=ref_out,
++                    ssm_state_indices=cache_indices,
++                    use_qk_l2norm_in_kernel=True,
++                )
++            else:
++                fused_recurrent_gated_delta_rule_packed_decode(
++                    mixed_qkv=mixed_qkv,
++                    a=a,
++                    b=b,
++                    A_log=A_log,
++                    dt_bias=dt_bias,
++                    scale=scale,
++                    initial_state=ref_state,
++                    out=ref_out,
++                    ssm_state_indices=cache_indices,
++                    use_qk_l2norm_in_kernel=True,
++                )
++
++            # ---- ReplaySSM buffered decode for this L ----
++            rep_out = mixed_qkv.new_empty(B, 1, HV, V)
++            # slice 2: force a flush at a radix track boundary even mid-buffer.
++            force_now = step in force_flush_steps
++            ff_tensor = (
++                torch.ones(B, device=device, dtype=torch.int32) if force_now else None
++            )
++            is_flush = bool((write_pos[0].item()) == L - 1) or force_now
++            flush_step_seen = flush_step_seen or is_flush
++            fused_recurrent_linear_replayssm_decode(
++                mixed_qkv=mixed_qkv,
++                a=a,
++                b=b,
++                A_log=A_log,
++                dt_bias=dt_bias,
++                scale=scale,
++                initial_state=rep_state,
++                d_cache=d_cache,
++                k_cache=k_cache,
++                g_cache=g_cache,
++                out=rep_out,
++                ssm_state_indices=cache_indices,
++                write_pos=write_pos,
++                force_flush=ff_tensor,
++                use_qk_l2norm_in_kernel=True,
++                is_kda=is_kda,
++                # nk=1 at L=1 keeps the K-reduction in a single tile (no
++                # K-tiling), matching the reference's single-pass reduction;
++                # nk=2 for L>1 exercises the K-tiled reconstruction path.
++                nk=1 if L == 1 else 2,
++            )
++
++            # Output must match every step.
++            if dtype == torch.float32 and L == 1 and not is_kda:
++                # GDN L=1: essentially bit-exact -- only an alpha*(sum) vs
++                # sum(alpha*) scalar-multiply reordering separates this from the
++                # reference. (KDA L=1 has the analogous per-K reorder, bounded by
++                # ~K*eps, so it uses the regular tensor-core tolerance below.)
++                torch.testing.assert_close(
++                    rep_out,
++                    ref_out,
++                    atol=2e-6,
++                    rtol=1e-5,
++                    msg=f"GDN L=1 step={step} out",
++                )
++            else:
++                torch.testing.assert_close(
++                    rep_out,
++                    ref_out,
++                    msg=f"is_kda={is_kda} L={L} step={step} out",
++                    **tols,
++                )
++
++            # On a flush step the ReplaySSM checkpoint is brought fully
++            # up-to-date and the ring logically clears -> compare states.
++            if is_flush:
++                if dtype == torch.float32 and L == 1 and not is_kda:
++                    torch.testing.assert_close(
++                        rep_state,
++                        ref_state,
++                        atol=2e-6,
++                        rtol=1e-5,
++                        msg=f"GDN L=1 step={step} state",
++                    )
++                else:
++                    # The flush state is reconstructed via the tensor-core dot,
++                    # so it carries tensor-core precision: ~tf32 (~4e-4, measured
++                    # max_abs ~7e-4) for fp32, ~bf16 (measured max_abs ~1.9e-3)
++                    # for bf16 -- looser than the per-step OUTPUT, which passes at
++                    # the tighter output tol because the tf32/bf16 error partly
++                    # cancels in the q-reduction. The per-step decay (alpha<1)
++                    # attenuates old reconstruction error so it does not
++                    # accumulate across flushes over a long decode; e2e accuracy
++                    # is unaffected (ReplaySSM GSM8K parity).
++                    state_tols = (
++                        dict(atol=1.5e-3, rtol=1e-3)
++                        if dtype == torch.float32
++                        else dict(atol=3e-3, rtol=1e-2)
++                    )
++                    torch.testing.assert_close(
++                        rep_state,
++                        ref_state,
++                        msg=f"is_kda={is_kda} L={L} step={step} state(flush)",
++                        **state_tols,
++                    )
++
++            # Advance the ring cursor (caller's responsibility in this phase):
++            # wrap to 0 after a flush (natural L-1 OR a forced track-boundary
++            # flush), otherwise increment.
++            if force_now:
++                write_pos = torch.zeros_like(write_pos)
++            else:
++                write_pos = torch.where(
++                    write_pos == L - 1,
++                    torch.zeros_like(write_pos),
++                    write_pos + 1,
++                )
++
++        # Explicit wrap/flush boundary must have been exercised for L>1; for
++        # L=1 every step is a flush.
++        self.assertTrue(flush_step_seen, f"flush boundary never hit for L={L}")
++
++    # ---- GDN (scalar gate) ----
++    def test_replayssm_matches_gdn_packed_decode_fp32(self):
++        for cfg in self.CONFIGS:
++            for L in self.L_SWEEP:
++                with self.subTest(cfg=cfg, L=L, dtype="fp32"):
++                    self._run_one(cfg, L, torch.float32)
++
++    def test_replayssm_matches_gdn_packed_decode_bf16(self):
++        for cfg in self.CONFIGS:
++            for L in self.L_SWEEP:
++                with self.subTest(cfg=cfg, L=L, dtype="bf16"):
++                    self._run_one(cfg, L, torch.bfloat16)
++
++    # ---- KDA (per-K gate) ----
++    def test_replayssm_matches_kda_packed_decode_fp32(self):
++        for cfg in self.CONFIGS:
++            for L in self.L_SWEEP:
++                with self.subTest(cfg=cfg, L=L, dtype="fp32"):
++                    self._run_one(cfg, L, torch.float32, is_kda=True)
++
++    def test_replayssm_matches_kda_packed_decode_bf16(self):
++        for cfg in self.CONFIGS:
++            for L in self.L_SWEEP:
++                with self.subTest(cfg=cfg, L=L, dtype="bf16"):
++                    self._run_one(cfg, L, torch.bfloat16, is_kda=True)
++
++    # ---- forced (radix track-boundary) flush, both gate types ----
++    def test_force_flush_matches_reference(self):
++        """A radix track-boundary forces a flush mid-buffer (write_pos != L-1).
++        The kernel must fold the partial ring + current token into the
++        checkpoint so an external snapshot reads an up-to-date state; output
++        every step and the forced-flush checkpoint must still match the running
++        recurrence -- for both the GDN scalar gate and the KDA per-K gate."""
++        cfg = dict(B=4, H=8, HV=16, K=128, V=128)
++        for is_kda in (False, True):
++            for dtype in (torch.float32, torch.bfloat16):
++                with self.subTest(is_kda=is_kda, dtype=str(dtype)):
++                    self._run_one(
++                        cfg,
++                        L=8,
++                        dtype=dtype,
++                        force_flush_steps=(3, 5, 11, 20),
++                        is_kda=is_kda,
++                    )
++
++    def test_flush_boundary_state_exact_l1(self):
++        """At L=1 (GDN) every step is a flush; the kernel is algebraically the
++        packed decode. Each step reproduces the reference output AND the full
++        state to atol 2e-6 / rtol 1e-5 (essentially bit-exact) in fp32. This also
++        exercises the ``write_pos == L-1`` flush boundary on every step."""
++        self._run_one(dict(B=4, H=4, HV=8, K=128, V=128), L=1, dtype=torch.float32)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/hardware_backend/mlx/test_attention_patching.py b/test/registered/unit/hardware_backend/mlx/test_attention_patching.py
+index d890564deade..6f77b20c987d 100644
+--- a/test/registered/unit/hardware_backend/mlx/test_attention_patching.py
++++ b/test/registered/unit/hardware_backend/mlx/test_attention_patching.py
+@@ -1207,8 +1207,7 @@ def test_finished_request_snapshots_before_release(self):
+             "_maybe_collect_customized_info": lambda *a, **k: None,
+         }
+         saved = {
+-            name: getattr(SchedulerBatchResultProcessor, name)
+-            for name in noop_stubs
++            name: getattr(SchedulerBatchResultProcessor, name) for name in noop_stubs
+         }
+         for name, value in noop_stubs.items():
+             setattr(SchedulerBatchResultProcessor, name, value)
+@@ -1229,9 +1228,7 @@ def test_finished_request_snapshots_before_release(self):
+         logits_output = SimpleNamespace(customized_info=None)
+         original_release = batch_result_processor_module.release_kv_cache
+         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
+-        original_get_server_args = (
+-            batch_result_processor_module.get_global_server_args
+-        )
++        original_get_server_args = batch_result_processor_module.get_global_server_args
+ 
+         def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
+             events.append(("release", release_req.rid))
+diff --git a/test/registered/unit/hardware_backend/mlx/test_mlx_runner_pool_contract.py b/test/registered/unit/hardware_backend/mlx/test_mlx_runner_pool_contract.py
+index e73162631105..266fdd446683 100644
+--- a/test/registered/unit/hardware_backend/mlx/test_mlx_runner_pool_contract.py
++++ b/test/registered/unit/hardware_backend/mlx/test_mlx_runner_pool_contract.py
+@@ -76,4 +76,4 @@ class _FakeConfig:
+ 
+ 
+ if __name__ == "__main__":
+-    unittest.main()
+\ No newline at end of file
++    unittest.main()

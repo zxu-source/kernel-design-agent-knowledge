@@ -1,0 +1,1765 @@
+diff --git a/cmake/external_projects/fmha_sm100.cmake b/cmake/external_projects/fmha_sm100.cmake
+index 4a2414f5b83c..3897f8e1b3f6 100644
+--- a/cmake/external_projects/fmha_sm100.cmake
++++ b/cmake/external_projects/fmha_sm100.cmake
+@@ -17,7 +17,7 @@ else()
+   FetchContent_Declare(
+     fmha_sm100
+     GIT_REPOSITORY https://github.com/vllm-project/MSA.git
+-    GIT_TAG 544eee5e09ae2dfa774d5b06739013f9b7402c57
++    GIT_TAG fee783153f3efe57e3e933c5cb7e267a7cebcfb5
+     GIT_PROGRESS TRUE
+     CONFIGURE_COMMAND ""
+     BUILD_COMMAND ""
+@@ -36,13 +36,38 @@ set(FMHA_SM100_PY_ROOT "${fmha_sm100_SOURCE_DIR}/python/fmha_sm100")
+ 
+ install(FILES
+   "${FMHA_SM100_PY_ROOT}/__init__.py"
++  "${FMHA_SM100_PY_ROOT}/api.py"
++  "${FMHA_SM100_PY_ROOT}/bench_utils.py"
++  "${FMHA_SM100_PY_ROOT}/jit.py"
+   "${FMHA_SM100_PY_ROOT}/sparse.py"
++  "${FMHA_SM100_PY_ROOT}/sparse_fmha_adapter.py"
+   DESTINATION vllm/third_party/fmha_sm100
+   COMPONENT fmha_sm100)
+ 
++install(DIRECTORY "${FMHA_SM100_PY_ROOT}/csrc/"
++  DESTINATION vllm/third_party/fmha_sm100/csrc
++  COMPONENT fmha_sm100
++  PATTERN "__pycache__" EXCLUDE
++  PATTERN "*.pyc" EXCLUDE
++  PATTERN ".git*" EXCLUDE)
++
+ install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cute/"
+   DESTINATION vllm/third_party/fmha_sm100/cute
+   COMPONENT fmha_sm100
+   PATTERN "__pycache__" EXCLUDE
+   PATTERN "*.pyc" EXCLUDE
+   PATTERN ".git*" EXCLUDE)
++
++install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cutlass/include/"
++  DESTINATION vllm/third_party/fmha_sm100/cutlass/include
++  COMPONENT fmha_sm100
++  PATTERN "__pycache__" EXCLUDE
++  PATTERN "*.pyc" EXCLUDE
++  PATTERN ".git*" EXCLUDE)
++
++install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cutlass/tools/util/include/"
++  DESTINATION vllm/third_party/fmha_sm100/cutlass/tools/util/include
++  COMPONENT fmha_sm100
++  PATTERN "__pycache__" EXCLUDE
++  PATTERN "*.pyc" EXCLUDE
++  PATTERN ".git*" EXCLUDE)
+diff --git a/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu b/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
+index 06c8048cd900..4261b702cd74 100644
+--- a/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
++++ b/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
+@@ -67,6 +67,13 @@
+   #include "../quantization/w8a8/fp8/nvidia/quant_utils.cuh"
+ #endif
+ 
++// Direct float -> E4M3 FP8 conversion for the indexer Q / index-K outputs.
++#ifndef USE_ROCM
++  #include <cuda_fp8.h>
++#else
++  #include <hip/hip_fp8.h>
++#endif
++
+ #ifndef FINAL_MASK
+   #ifdef USE_ROCM
+     #define FINAL_MASK 0xffffffffffffffffULL
+@@ -75,6 +82,19 @@
+   #endif
+ #endif
+ 
++#ifdef USE_ROCM
++// ROCm-compatible direct float -> E4M3 FP8 conversion (mirrors the DeepSeek V4
++// fused kernel).
++__device__ __forceinline__ uint8_t rocm_cvt_float_to_fp8_e4m3(float val) {
++  #if defined(HIP_FP8_TYPE_OCP)
++  __hip_fp8_e4m3 fp8_val(val);
++  #else
++  __hip_fp8_e4m3_fnuz fp8_val(val);
++  #endif
++  return reinterpret_cast<uint8_t&>(fp8_val);
++}
++#endif
++
+ namespace vllm {
+ namespace minimax_m3_fused_ops {
+ 
+@@ -193,6 +213,8 @@ __device__ __forceinline__ void storeElems(
+   *reinterpret_cast<uint2*>(dst) = v;
+ }
+ 
++// Main K/V cache store. kAuto = unquantized (cache_t == scalar_t); fp8 cache
++// dtypes use the scaled-convert path with identity scale.
+ template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+ __device__ __forceinline__ void storeCacheElems(
+     cache_t* __restrict__ dst, float const (&elems)[kElemsPerLane]) {
+@@ -208,6 +230,32 @@ __device__ __forceinline__ void storeCacheElems(
+   }
+ }
+ 
++// Store 4 fp32 registers -> 4 contiguous E4M3 FP8 bytes (direct cast,
++// saturating to ±448). Used for the fp8 indexer-Q / index-K outputs; no scale
++// (RMSNorm outputs are O(1) and the score path only needs relative block
++// ordering).
++__device__ __forceinline__ void storeElemsFp8(
++    uint8_t* __restrict__ dst, float const (&elems)[kElemsPerLane]) {
++  constexpr float kFp8Max = 448.0f;
++#ifndef USE_ROCM
++  __nv_fp8x2_storage_t out2[kElemsPerLane / 2];
++  #pragma unroll
++  for (int i = 0; i < kElemsPerLane / 2; i++) {
++    float2 vv = make_float2(elems[2 * i], elems[2 * i + 1]);
++    vv.x = fminf(fmaxf(vv.x, -kFp8Max), kFp8Max);
++    vv.y = fminf(fmaxf(vv.y, -kFp8Max), kFp8Max);
++    out2[i] = __nv_cvt_float2_to_fp8x2(vv, __NV_SATFINITE, __NV_E4M3);
++  }
++  *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<uint32_t const*>(out2);
++#else
++  #pragma unroll
++  for (int i = 0; i < kElemsPerLane; i++) {
++    float vv = fminf(fmaxf(elems[i], -kFp8Max), kFp8Max);
++    dst[i] = rocm_cvt_float_to_fp8_e4m3(vv);
++  }
++#endif
++}
++
+ // ────────────────────────────────────────────────────────────────────────────
+ // Kernel
+ // ────────────────────────────────────────────────────────────────────────────
+@@ -224,12 +272,14 @@ __device__ __forceinline__ void storeCacheElems(
+ //     V : nkv  only if kInsertKV        (V-cache insert; no warps in dense)
+ //     IQ: niq  only if kIsSparse        (norm+RoPE)
+ //     IK: 1    only if kIsSparse        (norm+RoPE; +index-cache insert)
++// cache_t/kv_dt: main attention KV-cache dtype (auto/fp8). out_idx_t/kFp8Idx:
++// indexer index-K cache + index-Q output dtype (scalar_t or e4m3 byte).
+ template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
+-          bool kIsSparse, bool kInsertKV>
++          typename out_idx_t, bool kIsSparse, bool kInsertKV, bool kFp8Idx>
+ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     scalar_t* __restrict__ qkv,  // [N, qkv_row] in/out (packs index if sparse)
+-    scalar_t* __restrict__ q_out,        // [N, nq*128] contiguous, or nullptr
+-    scalar_t* __restrict__ index_q_out,  // [N, niq*128] contiguous, or nullptr
++    scalar_t* __restrict__ q_out,         // [N, nq*128] contiguous, or nullptr
++    out_idx_t* __restrict__ index_q_out,  // [N, niq*128]; scalar_t or e4m3 byte
+     scalar_t const* __restrict__ q_norm_w,
+     scalar_t const* __restrict__ k_norm_w,
+     scalar_t const* __restrict__ iq_norm_w,
+@@ -238,8 +288,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     int64_t const* __restrict__ positions,       // [N] i64
+     int64_t const* __restrict__ slot_mapping,    // main K/V slots or nullptr
+     int64_t const* __restrict__ index_slot_mapping,  // index K slots/nullptr
+-    cache_t* __restrict__ kv_cache,      // [nb,2,bs,nkv,128] or nullptr
+-    scalar_t* __restrict__ index_cache,  // [nb*bs, 128] or nullptr
++    cache_t* __restrict__ kv_cache,       // [nb,2,bs,nkv,128] or nullptr
++    out_idx_t* __restrict__ index_cache,  // [nb*bs, 128]; scalar_t or e4m3 byte
+     float const eps, int const rotary_dim, int const num_tokens, int const nq,
+     int const nkv, int const niq, int const block_size,
+     // kv_cache strides (in elements) for logical shape [nb, 2, bs, nkv, 128].
+@@ -334,9 +384,12 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+       store_ptr = q_out + static_cast<int64_t>(tokenIdx) * nq * kHeadDim +
+                   slot * kHeadDim;
+     } else if (isIQ && index_q_out != nullptr) {
+-      store_ptr = index_q_out +
+-                  static_cast<int64_t>(tokenIdx) * niq * kHeadDim +
+-                  (slot - iq_begin) * kHeadDim;
++      // bf16 index_q_out: gather here. fp8: written by the explicit fp8 store.
++      if constexpr (!kFp8Idx) {
++        store_ptr = index_q_out +
++                    static_cast<int64_t>(tokenIdx) * niq * kHeadDim +
++                    (slot - iq_begin) * kHeadDim;
++      }
+     }
+ 
+     // PDL: wait for the predecessor kernel (the qkv-projection GEMM that
+@@ -356,7 +409,19 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+       scalar_t const* cos_ptr = cos_sin_cache + pos * rotary_dim;
+       normAndRope<scalar_t>(elems, laneId, eps, norm_w, do_rope, rotary_dim,
+                             cos_ptr, /*apply_norm=*/norm_w != nullptr);
+-      storeElems<scalar_t>(store_ptr + dim_base, elems);
++      if constexpr (kFp8Idx) {
++        // index_q is e4m3 bytes; Q/K (and in-place index_k) stay scalar_t.
++        if (isIQ && index_q_out != nullptr) {
++          storeElemsFp8(index_q_out +
++                            static_cast<int64_t>(tokenIdx) * niq * kHeadDim +
++                            (slot - iq_begin) * kHeadDim + dim_base,
++                        elems);
++        } else {
++          storeElems<scalar_t>(store_ptr + dim_base, elems);
++        }
++      } else {
++        storeElems<scalar_t>(store_ptr + dim_base, elems);
++      }
+     }
+ 
+     // ── Cache inserts (sparse serving only). ───────────────────────────────
+@@ -367,8 +432,11 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+                              : (isIK ? index_slot_mapping[tokenIdx] : -1);
+       if (sm >= 0) {  // skip padded / unscheduled tokens
+         if (isIK) {
+-          scalar_t* dst = index_cache + sm * kHeadDim + dim_base;
+-          storeElems<scalar_t>(dst, elems);
++          if constexpr (kFp8Idx) {
++            storeElemsFp8(index_cache + sm * kHeadDim + dim_base, elems);
++          } else {
++            storeElems<scalar_t>(index_cache + sm * kHeadDim + dim_base, elems);
++          }
+         } else if (isK || isV) {
+           // kv_cache logical shape [num_blocks, 2, block_size, nkv, head_dim].
+           // Paging is logical (block = sm/block_size, token = sm%block_size);
+@@ -398,19 +466,19 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+ // Launch wrapper
+ // ────────────────────────────────────────────────────────────────────────────
+ template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+-void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+-                          scalar_t const* q_norm_w, scalar_t const* k_norm_w,
+-                          scalar_t const* iq_norm_w, scalar_t const* ik_norm_w,
+-                          scalar_t const* cos_sin_cache,
+-                          int64_t const* positions, int64_t const* slot_mapping,
+-                          int64_t const* index_slot_mapping, cache_t* kv_cache,
+-                          scalar_t* index_cache, float const eps,
+-                          int const rotary_dim, int const num_tokens,
+-                          int const nq, int const nkv, int const niq,
+-                          int const block_size, int64_t const kv_s_block,
+-                          int64_t const kv_s_kv, int64_t const kv_s_token,
+-                          int64_t const kv_s_head, bool const has_index,
+-                          bool const insert_kv, cudaStream_t stream) {
++void launchFusedMiniMaxM3(
++    scalar_t* qkv, scalar_t* q_out, void* index_q_out, scalar_t const* q_norm_w,
++    scalar_t const* k_norm_w, scalar_t const* iq_norm_w,
++    scalar_t const* ik_norm_w, scalar_t const* cos_sin_cache,
++    int64_t const* positions, int64_t const* slot_mapping,
++    int64_t const* index_slot_mapping, cache_t* kv_cache, void* index_cache,
++    float const eps, int const rotary_dim, int const num_tokens, int const nq,
++    int const nkv, int const niq, int const block_size,
++    int64_t const kv_s_block, int64_t const kv_s_kv, int64_t const kv_s_token,
++    int64_t const kv_s_head, bool const has_index, bool const insert_kv,
++    bool const fp8_idx, cudaStream_t stream) {
++  // Index outputs are scalar_t (bf16) or e4m3 bytes (uint8_t); reinterpret the
++  // void* pointers per instantiation in the LAUNCH macro.
+   // Slot count must match the kernel's compile-time gating.
+   int const v_slots = insert_kv ? nkv : 0;
+   int const idx_slots = has_index ? niq + 1 : 0;
+@@ -440,25 +508,27 @@ void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+   config.attrs = attrs;
+   config.numAttrs = (sm_version >= 90) ? 1 : 0;
+ 
+-  #define LAUNCH(IS_SPARSE, INSERT)                                           \
+-    cudaLaunchKernelEx(                                                       \
+-        &config,                                                              \
+-        fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt,       \
+-                                              IS_SPARSE, INSERT>,             \
+-        qkv, q_out, index_q_out, q_norm_w, k_norm_w, iq_norm_w, ik_norm_w,    \
+-        cos_sin_cache, positions, slot_mapping, index_slot_mapping, kv_cache, \
+-        index_cache, eps, rotary_dim, num_tokens, nq, nkv, niq, block_size,   \
+-        kv_s_block, kv_s_kv, kv_s_token, kv_s_head)
++  #define LAUNCH(IS_SPARSE, INSERT, FP8, OUT_T)                                \
++    cudaLaunchKernelEx(                                                        \
++        &config,                                                               \
++        fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt, OUT_T, \
++                                              IS_SPARSE, INSERT, FP8>,         \
++        qkv, q_out, reinterpret_cast<OUT_T*>(index_q_out), q_norm_w, k_norm_w, \
++        iq_norm_w, ik_norm_w, cos_sin_cache, positions, slot_mapping,          \
++        index_slot_mapping, kv_cache, reinterpret_cast<OUT_T*>(index_cache),   \
++        eps, rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,     \
++        kv_s_kv, kv_s_token, kv_s_head)
+ #else
+   // ROCm: standard kernel launch syntax (no PDL/stream serialization).
+   // clang-format off
+-  #define LAUNCH(IS_SPARSE, INSERT)                                          \
+-    fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt,          \
+-                                          IS_SPARSE, INSERT>                 \
++  #define LAUNCH(IS_SPARSE, INSERT, FP8, OUT_T)                              \
++    fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt, OUT_T,   \
++                                          IS_SPARSE, INSERT, FP8>            \
+         <<<grid, kBlockSize, 0, stream>>>(                                   \
+-            qkv, q_out, index_q_out, q_norm_w, k_norm_w, iq_norm_w,          \
+-            ik_norm_w, cos_sin_cache, positions, slot_mapping,               \
+-            index_slot_mapping, kv_cache, index_cache, eps, rotary_dim,      \
++            qkv, q_out, reinterpret_cast<OUT_T*>(index_q_out), q_norm_w,     \
++            k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions,        \
++            slot_mapping, index_slot_mapping, kv_cache,                      \
++            reinterpret_cast<OUT_T*>(index_cache), eps, rotary_dim,          \
+             num_tokens, nq, nkv, niq, block_size, kv_s_block, kv_s_kv,       \
+             kv_s_token, kv_s_head)
+   // clang-format on
+@@ -466,14 +536,22 @@ void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+ 
+   if (has_index) {
+     if (insert_kv) {
+-      LAUNCH(true, true);  // sparse serving
++      if (fp8_idx) {
++        LAUNCH(true, true, true, uint8_t);  // sparse serving, fp8 index outputs
++      } else {
++        LAUNCH(true, true, false, scalar_t);  // sparse serving, bf16
++      }
+     } else {
+-      LAUNCH(true, false);  // sparse profiling
++      if (fp8_idx) {
++        LAUNCH(true, false, true, uint8_t);  // sparse profiling, fp8 index_q
++      } else {
++        LAUNCH(true, false, false, scalar_t);  // sparse profiling, bf16
++      }
+     }
+   } else {
+     // Dense layer: never has an index branch and never inserts here (the
+     // generic Attention layer owns the KV insert).
+-    LAUNCH(false, false);
++    LAUNCH(false, false, false, scalar_t);
+   }
+ #undef LAUNCH
+ }
+@@ -485,8 +563,9 @@ void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+   vllm::minimax_m3_fused_ops::launchFusedMiniMaxM3<st, CACHE_T, KV_DTYPE>(     \
+       reinterpret_cast<st*>(qkv.data_ptr()),                                   \
+       q_out.has_value() ? reinterpret_cast<st*>(q_out->data_ptr()) : nullptr,  \
+-      index_q_out.has_value() ? reinterpret_cast<st*>(index_q_out->data_ptr()) \
+-                              : nullptr,                                       \
++      index_q_out.has_value()                                                  \
++          ? reinterpret_cast<void*>(index_q_out->data_ptr())                   \
++          : nullptr,                                                           \
+       reinterpret_cast<st const*>(q_norm_weight.data_ptr()),                   \
+       reinterpret_cast<st const*>(k_norm_weight.data_ptr()),                   \
+       has_index ? reinterpret_cast<st const*>(index_q_norm_weight->data_ptr()) \
+@@ -502,11 +581,11 @@ void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+                 : nullptr,                                                     \
+       insert_kv ? reinterpret_cast<CACHE_T*>(kv_cache->data_ptr()) : nullptr,  \
+       (insert_kv && has_index)                                                 \
+-          ? reinterpret_cast<st*>(index_cache->data_ptr())                     \
++          ? reinterpret_cast<void*>(index_cache->data_ptr())                   \
+           : nullptr,                                                           \
+       static_cast<float>(eps), static_cast<int>(rotary_dim), num_tokens, nq,   \
+       nkv, niq, static_cast<int>(block_size), kv_s_block, kv_s_kv, kv_s_token, \
+-      kv_s_head, has_index, insert_kv, stream)
++      kv_s_head, has_index, insert_kv, fp8_idx, stream)
+ 
+ // ────────────────────────────────────────────────────────────────────────────
+ // Torch op wrapper
+@@ -612,6 +691,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+                  torch::headeronly::ScalarType::Long &&
+              index_slot_mapping->numel() == slot_mapping->numel()),
+         "index_slot_mapping must be int64 CUDA with slot_mapping length");
++    // Main attention KV cache: auto matches qkv, fp8 uses uint8 storage.
+     if (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
+       STD_TORCH_CHECK(kv_cache->scalar_type() == qkv.scalar_type(),
+                       "auto kv_cache dtype must match qkv");
+@@ -620,9 +700,13 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+           kv_cache->scalar_type() == torch::headeronly::ScalarType::Byte,
+           "fp8 kv_cache must use uint8 storage");
+     }
+-    STD_TORCH_CHECK(index_cache.has_value() &&
+-                        index_cache->scalar_type() == qkv.scalar_type(),
+-                    "insert mode requires matching index_cache");
++    // Indexer index-K cache: independent dtype -- qkv dtype or fp8 e4m3.
++    STD_TORCH_CHECK(
++        index_cache.has_value() &&
++            (index_cache->scalar_type() == qkv.scalar_type() ||
++             index_cache->scalar_type() ==
++                 torch::headeronly::ScalarType::Float8_e4m3fn),
++        "insert mode requires index_cache matching qkv dtype or fp8 e4m3");
+     STD_TORCH_CHECK(kv_cache->dim() == 5 && kv_cache->stride(4) == 1,
+                     "kv_cache must be [nb,2,bs,nkv,head_dim] with contiguous "
+                     "head_dim (stride(4)==1)");
+@@ -652,14 +736,31 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+         "index_q_out requires the index branch (num_index_heads > 0)");
+     STD_TORCH_CHECK(
+         index_q_out->is_cuda() && index_q_out->is_contiguous() &&
+-            index_q_out->scalar_type() == qkv.scalar_type(),
+-        "index_q_out must be a contiguous CUDA tensor matching qkv dtype");
++            (index_q_out->scalar_type() == qkv.scalar_type() ||
++             index_q_out->scalar_type() ==
++                 torch::headeronly::ScalarType::Float8_e4m3fn),
++        "index_q_out must be contiguous CUDA, qkv dtype or fp8 e4m3");
+     STD_TORCH_CHECK(index_q_out->numel() ==
+                         static_cast<int64_t>(num_tokens) * niq * kHeadDim,
+                     "index_q_out must have num_tokens * num_index_heads * 128 "
+                     "elements");
+   }
+ 
++  // fp8 index path: the index-K cache and index-Q outputs are e4m3 bytes while
++  // q/k/v + q_out stay qkv dtype. Both index outputs must agree.
++  auto const kFp8 = torch::headeronly::ScalarType::Float8_e4m3fn;
++  bool const fp8_idx =
++      (index_cache.has_value() && index_cache->scalar_type() == kFp8) ||
++      (index_q_out.has_value() && index_q_out->scalar_type() == kFp8);
++  if (fp8_idx) {
++    STD_TORCH_CHECK(
++        !index_cache.has_value() || index_cache->scalar_type() == kFp8,
++        "fp8 index path: index_cache must be fp8 e4m3");
++    STD_TORCH_CHECK(
++        !index_q_out.has_value() || index_q_out->scalar_type() == kFp8,
++        "fp8 index path: index_q_out must be fp8 e4m3");
++  }
++
+   const torch::stable::accelerator::DeviceGuard device_guard(
+       qkv.get_device_index());
+   auto stream = get_current_cuda_stream(qkv.get_device_index());
+diff --git a/setup.py b/setup.py
+index b807b2215dbe..ad9aed07a31c 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1171,7 +1171,15 @@ def _read_requirements(filename: str) -> list[str]:
+         "third_party/deep_gemm/include/**/*.h",
+         "third_party/deep_gemm/include/**/*.hpp",
+         # fmha_sm100 sparse CuTe-DSL helper kernels (vendored via cmake)
++        "third_party/fmha_sm100/csrc/**/*.cu",
++        "third_party/fmha_sm100/csrc/**/*.h",
++        "third_party/fmha_sm100/csrc/**/*.jinja",
++        "third_party/fmha_sm100/csrc/**/*.cu.jinja",
+         "third_party/fmha_sm100/cute/**/*.cu",
++        "third_party/fmha_sm100/cutlass/include/**/*.h",
++        "third_party/fmha_sm100/cutlass/include/**/*.hpp",
++        "third_party/fmha_sm100/cutlass/tools/util/include/**/*.h",
++        "third_party/fmha_sm100/cutlass/tools/util/include/**/*.hpp",
+     ]
+ }
+ 
+diff --git a/tests/kernels/attention/test_minimax_m3.py b/tests/kernels/attention/test_minimax_m3.py
+index 1246f1721c20..0340ca9a477c 100644
+--- a/tests/kernels/attention/test_minimax_m3.py
++++ b/tests/kernels/attention/test_minimax_m3.py
+@@ -134,6 +134,7 @@ def _reference_index_topk(
+     topk: int,
+     init_blocks: int,
+     local_blocks: int,
++    sm_scale: float = 1.0,
+ ) -> torch.Tensor:
+     total_q, num_idx_heads, _ = idx_q.shape
+     out = torch.full(
+@@ -149,7 +150,7 @@ def _reference_index_topk(
+         num_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+         pages = block_table[req_id, :num_blocks]
+         k = index_kv_cache[pages].reshape(num_blocks * BLOCK_SIZE, -1)
+-        score = torch.einsum("qhd,kd->hqk", q.float(), k.float())
++        score = torch.einsum("qhd,kd->hqk", q.float(), k.float()) * sm_scale
+ 
+         q_pos = prefix_len + torch.arange(q_len, device=idx_q.device)
+         k_pos = torch.arange(k.shape[0], device=idx_q.device)
+@@ -244,6 +245,270 @@ def test_prefill_index_topk_correctness():
+     _assert_topk_indices_equal_unordered(actual, expected)
+ 
+ 
++# MSA indexer (SM100): fmha_sm100 OnlyScore for the per-block scores, then the
++# Triton minimax_m3_index_topk for selection (no sparse_topk_select). Uses a
++# deterministic construction (idx_q == 1, distinct e4m3-exact per-block values)
++# so scores are strictly monotonic in the block id -> exact top-k agreement.
++def _fmha_indexer_topk(
++    idx_q: torch.Tensor,  # [total_q, H, 128] bf16/e4m3
++    index_cache: torch.Tensor,  # [num_pages, 128, 128] bf16/e4m3
++    block_table: torch.Tensor,
++    q_lens: torch.Tensor,
++    seq_lens: torch.Tensor,
++    prefix_lens: torch.Tensor,
++    sm_scale: float,
++    topk: int,
++) -> torch.Tensor:
++    """Replicate MiniMaxM3IndexerMSAImpl's score path (single decode/prefill side)."""
++    from vllm.third_party.fmha_sm100.api import _fmha_sm100, _fmha_sm100_plan
++
++    num_idx_heads, head_dim = idx_q.shape[1], idx_q.shape[2]
++    nvp = [(s + 127) // 128 for s in seq_lens.tolist()]
++    kv_indices = torch.cat([block_table[r, : nvp[r]] for r in range(len(nvp))]).to(
++        torch.int32
++    )
++
++    qo = q_lens.cpu().to(torch.int32)
++    kv = seq_lens.cpu().to(torch.int32)
++    plan = _fmha_sm100_plan(
++        qo,
++        kv,
++        num_idx_heads,
++        num_kv_heads=1,
++        qo_offset=kv - qo,
++        page_size=128,
++        output_maxscore=True,
++        causal=True,
++        num_kv_splits=1,
++    )
++    k_pages = index_cache.view(index_cache.shape[0], 1, 128, head_dim)
++    _, max_score = _fmha_sm100(
++        idx_q,
++        k_pages,
++        k_pages,
++        plan,
++        kv_indices=kv_indices,
++        output_o=False,
++        output_maxscore=True,
++        sm_scale=sm_scale,
++    )
++
++    batch = q_lens.numel()
++    cu = torch.zeros(batch + 1, dtype=torch.int32, device=idx_q.device)
++    cu[1:] = q_lens.to(torch.int32).cumsum(0)
++    # max_score [H, k_tiles, total_q] -> transpose to [H, total_q, k_tiles].
++    return minimax_m3_index_topk(
++        max_score.transpose(1, 2),
++        cu,
++        prefix_lens.to(torch.int32),
++        int(q_lens.max()),
++        topk,
++        0,  # init_blocks
++        0,  # local_blocks
++    )
++
++
++# e4m3-exact, strictly-increasing per-block values: with idx_q == 1 (also exact)
++# the per-block scores are exact and distinct in BOTH bf16 and e4m3, so the fp8
++# score path selects the same top-k as the reference (no quantization ties).
++_E4M3_EXACT_VALUES = [
++    *range(1, 17),  # 1..16  (step 1)
++    *range(18, 33, 2),  # 18..32 (step 2)
++    *range(36, 65, 4),  # 36..64 (step 4)
++    *range(72, 129, 8),  # 72..128 (step 8)
++]
++
++
++@pytest.mark.skipif(
++    not current_platform.is_device_capability_family(100),
++    reason="fmha_sm100 indexer requires SM100 (Blackwell).",
++)
++@pytest.mark.parametrize("index_dtype", [torch.bfloat16, torch.float8_e4m3fn])
++@pytest.mark.parametrize(
++    ("q_lens", "prefix_lens"),
++    [
++        ((4, 3), (2048, 2560)),  # prefill: every token sees >= 16 causal blocks
++        ((1, 1, 1), (2048, 3000, 4096)),  # decode: one query token per request
++    ],
++)
++def test_fmha_sm100_indexer_matches_reference(q_lens, prefix_lens, index_dtype):
++    torch.manual_seed(0)
++    num_idx_heads, head_dim = 4, HEAD_DIM
++    device = "cuda"
++
++    q_lens_t = torch.tensor(q_lens, device=device, dtype=torch.int32)
++    prefix_lens_t = torch.tensor(prefix_lens, device=device, dtype=torch.int32)
++    seq_lens = prefix_lens_t + q_lens_t
++    batch = len(q_lens)
++    max_blocks = (int(seq_lens.max()) + BLOCK_SIZE - 1) // BLOCK_SIZE
++    assert max_blocks <= len(_E4M3_EXACT_VALUES)
++    num_pages = batch * max_blocks
++    block_table = torch.randperm(num_pages, device=device, dtype=torch.int32).reshape(
++        batch, max_blocks
++    )
++
++    idx_q = torch.ones(
++        int(q_lens_t.sum()), num_idx_heads, head_dim, device=device, dtype=index_dtype
++    )
++    index_cache = torch.empty(
++        num_pages, BLOCK_SIZE, head_dim, device=device, dtype=index_dtype
++    )
++    for r in range(batch):
++        for b in range(max_blocks):
++            index_cache[block_table[r, b]] = float(_E4M3_EXACT_VALUES[b])
++
++    sm_scale = head_dim**-0.5
++    actual = _fmha_indexer_topk(
++        idx_q,
++        index_cache,
++        block_table,
++        q_lens_t,
++        seq_lens,
++        prefix_lens_t,
++        sm_scale,
++        TOPK,
++    )
++    expected = _reference_index_topk(
++        idx_q,
++        index_cache,
++        block_table,
++        q_lens_t,
++        seq_lens,
++        prefix_lens_t,
++        TOPK,
++        init_blocks=0,
++        local_blocks=0,
++        sm_scale=sm_scale,
++    )
++    _assert_topk_indices_equal_unordered(actual, expected)
++
++
++# Full impl-level parity: drive both MiniMaxM3IndexerMSAImpl (fmha_sm100 score +
++# Triton top-k) and MiniMaxM3IndexerTritonImpl through their real metadata
++# builders on the SAME CommonAttentionMetadata + index cache, and assert the
++# selected blocks agree. This exercises all the metadata the impl/kernels consume
++# (decode/prefill split, cu_seqlens_q rebasing, prefix_lens, kv_indices gather,
++# decode_pages split) -- a metadata bug on either side shifts the causal window
++# or the block->page mapping and breaks the comparison.
++@pytest.mark.skipif(
++    not current_platform.is_device_capability_family(100),
++    reason="fmha_sm100 indexer requires SM100 (Blackwell).",
++)
++@pytest.mark.parametrize("topk", [8, 16])
++def test_msa_indexer_impl_matches_triton(topk, monkeypatch):
++    import vllm.models.minimax_m3.common.indexer as indexer_mod
++    from tests.v1.attention.utils import (
++        BatchSpec,
++        create_common_attn_metadata,
++        create_vllm_config,
++    )
++    from vllm.config import set_current_vllm_config
++    from vllm.forward_context import set_forward_context
++    from vllm.models.minimax_m3.common.indexer import (
++        MiniMaxM3IndexerTritonImpl,
++        MiniMaxM3IndexerTritonMetadataBuilder,
++    )
++    from vllm.models.minimax_m3.nvidia.indexer_msa import (
++        MiniMaxM3IndexerMSAImpl,
++        MiniMaxM3IndexerMSAMetadataBuilder,
++    )
++
++    torch.manual_seed(0)
++    device = torch.device("cuda")
++    num_idx_heads, head_dim = 4, HEAD_DIM
++    # TP=1: avoid requiring an initialized distributed group in a unit test.
++    monkeypatch.setattr(indexer_mod, "get_tensor_model_parallel_world_size", lambda: 1)
++
++    vllm_config = create_vllm_config(
++        block_size=BLOCK_SIZE, max_model_len=8192, max_num_batched_tokens=8192
++    )
++    vllm_config.model_config.hf_config.sparse_attention_config = {
++        "sparse_num_index_heads": num_idx_heads
++    }
++
++    # Decode-first mixed batch: 2 decode reqs (q_len 1) then 2 prefill reqs. Long
++    # prefixes so every token sees > TOPK causal blocks (non-trivial selection).
++    batch = BatchSpec(seq_lens=[2305, 2561, 2624, 2720], query_lens=[1, 1, 64, 96])
++    common = create_common_attn_metadata(
++        batch, BLOCK_SIZE, device, arange_block_indices=True
++    )
++    num_tokens = batch.compute_num_tokens()
++
++    # Deterministic index cache: distinct, monotonic per-logical-block values so
++    # the top-k is unambiguous (both kernels pick the same blocks, no fp ties).
++    block_table = common.block_table_tensor
++    num_pages = int(block_table.max().item()) + 1
++    index_cache = torch.zeros(
++        num_pages, BLOCK_SIZE, head_dim, device=device, dtype=DTYPE
++    )
++    for r, seq_len in enumerate(batch.seq_lens):
++        for b in range((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE):
++            index_cache[block_table[r, b]] = float(b + 1)
++    index_q = torch.ones(
++        num_tokens, num_idx_heads * head_dim, device=device, dtype=DTYPE
++    )
++
++    spec = MLAAttentionSpec(
++        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=head_dim, dtype=DTYPE
++    )
++    impl_kwargs = dict(
++        num_kv_heads=num_idx_heads,
++        scale=head_dim**-0.5,
++        topk_blocks=topk,
++        sparse_block_size=BLOCK_SIZE,
++        num_index_heads=num_idx_heads,
++        index_head_dim=head_dim,
++        init_blocks=0,
++        local_blocks=0,
++    )
++
++    with set_current_vllm_config(vllm_config):
++        msa_impl = MiniMaxM3IndexerMSAImpl(prefix="idx_msa", **impl_kwargs)
++        triton_impl = MiniMaxM3IndexerTritonImpl(prefix="idx_triton", **impl_kwargs)
++        msa_builder = MiniMaxM3IndexerMSAMetadataBuilder(
++            spec, [msa_impl.index_cache.prefix], vllm_config, device
++        )
++        triton_builder = MiniMaxM3IndexerTritonMetadataBuilder(
++            spec, [triton_impl.index_cache.prefix], vllm_config, device
++        )
++
++    # Both impls score against the same index keys.
++    msa_impl.index_cache.kv_cache = index_cache
++    triton_impl.index_cache.kv_cache = index_cache
++
++    # Exercise the shared persistent top-k buffer for BOTH impls: each must write
++    # decode ([:, :nd]) and prefill ([:, nd:]) into its buffer and return views.
++    # Separate buffers so the two forwards don't clobber each other.
++    nd = sum(q for q in batch.query_lens if q <= 1)
++    msa_impl.topk_indices_buffer = torch.full(
++        (num_idx_heads, num_tokens, topk), -2, dtype=torch.int32, device=device
++    )
++    triton_impl.topk_indices_buffer = torch.full(
++        (num_idx_heads, num_tokens, topk), -2, dtype=torch.int32, device=device
++    )
++
++    attn_metadata = {
++        msa_impl.index_cache.prefix: msa_builder.build(0, common),
++        triton_impl.index_cache.prefix: triton_builder.build(0, common),
++    }
++    with set_forward_context(attn_metadata, vllm_config):
++        msa_decode, msa_prefill = msa_impl(index_q)
++        tri_decode, tri_prefill = triton_impl(index_q)
++
++    assert msa_decode is not None and tri_decode is not None
++    assert msa_prefill is not None and tri_prefill is not None
++    _assert_topk_indices_equal_unordered(msa_decode, tri_decode)
++    _assert_topk_indices_equal_unordered(msa_prefill, tri_prefill)
++    # decode/prefill outputs are views into each impl's persistent buffer.
++    for impl, dec, pre in (
++        (msa_impl, msa_decode, msa_prefill),
++        (triton_impl, tri_decode, tri_prefill),
++    ):
++        buf = impl.topk_indices_buffer
++        assert dec.data_ptr() == buf[:, :nd, :].data_ptr()
++        assert pre.data_ptr() == buf[:, nd:, :].data_ptr()
++
++
+ @pytest.mark.parametrize(
+     ("decode_query_len", "max_decode_query_len"),
+     [
+@@ -317,6 +582,65 @@ def test_decode_index_topk_correctness(
+     _assert_topk_indices_equal_unordered(actual, expected)
+ 
+ 
++@pytest.mark.skipif(
++    not current_platform.is_device_capability_family(100),
++    reason="fp8 e4m3 indexer cache is the SM100 (MSA) path.",
++)
++@pytest.mark.parametrize("num_idx_heads", [1, 4])
++def test_decode_index_topk_fp8(num_idx_heads: int):
++    """The fp8 (e4m3) indexer cache feeds the Triton decode kernel on the MSA
++    path. The kernel must score in fp32 (no scaling) so its top-k matches a
++    reference computed from the dequantized fp8 values."""
++    torch.manual_seed(0)
++    topk, init_blocks, local_blocks, head_dim = 8, 0, 1, 128
++    decode_query_len = 1
++    active_seq_lens = torch.tensor((129, 1025, 4097), device="cuda", dtype=torch.int32)
++    q_lens = torch.full_like(active_seq_lens, decode_query_len)
++    prefix_lens = active_seq_lens - decode_query_len
++    batch = active_seq_lens.numel()
++    max_seq_len = int(active_seq_lens.max())
++    max_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
++    num_pages = batch * max_blocks
++    block_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
++        batch, max_blocks
++    )
++    idx_q = torch.randn(
++        batch * decode_query_len, num_idx_heads, head_dim, device="cuda"
++    ).to(torch.float8_e4m3fn)
++    index_kv_cache = torch.randn(num_pages, BLOCK_SIZE, head_dim, device="cuda").to(
++        torch.float8_e4m3fn
++    )
++
++    actual = minimax_m3_index_decode(
++        idx_q,
++        index_kv_cache,
++        block_table,
++        active_seq_lens,
++        max_seq_len=max_seq_len,
++        topk=topk,
++        init_blocks=init_blocks,
++        local_blocks=local_blocks,
++        num_kv_heads=num_idx_heads,
++        sm_scale=head_dim**-0.5,
++        decode_query_len=decode_query_len,
++    )
++    # Reference from the DEQUANTIZED fp8 values (the kernel computes the fp8 QK
++    # in fp32, so it must match an fp32 matmul of the same e4m3 values).
++    expected = _reference_index_topk(
++        idx_q.float(),
++        index_kv_cache.float(),
++        block_table,
++        q_lens,
++        active_seq_lens,
++        prefix_lens,
++        topk,
++        init_blocks,
++        local_blocks,
++        head_dim**-0.5,
++    )
++    _assert_topk_indices_equal_unordered(actual, expected)
++
++
+ # Sparse attention kernels.
+ def _reference_sparse_attn(
+     q: torch.Tensor,
+diff --git a/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py b/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
+index 96729614f822..3f79d4f5db0c 100644
+--- a/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
++++ b/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
+@@ -278,3 +278,99 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
+     torch.testing.assert_close(
+         index_cache.view(-1, HEAD_DIM), expected_index_cache, rtol=0, atol=0
+     )
++
++
++# ── Test 3: fp8 (e4m3) index outputs ─────────────────────────────────────────
++# The fp8 score path stores index_q and the index-K cache as e4m3 while q/k/v +
++# q_out stay bf16. Asserts: (1) q/k/v/q_out are bit-identical to the bf16 run
++# (the index dtype must not perturb the main branch), and (2) the e4m3 index
++# outputs dequantize close to the bf16 reference.
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
++    reason="e4m3 conversion requires CUDA SM89+.",
++)
++@pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
++@pytest.mark.parametrize("block_size", [16, 64])
++def test_sparse_full_fp8_index(num_tokens, block_size):
++    torch.manual_seed(1)
++    device, dtype, eps = "cuda", torch.bfloat16, 1e-6
++    base, max_pos = 5_000_000.0, 4096
++    num_heads, num_kv_heads, num_idx_heads = 16, 4, 4
++
++    q_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
++    k_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
++    iq_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
++    ik_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
++    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
++    positions = torch.randint(
++        0, max_pos, (num_tokens,), dtype=torch.int64, device=device
++    )
++
++    qsz, kvsz = num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
++    iqsz, iksz = num_idx_heads * HEAD_DIM, HEAD_DIM
++    qkv0 = torch.randn(
++        num_tokens, qsz + 2 * kvsz + iqsz + iksz, dtype=dtype, device=device
++    )
++
++    num_blocks = (num_tokens + block_size - 1) // block_size + 1
++    slot_mapping = torch.randperm(
++        num_blocks * block_size, dtype=torch.int64, device=device
++    )[:num_tokens]
++    index_slot_mapping = torch.roll(slot_mapping, shifts=1)
++
++    def run(index_dtype):
++        qkv = qkv0.clone()
++        kv_cache = torch.zeros(
++            num_blocks,
++            2,
++            block_size,
++            num_kv_heads,
++            HEAD_DIM,
++            dtype=dtype,
++            device=device,
++        )
++        index_cache = torch.zeros(
++            num_blocks, block_size, HEAD_DIM, dtype=index_dtype, device=device
++        )
++        q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
++        index_q = torch.empty(num_tokens, iqsz, dtype=index_dtype, device=device)
++        ops.fused_minimax_m3_qknorm_rope_kv_insert(
++            qkv,
++            q_w,
++            k_w,
++            cos_sin,
++            positions,
++            num_heads,
++            num_kv_heads,
++            ROTARY_DIM,
++            eps,
++            iq_w,
++            ik_w,
++            num_idx_heads,
++            slot_mapping,
++            index_slot_mapping,
++            kv_cache,
++            index_cache,
++            block_size,
++            q_out,
++            index_q,
++        )
++        return qkv, kv_cache, index_cache, q_out, index_q
++
++    qkv_bf, kvc_bf, idxc_bf, qo_bf, iq_bf = run(torch.bfloat16)
++    qkv_fp, kvc_fp, idxc_fp, qo_fp, iq_fp = run(torch.float8_e4m3fn)
++
++    assert iq_fp.dtype == torch.float8_e4m3fn
++    assert idxc_fp.dtype == torch.float8_e4m3fn
++
++    # (1) The main branch (q/k/v in qkv, q_out, kv cache) must be bit-identical:
++    # the index output dtype must not perturb anything else.
++    torch.testing.assert_close(qo_fp, qo_bf, rtol=0, atol=0)
++    torch.testing.assert_close(qkv_fp, qkv_bf, rtol=0, atol=0)
++    torch.testing.assert_close(kvc_fp, kvc_bf, rtol=0, atol=0)
++
++    # (2) Dequantized e4m3 index outputs match the bf16 reference within fp8 ulp.
++    torch.testing.assert_close(iq_fp.float(), iq_bf.float(), rtol=0.13, atol=0.05)
++    torch.testing.assert_close(idxc_fp.float(), idxc_bf.float(), rtol=0.13, atol=0.05)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 190b15667dd1..d38014e468bf 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1580,10 +1580,9 @@ def _resolve_rust_frontend_path() -> str | None:
+         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
+     ),
+     # Enforce function parameter schemas in structural-tag based tool calling.
+-    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: os.getenv(
+-        "VLLM_ENFORCE_STRICT_TOOL_CALLING", "True"
+-    ).lower()
+-    in ("true", "1"),
++    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: (
++        os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
++    ),
+     # Control the max chunk bytes (in MB) for the rpc message queue.
+     # Object larger than this threshold will be broadcast to worker
+     # processes via zmq.
+diff --git a/vllm/models/minimax_m3/amd/model.py b/vllm/models/minimax_m3/amd/model.py
+index 54d1beb7d4d8..c171b4bfe8c5 100644
+--- a/vllm/models/minimax_m3/amd/model.py
++++ b/vllm/models/minimax_m3/amd/model.py
+@@ -457,6 +457,7 @@ def __init__(
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+         cache_config: CacheConfig | None = None,
++        topk_indices_buffer: torch.Tensor | None = None,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = config.hidden_size
+@@ -535,6 +536,9 @@ def __init__(
+             self.kv_cache_dtype, vllm_config.model_config
+         )
+ 
++        # Shared top-k buffer: the indexer writes the selected blocks into it and
++        # the attend impl reads them back (no Python value crosses the break).
++        self.topk_indices_buffer = topk_indices_buffer
+         self.attn_backend = MiniMaxM3SparseBackend
+         # Indexer and main attention are separate impls. On ROCm the SM100 gate
+         # is always False, so both pick Triton and the index cache stays bf16.
+@@ -565,6 +569,7 @@ def __init__(
+             local_blocks=sparse_cfg.get("sparse_local_block", 0),
+             score_type=sparse_cfg.get("sparse_score_type", "max"),
+             cache_config=cache_config,
++            topk_indices_buffer=topk_indices_buffer,
+         )
+ 
+         # Register the main K/V cache so the KV-cache manager allocates it.
+@@ -657,9 +662,10 @@ def _run_attention(
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         # Single eager break around both: their split-K kernels read per-request
+-        # metadata and can't be captured into a cudagraph.
+-        topk_idx = self.indexer(index_query)
+-        return self.impl.forward(self, query, self.kv_cache, topk_idx, output)
++        # metadata and can't be captured into a cudagraph. The indexer writes its
++        # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
++        self.indexer(index_query)
++        return self.impl.forward(self, query, self.kv_cache, output)
+ 
+ 
+ class MiniMaxM3DecoderLayer(nn.Module):
+@@ -671,6 +677,7 @@ def __init__(
+         quant_config: QuantizationConfig | None = None,
+         force_sparse_attn: bool = False,
+         force_moe: bool = False,
++        topk_indices_buffer: torch.Tensor | None = None,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = config.hidden_size
+@@ -690,6 +697,7 @@ def __init__(
+                 quant_config=quant_config,
+                 prefix=f"{prefix}.self_attn",
+                 cache_config=cache_config,
++                topk_indices_buffer=topk_indices_buffer,
+             )
+         else:
+             self.self_attn = MiniMaxM3Attention(
+@@ -771,6 +779,22 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             prefix=f"{prefix}.embed_tokens",
+         )
+ 
++        # Reserved top-k indices buffer shared by all sparse-attention indexer
++        # layers (mirrors DeepseekV4); the indexer writes its per-head decode/
++        # prefill block selection into it, the attend reads it back.
++        sparse_cfg = getattr(config, "sparse_attention_config", None)
++        if sparse_cfg is not None:
++            tp_size = get_tensor_model_parallel_world_size()
++            num_index_heads = max(1, sparse_cfg["sparse_num_index_heads"] // tp_size)
++            self.topk_indices_buffer = torch.empty(
++                num_index_heads,
++                vllm_config.scheduler_config.max_num_batched_tokens,
++                sparse_cfg["sparse_topk_blocks"],
++                dtype=torch.int32,
++            )
++        else:
++            self.topk_indices_buffer = None
++
+         self.start_layer, self.end_layer, self.layers = make_layers(
+             config.num_hidden_layers,
+             lambda prefix: MiniMaxM3DecoderLayer(
+@@ -778,6 +802,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+                 prefix,
+                 cache_config=cache_config,
+                 quant_config=quant_config,
++                topk_indices_buffer=self.topk_indices_buffer,
+             ),
+             prefix=f"{prefix}.layers",
+         )
+diff --git a/vllm/models/minimax_m3/common/indexer.py b/vllm/models/minimax_m3/common/indexer.py
+index 4da528056042..4a72b6bc2c91 100644
+--- a/vllm/models/minimax_m3/common/indexer.py
++++ b/vllm/models/minimax_m3/common/indexer.py
+@@ -25,12 +25,14 @@
+ from vllm.config.cache import CacheDType
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.models.minimax_m3.common.ops.index_topk import (
+     minimax_m3_index_decode,
+     minimax_m3_index_score,
+     minimax_m3_index_topk,
+ )
++from vllm.platforms import current_platform
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionCGSupport,
+@@ -46,6 +48,8 @@
+     MLAAttentionSpec,
+ )
+ 
++logger = init_logger(__name__)
++
+ 
+ class MiniMaxM3IndexerBackend(AttentionBackend):
+     """Indexer side-cache backend (key-only)."""
+@@ -120,16 +124,20 @@ def __init__(
+         backend_cls: type[AttentionBackend] = MiniMaxM3IndexerBackend,
+     ) -> None:
+         super().__init__()
+-        if indexer_kv_dtype != "bf16":
++        if indexer_kv_dtype in ("fp8", "fp8_e4m3"):
++            cache_dtype = torch.float8_e4m3fn
++        elif indexer_kv_dtype == "bf16":
++            cache_dtype = torch.bfloat16
++        else:
+             raise NotImplementedError(
+-                f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported yet "
+-                "for the MiniMax M3 indexer cache (only 'bf16')."
++                f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
++                "MiniMax M3 indexer cache (only 'bf16' or 'fp8'/'fp8_e4m3')."
+             )
+         self.kv_cache = torch.tensor([])
+         self.head_dim = head_dim
+         self.indexer_kv_dtype = indexer_kv_dtype
+-        # Storage dtype for the side cache (bf16 today; quantized layouts later).
+-        self.dtype = torch.bfloat16
++        # Side-cache storage dtype: bf16, or e4m3 for the fp8 score path.
++        self.dtype = cache_dtype
+         self.prefix = prefix
+         self.cache_config = cache_config
+         # Impl-chosen backend -> each impl gets its own builder (get_attn_backend).
+@@ -344,6 +352,7 @@ def __init__(
+         score_type: str = "max",
+         cache_config: CacheConfig | None = None,
+         indexer_kv_dtype: IndexerKVDType = "bf16",
++        topk_indices_buffer: torch.Tensor | None = None,
+     ) -> None:
+         super().__init__()
+         self.num_kv_heads = num_kv_heads
+@@ -356,6 +365,9 @@ def __init__(
+         self.num_index_heads = num_index_heads
+         self.index_head_dim = index_head_dim
+         self.indexer_kv_dtype = indexer_kv_dtype
++        # Shared, stable-address top-k output buffer (set by the model for the
++        # cudagraph-safe MSA impl); None -> impl allocates fresh (eager).
++        self.topk_indices_buffer = topk_indices_buffer
+         # Owns the side cache (registers itself in the static forward context).
+         self.index_cache = MiniMaxM3IndexerCache(
+             head_dim=index_head_dim,
+@@ -392,6 +404,10 @@ def forward(
+         )
+         kv = self.index_cache.kv_cache
+ 
++        # Both sides write into the single shared persistent topk_indices_buffer
++        # (decode at [:, :nd], prefill at [:, nd:]) and return views into it; the
++        # kernels' out= writes out[:, :total_q]. None -> allocate fresh.
++        buf = self.topk_indices_buffer
+         decode_topk: torch.Tensor | None = None
+         prefill_topk: torch.Tensor | None = None
+         if index_md.num_decodes > 0:
+@@ -409,6 +425,7 @@ def forward(
+                 self.num_kv_heads,
+                 d.decode_query_len,
+                 d.max_decode_query_len,
++                out=buf,
+             )
+         if index_md.num_prefills > 0:
+             p = index_md.prefill
+@@ -432,29 +449,61 @@ def forward(
+                 self.topk_blocks,
+                 self.init_blocks,
+                 self.local_blocks,
++                out=buf[:, nd:, :] if buf is not None else None,
+             )
+         return decode_topk, prefill_topk
+ 
+ 
+ def select_indexer_impl_cls(
+     *,
++    topk_blocks: int,
+     indexer_kv_dtype: IndexerKVDType = "bf16",
+ ) -> type[MiniMaxM3IndexerImpl]:
+-    """Pick the indexer impl off the index-cache dtype.
++    """Pick the indexer impl off the platform, top-k count, and cache dtype.
+ 
+-    The SM100 MSA indexer score path is disabled for now; use the local Triton
+-    indexer. If re-enabled, add a NVIDIA-specific ``MiniMaxM3IndexerImpl`` here.
++    On Blackwell (SM100) with ``topk_blocks`` in ``(4, 8, 16, 32)`` (matching the
++    main MSA attend), the fmha_sm100 score path + Triton top-k is used for both
++    bf16 and fp8 index caches. Everything else falls back to the Triton indexer
++    (bf16 only).
+     """
+     if indexer_kv_dtype in ("mxfp4", "nvfp4"):
+         raise NotImplementedError(
+             f"indexer_kv_dtype={indexer_kv_dtype!r} needs the (not-yet-added) "
+             "CuteDSL indexer impl."
+         )
++    is_sm100 = (
++        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
++    )
++    use_msa = (
++        is_sm100
++        and topk_blocks in (4, 8, 16, 32)
++        and indexer_kv_dtype in ("bf16", "fp8", "fp8_e4m3")
++    )
++    if use_msa:
++        # Lazy import so AMD / non-SM100 never import fmha_sm100.
++        from vllm.models.minimax_m3.nvidia.indexer_msa import (
++            MiniMaxM3IndexerMSAImpl,
++        )
++
++        logger.info_once(
++            "MiniMax M3 indexer: selected MSA (fmha_sm100 score + Triton top-k) "
++            "[topk_blocks=%d, indexer_kv_dtype=%s]",
++            topk_blocks,
++            indexer_kv_dtype,
++        )
++        return MiniMaxM3IndexerMSAImpl
+     if indexer_kv_dtype != "bf16":
+         raise NotImplementedError(
+             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
+             "Triton indexer impl."
+         )
++    logger.info_once(
++        "MiniMax M3 indexer: selected Triton (no fmha_sm100) "
++        "[topk_blocks=%d, indexer_kv_dtype=%s, sm100=%s]",
++        topk_blocks,
++        indexer_kv_dtype,
++        is_sm100,
++    )
+     return MiniMaxM3IndexerTritonImpl
+ 
+ 
+@@ -480,9 +529,11 @@ def __init__(
+         score_type: str = "max",
+         cache_config: CacheConfig | None = None,
+         indexer_kv_dtype: IndexerKVDType = "bf16",
++        topk_indices_buffer: torch.Tensor | None = None,
+     ) -> None:
+         super().__init__()
+         impl_cls = select_indexer_impl_cls(
++            topk_blocks=topk_blocks,
+             indexer_kv_dtype=indexer_kv_dtype,
+         )
+         self.impl = impl_cls(
+@@ -498,6 +549,7 @@ def __init__(
+             score_type=score_type,
+             cache_config=cache_config,
+             indexer_kv_dtype=indexer_kv_dtype,
++            topk_indices_buffer=topk_indices_buffer,
+         )
+ 
+     @property
+diff --git a/vllm/models/minimax_m3/common/ops/index_topk.py b/vllm/models/minimax_m3/common/ops/index_topk.py
+index 208c2d690067..28becf7bfec4 100644
+--- a/vllm/models/minimax_m3/common/ops/index_topk.py
++++ b/vllm/models/minimax_m3/common/ops/index_topk.py
+@@ -373,7 +373,10 @@ def _decode_index_score_kernel(
+             + off_k[:, None] * stride_ik_pos
+             + off_d * stride_ik_d,
+         )  # [N,D]
+-        kq = tl.dot(k, q)  # [N,HQ]
++        # fp32 accumulation is required for the fp8 (e4m3) index cache: q/k are
++        # loaded in their stored dtype (bf16 or e4m3) and the MMA accumulates in
++        # fp32 so the per-block max score is exact for the fp8 indexer too.
++        kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
+         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
+         score = tl.max(kq, axis=0)  # [HQ]
+         is_visible_block = blk < num_blocks_q
+@@ -709,16 +712,25 @@ def minimax_m3_index_topk(
+     topk: int,
+     init_blocks: int,
+     local_blocks: int,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    """Select index top-k from a precomputed score tensor."""
++    """Select index top-k from a precomputed score tensor.
++
++    When ``out`` is provided (a ``[num_idx_heads, >=total_q, topk]`` buffer), the
++    result is written into ``out[:, :total_q, :]`` instead of a fresh tensor --
++    used to keep the top-k output at a stable address for cudagraph capture.
++    """
+     num_idx_heads = score.shape[0]
+     batch = cu_seqlens_q.shape[0] - 1
+     total_q = score.shape[1]
+-    topk_idx = torch.empty(
+-        (num_idx_heads, total_q, topk),
+-        dtype=torch.int32,
+-        device=score.device,
+-    )
++    if out is not None:
++        topk_idx = out[:, :total_q, :]
++    else:
++        topk_idx = torch.empty(
++            (num_idx_heads, total_q, topk),
++            dtype=torch.int32,
++            device=score.device,
++        )
+     # block_size_q == 1 -> query blocks coincide with query tokens.
+     grid_topk = (max_query_len, batch, num_idx_heads)
+     _topk_index_kernel[grid_topk](
+@@ -757,10 +769,13 @@ def minimax_m3_index_decode(
+     num_kv_heads: int,
+     decode_query_len: int,
+     max_decode_query_len: int,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Decode index block-score + top-k, both split-K (cudagraph-safe).
+ 
+     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
++    When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
++    ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
+     """
+     total_q, num_idx_heads, head_dim = idx_q.shape
+     assert num_idx_heads == num_kv_heads, (
+@@ -834,11 +849,14 @@ def minimax_m3_index_decode(
+         **score_kwargs,
+     )
+ 
+-    topk_idx = torch.empty(
+-        (num_idx_heads, total_q, topk),
+-        dtype=torch.int32,
+-        device=idx_q.device,
+-    )
++    if out is not None:
++        topk_idx = out[:, :total_q, :]
++    else:
++        topk_idx = torch.empty(
++            (num_idx_heads, total_q, topk),
++            dtype=torch.int32,
++            device=idx_q.device,
++        )
+     # Chunk count is shape-constant (cudagraph-safe), capped so the merge sorts
+     # pow2(num_topk_chunks * pow2(topk)) candidates.
+     TOPK_TARGET_GRID = 64
+diff --git a/vllm/models/minimax_m3/common/sparse_attention.py b/vllm/models/minimax_m3/common/sparse_attention.py
+index b8d60e09e4b8..55542230885b 100644
+--- a/vllm/models/minimax_m3/common/sparse_attention.py
++++ b/vllm/models/minimax_m3/common/sparse_attention.py
+@@ -2,10 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Main block-sparse GQA attention for MiniMax M3 sparse layers.
+ 
+-The lightning indexer (``indexer.py``) selects the top-k KV blocks; this module
+-holds the main attention that attends only to those blocks: the paged K/V cache
+-backend, its metadata + builder, and the impl that consumes the indexer's
+-``topk_idx``. The Triton attend kernel lives here; the SM100 (MSA)
++The lightning indexer (``indexer.py``) selects the top-k KV blocks (written into
++the shared ``layer.topk_indices_buffer``); this module holds the main attention
++that attends only to those blocks: the paged K/V cache backend, its metadata +
++builder, and the impl that reads the indexer's top-k from that buffer. The Triton
++attend kernel lives here; the SM100 (MSA)
+ ``build_k2q_csr`` + ``sparse_atten_func`` attend lives in
+ ``nvidia/sparse_attention_msa.py``.
+ 
+@@ -272,9 +273,10 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
+     """Abstract base for block-sparse GQA over the indexer-selected blocks.
+ 
+     Inherits ``AttentionImplBase`` for a custom forward signature (the layer
+-    pre-inserts K/V and runs the indexer, so forward takes the queries +
+-    ``topk_idx``). The Triton and MSA subclasses each own a full ``forward`` --
+-    no shared forward code.
++    pre-inserts K/V and runs the indexer, which writes the selected blocks into
++    the shared ``layer.topk_indices_buffer``; the attend reads them back from
++    there). The Triton and MSA subclasses each own a full ``forward`` -- no
++    shared forward code.
+     """
+ 
+     def __init__(
+@@ -311,10 +313,14 @@ def forward(
+         layer: AttentionLayer,
+         query: torch.Tensor,
+         kv_cache: torch.Tensor,
+-        topk_idx: tuple[torch.Tensor | None, torch.Tensor | None],
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+-        """Attend the queries to the indexer-selected blocks. Per kernel."""
++        """Attend the queries to the indexer-selected blocks. Per kernel.
++
++        The indexer has already written the top-k block ids into
++        ``layer.topk_indices_buffer`` (decode at ``[:, :nd]``, prefill at
++        ``[:, nd:num_tokens]``); the attend reads them from there.
++        """
+         raise NotImplementedError
+ 
+ 
+@@ -326,7 +332,6 @@ def forward(
+         layer: AttentionLayer,
+         query: torch.Tensor,
+         kv_cache: torch.Tensor,
+-        topk_idx: tuple[torch.Tensor | None, torch.Tensor | None],
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         attn_metadata = get_forward_context().attn_metadata
+@@ -334,10 +339,12 @@ def forward(
+             return output  # profiling run; caches unbound
+         main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
+         assert isinstance(main_md, MiniMaxM3SparseMetadata)
+-        decode_topk, prefill_topk = topk_idx
+ 
+         nd = main_md.num_decode_tokens
+         num_tokens = main_md.num_actual_tokens
++        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
++        topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
++        assert topk is not None
+         hd = self.head_size
+         q = query[:num_tokens].view(-1, self.num_heads, hd)
+         out = output[:num_tokens].view(-1, self.num_heads, hd)
+@@ -348,11 +355,11 @@ def forward(
+         # Decode [:nd]: split-K over the selected blocks (request-major chunks).
+         if main_md.num_decodes > 0:
+             d = main_md.decode
+-            assert d is not None and decode_topk is not None
++            assert d is not None
+             minimax_m3_sparse_attn_decode(
+                 q[:nd],
+                 kv_cache,
+-                decode_topk,
++                topk[:, :nd, :],
+                 d.block_table,
+                 d.seq_lens,
+                 self.num_kv_heads,
+@@ -364,11 +371,11 @@ def forward(
+         # Prefill [nd:]: cu_seqlens_q already rebased to 0.
+         if main_md.num_prefills > 0:
+             p = main_md.prefill
+-            assert p is not None and prefill_topk is not None
++            assert p is not None
+             minimax_m3_sparse_attn(
+                 q[nd:],
+                 kv_cache,
+-                prefill_topk,
++                topk[:, nd:num_tokens, :],
+                 p.block_table,
+                 p.cu_seqlens_q,
+                 p.seq_lens,
+diff --git a/vllm/models/minimax_m3/nvidia/indexer_msa.py b/vllm/models/minimax_m3/nvidia/indexer_msa.py
+new file mode 100644
+index 000000000000..432c8bb790df
+--- /dev/null
++++ b/vllm/models/minimax_m3/nvidia/indexer_msa.py
+@@ -0,0 +1,251 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""MSA (SM100/Blackwell) indexer impl for MiniMax M3.
++
++Prefill scores with ``fmha_sm100``'s score-only (``OnlyScore``) path then selects
++top-k blocks with the Triton ``minimax_m3_index_topk`` kernel -- fmha is much
++faster than Triton for the wide prefill score (benchmarked ~3-5x).
++
++Decode uses the Triton fused ``minimax_m3_index_decode`` (the same kernel the
++Triton indexer impl uses): for q_len==1 it is a purpose-built vector x matrix
++score (no wasted tensor-core tiles) with a 256-way split-K and a fused split-K
++top-k, which beats fmha's OnlyScore (wasted MMA on a single query, 64-split cap)
++by ~1.1-3.7x. It is cudagraph-safe by construction (shape-constant split grids)
++and writes the shared ``topk_indices_buffer`` via ``out=``.
++
++``fmha_sm100`` imports are function-local so this module is import-safe on
++AMD / non-SM100.
++"""
++
++from dataclasses import dataclass
++from typing import ClassVar
++
++import torch
++
++from vllm.forward_context import get_forward_context
++from vllm.models.minimax_m3.common.indexer import (
++    MiniMaxM3IndexerBackend,
++    MiniMaxM3IndexerDecodeMetadata,
++    MiniMaxM3IndexerImpl,
++    MiniMaxM3IndexerMetadata,
++    MiniMaxM3IndexerMetadataBuilder,
++)
++from vllm.models.minimax_m3.common.ops.index_topk import (
++    minimax_m3_index_decode,
++    minimax_m3_index_topk,
++)
++from vllm.v1.attention.backend import (
++    AttentionBackend,
++    AttentionCGSupport,
++    CommonAttentionMetadata,
++)
++from vllm.v1.attention.backends.utils import split_decodes_and_prefills
++
++# Page size == sparse block size == index-K block; fmha tile id == M3 block id.
++PAGE_SIZE = 128
++
++
++class MiniMaxM3IndexerMSABackend(MiniMaxM3IndexerBackend):
++    """Indexer side-cache backend selecting the MSA builder."""
++
++    @staticmethod
++    def get_builder_cls() -> type["MiniMaxM3IndexerMSAMetadataBuilder"]:
++        return MiniMaxM3IndexerMSAMetadataBuilder
++
++
++@dataclass
++class MiniMaxM3IndexerMSAPrefillMetadata:
++    """fmha score plan + Triton top-k inputs for the prefill side (eager)."""
++
++    plan: dict  # fmha_sm100 PlanInfo
++    cu_seqlens_q: torch.Tensor  # [num_prefills + 1] int32, rebased to 0
++    prefix_lens: torch.Tensor  # [num_prefills] int32, context tokens
++    max_query_len: int
++    page_table: torch.Tensor  # flat physical page indices for the prefill side
++
++
++@dataclass
++class MiniMaxM3IndexerMSAMetadata(MiniMaxM3IndexerMetadata):
++    """Decode reuses the inherited base ``decode`` field (the Triton decode
++    metadata); ``prefill_msa`` carries the fmha score plan for the prefill side
++    (the base ``prefill`` field is unused on this path)."""
++
++    prefill_msa: MiniMaxM3IndexerMSAPrefillMetadata | None = None
++
++
++class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
++    """Decode metadata is the cudagraph-safe Triton decode metadata; the prefill
++    fmha plan is built eagerly (prefill batches are not captured)."""
++
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    def build(
++        self,
++        common_prefix_len: int,
++        common_attn_metadata: CommonAttentionMetadata,
++        fast_build: bool = False,
++    ) -> MiniMaxM3IndexerMSAMetadata:
++        num_reqs = common_attn_metadata.num_reqs
++        num_tokens = common_attn_metadata.num_actual_tokens
++        seq_lens = common_attn_metadata.seq_lens
++        block_table = common_attn_metadata.block_table_tensor
++        query_start_loc = common_attn_metadata.query_start_loc
++
++        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
++            split_decodes_and_prefills(
++                common_attn_metadata,
++                decode_threshold=self.reorder_batch_threshold,
++                require_uniform=True,
++            )
++        )
++        assert num_decodes + num_prefills == num_reqs
++        assert num_decode_tokens + num_prefill_tokens == num_tokens
++
++        # Context (prefix) lengths into the stable cudagraph buffer.
++        context_lens = self.context_len_buffer[:num_reqs]
++        context_lens.copy_(
++            common_attn_metadata.compute_num_computed_tokens(), non_blocking=True
++        )
++
++        decode: MiniMaxM3IndexerDecodeMetadata | None = None
++        if num_decodes > 0:
++            qsl_cpu = common_attn_metadata.query_start_loc_cpu
++            query_lens_cpu = qsl_cpu[1 : num_decodes + 1] - qsl_cpu[:num_decodes]
++            decode_query_len = int(query_lens_cpu[0].item())
++            assert decode_query_len > 0
++            assert torch.all(
++                (query_lens_cpu == decode_query_len) | (query_lens_cpu == 0)
++            )
++            decode = MiniMaxM3IndexerDecodeMetadata(
++                seq_lens=seq_lens[:num_decodes],
++                block_table=block_table[:num_decodes],
++                max_seq_len=common_attn_metadata.max_seq_len,
++                decode_query_len=decode_query_len,
++                max_decode_query_len=self.max_decode_query_len,
++            )
++
++        prefill: MiniMaxM3IndexerMSAPrefillMetadata | None = None
++        if num_prefills > 0:
++            # Prefill is eager (not captured); the host lengths it needs (and the
++            # _fmha_sm100_plan .tolist() inside) make the D->H sync acceptable.
++            from vllm.third_party.fmha_sm100.api import _fmha_sm100_plan
++
++            lo, hi = num_decodes, num_reqs
++            qsl_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
++            qo_lens_cpu = (qsl_cpu[1:] - qsl_cpu[:-1]).to(torch.int32)
++            kv_lens_cpu = seq_lens[:num_reqs].cpu().to(torch.int32)
++            nvp = (kv_lens_cpu + PAGE_SIZE - 1) // PAGE_SIZE
++            side_qo = qo_lens_cpu[lo:hi]
++            side_kv = kv_lens_cpu[lo:hi]
++            plan = _fmha_sm100_plan(
++                side_qo,
++                side_kv,
++                self.num_index_heads,
++                num_kv_heads=1,
++                qo_offset=side_kv - side_qo,  # bottom-right causal
++                page_size=PAGE_SIZE,
++                output_maxscore=True,
++                causal=True,
++                num_kv_splits=1,
++            )
++            cols = torch.arange(block_table.shape[1], device=block_table.device)
++            valid = cols[None, :] < nvp[lo:hi].to(block_table.device)[:, None]
++            prefill = MiniMaxM3IndexerMSAPrefillMetadata(
++                plan=plan,
++                cu_seqlens_q=(query_start_loc[lo : hi + 1] - query_start_loc[lo]).to(
++                    torch.int32
++                ),
++                prefix_lens=context_lens[lo:hi],
++                max_query_len=int(side_qo.max()),
++                page_table=block_table[lo:hi][valid].to(torch.int32),
++            )
++
++        return MiniMaxM3IndexerMSAMetadata(
++            seq_lens=seq_lens,
++            max_seq_len=common_attn_metadata.max_seq_len,
++            slot_mapping=common_attn_metadata.slot_mapping,
++            num_actual_tokens=num_tokens,
++            num_decodes=num_decodes,
++            num_decode_tokens=num_decode_tokens,
++            num_prefills=num_prefills,
++            num_prefill_tokens=num_prefill_tokens,
++            decode=decode,
++            prefill_msa=prefill,
++        )
++
++
++class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
++    """Decode: Triton fused score+top-k. Prefill: fmha_sm100 OnlyScore + top-k."""
++
++    indexer_backend_cls: ClassVar[type[AttentionBackend]] = MiniMaxM3IndexerMSABackend
++
++    def forward(
++        self,
++        index_query: torch.Tensor,
++    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
++        attn_metadata = get_forward_context().attn_metadata
++        if not isinstance(attn_metadata, dict):
++            return None, None  # profiling run; caches unbound
++        md = attn_metadata[self.index_cache.prefix]
++        assert isinstance(md, MiniMaxM3IndexerMSAMetadata)
++
++        num_tokens = md.num_actual_tokens
++        nd = md.num_decode_tokens
++        index_q = index_query[:num_tokens].view(
++            -1, self.num_index_heads, self.index_head_dim
++        )
++        kv = self.index_cache.kv_cache
++        # Both sides write into the single shared persistent topk_indices_buffer:
++        # decode at [:, :nd], prefill at [:, nd:] (each kernel writes [:, :total_q]).
++        buf = self.topk_indices_buffer
++
++        decode_topk: torch.Tensor | None = None
++        if md.decode is not None:
++            d = md.decode
++            decode_topk = minimax_m3_index_decode(
++                index_q[:nd],
++                kv,
++                d.block_table,
++                d.seq_lens,
++                d.max_seq_len,
++                self.topk_blocks,
++                self.init_blocks,
++                self.local_blocks,
++                self.num_kv_heads,
++                d.decode_query_len,
++                d.max_decode_query_len,
++                out=buf,
++            )
++
++        prefill_topk: torch.Tensor | None = None
++        if md.prefill_msa is not None:
++            from vllm.third_party.fmha_sm100.api import _fmha_sm100
++
++            p = md.prefill_msa
++            # Index-K cache (num_blocks, 128, D) -> paged MQA (num_blocks,1,128,D).
++            k_pages = kv.view(kv.shape[0], 1, PAGE_SIZE, self.index_head_dim)
++            _, max_score = _fmha_sm100(
++                index_q[nd:],
++                k_pages,
++                k_pages,  # V placeholder; not read in OnlyScore
++                p.plan,
++                kv_indices=p.page_table,
++                output_o=False,
++                output_maxscore=True,
++                sm_scale=self.scale,
++            )
++            # Triton top-k wants [num_index_heads, num_tokens, max_block]; the
++            # transpose is a strided view (the kernel reads via strides).
++            out = buf[:, nd:, :] if buf is not None else None
++            prefill_topk = minimax_m3_index_topk(
++                max_score.transpose(1, 2),
++                p.cu_seqlens_q,
++                p.prefix_lens,
++                p.max_query_len,
++                self.topk_blocks,
++                self.init_blocks,
++                self.local_blocks,
++                out=out,
++            )
++
++        return decode_topk, prefill_topk
+diff --git a/vllm/models/minimax_m3/nvidia/model.py b/vllm/models/minimax_m3/nvidia/model.py
+index aaced78ed7cd..c27ded3b83ef 100644
+--- a/vllm/models/minimax_m3/nvidia/model.py
++++ b/vllm/models/minimax_m3/nvidia/model.py
+@@ -402,6 +402,7 @@ def __init__(
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+         cache_config: CacheConfig | None = None,
++        topk_indices_buffer: torch.Tensor | None = None,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = config.hidden_size
+@@ -489,6 +490,10 @@ def __init__(
+         # cache (--attention-config '{"indexer_kv_dtype": ...}').
+         self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
+ 
++        # Shared top-k buffer: the indexer writes the selected blocks into it and
++        # the attend impl reads them back (so nothing crosses the eager break as a
++        # Python value, which would freeze at capture).
++        self.topk_indices_buffer = topk_indices_buffer
+         self.attn_backend = MiniMaxM3SparseBackend
+         # Indexer (top-k selection) and main attention are separate impls, each
+         # picking Triton vs MSA off its cache dtype. impl is AttentionImplBase
+@@ -519,6 +524,7 @@ def __init__(
+             score_type=sparse_cfg.get("sparse_score_type", "max"),
+             cache_config=cache_config,
+             indexer_kv_dtype=self.indexer_kv_dtype,
++            topk_indices_buffer=topk_indices_buffer,
+         )
+ 
+         # Register the main K/V cache so the KV-cache manager allocates it.
+@@ -576,7 +582,12 @@ def forward(
+         main_slot_mapping = fwd_slot_mapping[self.layer_name]
+         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+         q = qkv.new_empty((num_tokens, self.q_size))
+-        index_q = qkv.new_empty((num_tokens, self.index_q_size))
++        # index_q matches the index-K cache dtype (e4m3 for the fp8 score path);
++        # the fused kernel emits fp8 directly when this buffer is e4m3.
++        index_q = qkv.new_empty(
++            (num_tokens, self.index_q_size),
++            dtype=self.indexer.index_cache.dtype,
++        )
+         ops.fused_minimax_m3_qknorm_rope_kv_insert(
+             qkv,
+             self.q_norm.weight,
+@@ -613,9 +624,10 @@ def _run_attention(
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         # Single eager break around both: their split-K kernels read per-request
+-        # metadata and can't be captured into a cudagraph.
+-        topk_idx = self.indexer(index_query)
+-        return self.impl.forward(self, query, self.kv_cache, topk_idx, output)
++        # metadata and can't be captured into a cudagraph. The indexer writes its
++        # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
++        self.indexer(index_query)
++        return self.impl.forward(self, query, self.kv_cache, output)
+ 
+ 
+ class MiniMaxM3DecoderLayer(nn.Module):
+@@ -627,6 +639,7 @@ def __init__(
+         force_sparse_attn: bool = False,
+         force_moe: bool = False,
+         is_mtp_block: bool = False,
++        topk_indices_buffer: torch.Tensor | None = None,
+     ) -> None:
+         super().__init__()
+         if is_mtp_block:
+@@ -662,6 +675,7 @@ def __init__(
+                 quant_config=quant_config,
+                 prefix=f"{prefix}.self_attn",
+                 cache_config=cache_config,
++                topk_indices_buffer=topk_indices_buffer,
+             )
+         else:
+             self.self_attn = MiniMaxM3Attention(
+@@ -747,11 +761,33 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             prefix=f"{prefix}.embed_tokens",
+         )
+ 
++        # Reserved top-k indices buffer shared by all sparse-attention indexer
++        # layers (mirrors DeepseekV4); kept at a stable address so the indexer's
++        # top-k output survives cudagraph capture/replay. Shape matches the
++        # per-head index top-k output [num_index_heads, total_q, topk].
++        sparse_cfg = getattr(config, "sparse_attention_config", None)
++        if sparse_cfg is not None:
++            tp_size = get_tensor_model_parallel_world_size()
++            num_index_heads = max(1, sparse_cfg["sparse_num_index_heads"] // tp_size)
++            # Pad tokens to a multiple of 4 so the buffer head stride stays
++            # int4-aligned for build_k2q_csr's vectorised int4 loads.
++            max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
++            padded_num_tokens = (max_num_batched_tokens + 3) // 4 * 4
++            self.topk_indices_buffer = torch.empty(
++                num_index_heads,
++                padded_num_tokens,
++                sparse_cfg["sparse_topk_blocks"],
++                dtype=torch.int32,
++            )
++        else:
++            self.topk_indices_buffer = None
++
+         self.start_layer, self.end_layer, self.layers = make_layers(
+             config.num_hidden_layers,
+             lambda prefix: MiniMaxM3DecoderLayer(
+                 vllm_config=vllm_config,
+                 prefix=prefix,
++                topk_indices_buffer=self.topk_indices_buffer,
+             ),
+             prefix=f"{prefix}.layers",
+         )
+diff --git a/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py b/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
+index 6ab59f8c4b57..0df2ed85bbd1 100644
+--- a/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
++++ b/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
+@@ -29,7 +29,6 @@ def forward(
+         layer: AttentionLayer,
+         query: torch.Tensor,
+         kv_cache: torch.Tensor,
+-        topk_idx: tuple[torch.Tensor | None, torch.Tensor | None],
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         attn_metadata = get_forward_context().attn_metadata
+@@ -37,10 +36,12 @@ def forward(
+             return output  # profiling run; caches unbound
+         main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
+         assert isinstance(main_md, MiniMaxM3SparseMetadata)
+-        decode_topk, prefill_topk = topk_idx
+ 
+         nd = main_md.num_decode_tokens
+         num_tokens = main_md.num_actual_tokens
++        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
++        topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
++        assert topk is not None
+         hd = self.head_size
+         q = query[:num_tokens].view(-1, self.num_heads, hd)
+         out = output[:num_tokens].view(-1, self.num_heads, hd)
+@@ -51,11 +52,11 @@ def forward(
+         # Decode [:nd]: Triton split-K placeholder (no MSA decode yet).
+         if main_md.num_decodes > 0:
+             d = main_md.decode
+-            assert d is not None and decode_topk is not None
++            assert d is not None
+             minimax_m3_sparse_attn_decode(
+                 q[:nd],
+                 kv_cache,
+-                decode_topk,
++                topk[:, :nd, :],
+                 d.block_table,
+                 d.seq_lens,
+                 self.num_kv_heads,
+@@ -72,7 +73,8 @@ def forward(
+             )
+ 
+             p = main_md.prefill
+-            assert p is not None and prefill_topk is not None
++            assert p is not None
++            prefill_topk = topk[:, nd:num_tokens, :]
+             qp = q[nd:]
+             k_cache = kv_cache[:, 0].transpose(1, 2)
+             v_cache = kv_cache[:, 1].transpose(1, 2)

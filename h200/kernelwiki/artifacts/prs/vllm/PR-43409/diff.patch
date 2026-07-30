@@ -1,0 +1,907 @@
+diff --git a/.buildkite/hardware_tests/cpu.yaml b/.buildkite/hardware_tests/cpu.yaml
+index 3db49d579e37..a064e53ebed7 100644
+--- a/.buildkite/hardware_tests/cpu.yaml
++++ b/.buildkite/hardware_tests/cpu.yaml
+@@ -91,7 +91,7 @@ steps:
+   - tests/quantization/test_cpu_wna16.py
+   commands:
+     - |
+-      bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 30m "
++      bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 45m "
+       pytest -x -v -s tests/quantization/test_compressed_tensors.py::test_compressed_tensors_w8a8_logprobs
+       pytest -x -v -s tests/quantization/test_cpu_wna16.py"
+       
+diff --git a/tests/kernels/moe/test_cpu_quant_fused_moe.py b/tests/kernels/moe/test_cpu_quant_fused_moe.py
+index f8967b199226..d8c1b9f2cb61 100644
+--- a/tests/kernels/moe/test_cpu_quant_fused_moe.py
++++ b/tests/kernels/moe/test_cpu_quant_fused_moe.py
+@@ -496,5 +496,258 @@ def test_mxfp4_cpu_fused_moe_bias_swiglu(M, N, K, E, topk, seed):
+     torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
+ 
+ 
++# INT4 W4A16 group-quantized MoE
++
++
++def _pack_int4_gptq(w_int4: torch.Tensor) -> torch.Tensor:
++    """Pack INT4 values [N, K] → [N, K//8] int32 along K dim (GPTQ format)."""
++    N, K = w_int4.shape
++    assert K % 8 == 0
++    w = w_int4.to(torch.int32)
++    w_packed = torch.zeros(N, K // 8, dtype=torch.int32)
++    for j in range(8):
++        w_packed |= (w[:, j::8] & 0xF) << (j * 4)
++    return w_packed
++
++
++def _pack_int4_awq(w_int4: torch.Tensor) -> torch.Tensor:
++    """Pack INT4 values [..., N] → [..., N//8] int32 along last dim (AWQ format)."""
++    # AWQ packing bitshifts: indices {0,4,1,5,2,6,3,7} * 4 bits each
++    _AWQ_BITSHIFTS = [0, 16, 4, 20, 8, 24, 12, 28]
++
++    N = w_int4.shape[-1]
++    assert N % 8 == 0
++    w = w_int4.to(torch.int32)
++    w_packed = torch.zeros(*w.shape[:-1], N // 8, dtype=torch.int32)
++    for j, shift in enumerate(_AWQ_BITSHIFTS):
++        w_packed |= (w[..., j::8] & 0xF) << shift
++    return w_packed
++
++
++def _ref_int4_moe(
++    a: torch.Tensor,
++    w1_int4: torch.Tensor,
++    w2_int4: torch.Tensor,
++    w1_zeros: torch.Tensor | None,
++    w2_zeros: torch.Tensor | None,
++    w1_s: torch.Tensor,
++    w2_s: torch.Tensor,
++    topk_weight: torch.Tensor,
++    topk_ids: torch.Tensor,
++    group_size: int,
++) -> torch.Tensor:
++    """Reference INT4 W4A16 group-quantized fused MoE in pure torch."""
++    B = a.shape[0]
++    topk = topk_ids.size(1)
++    K_out = a.shape[1]
++
++    out = torch.zeros(B, topk, K_out, dtype=torch.float32)
++    for b in range(B):
++        for t in range(topk):
++            eid = topk_ids[b, t].item()
++            x = a[b : b + 1].float()
++
++            # Dequantize w1: [K, 2*N], groups along K (input dim)
++            K_dim = w1_int4.shape[1]
++            w1_dq = torch.zeros(K_dim, w1_int4.shape[2], dtype=torch.float32)
++            for g in range(w1_s.shape[1]):
++                k_start = g * group_size
++                k_end = min((g + 1) * group_size, K_dim)
++                zp = w1_zeros[eid, g, :].float() if w1_zeros is not None else 8.0
++                w1_dq[k_start:k_end, :] = (
++                    w1_int4[eid, k_start:k_end, :].float() - zp
++                ) * w1_s[eid, g, :].float()
++
++            ic = torch.matmul(x, w1_dq)  # [1, K] @ [K, 2*N] → [1, 2*N]
++            ic = _silu_and_mul(ic)  # [1, N]
++
++            # Dequantize w2: [N, K], groups along N (input dim)
++            N_dim = w2_int4.shape[1]
++            w2_dq = torch.zeros(N_dim, w2_int4.shape[2], dtype=torch.float32)
++            for g in range(w2_s.shape[1]):
++                n_start = g * group_size
++                n_end = min((g + 1) * group_size, N_dim)
++                zp = w2_zeros[eid, g, :].float() if w2_zeros is not None else 8.0
++                w2_dq[n_start:n_end, :] = (
++                    w2_int4[eid, n_start:n_end, :].float() - zp
++                ) * w2_s[eid, g, :].float()
++
++            oc = torch.matmul(ic, w2_dq)  # [1, N] @ [N, K] → [1, K]
++            out[b, t] = oc.squeeze(0)
++
++    return (out * topk_weight.unsqueeze(-1)).sum(dim=1).to(a.dtype)
++
++
++def _make_int4_moe_weights(E, N, K, group_size, quant_algo):
++    """Create INT4 MoE weights in GPTQ or AWQ packed format.
++
++    Canonical layout (input × output):
++      w1_int4: [E, K, 2*N]  w2_int4: [E, N, K]
++
++    GPTQ packed (pack transposed weight along input/K dim):
++      w1_packed: [E, K//8, 2*N]  w2_packed: [E, N//8, K]
++      zeros: actual int4 zero points, same packing as weights
++
++    AWQ packed (pack along output/N dim):
++      w1_packed: [E, K, 2*N//8]  w2_packed: [E, N, K//8]
++      zeros: actual int4 zero points, same packing as weights
++
++    Returns:
++        w1_int4, w2_int4,
++        w1_packed, w2_packed,
++        w1_zeros, w2_zeros,
++        w1_zeros_packed, w2_zeros_packed,
++        w1_s, w2_s
++    """
++    w1_int4 = torch.randint(0, 16, (E, K, 2 * N), dtype=torch.int32)
++    w2_int4 = torch.randint(0, 16, (E, N, K), dtype=torch.int32)
++
++    num_groups_w1 = K // group_size
++    num_groups_w2 = N // group_size
++    w1_s = (
++        torch.randn(E, num_groups_w1, 2 * N, dtype=torch.bfloat16) * 0.01
++    ).abs() + 0.001
++    w2_s = (torch.randn(E, num_groups_w2, K, dtype=torch.bfloat16) * 0.01).abs() + 0.001
++
++    if quant_algo == ops.CPUQuantAlgo.GPTQ:
++        # Pack: canonical [E, K, 2*N] → transpose [E, 2*N, K] → GPTQ pack
++        # [E, 2*N, K//8] → transpose [E, K//8, 2*N]
++        w1_t = w1_int4.transpose(1, 2).contiguous()  # [E, 2*N, K]
++        w1_packed = (
++            torch.stack([_pack_int4_gptq(w1_t[e]) for e in range(E)])
++            .transpose(1, 2)
++            .contiguous()
++        )  # [E, K//8, 2*N]
++        w2_t = w2_int4.transpose(1, 2).contiguous()  # [E, K, N]
++        w2_packed = (
++            torch.stack([_pack_int4_gptq(w2_t[e]) for e in range(E)])
++            .transpose(1, 2)
++            .contiguous()
++        )  # [E, N//8, K]
++        w1_zeros = w2_zeros = None
++        w1_zeros_packed = torch.full(
++            (E, num_groups_w1, 2 * N // 8), 0x77777777, dtype=torch.int32
++        )
++        w2_zeros_packed = torch.full(
++            (E, num_groups_w2, K // 8), 0x77777777, dtype=torch.int32
++        )
++    else:  # AWQ
++        # Asymmetric: actual zero points, packed along output dim.
++        w1_zeros = torch.randint(1, 15, (E, num_groups_w1, 2 * N), dtype=torch.int32)
++        w2_zeros = torch.randint(1, 15, (E, num_groups_w2, K), dtype=torch.int32)
++        w1_packed = torch.stack(
++            [_pack_int4_awq(w1_int4[e]) for e in range(E)]
++        )  # [E, K, 2*N//8]
++        w2_packed = torch.stack(
++            [_pack_int4_awq(w2_int4[e]) for e in range(E)]
++        )  # [E, N, K//8]
++        w1_zeros_packed = torch.stack(
++            [_pack_int4_awq(w1_zeros[e]) for e in range(E)]
++        )  # [E, K//gs, 2*N//8]
++        w2_zeros_packed = torch.stack(
++            [_pack_int4_awq(w2_zeros[e]) for e in range(E)]
++        )  # [E, N//gs, K//8]
++
++    return (
++        w1_int4,
++        w2_int4,
++        w1_packed,
++        w2_packed,
++        w1_zeros,
++        w2_zeros,
++        w1_zeros_packed,
++        w2_zeros_packed,
++        w1_s,
++        w2_s,
++    )
++
++
++INT4_MOE_CONFIGS = [
++    # (N, K, E, topk, group_size)
++    (256, 512, 8, 2, 128),
++    (512, 256, 8, 2, 128),
++    (512, 512, 8, 4, 128),
++    (768, 2048, 8, 2, 128),
++]
++
++
++@pytest.mark.parametrize("M", [1, 2, 64, 121])
++@pytest.mark.parametrize("N,K,E,topk,group_size", INT4_MOE_CONFIGS)
++@pytest.mark.parametrize("quant_algo", [ops.CPUQuantAlgo.GPTQ, ops.CPUQuantAlgo.AWQ])
++@pytest.mark.parametrize("seed", [0])
++def test_int4_w4a16_cpu_fused_moe(M, N, K, E, topk, group_size, quant_algo, seed):
++    """Test fused_experts_cpu INT4 W4A16 for both GPTQ and AWQ quant formats."""
++    set_random_seed(seed)
++
++    a = torch.randn(M, K, dtype=torch.bfloat16) / (0.5 * K**0.5)
++    (
++        w1_int4,
++        w2_int4,
++        w1_packed,
++        w2_packed,
++        w1_zeros,
++        w2_zeros,
++        w1_zeros_packed,
++        w2_zeros_packed,
++        w1_s,
++        w2_s,
++    ) = _make_int4_moe_weights(E, N, K, group_size, quant_algo)
++
++    score = torch.randn(M, E, dtype=torch.bfloat16)
++    score = torch.softmax(score, dim=-1, dtype=torch.float32)
++    topk_weight, topk_ids = torch.topk(score, topk)
++    topk_ids = topk_ids.to(torch.int32)
++
++    ref_out = _ref_int4_moe(
++        a,
++        w1_int4,
++        w2_int4,
++        w1_zeros,
++        w2_zeros,
++        w1_s,
++        w2_s,
++        topk_weight,
++        topk_ids,
++        group_size,
++    )
++
++    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
++        prepare_int4_moe_layer_for_cpu,
++    )
++
++    (blocked_w1, blocked_w2, blocked_s1, blocked_s2, blocked_z1, blocked_z2) = (
++        prepare_int4_moe_layer_for_cpu(
++            w1_packed,
++            w2_packed,
++            w1_s,
++            w2_s,
++            quant_algo=quant_algo,
++            w13_zeros=w1_zeros_packed,
++            w2_zeros=w2_zeros_packed,
++        )
++    )
++
++    out = ops.fused_experts_cpu(
++        a.clone(),
++        blocked_w1,
++        blocked_w2,
++        topk_weight,
++        topk_ids,
++        False,  # inplace
++        ops.CPUQuantMethod.INT4_W4A8,
++        blocked_s1,
++        blocked_s2,
++        blocked_z1,
++        blocked_z2,
++        None,  # block_size
++        None,  # w1_bias
++        None,  # w2_bias
++        None,  # alpha
++        None,  # limit
++        True,  # is_vnni
++    )
++    torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
++
++
+ if __name__ == "__main__":
+     sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/quantization/test_cpu_wna16.py b/tests/quantization/test_cpu_wna16.py
+index 5414d7571a53..db8783c9211d 100644
+--- a/tests/quantization/test_cpu_wna16.py
++++ b/tests/quantization/test_cpu_wna16.py
+@@ -16,6 +16,9 @@
+     "Qwen/Qwen3-0.6B-FP8",  # FP8 W8A16 block-quantized linear
+     "Qwen/Qwen3-30B-A3B-FP8",  # FP8 W8A16 block-quantized MoE
+     "openai/gpt-oss-20b",  # MXFP4 W4A16
++    "QuixiAI/Qwen3-30B-A3B-AWQ",  # AWQ W4A16 MoE
++    "Qwen/Qwen3-30B-A3B-GPTQ-Int4",  # GPTQ W4A16 MoE
++    "RedHatAI/Qwen3-30B-A3B-quantized.w4a16",  # compressed-tensors W4A16 MoE
+ ]
+ DTYPE = ["bfloat16"]
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+index 84740fc05703..11ed775f28e5 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+@@ -5,7 +5,12 @@
+ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+-from vllm._custom_ops import CPUQuantMethod, fused_experts_cpu
++from vllm._custom_ops import (
++    CPUQuantAlgo,
++    CPUQuantMethod,
++    convert_weight_packed_scale_zp,
++    fused_experts_cpu,
++)
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -17,6 +22,7 @@
+     QuantKey,
+     kFp8Dynamic128Sym,
+     kFp8Static128BlockSym,
++    kInt4Static,
+     kMxfp4Static,
+ )
+ from vllm.platforms import current_platform
+@@ -318,3 +324,209 @@ def apply(
+             limit,
+             True,  # is_vnni
+         )
++
++
++def prepare_int4_moe_layer_for_cpu(
++    w13_packed: torch.Tensor,
++    w2_packed: torch.Tensor,
++    w13_scale: torch.Tensor,
++    w2_scale: torch.Tensor,
++    quant_algo: CPUQuantAlgo = CPUQuantAlgo.GPTQ,
++    w13_zeros: torch.Tensor | None = None,
++    w2_zeros: torch.Tensor | None = None,
++) -> tuple[
++    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
++]:
++    """Repack INT4 MoE weights via convert_weight_packed_scale_zp for CPU.
++
++    Args:
++        w13_packed: [E, K//8, 2*I] int32 (packed int4)
++        w2_packed: [E, I//8, K] int32 (packed int4)
++        w13_scale: [E, num_groups, 2*I] float16/bf16
++        w2_scale: [E, num_groups, K] float16/bf16
++        quant_algo: CPUQuantAlgo.GPTQ or CPUQuantAlgo.AWQ
++        w13_zeros: optional [E, num_groups, N//8] int32 packed zeros.
++                   If None, synthetic zeros are created for symmetric quant.
++        w2_zeros: optional [E, num_groups, N//8] int32 packed zeros.
++                  If None, synthetic zeros are created for symmetric quant.
++
++    Returns:
++        (blocked_w13, blocked_w2, blocked_s13, blocked_s2,
++         blocked_z13, blocked_z2)
++    """
++    E = w13_packed.size(0)
++
++    # No qzeros are available in compressed-tensors symmetric checkpoints.
++    # The GPTQ unpack kernel (unpack_4bit_to_32bit_signed) adds +1 to stored zeros,
++    # so we store 7 per nibble: 0x77777777 → +1 → 8.
++    if w13_zeros is None:
++        num_groups_w13 = w13_scale.size(1)
++        N_w13 = w13_scale.size(2)  # 2*I
++        _zp = 0x77777777
++        w13_zeros = torch.full(
++            (E, num_groups_w13, N_w13 // 8),
++            _zp,
++            dtype=torch.int32,
++        )
++
++    if w2_zeros is None:
++        num_groups_w2 = w2_scale.size(1)
++        N_w2 = w2_scale.size(2)  # K
++        _zp = 0x77777777
++        w2_zeros = torch.full(
++            (E, num_groups_w2, N_w2 // 8),
++            _zp,
++            dtype=torch.int32,
++        )
++
++    blocked_w13, blocked_z13, blocked_s13 = convert_weight_packed_scale_zp(
++        w13_packed, w13_zeros, w13_scale, quant_algo
++    )
++    blocked_w2, blocked_z2, blocked_s2 = convert_weight_packed_scale_zp(
++        w2_packed, w2_zeros, w2_scale, quant_algo
++    )
++    return (blocked_w13, blocked_w2, blocked_s13, blocked_s2, blocked_z13, blocked_z2)
++
++
++class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
++    """CPU INT4 W4A16 group-quantized monolithic MoE experts.
++
++    Weights are int4 (packed), activations are bf16/fp16.
++    Internally uses int8 compute via fused_experts_cpu with INT4_W4A8.
++    """
++
++    def __init__(
++        self,
++        moe_config: FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++        max_num_tokens: int | None = None,
++        num_dispatchers: int | None = None,
++    ):
++        super().__init__(
++            moe_config,
++            quant_config,
++        )
++
++    @property
++    def expects_unquantized_inputs(self) -> bool:
++        return True
++
++    @staticmethod
++    def activation_format() -> mk.FusedMoEActivationFormat:
++        return mk.FusedMoEActivationFormat.Standard
++
++    @staticmethod
++    def _supports_current_device() -> bool:
++        return current_platform.is_cpu()
++
++    @staticmethod
++    def _supports_no_act_and_mul() -> bool:
++        return False
++
++    @staticmethod
++    def _supports_activation(activation: MoEActivation) -> bool:
++        return activation == MoEActivation.SILU
++
++    @staticmethod
++    def _supports_parallel_config(
++        moe_parallel_config: FusedMoEParallelConfig,
++    ) -> bool:
++        return True
++
++    @staticmethod
++    def _supports_quant_scheme(
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        SUPPORTED_W_A = [
++            (kInt4Static, None),
++        ]
++        return (weight_key, activation_key) in SUPPORTED_W_A
++
++    @staticmethod
++    def _supports_routing_method(
++        routing_method: RoutingMethodType,
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        return routing_method in [
++            RoutingMethodType.Default,
++            RoutingMethodType.Renormalize,
++            RoutingMethodType.RenormalizeNaive,
++        ]
++
++    @staticmethod
++    def _supports_router_logits_dtype(
++        router_logits_dtype: torch.dtype | None,
++        routing_method: RoutingMethodType,
++    ) -> bool:
++        return True
++
++    def supports_expert_map(self) -> bool:
++        return False
++
++    def apply(
++        self,
++        hidden_states: torch.Tensor,
++        w1: torch.Tensor,
++        w2: torch.Tensor,
++        router_logits: torch.Tensor,
++        activation: MoEActivation,
++        global_num_experts: int,
++        expert_map: torch.Tensor | None,
++        a1q_scale: torch.Tensor | None,
++        apply_router_weight_on_input: bool,
++        # grouped topk + fused topk bias parameters
++        num_expert_group: int | None = None,
++        e_score_correction_bias: torch.Tensor | None = None,
++        routed_scaling_factor: float | None = None,
++        topk_group: int | None = None,
++    ) -> torch.Tensor:
++        if apply_router_weight_on_input:
++            raise NotImplementedError(
++                "CPUExpertsInt4 (W4A16) does not support "
++                "apply_router_weight_on_input=True. "
++            )
++
++        from vllm.model_executor.layers.fused_moe.cpu_fused_moe import (
++            select_experts,
++        )
++
++        topk_weights, topk_ids = select_experts(
++            hidden_states=hidden_states,
++            router_logits=router_logits,
++            use_grouped_topk=num_expert_group is not None,
++            top_k=self.moe_config.experts_per_token,
++            renormalize=self.moe_config.routing_method
++            in (
++                RoutingMethodType.Renormalize,
++                RoutingMethodType.RenormalizeNaive,
++            ),
++            topk_group=topk_group,
++            num_expert_group=num_expert_group,
++            scoring_func="softmax",
++            routed_scaling_factor=(
++                routed_scaling_factor if routed_scaling_factor is not None else 1.0
++            ),
++            e_score_correction_bias=e_score_correction_bias,
++        )
++
++        return fused_experts_cpu(
++            hidden_states,
++            w1,
++            w2,
++            topk_weights,
++            topk_ids,
++            False,  # inplace
++            CPUQuantMethod.INT4_W4A8,
++            self.w1_scale,
++            self.w2_scale,
++            self.w1_zp,
++            self.w2_zp,
++            None,  # block_size
++            None,  # w1_bias
++            None,  # w2_bias
++            None,  # alpha
++            None,  # limit
++            True,  # is_vnni
++        )
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+index 6ad60d62e97d..8de6269e2e9e 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+@@ -45,6 +45,7 @@
+ class WNA16MoEBackend(Enum):
+     MARLIN = "MARLIN"
+     BATCHED_MARLIN = "BATCHED_MARLIN"
++    CPU = "CPU"
+     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
+     XPU = "XPU"
+ 
+@@ -65,6 +66,12 @@ def backend_to_kernel_cls(
+         )
+ 
+         return [XPUExpertsWNA16]
++    elif backend == WNA16MoEBackend.CPU:
++        from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
++            CPUExpertsInt4,
++        )
++
++        return [CPUExpertsInt4]
+     else:
+         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
+ 
+@@ -73,6 +80,8 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
+     """
+     Get available backends in priority order based on platform and config.
+     """
++    if current_platform.is_cpu():
++        return [WNA16MoEBackend.CPU]
+     if current_platform.is_xpu():
+         return [WNA16MoEBackend.XPU]
+ 
+@@ -210,17 +219,21 @@ def make_wna16_moe_kernel(
+     from vllm.model_executor.layers.fused_moe.all2all_utils import (
+         maybe_make_prepare_finalize,
+     )
++    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
++        CPUExpertsInt4,
++    )
+     from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
+         XPUExpertsWNA16,
+     )
+ 
+-    # Currently, we only support TrtLlmMxint4ExpertsMonolithic, MarlinExperts
+-    # and BatchedMarlinExperts
++    # Currently, we only support TrtLlmMxint4ExpertsMonolithic, MarlinExperts,
++    # BatchedMarlinExperts, XPUExpertsWNA16, and CPUExpertsInt4
+     assert experts_cls in (
+         MarlinExperts,
+         BatchedMarlinExperts,
+         TrtLlmMxint4ExpertsMonolithic,
+         XPUExpertsWNA16,
++        CPUExpertsInt4,
+     )
+ 
+     is_monolithic = experts_cls.is_monolithic()
+@@ -683,6 +696,117 @@ def _process_awq_weights_marlin(
+     )
+ 
+ 
++def _process_weights_cpu(
++    quant_config: QuantizationConfig | QuantizationArgs | None,
++    w13: torch.Tensor,
++    w2: torch.Tensor,
++    w13_scale: torch.Tensor,
++    w2_scale: torch.Tensor,
++    w13_g_idx: torch.Tensor | None = None,
++    w2_g_idx: torch.Tensor | None = None,
++    w13_qzeros: torch.Tensor | None = None,
++    w2_qzeros: torch.Tensor | None = None,
++    w13_bias: torch.Tensor | None = None,
++    w2_bias: torch.Tensor | None = None,
++) -> tuple[
++    torch.Tensor,  # w13_qweight
++    torch.Tensor,  # w2_qweight
++    torch.Tensor,  # w13_scales
++    torch.Tensor,  # w2_scales
++    torch.Tensor | None,  # w13_g_idx
++    torch.Tensor | None,  # w2_g_idx
++    torch.Tensor | None,  # w13_g_idx_sort_indices
++    torch.Tensor | None,  # w2_g_idx_sort_indices
++    torch.Tensor | None,  # w13_qzeros
++    torch.Tensor | None,  # w2_qzeros
++    torch.Tensor | None,  # w13_input_global_scale
++    torch.Tensor | None,  # w2_input_global_scale
++    torch.Tensor | None,  # w13_bias
++    torch.Tensor | None,  # w2_bias
++]:
++    """CPU INT4 W4A16 weight post-processing."""
++    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
++        prepare_int4_moe_layer_for_cpu,
++    )
++    from vllm.model_executor.layers.quantization.auto_gptq import (
++        AutoGPTQConfig,
++    )
++    from vllm.model_executor.layers.quantization.awq_marlin import (
++        AWQMarlinConfig,
++    )
++
++    # Detect packing format.
++    # AWQ: qweight is [E, K, 2*N//8] (packed along output/N dim).
++    # GPTQ: qweight is [E, K//8, 2*N] (packed along input/K dim).
++    # compressed-tensors: qweight is [E, K//8, 2*N] (packed along input/K dim).
++    if isinstance(quant_config, AWQMarlinConfig):
++        # AWQ: K is stored unpacked in dim 1.
++        cpu_quant_algo = ops.CPUQuantAlgo.AWQ
++    elif isinstance(quant_config, (AutoGPTQConfig, QuantizationArgs)):
++        # GPTQ / compressed-tensors: K//8 is stored packed in dim 1.
++        if isinstance(quant_config, AutoGPTQConfig) and quant_config.desc_act:
++            raise NotImplementedError(
++                "CPU WNA16 MoE backend does not support GPTQ with "
++                "desc_act=True. The fused MoE kernel has no g_idx "
++                "reordering support."
++            )
++        cpu_quant_algo = ops.CPUQuantAlgo.GPTQ
++    else:
++        raise TypeError(
++            "CPU WNA16 MoE backend requires AWQMarlinConfig, AutoGPTQConfig "
++            f"or QuantizationArgs, got {type(quant_config).__name__}."
++        )
++
++    # Determine zero points for repacking.
++    w13_zeros: torch.Tensor | None = None
++    w2_zeros: torch.Tensor | None = None
++    if w13_qzeros is not None:
++        w13_zeros = (
++            w13_qzeros.data.view(torch.int32)
++            if w13_qzeros.dtype != torch.int32
++            else w13_qzeros.data
++        )
++    if w2_qzeros is not None:
++        w2_zeros = (
++            w2_qzeros.data.view(torch.int32)
++            if w2_qzeros.dtype != torch.int32
++            else w2_qzeros.data
++        )
++
++    (
++        blocked_w13,
++        blocked_w2,
++        blocked_s13,
++        blocked_s2,
++        blocked_z13,
++        blocked_z2,
++    ) = prepare_int4_moe_layer_for_cpu(
++        w13,
++        w2,
++        w13_scale,
++        w2_scale,
++        quant_algo=cpu_quant_algo,
++        w13_zeros=w13_zeros,
++        w2_zeros=w2_zeros,
++    )
++    return (
++        blocked_w13,
++        blocked_w2,
++        blocked_s13,
++        blocked_s2,
++        w13_g_idx,
++        w2_g_idx,
++        None,  # w13_g_idx_sort_indices (unused on CPU)
++        None,  # w2_g_idx_sort_indices (unused on CPU)
++        blocked_z13,
++        blocked_z2,
++        None,  # w13_input_global_scale
++        None,  # w2_input_global_scale
++        w13_bias.to(torch.float32) if w13_bias is not None else None,
++        w2_bias.to(torch.float32) if w2_bias is not None else None,
++    )
++
++
+ def _process_weights_xpu(
+     layer: torch.nn.Module,
+     quant_config: QuantizationConfig,
+@@ -857,6 +981,20 @@ def convert_to_wna16_moe_kernel_format(
+             w13_bias,
+             w2_bias,
+         )
++    elif backend == WNA16MoEBackend.CPU:
++        return _process_weights_cpu(
++            quant_config,
++            w13,
++            w2,
++            w13_scale,
++            w2_scale,
++            w13_g_idx,
++            w2_g_idx,
++            w13_qzeros,
++            w2_qzeros,
++            w13_bias,
++            w2_bias,
++        )
+     elif backend == WNA16MoEBackend.FLASHINFER_TRTLLM:
+         return _process_weights_flashinfer(
+             w13,
+diff --git a/vllm/model_executor/layers/quantization/auto_gptq.py b/vllm/model_executor/layers/quantization/auto_gptq.py
+index 1821fd5c7f71..459a61583271 100644
+--- a/vllm/model_executor/layers/quantization/auto_gptq.py
++++ b/vllm/model_executor/layers/quantization/auto_gptq.py
+@@ -16,6 +16,7 @@
+ )
+ from vllm.model_executor.layers.fused_moe import (
+     FusedMoEConfig,
++    FusedMoEExpertsModular,
+     FusedMoEMethodBase,
+     FusedMoEQuantConfig,
+     FusedMoeWeightScaleSupported,
+@@ -640,8 +641,11 @@ def create_weights(
+         layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+         set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+ 
+-        device = layer.w13_qweight.device
+-        layer.workspace = marlin_make_workspace_new(device, 4)
++        if self.experts_cls is not None and issubclass(
++            self.experts_cls, FusedMoEExpertsModular
++        ):
++            device = layer.w13_qweight.device
++            layer.workspace = marlin_make_workspace_new(device, 4)
+ 
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
+@@ -660,8 +664,8 @@ def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+             w2_g_idx,
+             w13_g_idx_sort_indices,
+             w2_g_idx_sort_indices,
+-            _w13_qzeros,
+-            _w2_qzeros,
++            w13_qzeros,
++            w2_qzeros,
+             w13_input_global_scale,
+             w2_input_global_scale,
+             w13_bias,
+@@ -689,6 +693,10 @@ def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         replace_parameter(layer, "w2_g_idx", w2_g_idx)
+         replace_parameter(layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices)
+         replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
++        if w13_qzeros is not None:
++            replace_parameter(layer, "w13_qzeros", w13_qzeros)
++        if w2_qzeros is not None:
++            replace_parameter(layer, "w2_qzeros", w2_qzeros)
+         if w13_input_global_scale is not None:
+             if hasattr(layer, "w13_input_global_scale"):
+                 replace_parameter(
+@@ -735,8 +743,8 @@ def _setup_kernel(self, layer: RoutedExperts) -> None:
+             is_k_full=self.is_k_full,
+             w13_g_idx=layer.w13_g_idx,
+             w2_g_idx=layer.w2_g_idx,
+-            w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
+-            w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
++            w13_g_idx_sort_indices=getattr(layer, "w13_g_idx_sort_indices", None),
++            w2_g_idx_sort_indices=getattr(layer, "w2_g_idx_sort_indices", None),
+             routing_tables=layer._expert_routing_tables(),
+         )
+ 
+@@ -750,12 +758,8 @@ def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfi
+             w2_scale=layer.w2_scales,
+             weight_bits=self.quant_config.weight_bits,
+             group_size=self.quant_config.group_size,
+-            w1_zp=getattr(layer, "w13_qzeros", None)
+-            if not self.quant_config.is_sym
+-            else None,
+-            w2_zp=getattr(layer, "w2_qzeros", None)
+-            if not self.quant_config.is_sym
+-            else None,
++            w1_zp=getattr(layer, "w13_qzeros", None),
++            w2_zp=getattr(layer, "w2_qzeros", None),
+             w1_bias=getattr(layer, "w13_bias", None),
+             w2_bias=getattr(layer, "w2_bias", None),
+         )
+@@ -794,3 +798,27 @@ def apply(
+             shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
++
++    def apply_monolithic(
++        self,
++        layer: RoutedExperts,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++        input_ids: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        assert self.is_monolithic
++        assert self.moe_kernel is not None
++        return self.moe_kernel.apply_monolithic(
++            hidden_states=x,
++            w1=layer.w13_qweight,
++            w2=layer.w2_qweight,
++            router_logits=router_logits,
++            activation=layer.activation,
++            global_num_experts=layer.global_num_experts,
++            expert_map=layer.expert_map,
++            apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            num_expert_group=layer.num_expert_group,
++            topk_group=layer.topk_group,
++            e_score_correction_bias=layer.e_score_correction_bias,
++            routed_scaling_factor=layer.routed_scaling_factor,
++        )
+diff --git a/vllm/model_executor/layers/quantization/awq_marlin.py b/vllm/model_executor/layers/quantization/awq_marlin.py
+index c3a5bd502465..846df44a28bd 100644
+--- a/vllm/model_executor/layers/quantization/awq_marlin.py
++++ b/vllm/model_executor/layers/quantization/awq_marlin.py
+@@ -700,8 +700,8 @@ def _setup_kernel(self, layer: RoutedExperts) -> None:
+             is_k_full=self.is_k_full,
+             w13_g_idx=getattr(layer, "w13_g_idx", None),
+             w2_g_idx=getattr(layer, "w2_g_idx", None),
+-            w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
+-            w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
++            w13_g_idx_sort_indices=getattr(layer, "w13_g_idx_sort_indices", None),
++            w2_g_idx_sort_indices=getattr(layer, "w2_g_idx_sort_indices", None),
+             routing_tables=layer._expert_routing_tables(),
+         )
+ 
+@@ -757,3 +757,27 @@ def apply(
+             shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
++
++    def apply_monolithic(
++        self,
++        layer: RoutedExperts,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++        input_ids: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        assert self.is_monolithic
++        assert self.moe_kernel is not None
++        return self.moe_kernel.apply_monolithic(
++            hidden_states=x,
++            w1=layer.w13_qweight,
++            w2=layer.w2_qweight,
++            router_logits=router_logits,
++            activation=layer.activation,
++            global_num_experts=layer.global_num_experts,
++            expert_map=layer.expert_map,
++            apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            num_expert_group=layer.num_expert_group,
++            topk_group=layer.topk_group,
++            e_score_correction_bias=layer.e_score_correction_bias,
++            routed_scaling_factor=layer.routed_scaling_factor,
++        )
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
+index 2a98d444afd5..a69d2a594ad6 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
+@@ -10,6 +10,7 @@
+ 
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
++    FusedMoEExpertsModular,
+     RoutedExperts,
+     SharedExperts,
+ )
+@@ -414,8 +415,9 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         replace_parameter(layer, "w13_weight_scale", w13_scales)
+         replace_parameter(layer, "w2_weight_scale", w2_scales)
+ 
+-        if not self.symmetric:
++        if w13_qzeros is not None:
+             replace_parameter(layer, "w13_weight_zero_point", w13_qzeros)
++        if w2_qzeros is not None:
+             replace_parameter(layer, "w2_weight_zero_point", w2_qzeros)
+ 
+         # Marlin-specific parameters (not needed for Flashinfer)
+@@ -437,9 +439,12 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+                     torch.nn.Parameter(w2_input_global_scale, requires_grad=False),
+                 )
+ 
+-            layer.workspace = marlin_make_workspace_new(
+-                layer.w13_weight_g_idx.device, 4
+-            )
++            if self.experts_cls is not None and issubclass(
++                self.experts_cls, FusedMoEExpertsModular
++            ):
++                layer.workspace = marlin_make_workspace_new(
++                    layer.w13_weight_g_idx.device, 4
++                )
+ 
+         # Alias packed weights to w13_weight/w2_weight for the modular kernel interface
+         layer.w13_weight = layer.w13_weight_packed

@@ -1,0 +1,471 @@
+diff --git a/csrc/libtorch_stable/dispatch_utils.h b/csrc/libtorch_stable/dispatch_utils.h
+index cd67ac751c4f..aa125a08fd6c 100644
+--- a/csrc/libtorch_stable/dispatch_utils.h
++++ b/csrc/libtorch_stable/dispatch_utils.h
+@@ -21,6 +21,21 @@
+ #define VLLM_STABLE_DISPATCH_FP8_CASE(enum_type, ...) \
+   THO_PRIVATE_CASE_TYPE_USING_HINT(enum_type, fp8_t, __VA_ARGS__)
+ 
++// Same idea, for dispatching on an int32/int64 index tensor (e.g. topk_ids)
++// nested inside a value-type dispatch. Named 'idx_t' instead of 'scalar_t'.
++#define VLLM_STABLE_DISPATCH_IDX_CASE(enum_type, ...) \
++  THO_PRIVATE_CASE_TYPE_USING_HINT(enum_type, idx_t, __VA_ARGS__)
++
++#define VLLM_STABLE_DISPATCH_CASE_IDX_TYPES(...)                     \
++  VLLM_STABLE_DISPATCH_IDX_CASE(torch::headeronly::ScalarType::Int,  \
++                                __VA_ARGS__)                         \
++  VLLM_STABLE_DISPATCH_IDX_CASE(torch::headeronly::ScalarType::Long, \
++                                __VA_ARGS__)
++
++#define VLLM_STABLE_DISPATCH_IDX_TYPES(TYPE, NAME, ...) \
++  THO_DISPATCH_SWITCH(TYPE, NAME,                       \
++                      VLLM_STABLE_DISPATCH_CASE_IDX_TYPES(__VA_ARGS__))
++
+ #define VLLM_STABLE_DISPATCH_CASE_FLOATING_TYPES(...)                  \
+   THO_DISPATCH_CASE(torch::headeronly::ScalarType::Float, __VA_ARGS__) \
+   THO_DISPATCH_CASE(torch::headeronly::ScalarType::Half, __VA_ARGS__)  \
+diff --git a/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu b/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu
+index 152bc116edb6..86ee5397fbc3 100644
+--- a/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu
++++ b/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu
+@@ -360,12 +360,24 @@ __global__ void count_and_sort_expert_tokens_kernel(
+ template <typename scalar_t>
+ constexpr int MOE_SUM_VEC = 16 / sizeof(scalar_t);
+ 
+-template <typename scalar_t, int TOPK>
++template <typename idx_t>
++__device__ __forceinline__ bool moe_sum_pad_aware_skip(
++    const idx_t* __restrict__ topk_ids, const int32_t* __restrict__ expert_map,
++    int64_t idx) {
++  int64_t expert_id = static_cast<int64_t>(topk_ids[idx]);
++  if (expert_id < 0) return true;
++  if (expert_map != nullptr && expert_map[expert_id] < 0) return true;
++  return false;
++}
++
++template <typename scalar_t, typename idx_t, int TOPK, bool PAD_AWARE>
+ __global__ void moe_sum_vec_kernel(
+     scalar_t* __restrict__ out,          // [num_tokens, d], contiguous
+     const scalar_t* __restrict__ input,  // [num_tokens, topk, d], d contiguous
+     const int64_t num_tokens, const int d, const int64_t stride_token,
+-    const int64_t stride_topk) {
++    const int64_t stride_topk, const idx_t* __restrict__ topk_ids,
++    const int32_t* __restrict__ expert_map, const int64_t stride_tk_token,
++    const int64_t stride_tk_k) {
+   using vec_t = vllm::vec_n_t<scalar_t, MOE_SUM_VEC<scalar_t>>;  // 16-byte pack
+   constexpr int VEC = MOE_SUM_VEC<scalar_t>;
+   const int64_t n_vec = d / VEC;
+@@ -375,6 +387,10 @@ __global__ void moe_sum_vec_kernel(
+     const int64_t token = i / n_vec;
+     const int64_t v = i % n_vec;
+     const scalar_t* in_tok = input + token * stride_token + v * VEC;
++    const idx_t* tk_tok = nullptr;
++    if constexpr (PAD_AWARE) {
++      tk_tok = topk_ids + token * stride_tk_token;
++    }
+ 
+     float acc[VEC];
+ #pragma unroll
+@@ -382,6 +398,11 @@ __global__ void moe_sum_vec_kernel(
+ 
+ #pragma unroll
+     for (int k = 0; k < TOPK; ++k) {
++      if constexpr (PAD_AWARE) {
++        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k)) {
++          continue;
++        }
++      }
+       vec_t packed = *reinterpret_cast<const vec_t*>(in_tok + k * stride_topk);
+ #pragma unroll
+       for (int j = 0; j < VEC; ++j) acc[j] += static_cast<float>(packed.val[j]);
+@@ -394,13 +415,16 @@ __global__ void moe_sum_vec_kernel(
+   }
+ }
+ 
+-// Runtime-topk variant of the above.
+-template <typename scalar_t>
++// Runtime-topk variant of the above, for topk values outside the templated
++// set.
++template <typename scalar_t, typename idx_t, bool PAD_AWARE>
+ __global__ void moe_sum_vec_dynamic_kernel(
+     scalar_t* __restrict__ out,          // [num_tokens, d], contiguous
+     const scalar_t* __restrict__ input,  // [num_tokens, topk, d], d contiguous
+     const int64_t num_tokens, const int d, const int topk,
+-    const int64_t stride_token, const int64_t stride_topk) {
++    const int64_t stride_token, const int64_t stride_topk,
++    const idx_t* __restrict__ topk_ids, const int32_t* __restrict__ expert_map,
++    const int64_t stride_tk_token, const int64_t stride_tk_k) {
+   using vec_t = vllm::vec_n_t<scalar_t, MOE_SUM_VEC<scalar_t>>;
+   constexpr int VEC = MOE_SUM_VEC<scalar_t>;
+   const int64_t n_vec = d / VEC;
+@@ -410,12 +434,21 @@ __global__ void moe_sum_vec_dynamic_kernel(
+     const int64_t token = i / n_vec;
+     const int64_t v = i % n_vec;
+     const scalar_t* in_tok = input + token * stride_token + v * VEC;
++    const idx_t* tk_tok = nullptr;
++    if constexpr (PAD_AWARE) {
++      tk_tok = topk_ids + token * stride_tk_token;
++    }
+ 
+     float acc[VEC];
+ #pragma unroll
+     for (int j = 0; j < VEC; ++j) acc[j] = 0.f;
+ 
+     for (int k = 0; k < topk; ++k) {
++      if constexpr (PAD_AWARE) {
++        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k)) {
++          continue;
++        }
++      }
+       vec_t packed = *reinterpret_cast<const vec_t*>(in_tok + k * stride_topk);
+ #pragma unroll
+       for (int j = 0; j < VEC; ++j) acc[j] += static_cast<float>(packed.val[j]);
+@@ -430,17 +463,28 @@ __global__ void moe_sum_vec_dynamic_kernel(
+ 
+ // Stride-aware scalar fallback: handles unaligned/non-vectorizable hidden dims
+ // (including a non-contiguous hidden stride) via per-element strided reads.
+-template <typename scalar_t>
++template <typename scalar_t, typename idx_t, bool PAD_AWARE>
+ __global__ void moe_sum_scalar_kernel(
+     scalar_t* __restrict__ out,          // [num_tokens, d], contiguous
+     const scalar_t* __restrict__ input,  // [num_tokens, topk, d]
+     const int d, const int topk, const int64_t stride_token,
+-    const int64_t stride_topk, const int64_t stride_hidden) {
++    const int64_t stride_topk, const int64_t stride_hidden,
++    const idx_t* __restrict__ topk_ids, const int32_t* __restrict__ expert_map,
++    const int64_t stride_tk_token, const int64_t stride_tk_k) {
+   const int64_t token_idx = blockIdx.x;
+   const scalar_t* in_tok = input + token_idx * stride_token;
++  const idx_t* tk_tok = nullptr;
++  if constexpr (PAD_AWARE) {
++    tk_tok = topk_ids + token_idx * stride_tk_token;
++  }
+   for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+     float x = 0.f;
+     for (int k = 0; k < topk; ++k) {
++      if constexpr (PAD_AWARE) {
++        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k)) {
++          continue;
++        }
++      }
+       x += static_cast<float>(
+           VLLM_LDG(&in_tok[k * stride_topk + idx * stride_hidden]));
+     }
+@@ -711,8 +755,9 @@ void batched_moe_align_block_size(int64_t max_tokens_per_batch,
+ }
+ 
+ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
+-             torch::stable::Tensor& output)  // [num_tokens, hidden_size]
+-{
++             torch::stable::Tensor& output,  // [num_tokens, hidden_size]
++             std::optional<torch::stable::Tensor> topk_ids,
++             std::optional<torch::stable::Tensor> expert_map) {
+   // Output is dense and written in place, so it must be contiguous. The input
+   // is read by its strides (no copy); only the hidden dim needs to be
+   // contiguous to take the vectorized path.
+@@ -731,10 +776,102 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
+   const cudaStream_t stream =
+       get_current_cuda_stream(output.get_device_index());
+ 
+-#define LAUNCH_MOE_SUM_VEC(TOPK)                \
+-  vllm::moe::moe_sum_vec_kernel<scalar_t, TOPK> \
+-      <<<grid, dim3(block), 0, stream>>>(       \
+-          out_ptr, in_ptr, num_tokens, hidden_size, stride_token, stride_topk)
++  if (topk_ids.has_value()) {
++    // Pad-aware reduce path
++    const torch::stable::Tensor& tk = topk_ids.value();
++    STD_TORCH_CHECK(tk.size(0) == num_tokens && tk.size(1) == topk,
++                    "moe_sum: topk_ids must have shape [num_tokens, topk]");
++    const int64_t stride_tk_token = tk.stride(0);
++    const int64_t stride_tk_k = tk.stride(1);
++
++    const int32_t* expert_map_ptr = nullptr;
++    if (expert_map.has_value()) {
++      STD_TORCH_CHECK(
++          expert_map->scalar_type() == torch::headeronly::ScalarType::Int,
++          "moe_sum: expert_map must be int32");
++      expert_map_ptr =
++          reinterpret_cast<const int32_t*>(expert_map->const_data_ptr());
++    }
++
++#define LAUNCH_MOE_SUM_PAD_AWARE_VEC(TOPK)                                     \
++  vllm::moe::moe_sum_vec_kernel<scalar_t, idx_t, TOPK, true>                   \
++      <<<grid, dim3(block), 0, stream>>>(                                      \
++          out_ptr, in_ptr, num_tokens, hidden_size, stride_token, stride_topk, \
++          topk_ids_ptr, expert_map_ptr, stride_tk_token, stride_tk_k)
++
++    VLLM_STABLE_DISPATCH_FLOATING_TYPES(
++        input.scalar_type(), "moe_sum_pad_aware", [&] {
++          constexpr int VEC = vllm::moe::MOE_SUM_VEC<scalar_t>;
++          constexpr int WIDTH = VEC * sizeof(scalar_t);
++          auto* out_ptr =
++              reinterpret_cast<scalar_t*>(output.mutable_data_ptr());
++          auto* in_ptr =
++              reinterpret_cast<const scalar_t*>(input.const_data_ptr());
++
++          const bool can_vec =
++              (stride_hidden == 1) && (hidden_size % VEC == 0) &&
++              (stride_token % VEC == 0) && (stride_topk % VEC == 0) &&
++              (reinterpret_cast<uintptr_t>(in_ptr) % WIDTH == 0) &&
++              (reinterpret_cast<uintptr_t>(out_ptr) % WIDTH == 0);
++
++          VLLM_STABLE_DISPATCH_IDX_TYPES(
++              tk.scalar_type(), "moe_sum_pad_aware_idx", [&] {
++                auto* topk_ids_ptr =
++                    reinterpret_cast<const idx_t*>(tk.const_data_ptr());
++                if (can_vec) {
++                  const int64_t n_vec = hidden_size / VEC;
++                  const int64_t total = num_tokens * n_vec;
++                  const int block = 256;
++                  const dim3 grid(
++                      std::min<int64_t>((total + block - 1) / block, 65535));
++                  switch (topk) {
++                    case 1:
++                      LAUNCH_MOE_SUM_PAD_AWARE_VEC(1);
++                      break;
++                    case 2:
++                      LAUNCH_MOE_SUM_PAD_AWARE_VEC(2);
++                      break;
++                    case 4:
++                      LAUNCH_MOE_SUM_PAD_AWARE_VEC(4);
++                      break;
++                    case 6:
++                      LAUNCH_MOE_SUM_PAD_AWARE_VEC(6);
++                      break;
++                    case 8:
++                      LAUNCH_MOE_SUM_PAD_AWARE_VEC(8);
++                      break;
++                    case 9:
++                      LAUNCH_MOE_SUM_PAD_AWARE_VEC(9);
++                      break;
++                    default:
++                      vllm::moe::moe_sum_vec_dynamic_kernel<scalar_t, idx_t,
++                                                            true>
++                          <<<grid, dim3(block), 0, stream>>>(
++                              out_ptr, in_ptr, num_tokens, hidden_size, topk,
++                              stride_token, stride_topk, topk_ids_ptr,
++                              expert_map_ptr, stride_tk_token, stride_tk_k);
++                      break;
++                  }
++                } else {
++                  dim3 grid(num_tokens);
++                  dim3 block(std::min(hidden_size, 1024));
++                  vllm::moe::moe_sum_scalar_kernel<scalar_t, idx_t, true>
++                      <<<grid, block, 0, stream>>>(
++                          out_ptr, in_ptr, hidden_size, topk, stride_token,
++                          stride_topk, stride_hidden, topk_ids_ptr,
++                          expert_map_ptr, stride_tk_token, stride_tk_k);
++                }
++              });
++        });
++#undef LAUNCH_MOE_SUM_PAD_AWARE_VEC
++    return;
++  }
++
++#define LAUNCH_MOE_SUM_VEC(TOPK)                                      \
++  vllm::moe::moe_sum_vec_kernel<scalar_t, int32_t, TOPK, false>       \
++      <<<grid, dim3(block), 0, stream>>>(out_ptr, in_ptr, num_tokens, \
++                                         hidden_size, stride_token,   \
++                                         stride_topk, nullptr, nullptr, 0, 0)
+ 
+   VLLM_STABLE_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum", [&] {
+     constexpr int VEC = vllm::moe::MOE_SUM_VEC<scalar_t>;
+@@ -774,18 +911,19 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
+           LAUNCH_MOE_SUM_VEC(9);
+           break;
+         default:
+-          vllm::moe::moe_sum_vec_dynamic_kernel<scalar_t>
+-              <<<grid, dim3(block), 0, stream>>>(out_ptr, in_ptr, num_tokens,
+-                                                 hidden_size, topk,
+-                                                 stride_token, stride_topk);
++          vllm::moe::moe_sum_vec_dynamic_kernel<scalar_t, int32_t, false>
++              <<<grid, dim3(block), 0, stream>>>(
++                  out_ptr, in_ptr, num_tokens, hidden_size, topk, stride_token,
++                  stride_topk, nullptr, nullptr, 0, 0);
+           break;
+       }
+     } else {
+       dim3 grid(num_tokens);
+       dim3 block(std::min(hidden_size, 1024));
+-      vllm::moe::moe_sum_scalar_kernel<scalar_t><<<grid, block, 0, stream>>>(
+-          out_ptr, in_ptr, hidden_size, topk, stride_token, stride_topk,
+-          stride_hidden);
++      vllm::moe::moe_sum_scalar_kernel<scalar_t, int32_t, false>
++          <<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size, topk,
++                                       stride_token, stride_topk, stride_hidden,
++                                       nullptr, nullptr, 0, 0);
+     }
+   });
+ #undef LAUNCH_MOE_SUM_VEC
+diff --git a/csrc/libtorch_stable/moe/moe_ops.h b/csrc/libtorch_stable/moe/moe_ops.h
+index b60d2d548f57..9ea1dae7cae1 100644
+--- a/csrc/libtorch_stable/moe/moe_ops.h
++++ b/csrc/libtorch_stable/moe/moe_ops.h
+@@ -27,7 +27,9 @@ void topk_softplus_sqrt(
+     const std::optional<torch::stable::Tensor>& input_ids,
+     const std::optional<torch::stable::Tensor>& tid2eid);
+ 
+-void moe_sum(torch::stable::Tensor& input, torch::stable::Tensor& output);
++void moe_sum(torch::stable::Tensor& input, torch::stable::Tensor& output,
++             std::optional<torch::stable::Tensor> topk_ids,
++             std::optional<torch::stable::Tensor> expert_map);
+ 
+ void moe_align_block_size(
+     torch::stable::Tensor topk_ids, int64_t num_experts, int64_t block_size,
+diff --git a/csrc/libtorch_stable/moe/torch_bindings.cpp b/csrc/libtorch_stable/moe/torch_bindings.cpp
+index ba5b9b896f18..a0296adca78b 100644
+--- a/csrc/libtorch_stable/moe/torch_bindings.cpp
++++ b/csrc/libtorch_stable/moe/torch_bindings.cpp
+@@ -23,8 +23,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
+       "bias, Tensor? input_ids, Tensor? tid2eid) -> ()");
+ 
+   // Calculate the result of moe by summing up the partial results
+-  // from all selected experts.
+-  m.def("moe_sum(Tensor input, Tensor! output) -> ()");
++  // from all selected experts. topk_ids/expert_map are optional and, when
++  // both given, enable pad-aware reduce that skips (token, expert)
++  // slots that were never actually computed (unrouted, or routed to an
++  // expert not owned by this rank under expert parallelism).
++  m.def(
++      "moe_sum(Tensor input, Tensor! output, Tensor? topk_ids=None, "
++      "Tensor? expert_map=None) -> ()");
+ 
+   // Aligning the number of tokens to be processed by each expert such
+   // that it is divisible by the block size.
+diff --git a/tests/kernels/moe/test_moe.py b/tests/kernels/moe/test_moe.py
+index 69c50cbb11fa..7fc0e777e60d 100644
+--- a/tests/kernels/moe/test_moe.py
++++ b/tests/kernels/moe/test_moe.py
+@@ -1271,6 +1271,32 @@ def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype, layout: str):
+     opcheck(torch.ops._moe_C.moe_sum, (input, actual))
+ 
+ 
++@pytest.mark.parametrize("topk", [2, 8])
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("topk_ids_dtype", [torch.int32, torch.int64])
++def test_moe_sum_pad_aware(topk: int, dtype: torch.dtype, topk_ids_dtype: torch.dtype):
++    m, k = 17, 128
++    input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
++
++    topk_ids = torch.randint(0, 4, (m, topk), device="cuda", dtype=topk_ids_dtype)
++    # Force some slots unrouted, independent of expert parallelism.
++    topk_ids[0, :] = -1
++    topk_ids[1, 0] = -1
++
++    expert_map = torch.tensor([0, -1, 1, -1], device="cuda", dtype=torch.int32)
++
++    actual = torch.empty((m, k), device="cuda", dtype=dtype)
++    torch.ops._moe_C.moe_sum(input, actual, topk_ids, expert_map)
++
++    routed = expert_map[topk_ids.clamp(min=0).long()] >= 0
++    routed &= topk_ids >= 0
++    expected = (input.float() * routed.unsqueeze(-1)).sum(dim=1).to(dtype)
++
++    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
++
++    opcheck(torch.ops._moe_C.moe_sum, (input, actual, topk_ids, expert_map))
++
++
+ @pytest.mark.usefixtures("default_vllm_config")
+ @pytest.mark.parametrize("m", [1, 33])
+ @pytest.mark.parametrize("n,k", [(128, 128)])
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 0d24c1fb4ecc..9fcc4ae87e8e 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2138,8 +2138,13 @@ def wvSplitKQ(
+ 
+ 
+ # moe
+-def moe_sum(input: torch.Tensor, output: torch.Tensor):
+-    torch.ops._moe_C.moe_sum(input, output)
++def moe_sum(
++    input: torch.Tensor,
++    output: torch.Tensor,
++    topk_ids: torch.Tensor | None = None,
++    expert_map: torch.Tensor | None = None,
++):
++    torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
+ 
+ 
+ def moe_align_block_size(
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 80533410d3a6..20576de5a608 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -176,9 +176,6 @@ def _fused_marlin_moe(
+     if output is None:
+         output = intermediate_cache3
+ 
+-    if expert_map is not None:
+-        output.zero_()
+-
+     a_scales2 = None
+     if input_dtype == torch.int8:
+         intermediate_cache2, a_scales2 = marlin_quant_input(
+@@ -238,7 +235,7 @@ def fused_marlin_moe(
+     global_num_experts: int = -1,
+     activation: MoEActivation = MoEActivation.SILU,
+     activation_func: Callable[..., None] = apply_moe_activation,
+-    moe_sum: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
++    moe_sum: Callable[..., torch.Tensor | None] | None = None,
+     expert_map: torch.Tensor | None = None,
+     input_global_scale1: torch.Tensor | None = None,
+     input_global_scale2: torch.Tensor | None = None,
+@@ -385,9 +382,12 @@ def fused_marlin_moe(
+         output = torch.empty_like(hidden_states)
+ 
+     if moe_sum is None:
++        if expert_map is not None:
++            ops.moe_sum(moe_output, output, topk_ids, expert_map)
++            return output
+         return torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
+     else:
+-        return moe_sum(moe_output, output)
++        return moe_sum(moe_output, output, topk_ids, expert_map)
+ 
+ 
+ def batched_fused_marlin_moe(
+@@ -874,7 +874,12 @@ def activation_with_lora(
+             )
+             lora_state["cache2"] = act_output
+ 
+-        def moe_sum_with_lora(moe_out: torch.Tensor, out: torch.Tensor) -> None:
++        def moe_sum_with_lora(
++            moe_out: torch.Tensor,
++            out: torch.Tensor,
++            topk_ids: torch.Tensor,
++            expert_map: torch.Tensor | None,
++        ) -> None:
+             # moe_out shape: (M, topk, K)
+             self.apply_w2_lora(
+                 ctx,
+@@ -890,7 +895,7 @@ def moe_sum_with_lora(moe_out: torch.Tensor, out: torch.Tensor) -> None:
+                 w2=w2,
+                 top_k_num=top_k_num,
+             )
+-            self.moe_sum(moe_out, out)
++            self.moe_sum(moe_out, out, topk_ids, expert_map)
+ 
+         return fused_marlin_moe(
+             hidden_states=hidden_states,
+@@ -929,8 +934,17 @@ def moe_sum_with_lora(moe_out: torch.Tensor, out: torch.Tensor) -> None:
+             gemm1_beta=self.gemm1_beta,
+         )
+ 
+-    def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+-        ops.moe_sum(input, output)
++    def moe_sum(
++        self,
++        input: torch.Tensor,
++        output: torch.Tensor,
++        topk_ids: torch.Tensor,
++        expert_map: torch.Tensor | None,
++    ) -> None:
++        if expert_map is not None:
++            ops.moe_sum(input, output, topk_ids, expert_map)
++        else:
++            ops.moe_sum(input, output)
+ 
+ 
+ class BatchedMarlinExperts(MarlinExpertsBase):

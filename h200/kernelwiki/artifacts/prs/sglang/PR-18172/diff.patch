@@ -1,0 +1,194 @@
+diff --git a/python/sglang/srt/hardware_backend/npu/moe/topk.py b/python/sglang/srt/hardware_backend/npu/moe/topk.py
+index 3ceb0eaad10b..5ef95d3e4ce8 100644
+--- a/python/sglang/srt/hardware_backend/npu/moe/topk.py
++++ b/python/sglang/srt/hardware_backend/npu/moe/topk.py
+@@ -41,42 +41,33 @@ def fused_topk_npu(
+             )
+         topk_weights = topk_weights.to(torch.float32)
+ 
+-    # Grouped top-k with correction bias
+-    elif use_grouped_topk and correction_bias is not None:
+-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+-            router_logits.to(torch.float32),
+-            k=topk_config.top_k,
+-            bias=correction_bias.to(torch.float32),
+-            k_group=topk_config.topk_group,
+-            group_count=topk_config.num_expert_group,
+-            group_select_mode=1,
+-            renorm=0,
+-            norm_type=1,
+-            routed_scaling_factor=(
+-                1 if renormalize else topk_config.routed_scaling_factor
+-            ),
+-            eps=float(1e-20),
+-        )
+-
+-    # npu_moe_gating_top_k is not yet supported custom_routing_function
+-    # torch native is not yet supported num_token_non_padded
++    # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
+     elif (
+-        topk_config.custom_routing_function is None
+-        and num_token_non_padded is not None
+-        and correction_bias is not None
++        correction_bias is not None
++        or topk_config.scoring_func == "sigmoid"
++        or num_token_non_padded is not None
+     ):
+         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+             router_logits.to(torch.float32),
+             k=topk_config.top_k,
+-            bias=correction_bias.to(torch.float32),
++            bias=(
++                correction_bias.to(torch.float32)
++                if correction_bias is not None
++                else None
++            ),
++            # num_expert_group and topk_group in some topk_config without group is None, (not supported by this ops)
++            k_group=topk_config.topk_group if use_grouped_topk else 1,
++            group_count=topk_config.num_expert_group if use_grouped_topk else 1,
++            group_select_mode=(1 if use_grouped_topk else 0),
+             renorm=0,
+-            norm_type=1,
++            norm_type=1,  # 1 for sigmoid, 0 for softmax
+             routed_scaling_factor=(
+                 1 if renormalize else topk_config.routed_scaling_factor
+             ),
+             eps=float(1e-20),
+         )
+ 
++    # torch native is not yet supported num_token_non_padded
+     # Fallback to torch native implementation
+     else:
+         topk_config.torch_native = True
+diff --git a/python/sglang/srt/models/afmoe.py b/python/sglang/srt/models/afmoe.py
+index 50548c1ccd80..543c8bb12f16 100644
+--- a/python/sglang/srt/models/afmoe.py
++++ b/python/sglang/srt/models/afmoe.py
+@@ -58,7 +58,16 @@
+ )
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+-from sglang.srt.utils import add_prefix
++from sglang.srt.utils import add_prefix, is_npu
++
++_is_npu = is_npu()
++
++if not _is_npu:
++    from sglang.srt.layers.moe.fused_moe_triton import fused_moe
++else:
++    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
++        fused_moe_npu as fused_moe,
++    )
+ 
+ 
+ def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]:
+@@ -200,6 +209,7 @@ def __init__(
+                 for idx in range(self.n_routed_experts)
+             ]
+         )
++
+         self.pack_params()
+ 
+         if self.num_shared_experts:
+@@ -216,7 +226,7 @@ def __init__(
+             self.shared_experts = None
+ 
+         custom_routing_fn = None
+-        correction_bias = None
++        correction_bias = None if not _is_npu else self.expert_bias
+         if self.use_grouped_topk:
+             correction_bias = self.expert_bias
+         elif self.score_func == "sigmoid":
+@@ -226,7 +236,9 @@ def __init__(
+                 expert_bias=self.expert_bias,
+             )
+ 
+-        renormalize = self.route_norm if self.score_func == "sigmoid" else False
++        renormalize = (
++            self.route_norm if self.score_func == "sigmoid" and not _is_npu else False
++        )
+         self.topk = TopK(
+             top_k=self.top_k,
+             renormalize=renormalize,
+@@ -236,6 +248,7 @@ def __init__(
+             custom_routing_function=custom_routing_fn,
+             correction_bias=correction_bias,
+             routed_scaling_factor=self.route_scale,
++            **({"scoring_func": self.score_func} if _is_npu else {}),
+         )
+ 
+     def pack_params(self) -> None:
+@@ -266,7 +279,7 @@ def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+ 
+         router_logits, _ = self.gate(hidden_states)
+         topk_output = self.topk(hidden_states, router_logits)
+-        final_hidden_states = fused_moe.fused_moe(
++        final_hidden_states = fused_moe(
+             hidden_states,
+             w1=self.w1,
+             w2=self.w2,
+diff --git a/python/sglang/test/ascend/test_ascend_utils.py b/python/sglang/test/ascend/test_ascend_utils.py
+index 90212acc5c36..94abdf1a19c2 100644
+--- a/python/sglang/test/ascend/test_ascend_utils.py
++++ b/python/sglang/test/ascend/test_ascend_utils.py
+@@ -154,6 +154,7 @@
+     MODEL_WEIGHTS_DIR, "stabilityai/stablelm-2-1_6b"
+ )
+ XVERSE_MOE_A36B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "xverse/XVERSE-MoE-A36B")
++TRINITY_MINI_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/Trinity-Mini")
+ MINIMAX_M2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-BF16")
+ 
+ # VLM model weights path
+diff --git a/test/registered/ascend/llm_models/test_ascend_trinity_mini.py b/test/registered/ascend/llm_models/test_ascend_trinity_mini.py
+new file mode 100644
+index 000000000000..a8fb1d316d11
+--- /dev/null
++++ b/test/registered/ascend/llm_models/test_ascend_trinity_mini.py
+@@ -0,0 +1,47 @@
++import unittest
++
++from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
++from sglang.test.ascend.test_ascend_utils import TRINITY_MINI_WEIGHTS_PATH
++from sglang.test.ci.ci_register import register_npu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_npu_ci(
++    est_time=400,
++    suite="nightly-2-npu-a3",
++    nightly=True,
++)
++
++
++class TestTrinityMini(GSM8KAscendMixin, CustomTestCase):
++    """Testcase: Verify that the inference accuracy of the arcee-ai/Trinity-Mini model on the GSM8K dataset is no less than 0.85.
++
++    [Test Category] Model
++    [Test Target] arcee-ai/Trinity-Mini
++    """
++
++    model = TRINITY_MINI_WEIGHTS_PATH
++    accuracy = 0.85
++    other_args = [
++        "--trust-remote-code",
++        "--mem-fraction-static",
++        "0.8",
++        "--attention-backend",
++        "ascend",
++        "--tp-size",
++        "2",
++        "--disable-cuda-graph",
++        "--disable-radix-cache",
++        "--disable-overlap-schedule",
++        "--context-length",
++        "4096",
++        "--max-running-requests",
++        "128",
++        "--chunked-prefill-size",
++        "-1",
++        "--chat-template",
++        f"{model}/chat_template.jinja",
++    ]
++
++
++if __name__ == "__main__":
++    unittest.main()

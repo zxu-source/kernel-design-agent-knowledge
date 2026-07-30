@@ -1,0 +1,2660 @@
+diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index f6ae4179db37..3c601d1d51a6 100644
+--- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -742,7 +742,6 @@ def forward(
+         forward_batch: ForwardBatch,
+         mup_vector: Optional[torch.Tensor] = None,
+         use_triton_causal_conv: bool = False,
+-        should_allreduce_fusion: bool = False,
+     ):
+         assert isinstance(self.forward_metadata, Mamba2Metadata)
+         # Page-major stores state strided; only the stride-aware Triton causal-conv
+@@ -759,7 +758,6 @@ def forward(
+             forward_batch=forward_batch,
+             mup_vector=mup_vector,
+             use_triton_causal_conv=use_triton_causal_conv,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         )
+ 
+         if forward_batch.mamba_track_mask is not None:
+diff --git a/python/sglang/srt/layers/attention/mamba/mamba.py b/python/sglang/srt/layers/attention/mamba/mamba.py
+index 7e6c072a5ad4..80ec14481d79 100644
+--- a/python/sglang/srt/layers/attention/mamba/mamba.py
++++ b/python/sglang/srt/layers/attention/mamba/mamba.py
+@@ -448,7 +448,6 @@ def forward(
+         forward_batch: ForwardBatch,
+         mup_vector: Optional[torch.Tensor] = None,
+         use_triton_causal_conv: bool = False,
+-        should_allreduce_fusion: bool = False,
+     ):
+         # Returns the projected result. When `output` is given it is also
+         # written into that buffer (required by the cuda-graph split ops, which
+@@ -761,9 +760,7 @@ def forward(
+         # norm usage
+         hidden_states = self.norm(preallocated_ssm_out, gate)
+ 
+-        mixer_out, _ = self.out_proj(
+-            hidden_states, skip_all_reduce=should_allreduce_fusion
+-        )
++        mixer_out, _ = self.out_proj(hidden_states)
+         if output is not None:
+             output[:padded_num_tokens].copy_(mixer_out)
+ 
+diff --git a/python/sglang/srt/layers/communicator.py b/python/sglang/srt/layers/communicator.py
+index ea84ae9a609c..03d558748c26 100644
+--- a/python/sglang/srt/layers/communicator.py
++++ b/python/sglang/srt/layers/communicator.py
+@@ -1383,7 +1383,7 @@ def _scatter_hidden_states_moe(
+         """Scatter MoE output back to TP_ATTN_FULL after MOE_FULL computation.
+ 
+         After moe_tensor_model_parallel_all_reduce (which runs unconditionally since
+-        use_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
++        mlp_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
+         full MoE result for all cp_per_moe token chunks. We simply slice out this rank's
+         CP-local portion.
+ 
+diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
+index 310cacb7e52c..bfb8009b2a3a 100644
+--- a/python/sglang/srt/layers/linear.py
++++ b/python/sglang/srt/layers/linear.py
+@@ -27,6 +27,7 @@
+ from sglang.srt.layers.dp_attention import (
+     is_allocation_symmetric,
+ )
++from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+ from sglang.srt.layers.parameter import (
+     BasevLLMParameter,
+     BlockQuantScaleParameter,
+@@ -1537,7 +1538,15 @@ def forward(self, input_, skip_all_reduce=False, forward_batch=None):
+         with symm_ctx:
+             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+ 
+-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
++        # skip_all_reduce: explicit call-site override. Also honor
++        # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
++        # the decoder — callers should not thread those flags into modules.
++        if (
++            self.reduce_results
++            and self.tp_size > 1
++            and not skip_all_reduce
++            and not should_skip_mlp_all_reduce()
++        ):
+             if self.use_dp_attention_reduce:
+                 output = get_parallel().attn_tp_group.all_reduce(output_parallel)
+             else:
+diff --git a/python/sglang/srt/layers/moe/__init__.py b/python/sglang/srt/layers/moe/__init__.py
+index b9bbcfad35cd..7086c8bdc6d8 100644
+--- a/python/sglang/srt/layers/moe/__init__.py
++++ b/python/sglang/srt/layers/moe/__init__.py
+@@ -10,6 +10,7 @@
+     get_tbo_token_distribution_threshold,
+     initialize_moe_config,
+     is_tbo_enabled,
++    should_skip_mlp_all_reduce,
+     should_skip_post_experts_all_reduce,
+     should_use_dp_reduce_scatterv,
+     should_use_flashinfer_cutlass_moe_fp4_allgather,
+@@ -25,6 +26,7 @@
+     "get_moe_a2a_backend",
+     "get_moe_runner_backend",
+     "get_deepep_mode",
++    "should_skip_mlp_all_reduce",
+     "should_skip_post_experts_all_reduce",
+     "should_use_dp_reduce_scatterv",
+     "should_use_flashinfer_cutlass_moe_fp4_allgather",
+diff --git a/python/sglang/srt/layers/moe/utils.py b/python/sglang/srt/layers/moe/utils.py
+index fe8eb3545aa7..c43c2069a2d4 100644
+--- a/python/sglang/srt/layers/moe/utils.py
++++ b/python/sglang/srt/layers/moe/utils.py
+@@ -12,7 +12,7 @@
+ from sglang.srt.layers.dp_attention import (
+     is_dp_attention_enabled,
+ )
+-from sglang.srt.runtime_context import get_flags, get_parallel
++from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+ from sglang.srt.utils import is_cuda, is_npu
+ 
+ _is_npu = is_npu()
+@@ -411,20 +411,27 @@ def should_use_dp_reduce_scatterv():
+     )
+ 
+ 
+-def should_skip_post_experts_all_reduce(
+-    *,
+-    is_tp_path: bool,
+-    use_reduce_scatter: bool = False,
+-    should_allreduce_fusion: bool = False,
+-) -> bool:
++def should_skip_mlp_all_reduce() -> bool:
++    """Whether dense MLP / row-parallel projections should skip their all-reduce.
++
++    True when the decoder published ``fuse_mlp_allreduce`` (next residual+LN
++    absorbs the AR) or ``mlp_reduce_scatter`` (postprocess will reduce-scatter)
++    on ``get_forward()``.
++    """
++    f = get_forward()
++    return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
++
++
++def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
+     """Whether to skip the post-experts all-reduce (EP or TP) because a
+     downstream component will fuse, replace, or absorb it.
+ 
+     Skip reasons, in order:
+-      - ``should_allreduce_fusion``: LayerCommunicator will fuse the all-reduce
+-        with the next layer's residual all-reduce.
+-      - ``use_reduce_scatter``: LayerCommunicator's post-attention scatter will
+-        do reduce-scatter, which would double-reduce on top of an all-reduce.
++      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
++        all-reduce with the next layer's residual all-reduce.
++      - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
++        scatter will do reduce-scatter, which would double-reduce on top of
++        an all-reduce.
+       - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
+         path replaces the all-reduce with a reduce-scatterv.
+       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
+@@ -437,11 +444,11 @@ def should_skip_post_experts_all_reduce(
+         ``not enable_alltoall`` gate
+         (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
+ 
+-    The first two args are layer-context flags from ``LayerCommunicator`` and
+-    default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
++    The first two reasons come from per-layer ``ForwardFlags`` published by
++    the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
+     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+     """
+-    if should_allreduce_fusion or use_reduce_scatter:
++    if should_skip_mlp_all_reduce():
+         return True
+     if should_use_dp_reduce_scatterv():
+         return True
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 411f053d5df4..f0032b80b606 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -19,6 +19,7 @@
+ )
+ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+ from sglang.srt.layers.moe.topk import TopKOutput
++from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+ from sglang.srt.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     VocabParallelEmbedding,
+@@ -732,6 +733,7 @@ def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=Non
+             self.base_layer.reduce_results
+             and self.base_layer.tp_size > 1
+             and not skip_all_reduce
++            and not should_skip_mlp_all_reduce()
+         )
+ 
+         if self.set_lora and should_reduce:
+diff --git a/python/sglang/srt/lora/trtllm_lora_temp/attention.py b/python/sglang/srt/lora/trtllm_lora_temp/attention.py
+index cdbaaca83dd5..e7415f830779 100644
+--- a/python/sglang/srt/lora/trtllm_lora_temp/attention.py
++++ b/python/sglang/srt/lora/trtllm_lora_temp/attention.py
+@@ -14,6 +14,7 @@
+     tensor_model_parallel_all_gather,
+     tensor_model_parallel_all_reduce,
+ )
++from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+ from sglang.srt.lora.trtllm_lora_temp import (
+     get_lora_side_stream,
+     get_original_column_forward,
+@@ -125,6 +126,7 @@ def row_parallel_lora_forward(
+         self.base_layer.reduce_results
+         and self.base_layer.tp_size > 1
+         and not skip_all_reduce
++        and not should_skip_mlp_all_reduce()
+     )
+ 
+     if should_reduce:
+diff --git a/python/sglang/srt/models/apertus.py b/python/sglang/srt/models/apertus.py
+index 2ba7f63d7765..b9f79000f871 100644
+--- a/python/sglang/srt/models/apertus.py
++++ b/python/sglang/srt/models/apertus.py
+@@ -96,15 +96,11 @@ def forward(
+         self,
+         x,
+         forward_batch=None,
+-        use_reduce_scatter: bool = False,
+     ):
+         # note: with xielu, there's no gate_proj
+         x, _ = self.up_proj(x)
+         x = self.act_fn(x)
+-        x, _ = self.down_proj(
+-            x,
+-            skip_all_reduce=use_reduce_scatter,
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+diff --git a/python/sglang/srt/models/bailing_moe.py b/python/sglang/srt/models/bailing_moe.py
+index 98063401c820..9abccdbe0f1f 100644
+--- a/python/sglang/srt/models/bailing_moe.py
++++ b/python/sglang/srt/models/bailing_moe.py
+@@ -77,7 +77,12 @@
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+ 
+ LoraConfig = None
+@@ -127,17 +132,13 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if (self.tp_size == 1) and hidden_states.shape[0] == 0:
+             return hidden_states
+ 
+         gate_up, _ = self.gate_up_proj(hidden_states)
+         hidden_states = self.act_fn(gate_up)
+-        hidden_states, _ = self.down_proj(
+-            hidden_states, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+-        )
++        hidden_states, _ = self.down_proj(hidden_states)
+         return hidden_states
+ 
+ 
+@@ -305,15 +306,9 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if not get_moe_a2a_backend().is_deepep():
+-            return self.forward_normal(
+-                hidden_states,
+-                should_allreduce_fusion,
+-                use_reduce_scatter,
+-            )
++            return self.forward_normal(hidden_states)
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
+@@ -356,8 +351,6 @@ def forward_normal_dual_stream(
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_size = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_size)
+@@ -379,8 +372,6 @@ def forward_normal(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states.view(num_tokens, hidden_size)
+@@ -672,22 +663,24 @@ def forward(
+             forward_batch=forward_batch,
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(
+-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/bailing_moe_linear.py b/python/sglang/srt/models/bailing_moe_linear.py
+index d87038d31e34..be78a26d094a 100644
+--- a/python/sglang/srt/models/bailing_moe_linear.py
++++ b/python/sglang/srt/models/bailing_moe_linear.py
+@@ -58,7 +58,12 @@
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
+ from sglang.srt.models.utils import WeightsMapper
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import (
+     BumpAllocator,
+     add_prefix,
+@@ -189,15 +194,10 @@ def __init__(
+     def forward(
+         self,
+         x,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ):
+         x, _ = self.gate_up_proj(x)
+         x = self.act_fn(x)
+-        x, _ = self.down_proj(
+-            x,
+-            skip_all_reduce=use_reduce_scatter or should_allreduce_fusion,
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -332,8 +332,6 @@ def __init__(
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_size = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_size)
+@@ -369,8 +367,6 @@ def forward(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states
+@@ -890,20 +886,25 @@ def forward(
+         # logger.warning(
+         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
+         # )
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+-        hidden_states = self.mlp(
+-            hidden_states, should_allreduce_fusion, use_reduce_scatter
+-        )
+-        hidden_states, residual = self.layer_communicator.postprocess_layer(
+-            hidden_states, residual, forward_batch
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(hidden_states)
++        if fuse_mlp_allreduce:
++            hidden_states._sglang_needs_allreduce_fusion = True
++        else:
++            hidden_states, residual = self.layer_communicator.postprocess_layer(
++                hidden_states, residual, forward_batch
++            )
+         return hidden_states, residual
+ 
+     @staticmethod
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index ef59bc0eaaf2..9b2050a52b79 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -182,7 +182,12 @@
+     _use_aiter_bpreshuffle_gfx95,
+     _use_aiter_gfx95,
+ )
+-from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
++from sglang.srt.runtime_context import (
++    get_flags,
++    get_forward,
++    get_parallel,
++    get_server_args,
++)
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+ from sglang.srt.utils import (
+     BumpAllocator,
+@@ -292,8 +297,6 @@ def forward(
+         self,
+         x,
+         forward_batch=None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+         gemm_output_zero_allocator: BumpAllocator = None,
+     ):
+         if (self.tp_size == 1) and x.shape[0] == 0:
+@@ -321,10 +324,7 @@ def forward(
+                 self.down_proj.input_scale_inv,
+                 enable_pdl=True,
+             )
+-            out, _ = self.down_proj(
+-                (out_fp4, out_scale),
+-                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+-            )
++            out, _ = self.down_proj((out_fp4, out_scale))
+             return out
+ 
+         if (
+@@ -426,10 +426,7 @@ def forward(
+                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+         else:
+             x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x,
+-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -857,8 +854,6 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+         gemm_output_zero_allocator: BumpAllocator = None,
+         input_ids: Optional[torch.Tensor] = None,
+         input_ids_global: Optional[torch.Tensor] = None,
+@@ -880,8 +875,6 @@ def forward(
+                 return dsv2_flashinfer_moe_dual_stream_graph(
+                     hidden_states,
+                     self.layer_id,
+-                    should_allreduce_fusion,
+-                    use_reduce_scatter,
+                 )
+             elif (
+                 self.alt_stream is not None
+@@ -897,8 +890,6 @@ def forward(
+             ):
+                 return self.forward_normal_dual_stream(
+                     hidden_states,
+-                    should_allreduce_fusion,
+-                    use_reduce_scatter,
+                     gemm_output_zero_allocator,
+                     input_ids,
+                     input_ids_global=input_ids_global,
+@@ -906,8 +897,6 @@ def forward(
+             else:
+                 return self.forward_normal(
+                     hidden_states,
+-                    should_allreduce_fusion,
+-                    use_reduce_scatter,
+                     gemm_output_zero_allocator,
+                     input_ids,
+                     input_ids_global=input_ids_global,
+@@ -921,19 +910,16 @@ def forward(
+     def forward_normal_dual_stream(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+         gemm_output_zero_allocator: BumpAllocator = None,
+         input_ids: Optional[torch.Tensor] = None,
+         input_ids_global: Optional[torch.Tensor] = None,
+-        *,
+-        use_flashinfer_trtllm_bypass: bool = False,
+     ) -> torch.Tensor:
+         # Note(kpham-sgl): issue order satisfies 3 constraints:
+         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
+         # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
+         # - dispose_tensor: disabled during capture (CaptureFlags.disable_dispose_tensor) so the routed
+         #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
++        use_flashinfer_trtllm_bypass = get_forward().flashinfer_trtllm_bypass
+         current_stream = torch.cuda.current_stream()
+         self.alt_stream.wait_stream(current_stream)
+         has_shared_output = (
+@@ -1014,8 +1000,6 @@ def forward_normal_dual_stream(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         # TP1 shared experts are replicated, so add them after all-reduce to
+@@ -1027,8 +1011,6 @@ def forward_normal_dual_stream(
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+         gemm_output_zero_allocator: BumpAllocator = None,
+         input_ids: Optional[torch.Tensor] = None,
+         input_ids_global: Optional[torch.Tensor] = None,
+@@ -1037,7 +1019,7 @@ def forward_normal(
+         if hasattr(self, "shared_experts") and use_intel_amx_backend(
+             self.shared_experts.gate_up_proj
+         ):
+-            return self.forward_cpu(hidden_states, should_allreduce_fusion)
++            return self.forward_cpu(hidden_states)
+         server_args = get_server_args()
+         dispatch_info = (
+             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+@@ -1140,8 +1122,6 @@ def _post_combine_hook(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         # TP1 shared experts are replicated, so add them after all-reduce to
+@@ -1153,7 +1133,6 @@ def _post_combine_hook(
+     def forward_cpu(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+     ) -> torch.Tensor:
+         # router_logits: (num_tokens, n_experts)
+         router_logits = self.gate(hidden_states)
+@@ -1202,7 +1181,7 @@ def forward_cpu(
+             ),  # block_size
+             True,  # is_vnni
+         )
+-        if self.tp_size > 1 and not should_allreduce_fusion:
++        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states
+ 
+@@ -2259,14 +2238,14 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+@@ -2284,22 +2263,24 @@ def forward(
+         else:
+             _mlp_ctx = nullcontext()
+ 
+-        with _mlp_ctx:
+-            hidden_states = self.mlp(
+-                hidden_states,
+-                forward_batch,
+-                should_allreduce_fusion,
+-                use_reduce_scatter,
+-                gemm_output_zero_allocator,
+-            )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            with _mlp_ctx:
++                hidden_states = self.mlp(
++                    hidden_states,
++                    forward_batch,
++                    gemm_output_zero_allocator,
++                )
+ 
+         if (
+             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
+-            and should_allreduce_fusion
++            and fuse_mlp_allreduce
+         ):
+             hidden_states._sglang_needs_allreduce_fusion = True
+ 
+-        if not should_allreduce_fusion:
++        if not fuse_mlp_allreduce:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+                 hidden_states, residual, forward_batch
+             )
+@@ -2996,8 +2977,6 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
+ def dsv2_flashinfer_moe_dual_stream_graph(
+     hidden_states: torch.Tensor,
+     layer_id: int,
+-    should_allreduce_fusion: bool,
+-    use_reduce_scatter: bool,
+ ) -> torch.Tensor:
+     forward_context = get_tc_piecewise_forward_context()
+     assert forward_context is not None
+@@ -3005,12 +2984,8 @@ def dsv2_flashinfer_moe_dual_stream_graph(
+ 
+     moe_fusion = forward_context.moe_fusions[layer_id]
+     assert moe_fusion is not None
+-    return moe_fusion.forward_normal_dual_stream(
+-        hidden_states,
+-        should_allreduce_fusion=should_allreduce_fusion,
+-        use_reduce_scatter=use_reduce_scatter,
+-        use_flashinfer_trtllm_bypass=True,
+-    )
++    with get_forward().scoped(flashinfer_trtllm_bypass=True):
++        return moe_fusion.forward_normal_dual_stream(hidden_states)
+ 
+ 
+ EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 0599fcd9a77e..7f7457924df6 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -122,7 +122,7 @@
+     _is_npu,
+     _is_xpu,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args
++from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+ 
+ if not _is_hip:
+     from sglang.srt.layers.utils.cp_utils import (
+@@ -134,7 +134,6 @@
+ else:
+     from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
+ 
+-from sglang.srt.runtime_context import get_server_args
+ from sglang.srt.utils import (
+     LazyValue,
+     add_prefix,
+@@ -1639,7 +1638,7 @@ def _run_moe_ffn_dp_sync(
+         # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
+         # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
+         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
+-        # MUST tell the MoE to skip it (use_reduce_scatter=True) or it
++        # MUST tell the MoE to skip it (mlp_reduce_scatter=True) or it
+         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
+         _use_reduce_scatterv = (
+             _use_tp_moe_gather
+@@ -1663,6 +1662,7 @@ def _run_moe_ffn_dp_sync(
+             and forward_batch.dp_padding_mode.is_max_len()
+             and get_parallel().tp_size == get_parallel().attn_dp_size
+         )
++        mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
+         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
+         # on LOCAL hidden before the gather and add it back after the combine
+         # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
+@@ -1702,17 +1702,17 @@ def _run_moe_ffn_dp_sync(
+             hidden_states = _a2a_scatter_chunks[r].contiguous()
+             input_ids = input_ids.tensor_split(s)[r].contiguous()
+             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+-        hidden_states = self.mlp(
+-            hidden_states,
+-            forward_batch,
+-            input_ids=input_ids,
+-            input_ids_global=input_ids_global,
+-            # Skip the MoE-internal post-experts all_reduce when we will do the
+-            # reduce via reduce_scatterv/reduce_scatter at the combine below
+-            # (else double-reduce).
+-            use_reduce_scatter=_use_cp or _use_reduce_scatterv or _use_reduce_scatter,
+-            skip_shared_experts=_do_shared_local,
+-        )
++        # Skip the MoE-internal post-experts all_reduce when we will do the
++        # reduce via reduce_scatterv/reduce_scatter at the combine below
++        # (else double-reduce).
++        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
++            hidden_states = self.mlp(
++                hidden_states,
++                forward_batch,
++                input_ids=input_ids,
++                input_ids_global=input_ids_global,
++                skip_shared_experts=_do_shared_local,
++            )
+         if _use_cp and get_moe_a2a_backend().is_none():
+             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+         elif _use_tp_moe_gather:
+@@ -1723,7 +1723,7 @@ def _run_moe_ffn_dp_sync(
+             if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
+                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
+                 # each rank its own token slice, in one op. Correct because the
+-                # MoE-internal all_reduce was skipped (use_reduce_scatter above).
++                # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
+                 # This is the symmetric inverse of the all_gatherv gather.
+                 get_tp_group().reduce_scatterv(
+                     global_hidden_states,
+@@ -1735,7 +1735,7 @@ def _run_moe_ffn_dp_sync(
+                 # expert outputs AND scatter each rank its own (MAX_LEN-padded)
+                 # token chunk in one op (symmetric inverse of the MAX_LEN
+                 # all_gather). Correct because the MoE-internal all_reduce was
+-                # skipped (use_reduce_scatter above). dp_reduce_scatter_tensor
++                # skipped (mlp_reduce_scatter above). dp_reduce_scatter_tensor
+                 # routes to the equal-chunk reduce_scatter_tensor here (its
+                 # variable-length reduce_scatterv branch is gated by
+                 # is_dp_gatherv_active(), which is False under MAX_LEN), which in
+@@ -1920,19 +1920,19 @@ def op_gather_b(self, state):
+         state.pop("gather_keepalive")
+ 
+     def op_moe(self, state):
+-        # MoE (gate/topk/experts) on the GLOBAL gathered buffer. use_reduce_scatter
++        # MoE (gate/topk/experts) on the GLOBAL gathered buffer. mlp_reduce_scatter
+         # skips the MoE-internal all_reduce (we reduce_scatterv in op_combine).
+         fb = state.forward_batch
+         global_hidden = state.pop("global_hidden")
+         global_ids = fb._tbo_global_input_ids
+-        state.global_expert_out = self.mlp(
+-            global_hidden,
+-            fb,
+-            use_reduce_scatter=True,
+-            input_ids=global_ids,
+-            input_ids_global=global_ids,
+-            skip_shared_experts=state.do_shared_local,
+-        )
++        with get_forward().scoped(mlp_reduce_scatter=True):
++            state.global_expert_out = self.mlp(
++                global_hidden,
++                fb,
++                input_ids=global_ids,
++                input_ids_global=global_ids,
++                skip_shared_experts=state.do_shared_local,
++            )
+ 
+     def op_combine_a(self, state):
+         # Launch reduce_scatterv (global partial expert sums -> per-rank local) on
+diff --git a/python/sglang/srt/models/exaone_moe.py b/python/sglang/srt/models/exaone_moe.py
+index c6a851a9264b..b90c75efe5e5 100755
+--- a/python/sglang/srt/models/exaone_moe.py
++++ b/python/sglang/srt/models/exaone_moe.py
+@@ -121,15 +121,10 @@ def forward(
+         self,
+         x,
+         forward_batch=None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ):
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x,
+-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -276,7 +271,6 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+@@ -300,7 +294,6 @@ def forward(
+             final_hidden_states = final_hidden_states + shared_output
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+diff --git a/python/sglang/srt/models/falcon_h1.py b/python/sglang/srt/models/falcon_h1.py
+index d215c21f7168..5283f27989e4 100644
+--- a/python/sglang/srt/models/falcon_h1.py
++++ b/python/sglang/srt/models/falcon_h1.py
+@@ -33,7 +33,12 @@
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_executor.forward_context import get_attn_backend
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import add_prefix, is_cuda, make_layers
+ 
+ logger = logging.getLogger(__name__)
+@@ -85,16 +90,12 @@ def forward(
+         self,
+         x,
+         forward_batch=None,
+-        use_reduce_scatter: bool = False,
+     ):
+         gate_up, _ = self.gate_up_proj(x)
+         gate_up[:, : self.intermediate_size // self.tp_size] *= self.gate_multiplier
+ 
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x,
+-            skip_all_reduce=use_reduce_scatter,
+-        )
++        x, _ = self.down_proj(x)
+         x = x * self.down_multiplier
+         return x
+ 
+@@ -358,12 +359,11 @@ def forward(
+         hidden_states, residual = self.layer_communicator.prepare_mlp(
+             hidden_states, residual, forward_batch
+         )
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+-        hidden_states = self.feed_forward(
+-            hidden_states, forward_batch, use_reduce_scatter
+-        )
++        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
++            hidden_states = self.feed_forward(hidden_states, forward_batch)
+ 
+         hidden_states, residual = self.layer_communicator.postprocess_layer(
+             hidden_states, residual, forward_batch
+diff --git a/python/sglang/srt/models/glm4.py b/python/sglang/srt/models/glm4.py
+index f4614a15988b..00a5057d0e3e 100644
+--- a/python/sglang/srt/models/glm4.py
++++ b/python/sglang/srt/models/glm4.py
+@@ -94,14 +94,10 @@ def forward(
+         self,
+         x,
+         forward_batch=None,
+-        use_reduce_scatter: bool = False,
+     ):
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x,
+-            skip_all_reduce=use_reduce_scatter,
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+diff --git a/python/sglang/srt/models/glm4_moe.py b/python/sglang/srt/models/glm4_moe.py
+index cab1809519ab..1484ab46723d 100644
+--- a/python/sglang/srt/models/glm4_moe.py
++++ b/python/sglang/srt/models/glm4_moe.py
+@@ -84,6 +84,7 @@
+ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+ from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
+ from sglang.srt.runtime_context import (
++    get_forward,
+     get_parallel,
+     get_server_args,
+     get_stream,
+@@ -167,17 +168,13 @@ def forward(
+         self,
+         x,
+         forward_batch=None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ):
+         if (self.tp_size == 1) and x.shape[0] == 0:
+             return x
+ 
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -564,8 +561,6 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if not self._enable_a2a_moe:
+             if (
+@@ -574,25 +569,15 @@ def forward(
+                 and hidden_states.shape[0] > 0
+                 and get_is_capture_mode()
+             ):
+-                return self.forward_normal_dual_stream(
+-                    hidden_states,
+-                    should_allreduce_fusion,
+-                    use_reduce_scatter,
+-                )
++                return self.forward_normal_dual_stream(hidden_states)
+             else:
+-                return self.forward_normal(
+-                    hidden_states,
+-                    should_allreduce_fusion,
+-                    use_reduce_scatter,
+-                )
++                return self.forward_normal(hidden_states)
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
+     def forward_normal_dual_stream(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         current_stream = torch.cuda.current_stream()
+         self.alt_stream.wait_stream(current_stream)
+@@ -610,8 +595,6 @@ def forward_normal_dual_stream(
+         final_hidden_states += shared_output
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states
+@@ -619,8 +602,6 @@ def forward_normal_dual_stream(
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if hidden_states.shape[0] > 0:
+             shared_output = self._forward_shared_experts(hidden_states)
+@@ -643,8 +624,6 @@ def forward_normal(
+             final_hidden_states = final_hidden_states_out
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states
+@@ -958,22 +937,24 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(
+-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/glm4_moe_lite.py b/python/sglang/srt/models/glm4_moe_lite.py
+index 0ad8e73afb89..c650585a58b1 100644
+--- a/python/sglang/srt/models/glm4_moe_lite.py
++++ b/python/sglang/srt/models/glm4_moe_lite.py
+@@ -74,7 +74,12 @@
+ )
+ from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
+ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import (
+     BumpAllocator,
+     LazyValue,
+@@ -132,17 +137,13 @@ def forward(
+         self,
+         x,
+         forward_batch=None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ):
+         if (self.tp_size == 1) and x.shape[0] == 0:
+             return x
+ 
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -313,8 +314,6 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if not self._enable_a2a_moe:
+             if (
+@@ -323,21 +322,15 @@ def forward(
+                 and hidden_states.shape[0] > 0
+                 and get_is_capture_mode()
+             ):
+-                return self.forward_normal_dual_stream(
+-                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+-                )
++                return self.forward_normal_dual_stream(hidden_states)
+             else:
+-                return self.forward_normal(
+-                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+-                )
++                return self.forward_normal(hidden_states)
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
+     def forward_normal_dual_stream(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         current_stream = torch.cuda.current_stream()
+         self.alt_stream.wait_stream(current_stream)
+@@ -355,8 +348,6 @@ def forward_normal_dual_stream(
+         final_hidden_states += shared_output
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states
+@@ -364,8 +355,6 @@ def forward_normal_dual_stream(
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if hidden_states.shape[0] > 0:
+             shared_output = self._forward_shared_experts(hidden_states)
+@@ -388,8 +377,6 @@ def forward_normal(
+             final_hidden_states = final_hidden_states_out
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states
+@@ -679,22 +666,24 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(
+-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/gpt_oss.py b/python/sglang/srt/models/gpt_oss.py
+index 2ed27d1702a3..190877707881 100644
+--- a/python/sglang/srt/models/gpt_oss.py
++++ b/python/sglang/srt/models/gpt_oss.py
+@@ -68,7 +68,7 @@
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args
++from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+ from sglang.srt.utils import (
+     LazyValue,
+     add_prefix,
+@@ -254,10 +254,9 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+     ) -> torch.Tensor:
+         if not get_moe_a2a_backend().is_deepep():
+-            return self.forward_normal(hidden_states, should_allreduce_fusion)
++            return self.forward_normal(hidden_states)
+         else:
+             raise Exception("forward_deepep branch not implemented yet")
+ 
+@@ -274,7 +273,6 @@ def get_moe_weights(self):
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+     ) -> torch.Tensor:
+         # `hidden_states` may arrive pre-padded along the last dim when the
+         # preceding RMSNorm fused the MoE input pad (gated by
+@@ -299,7 +297,7 @@ def forward_normal(
+             topk_output = self.topk(router_input, router_logits)
+             final_hidden_states = self.experts(hidden_states, topk_output)
+ 
+-        if self.tp_size > 1 and not should_allreduce_fusion:
++        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+         # When input was pre-padded, FusedMoE.forward_impl captured the
+@@ -603,18 +601,19 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+-        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
++        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+ 
+-        if not should_allreduce_fusion:
++        if not fuse_mlp_allreduce:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+                 hidden_states, residual, forward_batch
+             )
+diff --git a/python/sglang/srt/models/laguna.py b/python/sglang/srt/models/laguna.py
+index a2dd566d842b..0373fd0c1b3d 100644
+--- a/python/sglang/srt/models/laguna.py
++++ b/python/sglang/srt/models/laguna.py
+@@ -53,7 +53,7 @@
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.utils import apply_qk_norm
+-from sglang.srt.runtime_context import get_parallel, get_server_args
++from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+ from sglang.srt.utils import LazyValue, add_prefix, make_layers
+ 
+ logger = logging.getLogger(__name__)
+@@ -101,17 +101,12 @@ def forward(
+         self,
+         x: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        # Skip the in-block reduce when LayerCommunicator will fuse it or when
+-        # the next layer expects reduce-scatter — otherwise we'd double-reduce.
+-        x, _ = self.down_proj(
+-            x,
+-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+-        )
++        # RowParallelLinear honors ForwardFlags (fuse_mlp_allreduce /
++        # mlp_reduce_scatter) published by the decoder via scoped().
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -204,8 +199,6 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if hidden_states.shape[0] == 0:
+             return hidden_states
+@@ -233,8 +226,6 @@ def forward(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final = tensor_model_parallel_all_reduce(final)
+         if self._shared_expert_tp1:
+@@ -502,23 +493,25 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(
+-            hidden_states,
+-            forward_batch=forward_batch,
+-            should_allreduce_fusion=should_allreduce_fusion,
+-            use_reduce_scatter=use_reduce_scatter,
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(
++                hidden_states,
++                forward_batch=forward_batch,
++            )
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/llada2.py b/python/sglang/srt/models/llada2.py
+index 3c93ce986412..94aec91b83d0 100644
+--- a/python/sglang/srt/models/llada2.py
++++ b/python/sglang/srt/models/llada2.py
+@@ -76,7 +76,12 @@
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import (
+     add_prefix,
+     is_cuda,
+@@ -134,16 +139,13 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if (self.tp_size == 1) and hidden_states.shape[0] == 0:
+             return hidden_states
+ 
+         gate_up, _ = self.gate_up_proj(hidden_states)
+         hidden_states = self.act_fn(gate_up)
+-        hidden_states, _ = self.down_proj(
+-            hidden_states, skip_all_reduce=use_reduce_scatter
+-        )
++        hidden_states, _ = self.down_proj(hidden_states)
+         return hidden_states
+ 
+ 
+@@ -317,10 +319,9 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if not get_moe_a2a_backend().is_deepep():
+-            return self.forward_normal(hidden_states, use_reduce_scatter)
++            return self.forward_normal(hidden_states)
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
+@@ -360,7 +361,6 @@ def forward_normal_dual_stream(
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_size = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_size)
+@@ -382,7 +382,6 @@ def forward_normal(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states.view(num_tokens, hidden_size)
+@@ -662,11 +661,12 @@ def forward(
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
++        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+         hidden_states, residual = self.layer_communicator.postprocess_layer(
+             hidden_states=hidden_states,
+diff --git a/python/sglang/srt/models/llama.py b/python/sglang/srt/models/llama.py
+index 91f89ef14fa4..a7eec70af5ef 100644
+--- a/python/sglang/srt/models/llama.py
++++ b/python/sglang/srt/models/llama.py
+@@ -112,14 +112,10 @@ def forward(
+         self,
+         x,
+         forward_batch=None,
+-        use_reduce_scatter: bool = False,
+     ):
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x,
+-            skip_all_reduce=use_reduce_scatter,
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+diff --git a/python/sglang/srt/models/llama4.py b/python/sglang/srt/models/llama4.py
+index bf322ef4e460..8d16ca406186 100644
+--- a/python/sglang/srt/models/llama4.py
++++ b/python/sglang/srt/models/llama4.py
+@@ -52,7 +52,7 @@
+ )
+ from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
+ from sglang.srt.models.utils import apply_qk_norm
+-from sglang.srt.runtime_context import get_parallel
++from sglang.srt.runtime_context import get_forward, get_parallel
+ from sglang.srt.utils import (
+     add_prefix,
+     fast_topk,
+@@ -139,7 +139,6 @@ def forward(
+         self,
+         hidden_states,
+         forward_batch: ForwardBatch,
+-        use_reduce_scatter: bool = False,
+     ):
+         shared_out, routed_out = self._forward_core(
+             hidden_states, forward_batch.forward_mode
+@@ -149,7 +148,6 @@ def forward(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+         ):
+             out_aD = tensor_model_parallel_all_reduce(out_aD)
+ 
+@@ -479,14 +477,13 @@ def forward(
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+         # Fully Connected
+-        hidden_states = self.feed_forward(
+-            hidden_states, forward_batch, use_reduce_scatter
+-        )
++        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
++            hidden_states = self.feed_forward(hidden_states, forward_batch)
+         hidden_states, residual = self.layer_communicator.postprocess_layer(
+             hidden_states, residual, forward_batch
+         )
+diff --git a/python/sglang/srt/models/mimo_v2.py b/python/sglang/srt/models/mimo_v2.py
+index c9deb0f407ff..56bc14d68f06 100644
+--- a/python/sglang/srt/models/mimo_v2.py
++++ b/python/sglang/srt/models/mimo_v2.py
+@@ -76,7 +76,7 @@
+ )
+ from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
+ from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+-from sglang.srt.runtime_context import get_parallel, get_server_args
++from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+ from sglang.srt.utils import (
+     LazyValue,
+     add_prefix,
+@@ -166,17 +166,13 @@ def forward(
+         self,
+         x,
+         forward_batch: ForwardBatch = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ):
+         if (self.tp_size == 1) and x.shape[0] == 0:
+             return x
+ 
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -315,23 +311,15 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if not self._enable_a2a_moe:
+-            return self.forward_normal(
+-                hidden_states,
+-                should_allreduce_fusion,
+-                use_reduce_scatter,
+-            )
++            return self.forward_normal(hidden_states)
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+ 
+         if hidden_states.shape[0] > 0:
+@@ -345,8 +333,6 @@ def forward_normal(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+@@ -746,22 +732,24 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(
+-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/minimax_m2.py b/python/sglang/srt/models/minimax_m2.py
+index 81cfd590a4ce..bb7503b1d08e 100644
+--- a/python/sglang/srt/models/minimax_m2.py
++++ b/python/sglang/srt/models/minimax_m2.py
+@@ -80,7 +80,7 @@
+     maybe_remap_kv_scale_name,
+     narrow_padded_param_and_loaded_weight,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args
++from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+ 
+ # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
+ # Importing from the wrong module causes this file to fail import, which prevents the
+@@ -553,24 +553,18 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if (
+             not get_moe_a2a_backend().is_deepep()
+             and not get_moe_a2a_backend().is_ascend_fuseep()
+         ):
+-            return self.forward_normal(
+-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+-            )
++            return self.forward_normal(hidden_states)
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+@@ -584,9 +578,7 @@ def forward_normal(
+ 
+         final_hidden_states = self.experts(hidden_states, topk_output)
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+-            is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
++            is_tp_path=True
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+@@ -1012,21 +1004,23 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.block_sparse_moe(
+-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/nemotron_h.py b/python/sglang/srt/models/nemotron_h.py
+index ee98ffed4598..c31c8a4f6a15 100644
+--- a/python/sglang/srt/models/nemotron_h.py
++++ b/python/sglang/srt/models/nemotron_h.py
+@@ -87,7 +87,7 @@
+     pad_to_original_num_tokens,
+ )
+ from sglang.srt.models.utils import WeightsMapper
+-from sglang.srt.runtime_context import get_parallel, get_server_args
++from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+ from sglang.srt.utils import (
+     add_prefix,
+     get_current_device_stream_fast,
+@@ -132,14 +132,10 @@ def __init__(
+     def forward(
+         self,
+         x: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ):
+         x, _ = self.up_proj(x)
+         x = self.act_fn(x)
+-        x, _ = self.down_proj(
+-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -306,8 +302,6 @@ def _forward_core_shared_routed_overlap(
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         # routed_scaling_factor is fused into the experts call (applied by the
+@@ -322,8 +316,6 @@ def forward(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+@@ -344,20 +336,20 @@ def forward(
+             hidden_states, residual = self.layer_communicator.prepare_mlp(
+                 hidden_states, residual, forward_batch
+             )
+-            use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++            mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+                 forward_batch
+             )
+-            should_allreduce_fusion = (
++            fuse_mlp_allreduce = (
+                 self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                     forward_batch
+                 )
+             )
+-            hidden_states = self.mixer.forward(
+-                hidden_states,
+-                should_allreduce_fusion=should_allreduce_fusion,
+-                use_reduce_scatter=use_reduce_scatter,
+-            )
+-            if should_allreduce_fusion:
++            with get_forward().scoped(
++                fuse_mlp_allreduce=fuse_mlp_allreduce,
++                mlp_reduce_scatter=mlp_reduce_scatter,
++            ):
++                hidden_states = self.mixer.forward(hidden_states)
++            if fuse_mlp_allreduce:
+                 hidden_states._sglang_needs_allreduce_fusion = True
+             else:
+                 hidden_states, residual = self.layer_communicator.postprocess_layer(
+@@ -369,15 +361,14 @@ def forward(
+             self.norm, hidden_states, residual
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+-        hidden_states = self.mixer.forward(
+-            hidden_states, should_allreduce_fusion=should_allreduce_fusion
+-        )
+-        if should_allreduce_fusion:
++        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
++            hidden_states = self.mixer.forward(hidden_states)
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         return hidden_states, residual
+ 
+@@ -505,7 +496,6 @@ def _forward_mamba(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: ForwardBatch,
+-        should_allreduce_fusion: bool = False,
+     ) -> torch.Tensor:
+         """Core Mamba forward logic, called directly or via split op."""
+         original_num_tokens = hidden_states.shape[0]
+@@ -523,7 +513,6 @@ def _forward_mamba(
+             output=None,
+             forward_batch=forward_batch,
+             use_triton_causal_conv=True,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         )
+         return pad_to_original_num_tokens(output, original_num_tokens)
+ 
+@@ -551,28 +540,25 @@ def forward(
+             self.norm, hidden_states, residual
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+-        if is_in_breakable_cuda_graph():
+-            output = torch.empty_like(hidden_states)
+-            breakable_nemotron_mamba2_with_output(
+-                hidden_states, output, self.layer_id, should_allreduce_fusion
+-            )
+-        elif is_in_tc_piecewise_cuda_graph():
+-            output = torch.empty_like(hidden_states)
+-            nemotron_mamba2_with_output(
+-                hidden_states, output, self.layer_id, should_allreduce_fusion
+-            )
+-        else:
+-            output = self._forward_mamba(
+-                hidden_states, forward_batch, should_allreduce_fusion
+-            )
++        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
++            if is_in_breakable_cuda_graph():
++                output = torch.empty_like(hidden_states)
++                breakable_nemotron_mamba2_with_output(
++                    hidden_states, output, self.layer_id
++                )
++            elif is_in_tc_piecewise_cuda_graph():
++                output = torch.empty_like(hidden_states)
++                nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
++            else:
++                output = self._forward_mamba(hidden_states, forward_batch)
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             output._sglang_needs_allreduce_fusion = True
+         return output, residual
+ 
+@@ -647,15 +633,12 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: ForwardBatch,
+-        should_allreduce_fusion: bool = False,
+     ) -> torch.Tensor:
+         if not is_dp_attention_enabled():
+             qkv, _ = self.qkv_proj(hidden_states)
+             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+             attn_output = self.attn.forward(q, k, v, forward_batch)
+-            output, _ = self.o_proj(
+-                attn_output, skip_all_reduce=should_allreduce_fusion
+-            )
++            output, _ = self.o_proj(attn_output)
+             return output
+ 
+         padded_shape = hidden_states.shape[0]
+@@ -733,18 +716,18 @@ def forward(
+             self.norm, hidden_states, residual
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+-        hidden_states = self.mixer.forward(
+-            hidden_states=hidden_states,
+-            forward_batch=forward_batch,
+-            should_allreduce_fusion=should_allreduce_fusion,
+-        )
+-        if should_allreduce_fusion:
++        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
++            hidden_states = self.mixer.forward(
++                hidden_states=hidden_states,
++                forward_batch=forward_batch,
++            )
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         return hidden_states, residual
+ 
+@@ -1206,7 +1189,6 @@ def nemotron_mamba2_with_output(
+     hidden_states: torch.Tensor,
+     output: torch.Tensor,
+     layer_id: int,
+-    should_allreduce_fusion: bool = False,
+ ) -> None:
+     """Split op for Mamba2 forward in piecewise CUDA graph mode."""
+     context = get_tc_piecewise_forward_context()
+@@ -1226,9 +1208,7 @@ def nemotron_mamba2_with_output(
+     if hidden_states.shape[0] != num_actual_tokens:
+         hidden_states = hidden_states[:num_actual_tokens]
+ 
+-    ret = mamba_layer._forward_mamba(
+-        hidden_states, forward_batch, should_allreduce_fusion
+-    )
++    ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
+ 
+     # Copy result back; output may be larger (padded) so only fill actual tokens
+     output[:num_actual_tokens].view(ret.shape).copy_(ret)
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index 0de2579761d4..7a77bc7be955 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -91,7 +91,7 @@
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_executor.runner import get_is_capture_mode
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+-from sglang.srt.runtime_context import get_parallel, get_server_args
++from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+ from sglang.srt.utils import (
+     add_prefix,
+     cpu_has_amx_support,
+@@ -209,14 +209,10 @@ def __init__(
+     def forward(
+         self,
+         x,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ):
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -545,8 +541,6 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        use_reduce_scatter: bool = False,
+-        should_allreduce_fusion: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+@@ -591,8 +585,6 @@ def forward(
+             self.tp_size > 1
+             and not should_skip_post_experts_all_reduce(
+                 is_tp_path=True,
+-                use_reduce_scatter=use_reduce_scatter,
+-                should_allreduce_fusion=should_allreduce_fusion,
+             )
+             and not get_moe_a2a_backend().is_flashinfer()
+         ):
+@@ -810,11 +802,12 @@ def forward(
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
++        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+         hidden_states, residual = self.layer_communicator.postprocess_layer(
+             hidden_states, residual, forward_batch
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 7db4a819dc47..bb1c9097923c 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -91,7 +91,12 @@
+     fused_qk_gemma_rmsnorm,
+     fused_qk_gemma_rmsnorm_with_gate,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ 
+ # Utils
+ from sglang.srt.utils import (
+@@ -682,27 +687,27 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+-            hidden_states = self.mlp(
+-                hidden_states,
+-                forward_batch,
+-                use_reduce_scatter,
+-                should_allreduce_fusion,
+-            )
+-        else:
+-            hidden_states = self.mlp(
+-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+-            )
+-        if should_allreduce_fusion:
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
++                hidden_states = self.mlp(
++                    hidden_states,
++                    forward_batch,
++                )
++            else:
++                hidden_states = self.mlp(hidden_states)
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+@@ -1067,27 +1072,27 @@ def forward(
+         hidden_states, residual = self.layer_communicator.prepare_mlp(
+             hidden_states, residual, forward_batch
+         )
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+-            hidden_states = self.mlp(
+-                hidden_states,
+-                forward_batch,
+-                use_reduce_scatter,
+-                should_allreduce_fusion,
+-            )
+-        else:
+-            hidden_states = self.mlp(
+-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+-            )
+-        if should_allreduce_fusion:
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
++                hidden_states = self.mlp(
++                    hidden_states,
++                    forward_batch,
++                )
++            else:
++                hidden_states = self.mlp(hidden_states)
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index 1f6391e071ee..9cee1d21d8d7 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -72,7 +72,12 @@
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import (
+     LazyValue,
+     add_prefix,
+@@ -286,17 +291,13 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+ 
+         if (
+             not get_moe_a2a_backend().is_deepep()
+             and not get_moe_a2a_backend().is_ascend_fuseep()
+         ):
+-            return self.forward_normal(
+-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+-            )
++            return self.forward_normal(hidden_states)
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
+@@ -313,8 +314,6 @@ def get_moe_weights(self):
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+@@ -325,16 +324,12 @@ def forward_normal(
+         final_hidden_states = self.experts(hidden_states, topk_output)
+ 
+         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
+-            is_tp_path=False,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
++            is_tp_path=False
+         ):
+             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+-            is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
++            is_tp_path=True
+         ):
+             final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                 final_hidden_states
+@@ -828,22 +823,24 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+ 
+         # For DP with padding, reduce scatter can be used instead of all-reduce.
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(
+-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
+index d65ec3e24b3f..e768df8608cd 100644
+--- a/python/sglang/srt/models/qwen3_next.py
++++ b/python/sglang/srt/models/qwen3_next.py
+@@ -47,7 +47,12 @@
+     sharded_weight_loader,
+ )
+ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import (
+     LazyValue,
+     add_prefix,
+@@ -471,30 +476,28 @@ def _apply_qwen3_next_mlp(
+     hidden_states, residual = layer.layer_communicator.prepare_mlp(
+         hidden_states, residual, forward_batch
+     )
+-    use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
++    mlp_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
+         forward_batch
+     )
+-    should_allreduce_fusion = (
++    fuse_mlp_allreduce = (
+         layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+             forward_batch
+         )
+     )
+ 
+-    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+-        hidden_states = layer.mlp(
+-            hidden_states,
+-            forward_batch=forward_batch,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+-        )
+-    else:
+-        hidden_states = layer.mlp(
+-            hidden_states,
+-            should_allreduce_fusion=should_allreduce_fusion,
+-            use_reduce_scatter=use_reduce_scatter,
+-        )
++    with get_forward().scoped(
++        fuse_mlp_allreduce=fuse_mlp_allreduce,
++        mlp_reduce_scatter=mlp_reduce_scatter,
++    ):
++        if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
++            hidden_states = layer.mlp(
++                hidden_states,
++                forward_batch=forward_batch,
++            )
++        else:
++            hidden_states = layer.mlp(hidden_states)
+ 
+-    if should_allreduce_fusion:
++    if fuse_mlp_allreduce:
+         hidden_states._sglang_needs_allreduce_fusion = True
+     else:
+         hidden_states, residual = layer.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/sarvam_moe.py b/python/sglang/srt/models/sarvam_moe.py
+index f6e40d15588b..0767d8865599 100644
+--- a/python/sglang/srt/models/sarvam_moe.py
++++ b/python/sglang/srt/models/sarvam_moe.py
+@@ -60,7 +60,12 @@
+ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
+     DeepseekMHAForwardMixin,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import (
+     BumpAllocator,
+     add_prefix,
+@@ -205,16 +210,12 @@ def forward(
+         self,
+         x,
+         forward_batch: ForwardBatch = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ):
+         if x.shape[0] == 0:
+             return x
+         gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(
+-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+-        )
++        x, _ = self.down_proj(x)
+         return x
+ 
+ 
+@@ -315,8 +316,6 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+         gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+     ) -> torch.Tensor:
+         del gemm_output_zero_allocator
+@@ -327,13 +326,9 @@ def forward(
+             and hidden_states.shape[0] > 0
+             and get_is_capture_mode()
+         ):
+-            return self.forward_normal_dual_stream(
+-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+-            )
++            return self.forward_normal_dual_stream(hidden_states)
+         else:
+-            return self.forward_normal(
+-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+-            )
++            return self.forward_normal(hidden_states)
+ 
+     def get_moe_weights(self):
+         return [
+@@ -359,8 +354,6 @@ def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+     def forward_normal_dual_stream(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         current_stream = torch.cuda.current_stream()
+@@ -374,8 +367,6 @@ def forward_normal_dual_stream(
+         final_hidden_states = final_hidden_states + shared_out
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states.view(num_tokens, hidden_dim)
+@@ -383,8 +374,6 @@ def forward_normal_dual_stream(
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if hidden_states.shape[0] == 0:
+             return hidden_states
+@@ -416,8 +405,6 @@ def forward_normal(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+@@ -1111,25 +1098,27 @@ def forward(
+         hidden_states, residual = self.layer_communicator.prepare_mlp(
+             hidden_states, residual, forward_batch
+         )
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+-        hidden_states = self.mlp(
+-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(hidden_states, forward_batch)
+         if (
+             not self.is_layer_sparse
+             and self.attn_tp_size > 1
+-            and not use_reduce_scatter
+-            and not should_allreduce_fusion
++            and not mlp_reduce_scatter
++            and not fuse_mlp_allreduce
+         ):
+             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/sdar.py b/python/sglang/srt/models/sdar.py
+index 4db26c8e4f41..91946db54b4e 100644
+--- a/python/sglang/srt/models/sdar.py
++++ b/python/sglang/srt/models/sdar.py
+@@ -41,7 +41,12 @@
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import add_prefix, is_cuda, make_layers
+ 
+ logger = logging.getLogger(__name__)
+@@ -74,12 +79,10 @@ def __init__(
+         )
+         self.act_fn = SiluAndMul()
+ 
+-    def forward(self, hidden_states: torch.Tensor, use_reduce_scatter: bool = False):
++    def forward(self, hidden_states: torch.Tensor):
+         gate_up, _ = self.gate_up_proj(hidden_states)
+         hidden_states = self.act_fn(gate_up)
+-        hidden_states, _ = self.down_proj(
+-            hidden_states, skip_all_reduce=use_reduce_scatter
+-        )
++        hidden_states, _ = self.down_proj(hidden_states)
+         return hidden_states
+ 
+ 
+@@ -333,10 +336,11 @@ def forward(
+             forward_batch,
+         )
+ 
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+-        hidden_states = self.mlp(hidden_states, use_reduce_scatter=use_reduce_scatter)
++        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
++            hidden_states = self.mlp(hidden_states)
+ 
+         hidden_states, residual = self.layer_communicator.postprocess_layer(
+             hidden_states, residual, forward_batch
+diff --git a/python/sglang/srt/models/sdar_moe.py b/python/sglang/srt/models/sdar_moe.py
+index e7fe81718a9b..b91db7be3359 100644
+--- a/python/sglang/srt/models/sdar_moe.py
++++ b/python/sglang/srt/models/sdar_moe.py
+@@ -57,7 +57,12 @@
+     create_fused_set_kv_buffer_arg,
+     enable_fused_set_kv_buffer,
+ )
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+ 
+ logger = logging.getLogger(__name__)
+@@ -126,18 +131,12 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         if (
+             not get_moe_a2a_backend().is_deepep()
+             and not get_moe_a2a_backend().is_ascend_fuseep()
+         ):
+-            return self.forward_normal(
+-                hidden_states,
+-                should_allreduce_fusion=should_allreduce_fusion,
+-                use_reduce_scatter=use_reduce_scatter,
+-            )
++            return self.forward_normal(hidden_states)
+         else:
+             assert forward_batch is not None, "deepep/fuseep MoE needs forward_batch"
+             return self.forward_deepep(hidden_states, forward_batch)
+@@ -145,8 +144,6 @@ def forward(
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+@@ -157,8 +154,6 @@ def forward_normal(
+ 
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             out = tensor_model_parallel_all_reduce(out)
+ 
+@@ -408,23 +403,25 @@ def forward(
+             hidden_states, residual, forward_batch
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+-        hidden_states = self.mlp(
+-            hidden_states,
+-            forward_batch=forward_batch,
+-            should_allreduce_fusion=should_allreduce_fusion,
+-            use_reduce_scatter=use_reduce_scatter,
+-        )
++        with get_forward().scoped(
++            fuse_mlp_allreduce=fuse_mlp_allreduce,
++            mlp_reduce_scatter=mlp_reduce_scatter,
++        ):
++            hidden_states = self.mlp(
++                hidden_states,
++                forward_batch=forward_batch,
++            )
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/models/step3p5.py b/python/sglang/srt/models/step3p5.py
+index d28929a8ed7a..117b795bd0fa 100644
+--- a/python/sglang/srt/models/step3p5.py
++++ b/python/sglang/srt/models/step3p5.py
+@@ -46,7 +46,12 @@
+ )
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
++from sglang.srt.runtime_context import (
++    get_forward,
++    get_parallel,
++    get_server_args,
++    get_stream,
++)
+ from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+ 
+ Step3p5Config = None
+@@ -179,17 +184,13 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+ 
+         if (
+             not get_moe_a2a_backend().is_deepep()
+             and not get_moe_a2a_backend().is_ascend_fuseep()
+         ):
+-            return self.forward_normal(
+-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+-            )
++            return self.forward_normal(hidden_states)
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
+@@ -206,8 +207,6 @@ def get_moe_weights(self):
+     def forward_normal(
+         self,
+         hidden_states: torch.Tensor,
+-        should_allreduce_fusion: bool = False,
+-        use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+@@ -231,8 +230,6 @@ def forward_normal(
+         final_hidden_states = self.experts(hidden_states, topk_output)
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+-            use_reduce_scatter=use_reduce_scatter,
+-            should_allreduce_fusion=should_allreduce_fusion,
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+@@ -617,12 +614,12 @@ def forward(
+             forward_batch,
+         )
+ 
+-        should_allreduce_fusion = (
++        fuse_mlp_allreduce = (
+             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                 forward_batch
+             )
+         )
+-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
++        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+ 
+@@ -630,24 +627,24 @@ def forward(
+             # Both share_expert and MoE return unreduced (TP-partial) outputs.
+             # Combine them first, then do a single all-reduce — saving one
+             # full-TP all-reduce per layer.
++            # Force fuse_mlp_allreduce=True so MoE skips its internal AR.
+             share_output = self.share_expert(hidden_states)
+-            moe_output = self.moe(
+-                hidden_states,
+-                forward_batch,
+-                should_allreduce_fusion=True,
+-                use_reduce_scatter=use_reduce_scatter,
+-            )
++            with get_forward().scoped(
++                fuse_mlp_allreduce=True,
++                mlp_reduce_scatter=mlp_reduce_scatter,
++            ):
++                moe_output = self.moe(hidden_states, forward_batch)
+             hidden_states = moe_output + share_output
+-            if not should_allreduce_fusion and not use_reduce_scatter:
++            if not fuse_mlp_allreduce and not mlp_reduce_scatter:
+                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+         else:
+             hidden_states = self.mlp(hidden_states)
+             # Dense MLP uses reduce_results=True, so the output is already
+             # all-reduced.  Do NOT set the fusion flag — otherwise the next
+             # layer would all-reduce again, multiplying values by world_size.
+-            should_allreduce_fusion = False
++            fuse_mlp_allreduce = False
+ 
+-        if should_allreduce_fusion:
++        if fuse_mlp_allreduce:
+             hidden_states._sglang_needs_allreduce_fusion = True
+         else:
+             hidden_states, residual = self.layer_communicator.postprocess_layer(
+diff --git a/python/sglang/srt/runtime_context.py b/python/sglang/srt/runtime_context.py
+index bbe16696ee45..4a330d14885b 100644
+--- a/python/sglang/srt/runtime_context.py
++++ b/python/sglang/srt/runtime_context.py
+@@ -407,17 +407,28 @@ class ForwardFlags:
+         # Sticky across forwards: every ForwardBatch construction writes it;
+         # graph runners force False around capture.
+         "is_extend_in_batch": False,
++        # Per-layer MLP collective control (set by decoder via scoped()
++        # around the MLP / MoE / hybrid mixer call).
++        # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
++        # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
++        # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
++        "fuse_mlp_allreduce": False,
++        "mlp_reduce_scatter": False,
++        "flashinfer_trtllm_bypass": False,
+     }
+ 
+     # Read/written inside compiled graphs (vocab embedding, communicator,
+-    # EP dispatch, DP gather/scatter): plain-slot backed. Before moving a
+-    # flag out of this set, prove no read/write site sits under
+-    # torch.compile.
++    # EP dispatch, DP gather/scatter, MLP/MoE skip-AR): plain-slot backed.
++    # Before moving a flag out of this set, prove no read/write site sits
++    # under torch.compile.
+     _GRAPH_VISIBLE = frozenset(
+         {
+             "attn_input_scattered",
+             "attn_inputs",
+             "is_extend_in_batch",
++            "fuse_mlp_allreduce",
++            "mlp_reduce_scatter",
++            "flashinfer_trtllm_bypass",
+         }
+     )
+ 
+diff --git a/test/registered/debug_utils/test_engine_dumper_comparator_e2e.py b/test/registered/debug_utils/test_engine_dumper_comparator_e2e.py
+index a675b4bf5c38..78df91bf6132 100644
+--- a/test/registered/debug_utils/test_engine_dumper_comparator_e2e.py
++++ b/test/registered/debug_utils/test_engine_dumper_comparator_e2e.py
+@@ -90,10 +90,7 @@
+               hidden_states, residual, forward_batch
+           )
+         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
+-      - match: |
+-          hidden_states = self.mlp(
+-              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-          )
++      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
+         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
+ 
+   # --- attention internals ---
+@@ -150,10 +147,7 @@
+               hidden_states, residual, forward_batch
+           )
+         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
+-      - match: |
+-          hidden_states = self.mlp(
+-              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+-          )
++      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
+         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
+ 
+   # --- attention internals ---
+diff --git a/test/registered/unit/test_runtime_context.py b/test/registered/unit/test_runtime_context.py
+index 78c9d87bc074..6a160a124754 100644
+--- a/test/registered/unit/test_runtime_context.py
++++ b/test/registered/unit/test_runtime_context.py
+@@ -696,6 +696,12 @@ def probe(x):
+                 x = x + 1
+             if fwd.is_extend_in_batch:
+                 x = x + 2
++            if fwd.fuse_mlp_allreduce:
++                x = x + 4
++            if fwd.mlp_reduce_scatter:
++                x = x + 8
++            if fwd.flashinfer_trtllm_bypass:
++                x = x + 16
+             return x
+ 
+         self.assertEqual(probe(torch.zeros(())).item(), 0)
+@@ -704,6 +710,13 @@ def probe(x):
+         get_forward().set("is_extend_in_batch", True)
+         self.assertEqual(probe(torch.zeros(())).item(), 2)
+         get_forward().set("is_extend_in_batch", False)
++        with get_forward().scoped(
++            fuse_mlp_allreduce=True,
++            mlp_reduce_scatter=True,
++            flashinfer_trtllm_bypass=True,
++        ):
++            self.assertEqual(probe(torch.zeros(())).item(), 28)
++        self.assertEqual(probe(torch.zeros(())).item(), 0)
+ 
+     def test_graph_visible_flags_are_process_visible_across_threads(self):
+         # Documented divergence from the contextvar-backed flags: plain slots
+@@ -812,6 +825,38 @@ def test_moe_output_buffer_ctx(self):
+             self.assertIs(get_forward().moe_output_buffer, sentinel)
+         self.assertIsNone(get_forward().moe_output_buffer)
+ 
++    def test_mlp_comm_forward_flags(self):
++        """Decoder-published MLP collective flags: scoped restore + skip helpers."""
++        from sglang.srt.layers.moe.utils import (
++            should_skip_mlp_all_reduce,
++            should_skip_post_experts_all_reduce,
++        )
++        from sglang.srt.runtime_context import get_forward
++
++        reset_context()
++        fwd = get_forward()
++        self.assertFalse(fwd.fuse_mlp_allreduce)
++        self.assertFalse(fwd.mlp_reduce_scatter)
++        self.assertFalse(fwd.flashinfer_trtllm_bypass)
++        self.assertFalse(should_skip_mlp_all_reduce())
++
++        with fwd.scoped(fuse_mlp_allreduce=True):
++            self.assertTrue(fwd.fuse_mlp_allreduce)
++            self.assertTrue(should_skip_mlp_all_reduce())
++            # Fusion alone is enough to skip post-experts AR.
++            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
++        self.assertFalse(fwd.fuse_mlp_allreduce)
++        self.assertFalse(should_skip_mlp_all_reduce())
++
++        with fwd.scoped(mlp_reduce_scatter=True):
++            self.assertTrue(fwd.mlp_reduce_scatter)
++            self.assertTrue(should_skip_mlp_all_reduce())
++        self.assertFalse(fwd.mlp_reduce_scatter)
++
++        with fwd.scoped(flashinfer_trtllm_bypass=True):
++            self.assertTrue(fwd.flashinfer_trtllm_bypass)
++        self.assertFalse(fwd.flashinfer_trtllm_bypass)
++
+ 
+ class TestPublishLifecycle(_IsolatedServerArgs):
+     """Publish installs the resolved server_args and seeds the capture tier."""

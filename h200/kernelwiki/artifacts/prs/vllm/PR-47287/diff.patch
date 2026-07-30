@@ -1,0 +1,2452 @@
+diff --git a/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu b/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
+index a2162a03b835..d8460f032eb2 100644
+--- a/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
++++ b/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
+@@ -39,12 +39,10 @@
+  * The IQ/IK warps address the index_q/index_k sub-blocks *inside* qkv at the
+  * fixed physical offsets (nq+2*nkv)*128 and (nq+2*nkv+niq)*128.
+  *
+- * Dense vs sparse is a compile-time choice via the ``kIsSparse``/``kInsertKV``
+- * template bools (3 instantiations: dense <false,false>, sparse-profiling
+- * <true,false>, sparse-serving <true,true>), so the index slots, the V slots
+- * and the cache inserts fold away entirely on paths that don't use them. The
+- * dense layer passes no caches/index: norm+RoPE happens in place and the
+- * generic ``Attention`` layer owns the cache write.
++ * Dense vs sparse row layout and index-branch processing are separate template
++ * choices. Skip-index-topk reuse layers still have sparse rows and insert main
++ * K/V cache entries, but compile away index_q/index_k work and index-cache
++ * writes.
+  *
+  * Q/K and (sparse) index_q/index_k are all rewritten in place inside the fused
+  * ``qkv`` tensor.  Caches (bf16) are scatter-written by slot.
+@@ -223,10 +221,25 @@ __device__ __forceinline__ void storeCacheElems(
+     // model dtype directly. FP8 cache dtypes use the conversion path below.
+     storeElems<scalar_t>(reinterpret_cast<scalar_t*>(dst), elems);
+   } else {
+-#pragma unroll
++#ifdef USE_ROCM
++    // Match ROCm's model-dtype materialization before FP8 cache conversion.
++    using Converter = vllm::_typeConvert<scalar_t>;
++    using rounded_t = typename Converter::hip_type;
++    rounded_t rounded[kElemsPerLane];
++  #pragma unroll
++    for (int i = 0; i < kElemsPerLane; i++) {
++      rounded[i] = Converter::convert(elems[i]);
++    }
++  #pragma unroll
++    for (int i = 0; i < kElemsPerLane; i++) {
++      dst[i] = fp8::scaled_convert<cache_t, rounded_t, kv_dt>(rounded[i], 1.0f);
++    }
++#else
++  #pragma unroll
+     for (int i = 0; i < kElemsPerLane; i++) {
+       dst[i] = fp8::scaled_convert<cache_t, float, kv_dt>(elems[i], 1.0f);
+     }
++#endif
+   }
+ }
+ 
+@@ -262,20 +275,25 @@ __device__ __forceinline__ void storeElemsFp8(
+ // Grid: 1D, ceil(num_tokens * slots_per_token / warps_per_block).
+ // Each warp = one (token, slot).
+ //
+-// `kIsSparse` and `kInsertKV` are compile-time template bools, so all the
+-// branch decisions that distinguish the dense layer from the sparse layer
+-// (index slots, KV/index inserts, V slots) fold away per instantiation.
+-// Three instantiations are built: dense <false,false>, sparse-profiling
+-// <true,false> and sparse-serving <true,true>.  Slots per token:
++// `kHasIndex`, `kProcessIndex`, and `kInsertKV` are compile-time template
++// bools, so branch decisions that distinguish the dense layer from the sparse
++// layer (index slots, KV/index inserts, V slots) fold away per instantiation.
++// Slots per token:
+ //     Q : nq                            (always — norm+RoPE)
+ //     K : nkv                           (always — norm+RoPE; +K-cache insert)
+ //     V : nkv  only if kInsertKV        (V-cache insert; no warps in dense)
+-//     IQ: niq  only if kIsSparse        (norm+RoPE)
+-//     IK: 1    only if kIsSparse        (norm+RoPE; +index-cache insert)
++//     IQ: niq  only if kProcessIndex    (norm+RoPE)
++//     IK: 1    only if kProcessIndex    (norm+RoPE; +index-cache insert)
+ // cache_t/kv_dt: main attention KV-cache dtype (auto/fp8). out_idx_t/kFp8Idx:
+ // indexer index-K cache + index-Q output dtype (scalar_t or e4m3 byte).
++// kHasIndex means the qkv row is laid out as sparse [q|k|v|index_q|index_k].
++// kProcessIndex controls whether this launch actually norms/ropes the index
++// branch and writes index_q/index_k outputs. Skip-index-topk reuse layers keep
++// kHasIndex=true but set kProcessIndex=false.
+ template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
+-          typename out_idx_t, bool kIsSparse, bool kInsertKV, bool kFp8Idx>
++          typename out_idx_t, bool kHasIndex, bool kInsertKV,
++          bool kProcessIndex,
++          bool kFp8Idx>
+ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     scalar_t* __restrict__ qkv,  // [N, qkv_row] in/out (packs index if sparse)
+     scalar_t* __restrict__ q_out,         // [N, nq*128] contiguous, or nullptr
+@@ -308,9 +326,12 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     int const laneId = threadIdx.x % 32;
+     int const globalWarpIdx = blockIdx.x * warpsPerBlock + (threadIdx.x / 32);
+ 
++    static_assert(!kProcessIndex || kHasIndex,
++                  "index processing requires sparse row layout");
++
+     // Slot layout (compile-time gated: dense has neither V nor index slots).
+     int const v_slots = kInsertKV ? nkv : 0;
+-    int const idx_slots = kIsSparse ? niq + 1 : 0;
++    int const idx_slots = kProcessIndex ? niq + 1 : 0;
+     int const slots_per_token = nq + nkv + v_slots + idx_slots;
+ 
+     int const tokenIdx = globalWarpIdx / slots_per_token;
+@@ -321,14 +342,14 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     int const k_begin = nq;
+     int const v_begin = nq + nkv;             // valid only when kInsertKV
+     int const iq_begin = nq + nkv + v_slots;  // index block start
+-    int const ik_slot = iq_begin + niq;       // valid only when kIsSparse
++    int const ik_slot = iq_begin + niq;       // valid only when kProcessIndex
+ 
+     bool const isQ = slot < k_begin;
+     bool const isK = slot >= k_begin && slot < v_begin;
+     bool isV = false;
+     if constexpr (kInsertKV) isV = slot >= v_begin && slot < v_begin + nkv;
+     bool isIQ = false, isIK = false;
+-    if constexpr (kIsSparse) {
++    if constexpr (kProcessIndex) {
+       isIQ = slot >= iq_begin && slot < ik_slot;
+       isIK = slot == ik_slot;
+     }
+@@ -336,7 +357,7 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     int const dim_base = laneId * kElemsPerLane;
+     // Physical row width of qkv: the dense layer packs [q|k|v]; the sparse
+     // layer additionally packs [index_q (niq heads) | index_k (1 head)].
+-    int const qkv_row = (nq + 2 * nkv + (kIsSparse ? (niq + 1) : 0)) * kHeadDim;
++    int const qkv_row = (nq + 2 * nkv + (kHasIndex ? (niq + 1) : 0)) * kHeadDim;
+ 
+     // ── Resolve source pointer + per-branch parameters. ────────────────────
+     scalar_t* row_ptr = nullptr;       // in-place output location
+@@ -367,10 +388,13 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+       row_ptr = qkv + static_cast<int64_t>(tokenIdx) * qkv_row +
+                 (nq + 2 * nkv + ih) * kHeadDim;
+       norm_w = iq_norm_w;
+-    } else {  // isIK -- single shared index key at (nq+2*nkv+niq)*128.
++    } else if (isIK) {
++      // Single shared index key at (nq+2*nkv+niq)*128.
+       row_ptr = qkv + static_cast<int64_t>(tokenIdx) * qkv_row +
+                 (nq + 2 * nkv + niq) * kHeadDim;
+       norm_w = ik_norm_w;
++    } else {
++      return;
+     }
+ 
+     // Store destination.  Q and index_q are gathered into dedicated contiguous
+@@ -426,9 +450,12 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     // ── Cache inserts (sparse serving only). ───────────────────────────────
+     if constexpr (kInsertKV) {
+       // Guard (not early-return) so every thread reaches the PDL trigger below.
+-      int64_t const sm = (isK || isV)
+-                             ? slot_mapping[tokenIdx]
+-                             : (isIK ? index_slot_mapping[tokenIdx] : -1);
++      int64_t sm = -1;
++      if (isK || isV) {
++        sm = slot_mapping[tokenIdx];
++      } else if constexpr (kProcessIndex) {
++        if (isIK) sm = index_slot_mapping[tokenIdx];
++      }
+       if (sm >= 0) {  // skip padded / unscheduled tokens
+         if (isIK) {
+           if constexpr (kFp8Idx) {
+@@ -475,12 +502,12 @@ void launchFusedMiniMaxM3(
+     int const nkv, int const niq, int const block_size,
+     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
+     int64_t const kv_s_dim, bool const has_index, bool const insert_kv,
+-    bool const fp8_idx, cudaStream_t stream) {
++    bool const process_index, bool const fp8_idx, cudaStream_t stream) {
+   // Index outputs are scalar_t (bf16) or e4m3 bytes (uint8_t); reinterpret the
+   // void* pointers per instantiation in the LAUNCH macro.
+   // Slot count must match the kernel's compile-time gating.
+   int const v_slots = insert_kv ? nkv : 0;
+-  int const idx_slots = has_index ? niq + 1 : 0;
++  int const idx_slots = process_index ? niq + 1 : 0;
+   int const slots_per_token = nq + nkv + v_slots + idx_slots;
+ 
+   constexpr int kBlockSize = 256;
+@@ -507,11 +534,12 @@ void launchFusedMiniMaxM3(
+   config.attrs = attrs;
+   config.numAttrs = (sm_version >= 90) ? 1 : 0;
+ 
+-  #define LAUNCH(IS_SPARSE, INSERT, FP8, OUT_T)                                \
++  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)                 \
+     cudaLaunchKernelEx(                                                        \
+         &config,                                                               \
+         fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt, OUT_T, \
+-                                              IS_SPARSE, INSERT, FP8>,         \
++                                              HAS_INDEX, INSERT,               \
++                                              PROCESS_INDEX, FP8>,             \
+         qkv, q_out, reinterpret_cast<OUT_T*>(index_q_out), q_norm_w, k_norm_w, \
+         iq_norm_w, ik_norm_w, cos_sin_cache, positions, slot_mapping,          \
+         index_slot_mapping, kv_cache, reinterpret_cast<OUT_T*>(index_cache),   \
+@@ -520,37 +548,45 @@ void launchFusedMiniMaxM3(
+ #else
+   // ROCm: standard kernel launch syntax (no PDL/stream serialization).
+   // clang-format off
+-  #define LAUNCH(IS_SPARSE, INSERT, FP8, OUT_T)                              \
+-        fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt, OUT_T,   \
+-                                          IS_SPARSE, INSERT, FP8>            \
+-        <<<grid, kBlockSize, 0, stream>>>(                                   \
+-            qkv, q_out, reinterpret_cast<OUT_T*>(index_q_out), q_norm_w,     \
+-            k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions,        \
+-            slot_mapping, index_slot_mapping, kv_cache,                      \
+-            reinterpret_cast<OUT_T*>(index_cache), eps, rotary_dim,          \
+-            num_tokens, nq, nkv, niq, block_size, kv_s_block, kv_s_head,     \
+-            kv_s_token, kv_s_dim)
++  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)              \
++    fusedMiniMaxM3QNormRopeKVInsertKernel<                                  \
++        scalar_t, cache_t, kv_dt, OUT_T, HAS_INDEX, INSERT, PROCESS_INDEX,  \
++        FP8><<<grid, kBlockSize, 0, stream>>>(                              \
++        qkv, q_out, reinterpret_cast<OUT_T*>(index_q_out), q_norm_w,        \
++        k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions,           \
++        slot_mapping, index_slot_mapping, kv_cache,                         \
++        reinterpret_cast<OUT_T*>(index_cache), eps, rotary_dim, num_tokens, \
++        nq, nkv, niq, block_size, kv_s_block, kv_s_head, kv_s_token,         \
++        kv_s_dim)
+   // clang-format on
+ #endif
+ 
+   if (has_index) {
+-    if (insert_kv) {
++    if (!process_index) {
++      if (insert_kv) {
++        LAUNCH(true, true, false, false, scalar_t);
++      } else {
++        LAUNCH(true, false, false, false, scalar_t);
++      }
++    } else if (insert_kv) {
+       if (fp8_idx) {
+-        LAUNCH(true, true, true, uint8_t);  // sparse serving, fp8 index outputs
++        LAUNCH(true, true, true, true,
++               uint8_t);  // sparse serving, fp8 index outputs
+       } else {
+-        LAUNCH(true, true, false, scalar_t);  // sparse serving, bf16
++        LAUNCH(true, true, true, false, scalar_t);  // sparse serving, bf16
+       }
+     } else {
+       if (fp8_idx) {
+-        LAUNCH(true, false, true, uint8_t);  // sparse profiling, fp8 index_q
++        LAUNCH(true, false, true, true,
++               uint8_t);  // sparse profiling, fp8 index_q
+       } else {
+-        LAUNCH(true, false, false, scalar_t);  // sparse profiling, bf16
++        LAUNCH(true, false, true, false, scalar_t);  // sparse profiling, bf16
+       }
+     }
+   } else {
+     // Dense layer: never has an index branch and never inserts here (the
+     // generic Attention layer owns the KV insert).
+-    LAUNCH(false, false, false, scalar_t);
++    LAUNCH(false, false, false, false, scalar_t);
+   }
+ #undef LAUNCH
+ }
+@@ -558,6 +594,7 @@ void launchFusedMiniMaxM3(
+ }  // namespace minimax_m3_fused_ops
+ }  // namespace vllm
+ 
++// clang-format off
+ #define CALL_FUSED_MINIMAX_M3(_RAW_T, CACHE_T, KV_DTYPE)                       \
+   vllm::minimax_m3_fused_ops::launchFusedMiniMaxM3<st, CACHE_T, KV_DTYPE>(     \
+       reinterpret_cast<st*>(qkv.data_ptr()),                                   \
+@@ -567,24 +604,29 @@ void launchFusedMiniMaxM3(
+           : nullptr,                                                           \
+       reinterpret_cast<st const*>(q_norm_weight.data_ptr()),                   \
+       reinterpret_cast<st const*>(k_norm_weight.data_ptr()),                   \
+-      has_index ? reinterpret_cast<st const*>(index_q_norm_weight->data_ptr()) \
+-                : nullptr,                                                     \
+-      has_index ? reinterpret_cast<st const*>(index_k_norm_weight->data_ptr()) \
+-                : nullptr,                                                     \
++      process_index                                                            \
++          ? reinterpret_cast<st const*>(index_q_norm_weight->data_ptr())       \
++          : nullptr,                                                           \
++      process_index                                                            \
++          ? reinterpret_cast<st const*>(index_k_norm_weight->data_ptr())       \
++          : nullptr,                                                           \
+       reinterpret_cast<st const*>(cos_sin_cache.data_ptr()),                   \
+       reinterpret_cast<int64_t const*>(positions.data_ptr()),                  \
+       insert_kv ? reinterpret_cast<int64_t const*>(slot_mapping->data_ptr())   \
+                 : nullptr,                                                     \
+-      insert_kv ? reinterpret_cast<int64_t const*>(                            \
+-                      effective_index_slot_mapping->data_ptr())                \
+-                : nullptr,                                                     \
++      (insert_kv && process_index)                                             \
++          ? reinterpret_cast<int64_t const*>(                                  \
++                effective_index_slot_mapping->data_ptr())                      \
++          : nullptr,                                                           \
+       insert_kv ? reinterpret_cast<CACHE_T*>(kv_cache->data_ptr()) : nullptr,  \
+-      (insert_kv && has_index)                                                 \
++      (insert_kv && process_index)                                             \
+           ? reinterpret_cast<void*>(index_cache->data_ptr())                   \
+           : nullptr,                                                           \
+       static_cast<float>(eps), static_cast<int>(rotary_dim), num_tokens, nq,   \
+       nkv, niq, static_cast<int>(block_size), kv_s_block, kv_s_head,           \
+-      kv_s_token, kv_s_dim, has_index, insert_kv, fp8_idx, stream)
++      kv_s_token, kv_s_dim, has_index, insert_kv, process_index, fp8_idx,       \
++      stream)
++// clang-format on
+ 
+ // ────────────────────────────────────────────────────────────────────────────
+ // Torch op wrapper
+@@ -607,7 +649,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+     std::optional<torch::stable::Tensor> q_out,  // [N, nq*128] contiguous
+     std::optional<torch::stable::Tensor>
+         index_q_out,  // [N, niq*128] contiguous
+-    const std::string& kv_cache_dtype) {
++    const std::string& kv_cache_dtype, bool skip_index_branch) {
+   STD_TORCH_CHECK(qkv.is_cuda() && qkv.is_contiguous(),
+                   "qkv must be contiguous CUDA");
+   STD_TORCH_CHECK(
+@@ -646,6 +688,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+   // (1 head)]) right after [q|k|v] in the same row; the dense layer does not.
+   bool const has_index = niq > 0;
+   bool const insert_kv = kv_cache.has_value();
++  bool const process_index = has_index && !skip_index_branch;
+   vllm::Fp8KVCacheDataType const kv_dt =
+       vllm::get_fp8_kv_cache_data_type(kv_cache_dtype);
+   int const kHeadDim = vllm::minimax_m3_fused_ops::kHeadDim;
+@@ -661,7 +704,9 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+   STD_TORCH_CHECK(
+       !insert_kv || has_index,
+       "insert mode (kv_cache) requires the index branch (sparse layer)");
+-  if (has_index) {
++  STD_TORCH_CHECK(has_index || !skip_index_branch,
++                  "skip_index_branch requires sparse qkv rows");
++  if (process_index) {
+     STD_TORCH_CHECK(
+         index_q_norm_weight.has_value() && index_k_norm_weight.has_value(),
+         "index branch requires both index norm weights");
+@@ -683,13 +728,15 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+         slot_mapping.has_value() && slot_mapping->is_cuda() &&
+             slot_mapping->scalar_type() == torch::headeronly::ScalarType::Long,
+         "insert mode requires int64 CUDA slot_mapping");
+-    STD_TORCH_CHECK(
+-        !index_slot_mapping.has_value() ||
+-            (index_slot_mapping->is_cuda() &&
+-             index_slot_mapping->scalar_type() ==
+-                 torch::headeronly::ScalarType::Long &&
+-             index_slot_mapping->numel() == slot_mapping->numel()),
+-        "index_slot_mapping must be int64 CUDA with slot_mapping length");
++    if (process_index) {
++      STD_TORCH_CHECK(
++          !index_slot_mapping.has_value() ||
++              (index_slot_mapping->is_cuda() &&
++               index_slot_mapping->scalar_type() ==
++                   torch::headeronly::ScalarType::Long &&
++               index_slot_mapping->numel() == slot_mapping->numel()),
++          "index_slot_mapping must be int64 CUDA with slot_mapping length");
++    }
+     // Main attention KV cache: auto matches qkv, fp8 uses uint8 storage.
+     if (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
+       STD_TORCH_CHECK(kv_cache->scalar_type() == qkv.scalar_type(),
+@@ -700,12 +747,14 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+           "fp8 kv_cache must use uint8 storage");
+     }
+     // Indexer index-K cache: independent dtype -- qkv dtype or fp8 e4m3.
+-    STD_TORCH_CHECK(
+-        index_cache.has_value() &&
+-            (index_cache->scalar_type() == qkv.scalar_type() ||
+-             index_cache->scalar_type() ==
+-                 torch::headeronly::ScalarType::Float8_e4m3fn),
+-        "insert mode requires index_cache matching qkv dtype or fp8 e4m3");
++    if (process_index) {
++      STD_TORCH_CHECK(
++          index_cache.has_value() &&
++              (index_cache->scalar_type() == qkv.scalar_type() ||
++               index_cache->scalar_type() ==
++                   torch::headeronly::ScalarType::Float8_e4m3fn),
++          "insert mode requires index_cache matching qkv dtype or fp8 e4m3");
++    }
+     STD_TORCH_CHECK(kv_cache->dim() == 4 && kv_cache->stride(3) == 1,
+                     "kv_cache must be [nb,nkv,bs,2*head_dim] with contiguous "
+                     "content dim (stride(3)==1)");
+@@ -713,9 +762,11 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+     kv_s_head = kv_cache->stride(1);
+     kv_s_token = kv_cache->stride(2);
+     kv_s_dim = kv_cache->stride(3);
+-    effective_index_slot_mapping = index_slot_mapping.has_value()
+-                                       ? &index_slot_mapping.value()
+-                                       : &slot_mapping.value();
++    if (process_index) {
++      effective_index_slot_mapping = index_slot_mapping.has_value()
++                                         ? &index_slot_mapping.value()
++                                         : &slot_mapping.value();
++    }
+   }
+   // Optional contiguous gather targets: when given, the normed/roped q (and
+   // index_q) are written here instead of in place, so callers avoid a separate
+@@ -730,9 +781,8 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+         "q_out must have num_tokens * num_heads * 128 elements");
+   }
+   if (index_q_out.has_value()) {
+-    STD_TORCH_CHECK(
+-        has_index,
+-        "index_q_out requires the index branch (num_index_heads > 0)");
++    STD_TORCH_CHECK(process_index,
++                    "index_q_out requires index branch processing");
+     STD_TORCH_CHECK(
+         index_q_out->is_cuda() && index_q_out->is_contiguous() &&
+             (index_q_out->scalar_type() == qkv.scalar_type() ||
+@@ -749,8 +799,9 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+   // q/k/v + q_out stay qkv dtype. Both index outputs must agree.
+   auto const kFp8 = torch::headeronly::ScalarType::Float8_e4m3fn;
+   bool const fp8_idx =
+-      (index_cache.has_value() && index_cache->scalar_type() == kFp8) ||
+-      (index_q_out.has_value() && index_q_out->scalar_type() == kFp8);
++      process_index &&
++      ((index_cache.has_value() && index_cache->scalar_type() == kFp8) ||
++       (index_q_out.has_value() && index_q_out->scalar_type() == kFp8));
+   if (fp8_idx) {
+     STD_TORCH_CHECK(
+         !index_cache.has_value() || index_cache->scalar_type() == kFp8,
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index 4520f4a99ec9..279a2b128037 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -313,7 +313,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+     std::optional<torch::stable::Tensor> index_cache, int64_t block_size,
+     std::optional<torch::stable::Tensor> q_out,
+     std::optional<torch::stable::Tensor> index_q_out,
+-    const std::string& kv_cache_dtype);
++    const std::string& kv_cache_dtype, bool skip_index_branch);
+ 
+ // Sampler kernels (shared CUDA/ROCm)
+ void apply_repetition_penalties_(
+diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
+index 7581769f4f45..a69b33dc2d9d 100644
+--- a/csrc/libtorch_stable/torch_bindings.cpp
++++ b/csrc/libtorch_stable/torch_bindings.cpp
+@@ -466,7 +466,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+       "Tensor? slot_mapping, Tensor? index_slot_mapping, "
+       "Tensor!? kv_cache, Tensor!? index_cache, "
+       "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
+-      "str kv_cache_dtype) -> ()");
++      "str kv_cache_dtype, bool skip_index_branch=False) -> ()");
+ 
+   // Apply repetition penalties to logits in-place.
+   ops.def(
+diff --git a/tests/kernels/attention/test_minimax_m3.py b/tests/kernels/attention/test_minimax_m3.py
+index 6251f423f1e1..8490d4b72567 100644
+--- a/tests/kernels/attention/test_minimax_m3.py
++++ b/tests/kernels/attention/test_minimax_m3.py
+@@ -820,6 +820,47 @@ def test_main_backend_layout_contract():
+         )
+ 
+ 
++def test_aiter_sparse_pa_layout_contract(monkeypatch):
++    """The shuffle-only AITER path retains separately contiguous K/V storage."""
++    import vllm.models.minimax_m3.common.sparse_attention as sparse_attn_mod
++
++    monkeypatch.setattr(sparse_attn_mod.rocm_aiter_ops, "is_enabled", lambda: True)
++    monkeypatch.setattr(
++        sparse_attn_mod.rocm_aiter_ops,
++        "is_shuffle_kv_cache_enabled",
++        lambda: True,
++    )
++
++    nb, bs, h, d = 7, BLOCK_SIZE, 1, HEAD_DIM
++    logical = MiniMaxM3SparseBackend.get_kv_cache_shape(nb, bs, h, d)
++    order = MiniMaxM3SparseBackend.get_kv_cache_stride_order()
++    assert logical == (nb, 2, bs, h, d)
++    assert order == (1, 0, 2, 3, 4)
++
++    physical_shape = tuple(logical[i] for i in order)
++    inv_order = [order.index(i) for i in range(len(order))]
++    raw = torch.empty(physical_shape, device="cuda", dtype=DTYPE)
++    logical_view = raw.permute(*inv_order)
++    key_cache, value_cache = logical_view.unbind(1)
++    assert key_cache.is_contiguous()
++    assert value_cache.is_contiguous()
++
++
++def test_aiter_sparse_pa_rejects_multiple_kv_heads(monkeypatch):
++    """Do not pair AITER's separated cache layout with the Triton fallback."""
++    import vllm.models.minimax_m3.common.sparse_attention as sparse_attn_mod
++
++    monkeypatch.setattr(sparse_attn_mod.rocm_aiter_ops, "is_enabled", lambda: True)
++    monkeypatch.setattr(
++        sparse_attn_mod.rocm_aiter_ops,
++        "is_shuffle_kv_cache_enabled",
++        lambda: True,
++    )
++
++    with pytest.raises(ValueError, match="num_kv_heads == 1"):
++        MiniMaxM3SparseBackend.get_kv_cache_shape(7, BLOCK_SIZE, 2, HEAD_DIM)
++
++
+ def test_main_backend_unknown_layout_raises(monkeypatch):
+     """An unrecognized layout (injected past env-var validation) is rejected."""
+     import vllm.models.minimax_m3.common.sparse_attention as sparse_attn_mod
+diff --git a/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py b/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
+index 3f79d4f5db0c..5c762b63df43 100644
+--- a/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
++++ b/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
+@@ -171,10 +171,9 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
+     kv_cache_storage_dtype = torch.uint8 if kv_cache_dtype == "fp8" else dtype
+     kv_cache = torch.zeros(
+         num_blocks,
+-        2,
+-        block_size,
+         num_kv_heads,
+-        HEAD_DIM,
++        block_size,
++        2 * HEAD_DIM,
+         dtype=kv_cache_storage_dtype,
+         device=device,
+     )
+@@ -246,18 +245,21 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
+     torch.testing.assert_close(index_k, ik_ref, rtol=1e-2, atol=1e-2)
+ 
+     # ── Cache inserts. ──
+-    # Main cache layout is [num_blocks, 2, block_size, num_kv_heads, head_dim]
+-    # (the K/V axis sits *before* block_size); index cache is [nb, bs, head_dim].
++    # Main cache layout is [num_blocks, num_kv_heads, block_size, 2*head_dim];
++    # index cache is [num_blocks, block_size, head_dim].
+     k_ref_h = k_ref.view(num_tokens, num_kv_heads, HEAD_DIM)
+     v_ref_h = v_in.view(num_tokens, num_kv_heads, HEAD_DIM)  # v is raw (no norm/rope)
+     if kv_cache_dtype == "fp8":
+         expected_kv_cache = torch.zeros_like(kv_cache)
++        expected_k_cache, expected_v_cache = expected_kv_cache.transpose(1, 2).split(
++            HEAD_DIM, dim=-1
++        )
+         scale = torch.ones((), device=device)
+         ops.reshape_and_cache_flash(
+             k_out.view(num_tokens, num_kv_heads, HEAD_DIM),
+             v_out.view(num_tokens, num_kv_heads, HEAD_DIM),
+-            expected_kv_cache[:, 0],
+-            expected_kv_cache[:, 1],
++            expected_k_cache,
++            expected_v_cache,
+             slot_mapping,
+             kv_cache_dtype,
+             scale,
+@@ -269,9 +271,11 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
+             s = slot_mapping[t].item()
+             b, pos = s // block_size, s % block_size
+             torch.testing.assert_close(
+-                kv_cache[b, 0, pos], k_ref_h[t], rtol=1e-2, atol=1e-2
++                kv_cache[b, :, pos, :HEAD_DIM], k_ref_h[t], rtol=1e-2, atol=1e-2
++            )
++            torch.testing.assert_close(
++                kv_cache[b, :, pos, HEAD_DIM:], v_ref_h[t], rtol=0, atol=0
+             )
+-            torch.testing.assert_close(kv_cache[b, 1, pos], v_ref_h[t], rtol=0, atol=0)
+ 
+     expected_index_cache = torch.zeros_like(index_cache).view(-1, HEAD_DIM)
+     expected_index_cache[index_slot_mapping] = index_k
+@@ -280,7 +284,121 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
+     )
+ 
+ 
+-# ── Test 3: fp8 (e4m3) index outputs ─────────────────────────────────────────
++@pytest.mark.parametrize("num_tokens", [1, 64, 513])
++@pytest.mark.parametrize("block_size", [16, 64])
++@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
++def test_sparse_skip_index_branch(num_tokens, block_size, kv_cache_dtype):
++    torch.manual_seed(2)
++    device, dtype, eps = "cuda", torch.bfloat16, 1e-6
++    base, max_pos = 5_000_000.0, 4096
++    num_heads, num_kv_heads, num_idx_heads = 16, 4, 4
++
++    q_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
++    k_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
++    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
++    positions = torch.randint(
++        0, max_pos, (num_tokens,), dtype=torch.int64, device=device
++    )
++
++    qsz, kvsz = num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
++    iqsz, iksz = num_idx_heads * HEAD_DIM, HEAD_DIM
++    qkv = torch.randn(
++        num_tokens, qsz + 2 * kvsz + iqsz + iksz, dtype=dtype, device=device
++    )
++    qkv_orig = qkv.clone()
++    splits = [qsz, kvsz, kvsz, iqsz, iksz]
++
++    num_blocks = (num_tokens + block_size - 1) // block_size + 1
++    kv_cache_storage_dtype = torch.uint8 if kv_cache_dtype == "fp8" else dtype
++    kv_cache = torch.zeros(
++        num_blocks,
++        num_kv_heads,
++        block_size,
++        2 * HEAD_DIM,
++        dtype=kv_cache_storage_dtype,
++        device=device,
++    )
++    index_cache = torch.randn(
++        num_blocks, block_size, HEAD_DIM, dtype=dtype, device=device
++    )
++    index_cache_orig = index_cache.clone()
++    slot_mapping = torch.randperm(
++        num_blocks * block_size, dtype=torch.int64, device=device
++    )[:num_tokens]
++    q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
++
++    ops.fused_minimax_m3_qknorm_rope_kv_insert(
++        qkv,
++        q_w,
++        k_w,
++        cos_sin,
++        positions,
++        num_heads,
++        num_kv_heads,
++        ROTARY_DIM,
++        eps,
++        num_index_heads=num_idx_heads,
++        slot_mapping=slot_mapping,
++        kv_cache=kv_cache,
++        index_cache=index_cache,
++        block_size=block_size,
++        q_out=q_out,
++        kv_cache_dtype=kv_cache_dtype,
++        skip_index_branch=True,
++    )
++
++    _, k_out, v_out, index_q_out, index_k_out = qkv.split(splits, dim=-1)
++    q_in, k_in, v_in, index_q_in, index_k_in = qkv_orig.split(splits, dim=-1)
++    q_ref = norm_rope_ref(
++        q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps
++    ).view(num_tokens, qsz)
++    k_ref = norm_rope_ref(
++        k_in.view(num_tokens, num_kv_heads, HEAD_DIM),
++        k_w,
++        positions,
++        cos_sin,
++        eps,
++    ).view(num_tokens, kvsz)
++
++    torch.testing.assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
++    torch.testing.assert_close(k_out, k_ref, rtol=1e-2, atol=1e-2)
++    torch.testing.assert_close(v_out, v_in, rtol=0, atol=0)
++    torch.testing.assert_close(index_q_out, index_q_in, rtol=0, atol=0)
++    torch.testing.assert_close(index_k_out, index_k_in, rtol=0, atol=0)
++    torch.testing.assert_close(index_cache, index_cache_orig, rtol=0, atol=0)
++
++    if kv_cache_dtype == "fp8":
++        expected_kv_cache = torch.zeros_like(kv_cache)
++        expected_k_cache, expected_v_cache = expected_kv_cache.transpose(1, 2).split(
++            HEAD_DIM, dim=-1
++        )
++        scale = torch.ones((), device=device)
++        ops.reshape_and_cache_flash(
++            k_out.view(num_tokens, num_kv_heads, HEAD_DIM),
++            v_out.view(num_tokens, num_kv_heads, HEAD_DIM),
++            expected_k_cache,
++            expected_v_cache,
++            slot_mapping,
++            kv_cache_dtype,
++            scale,
++            scale,
++        )
++        torch.testing.assert_close(kv_cache, expected_kv_cache, rtol=0, atol=0)
++    else:
++        k_ref_h = k_ref.view(num_tokens, num_kv_heads, HEAD_DIM)
++        v_ref_h = v_in.view(num_tokens, num_kv_heads, HEAD_DIM)
++        for t in range(num_tokens):
++            s = slot_mapping[t].item()
++            b, pos = s // block_size, s % block_size
++            torch.testing.assert_close(
++                kv_cache[b, :, pos, :HEAD_DIM], k_ref_h[t], rtol=1e-2, atol=1e-2
++            )
++            torch.testing.assert_close(
++                kv_cache[b, :, pos, HEAD_DIM:], v_ref_h[t], rtol=0, atol=0
++            )
++
++
++# ── Test 4: fp8 (e4m3) index outputs ─────────────────────────────────────────
+ # The fp8 score path stores index_q and the index-K cache as e4m3 while q/k/v +
+ # q_out stay bf16. Asserts: (1) q/k/v/q_out are bit-identical to the bf16 run
+ # (the index dtype must not perturb the main branch), and (2) the e4m3 index
+@@ -324,10 +442,9 @@ def run(index_dtype):
+         qkv = qkv0.clone()
+         kv_cache = torch.zeros(
+             num_blocks,
+-            2,
+-            block_size,
+             num_kv_heads,
+-            HEAD_DIM,
++            block_size,
++            2 * HEAD_DIM,
+             dtype=dtype,
+             device=device,
+         )
+diff --git a/tests/kernels/test_minimax_m3_sparse_attn_fp8_scale.py b/tests/kernels/test_minimax_m3_sparse_attn_fp8_scale.py
+new file mode 100644
+index 000000000000..9cd481b5e336
+--- /dev/null
++++ b/tests/kernels/test_minimax_m3_sparse_attn_fp8_scale.py
+@@ -0,0 +1,189 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not torch.cuda.is_available() or not current_platform.supports_fp8():
++    pytest.skip(
++        "MiniMax-M3 FP8 sparse attention scale tests require an FP8 GPU.",
++        allow_module_level=True,
++    )
++
++if current_platform.is_rocm():
++    from vllm.models.minimax_m3.amd.ops.sparse_attn import (
++        SPARSE_BLOCK_SIZE,
++        minimax_m3_sparse_attn,
++        minimax_m3_sparse_attn_decode,
++    )
++else:
++    from vllm.models.minimax_m3.common.ops.sparse_attn import (
++        SPARSE_BLOCK_SIZE,
++        minimax_m3_sparse_attn,
++        minimax_m3_sparse_attn_decode,
++    )
++
++
++DEVICE = "cuda"
++DTYPE = torch.bfloat16
++HEAD_DIM = 128
++NUM_KV_HEADS = 1
++NUM_HEADS = 2
++K_SCALE = 0.25
++V_SCALE = 0.5
++
++
++def _scale_tensors(mode: str, num_blocks: int):
++    if mode == "scalar":
++        k_scale = torch.tensor(K_SCALE, dtype=torch.float32, device=DEVICE)
++        v_scale = torch.tensor(V_SCALE, dtype=torch.float32, device=DEVICE)
++    else:
++        shape = (NUM_KV_HEADS, num_blocks * SPARSE_BLOCK_SIZE)
++        k_scale = torch.full(shape, K_SCALE, dtype=torch.float32, device=DEVICE)
++        v_scale = torch.full(shape, V_SCALE, dtype=torch.float32, device=DEVICE)
++    return k_scale, v_scale
++
++
++def _make_kv_cache(num_blocks: int, seed: int):
++    torch.manual_seed(seed)
++    fp8_dtype = current_platform.fp8_dtype()
++    kv_ref = torch.randn(
++        num_blocks,
++        NUM_KV_HEADS,
++        SPARSE_BLOCK_SIZE,
++        2 * HEAD_DIM,
++        dtype=DTYPE,
++        device=DEVICE,
++    )
++    kv_fp8 = torch.empty_like(kv_ref, dtype=fp8_dtype)
++    kv_fp8[..., :HEAD_DIM] = (kv_ref[..., :HEAD_DIM].float() / K_SCALE).to(fp8_dtype)
++    kv_fp8[..., HEAD_DIM:] = (kv_ref[..., HEAD_DIM:].float() / V_SCALE).to(fp8_dtype)
++
++    kv_dequant = torch.empty_like(kv_ref)
++    kv_dequant[..., :HEAD_DIM] = (kv_fp8[..., :HEAD_DIM].float() * K_SCALE).to(DTYPE)
++    kv_dequant[..., HEAD_DIM:] = (kv_fp8[..., HEAD_DIM:].float() * V_SCALE).to(DTYPE)
++    return kv_fp8, kv_dequant
++
++
++@pytest.mark.parametrize("scale_mode", ["scalar", "per_token_head"])
++@torch.inference_mode()
++def test_minimax_m3_sparse_prefill_fp8_kv_scales(scale_mode: str):
++    total_q = 17
++    num_blocks = 1
++    torch.manual_seed(0)
++    q = torch.randn(total_q, NUM_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) * 0.1
++    kv_fp8, kv_dequant = _make_kv_cache(num_blocks, seed=1)
++    k_scale, v_scale = _scale_tensors(scale_mode, num_blocks)
++
++    topk = torch.zeros(NUM_KV_HEADS, total_q, 1, dtype=torch.int32, device=DEVICE)
++    block_table = torch.zeros(1, 1, dtype=torch.int32, device=DEVICE)
++    cu_seqlens = torch.tensor([0, total_q], dtype=torch.int32, device=DEVICE)
++    seq_lens = torch.tensor([total_q], dtype=torch.int32, device=DEVICE)
++    prefix_lens = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++    got = torch.empty_like(q)
++    ref = torch.empty_like(q)
++    unscaled = torch.empty_like(q)
++
++    minimax_m3_sparse_attn(
++        q,
++        kv_fp8,
++        topk,
++        block_table,
++        cu_seqlens,
++        seq_lens,
++        prefix_lens,
++        total_q,
++        NUM_KV_HEADS,
++        HEAD_DIM**-0.5,
++        got,
++        k_scale=k_scale,
++        v_scale=v_scale,
++    )
++    minimax_m3_sparse_attn(
++        q,
++        kv_dequant,
++        topk,
++        block_table,
++        cu_seqlens,
++        seq_lens,
++        prefix_lens,
++        total_q,
++        NUM_KV_HEADS,
++        HEAD_DIM**-0.5,
++        ref,
++    )
++    minimax_m3_sparse_attn(
++        q,
++        kv_fp8,
++        topk,
++        block_table,
++        cu_seqlens,
++        seq_lens,
++        prefix_lens,
++        total_q,
++        NUM_KV_HEADS,
++        HEAD_DIM**-0.5,
++        unscaled,
++    )
++
++    torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
++    assert not torch.allclose(unscaled, ref, rtol=1e-1, atol=1e-1)
++
++
++@pytest.mark.parametrize("scale_mode", ["scalar", "per_token_head"])
++@torch.inference_mode()
++def test_minimax_m3_sparse_decode_fp8_kv_scales(scale_mode: str):
++    total_q = 2
++    num_blocks = 1
++    torch.manual_seed(2)
++    q = torch.randn(total_q, NUM_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) * 0.1
++    kv_fp8, kv_dequant = _make_kv_cache(num_blocks, seed=3)
++    k_scale, v_scale = _scale_tensors(scale_mode, num_blocks)
++
++    topk = torch.zeros(NUM_KV_HEADS, total_q, 1, dtype=torch.int32, device=DEVICE)
++    block_table = torch.zeros(total_q, 1, dtype=torch.int32, device=DEVICE)
++    seq_lens = torch.tensor([64, 128], dtype=torch.int32, device=DEVICE)
++    got = torch.empty_like(q)
++    ref = torch.empty_like(q)
++    unscaled = torch.empty_like(q)
++
++    minimax_m3_sparse_attn_decode(
++        q,
++        kv_fp8,
++        topk,
++        block_table,
++        seq_lens,
++        NUM_KV_HEADS,
++        HEAD_DIM**-0.5,
++        got,
++        decode_query_len=1,
++        k_scale=k_scale,
++        v_scale=v_scale,
++    )
++    minimax_m3_sparse_attn_decode(
++        q,
++        kv_dequant,
++        topk,
++        block_table,
++        seq_lens,
++        NUM_KV_HEADS,
++        HEAD_DIM**-0.5,
++        ref,
++        decode_query_len=1,
++    )
++    minimax_m3_sparse_attn_decode(
++        q,
++        kv_fp8,
++        topk,
++        block_table,
++        seq_lens,
++        NUM_KV_HEADS,
++        HEAD_DIM**-0.5,
++        unscaled,
++        decode_query_len=1,
++    )
++
++    torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
++    assert not torch.allclose(unscaled, ref, rtol=1e-1, atol=1e-1)
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 627058cb2e33..2e1ce0a8de03 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2516,6 +2516,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
+     q_out: torch.Tensor | None = None,
+     index_q_out: torch.Tensor | None = None,
+     kv_cache_dtype: str = "auto",
++    skip_index_branch: bool = False,
+ ) -> None:
+     """Fused MiniMax-M3 attention pre-processing (in-place).
+ 
+@@ -2537,6 +2538,11 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
+     instead of in place — folding the de-interleave into this kernel's store so
+     callers skip a separate ``.contiguous()`` copy before the SM100 sparse
+     attention's flat TMA descriptor.
++
++    When ``skip_index_branch`` is true, sparse rows still keep their packed
++    ``[index_q | index_k]`` tail, but the kernel only processes the main q/k/v
++    branches and main KV cache. This is used by MiniMax-M3 index-topk reuse
++    layers that consume top-k block ids selected by an earlier sparse layer.
+     """
+     torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
+         qkv,
+@@ -2559,6 +2565,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
+         q_out,
+         index_q_out,
+         kv_cache_dtype,
++        skip_index_branch,
+     )
+ 
+ 
+diff --git a/vllm/models/minimax_m3/amd/model.py b/vllm/models/minimax_m3/amd/model.py
+index 6504ba5d41cc..324104e055f8 100644
+--- a/vllm/models/minimax_m3/amd/model.py
++++ b/vllm/models/minimax_m3/amd/model.py
+@@ -35,6 +35,7 @@
+ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.layers.attention.attention import set_default_quant_scales
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
+     fused_allreduce_gemma_rms_norm,
+@@ -93,6 +94,7 @@
+ from vllm.models.minimax_m3.common.sparse_attention import (
+     MiniMaxM3SparseBackend,
+     MiniMaxM3SparseImpl,
++    minimax_m3_use_aiter_sparse_pa,
+     select_main_impl_cls,
+ )
+ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
+@@ -103,6 +105,7 @@
+     FullAttentionSpec,
+     KVCacheSpec,
+     get_kv_quant_mode,
++    is_quantized_kv_cache,
+ )
+ 
+ 
+@@ -636,6 +639,11 @@ def __init__(
+         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+             self.kv_cache_dtype, vllm_config.model_config
+         )
++        # MiniMax-M3 sparse attention owns its KV-cache insert/read path instead
++        # of wrapping the generic Attention module. Keep the same runtime scale
++        # attributes so FP8 KV reads can honor vLLM's per-layer descale contract.
++        self.calculate_kv_scales = False
++        set_default_quant_scales(self, register_buffer=True)
+ 
+         # Shared top-k buffer: the indexer writes the selected blocks into it and
+         # the attend impl reads them back (no Python value crosses the break).
+@@ -647,6 +655,7 @@ def __init__(
+         self.impl: MiniMaxM3SparseImpl = select_main_impl_cls(  # type: ignore[assignment]
+             topk_blocks=sparse_cfg["sparse_topk_blocks"],
+             kv_cache_dtype=self.kv_cache_dtype,
++            num_kv_heads=self.num_kv_heads,
+         )(
+             self.num_heads,
+             self.head_dim,
+@@ -656,6 +665,10 @@ def __init__(
+             topk_blocks=sparse_cfg["sparse_topk_blocks"],
+             sparse_block_size=sparse_cfg["sparse_block_size"],
+         )
++        self.use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(self.num_kv_heads)
++        self.kv_cache_k = torch.tensor([])
++        self.kv_cache_v = torch.tensor([])
++        self._aiter_sparse_pa_cache_data_ptr = 0
+         # Self-contained nn.Module: owns its side cache, selects its impl in init
+         # (Triton on ROCm, where the SM100 gate is always False).
+         self.indexer = MiniMaxM3Indexer(
+@@ -694,6 +707,91 @@ def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+         )
+ 
++    def _ensure_aiter_sparse_pa_kv_cache(self) -> None:
++        if self.kv_cache.numel() == 0:
++            return
++        if self._aiter_sparse_pa_cache_data_ptr == self.kv_cache.data_ptr():
++            return
++
++        kv_cache = self.kv_cache
++        if is_quantized_kv_cache(self.kv_cache_dtype):
++            kv_cache = kv_cache.view(self.impl.kv_cache_fp8_dtype)
++        key_cache, value_cache = kv_cache.unbind(1)
++        if not key_cache.is_contiguous() or not value_cache.is_contiguous():
++            raise RuntimeError(
++                "MiniMax-M3 AITER sparse PA requires K/V-separated KV cache "
++                "storage. Set VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1 before "
++                "initializing the engine."
++            )
++
++        x = 16 // key_cache.element_size()
++        if self.head_dim % x != 0:
++            raise RuntimeError(
++                "MiniMax-M3 AITER sparse PA requires head_dim divisible by "
++                f"16 / dtype_size, got head_dim={self.head_dim}, x={x}"
++            )
++        num_blocks = key_cache.shape[0]
++        num_phys16 = num_blocks * 8
++        self.kv_cache_k = key_cache.view(
++            num_phys16,
++            self.num_kv_heads,
++            self.head_dim // x,
++            16,
++            x,
++        )
++        self.kv_cache_v = value_cache.view(
++            num_phys16,
++            self.num_kv_heads,
++            16 // x,
++            self.head_dim,
++            x,
++        )
++        self._aiter_sparse_pa_cache_data_ptr = self.kv_cache.data_ptr()
++
++    def get_aiter_sparse_pa_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
++        self._ensure_aiter_sparse_pa_kv_cache()
++        return self.kv_cache_k, self.kv_cache_v
++
++    def _insert_aiter_sparse_pa_kv(
++        self,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        index_k: torch.Tensor | None,
++        slot_mapping: torch.Tensor,
++        index_slot_mapping: torch.Tensor | None,
++    ) -> None:
++        if self.kv_cache.numel() == 0:
++            return
++        from aiter import reshape_and_cache
++
++        from vllm.models.minimax_m3.amd.ops.sparse_pa import (
++            minimax_m3_insert_index_cache,
++        )
++
++        key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
++        kv_cache_dtype = (
++            self.kv_cache_dtype
++            if is_quantized_kv_cache(self.kv_cache_dtype)
++            else "auto"
++        )
++        reshape_and_cache(
++            k.contiguous(),
++            v.contiguous(),
++            key_cache,
++            value_cache,
++            slot_mapping,
++            kv_cache_dtype=kv_cache_dtype,
++            k_scale=getattr(self, "_k_scale", None),
++            v_scale=getattr(self, "_v_scale", None),
++            asm_layout=True,
++        )
++        if index_k is None or index_slot_mapping is None:
++            return
++        index_cache = self.indexer.index_cache.kv_cache
++        if index_cache.numel() == 0:
++            return
++        minimax_m3_insert_index_cache(index_k, index_cache, index_slot_mapping)
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -724,31 +822,121 @@ def forward(
+             return qkv.new_zeros((num_tokens, self.hidden_size))
+ 
+         main_slot_mapping = fwd_slot_mapping[self.layer_name]
+-        index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+         q = qkv.new_empty((num_tokens, self.q_size))
+-        index_q = qkv.new_empty((num_tokens, self.index_q_size))
+-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+-            qkv,
+-            self.q_norm.weight,
+-            self.k_norm.weight,
+-            cos_sin_cache,
+-            positions,
+-            self.num_heads,
+-            self.num_kv_heads,
+-            rotary_dim,
+-            eps,
+-            self.index_q_norm.weight,
+-            self.index_k_norm.weight,
+-            self.num_idx_heads,
+-            main_slot_mapping,
+-            index_slot_mapping,
+-            self.kv_cache,
+-            self.indexer.index_cache.kv_cache,
+-            self.kv_cache.size(2),  # paged-cache block size
+-            q,
+-            index_q,
+-            self.kv_cache_dtype,
+-        )
++        if self.skip_index_topk:
++            index_q = None
++            if self.use_aiter_sparse_pa:
++                ops.fused_minimax_m3_qknorm_rope_kv_insert(
++                    qkv,
++                    self.q_norm.weight,
++                    self.k_norm.weight,
++                    cos_sin_cache,
++                    positions,
++                    self.num_heads,
++                    self.num_kv_heads,
++                    rotary_dim,
++                    eps,
++                    num_index_heads=self.num_idx_heads,
++                    q_out=q,
++                    skip_index_branch=True,
++                )
++                k_start = self.q_size
++                v_start = k_start + self.kv_size
++                k = qkv[:, k_start:v_start].view(
++                    num_tokens, self.num_kv_heads, self.head_dim
++                )
++                v = qkv[:, v_start : v_start + self.kv_size].view(
++                    num_tokens, self.num_kv_heads, self.head_dim
++                )
++                self._insert_aiter_sparse_pa_kv(
++                    k,
++                    v,
++                    None,
++                    main_slot_mapping,
++                    None,
++                )
++            else:
++                ops.fused_minimax_m3_qknorm_rope_kv_insert(
++                    qkv,
++                    self.q_norm.weight,
++                    self.k_norm.weight,
++                    cos_sin_cache,
++                    positions,
++                    self.num_heads,
++                    self.num_kv_heads,
++                    rotary_dim,
++                    eps,
++                    num_index_heads=self.num_idx_heads,
++                    slot_mapping=main_slot_mapping,
++                    kv_cache=self.kv_cache,
++                    block_size=self.kv_cache.size(2),  # paged-cache block size
++                    q_out=q,
++                    kv_cache_dtype=self.kv_cache_dtype,
++                    skip_index_branch=True,
++                )
++        else:
++            index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
++            index_q = qkv.new_empty((num_tokens, self.index_q_size))
++            if self.use_aiter_sparse_pa:
++                ops.fused_minimax_m3_qknorm_rope_kv_insert(
++                    qkv,
++                    self.q_norm.weight,
++                    self.k_norm.weight,
++                    cos_sin_cache,
++                    positions,
++                    self.num_heads,
++                    self.num_kv_heads,
++                    rotary_dim,
++                    eps,
++                    self.index_q_norm.weight,
++                    self.index_k_norm.weight,
++                    self.num_idx_heads,
++                    q_out=q,
++                    index_q_out=index_q,
++                    kv_cache_dtype=self.kv_cache_dtype,
++                )
++                k_start = self.q_size
++                v_start = k_start + self.kv_size
++                index_k_start = v_start + self.kv_size + self.index_q_size
++                k = qkv[:, k_start:v_start].view(
++                    num_tokens, self.num_kv_heads, self.head_dim
++                )
++                v = qkv[:, v_start : v_start + self.kv_size].view(
++                    num_tokens, self.num_kv_heads, self.head_dim
++                )
++                index_k = qkv[
++                    :, index_k_start : index_k_start + self.idx_head_dim
++                ].view(num_tokens, self.idx_head_dim)
++                self._insert_aiter_sparse_pa_kv(
++                    k,
++                    v,
++                    index_k,
++                    main_slot_mapping,
++                    index_slot_mapping,
++                )
++            else:
++                ops.fused_minimax_m3_qknorm_rope_kv_insert(
++                    qkv,
++                    self.q_norm.weight,
++                    self.k_norm.weight,
++                    cos_sin_cache,
++                    positions,
++                    self.num_heads,
++                    self.num_kv_heads,
++                    rotary_dim,
++                    eps,
++                    self.index_q_norm.weight,
++                    self.index_k_norm.weight,
++                    self.num_idx_heads,
++                    main_slot_mapping,
++                    index_slot_mapping,
++                    self.kv_cache,
++                    self.indexer.index_cache.kv_cache,
++                    self.kv_cache.size(2),  # paged-cache block size
++                    q,
++                    index_q,
++                    self.kv_cache_dtype,
++                )
+ 
+         output = torch.empty_like(q)
+         attn_output = self._run_attention(q, index_q, output)
+@@ -759,7 +947,7 @@ def forward(
+     def _run_attention(
+         self,
+         query: torch.Tensor,
+-        index_query: torch.Tensor,
++        index_query: torch.Tensor | None,
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         # Single eager break around both: their split-K kernels read per-request
+@@ -768,6 +956,7 @@ def _run_attention(
+         # When skip_index_topk is set (ATOM index_topk_freq), reuse the selection
+         # the preceding compute layer wrote into the shared buffer this forward.
+         if not self.skip_index_topk:
++            assert index_query is not None
+             self.indexer(index_query)
+         return self.impl.forward(self, query, self.kv_cache, output)
+ 
+diff --git a/vllm/models/minimax_m3/amd/ops/sparse_attn.py b/vllm/models/minimax_m3/amd/ops/sparse_attn.py
+index 015a4c516bce..0719374496be 100644
+--- a/vllm/models/minimax_m3/amd/ops/sparse_attn.py
++++ b/vllm/models/minimax_m3/amd/ops/sparse_attn.py
+@@ -12,7 +12,9 @@
+ 
+ from vllm.models.minimax_m3.common.ops.sparse_attn import (
+     _FP8_DTYPES,
++    _KV_SCALE_NONE,
+     SPARSE_BLOCK_SIZE,
++    _kv_scale_args,
+     minimax_m3_sparse_attn_decode,
+ )
+ from vllm.platforms.rocm import on_gfx950, on_mi3xx
+@@ -70,7 +72,9 @@ def _sparse_attn_prefill_kwargs() -> dict:
+ @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
+ def _gqa_sparse_fwd_kernel(
+     q_ptr,  # [total_q, num_heads, head_dim]
+-    kv_cache_ptr,  # main cache: [num_blocks, 2, 128, num_kv_heads, head_dim]
++    kv_cache_ptr,  # main cache: [num_blocks, num_kv_heads, 128, 2*head_dim]
++    k_scale_ptr,
++    v_scale_ptr,
+     t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+     o_ptr,  # [total_q, num_heads, head_dim]
+     block_table_ptr,  # [num_reqs, max_blocks]
+@@ -88,10 +92,13 @@ def _gqa_sparse_fwd_kernel(
+     stride_qh,
+     stride_qd,
+     stride_kv_blk,
+-    stride_kv_kv,
+-    stride_kv_pos,
+     stride_kv_h,
++    stride_kv_pos,
+     stride_kv_d,
++    stride_ks_h,
++    stride_ks_t,
++    stride_vs_h,
++    stride_vs_t,
+     stride_th,
+     stride_tn,
+     stride_tk,
+@@ -106,6 +113,7 @@ def _gqa_sparse_fwd_kernel(
+     BLOCK_SIZE_T: tl.constexpr,
+     BLOCK_SIZE_QH: tl.constexpr,
+     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
++    KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+     SUB_K: tl.constexpr,  # CDNA only: KV sub-tile width (see _IS_MI3XX)
+ ):
+     sm_scale_log2e = sm_scale * 1.4426950409
+@@ -161,7 +169,6 @@ def _gqa_sparse_fwd_kernel(
+                 pos_mask_sub = pos_sub < seq_len
+                 k_sub = tl.load(
+                     kv_base
+-                    + 0 * stride_kv_kv
+                     + off_sub[None, :] * stride_kv_pos
+                     + off_d[:, None] * stride_kv_d,
+                     mask=d_mask[:, None] & pos_mask_sub[None, :],
+@@ -169,6 +176,17 @@ def _gqa_sparse_fwd_kernel(
+                 )
+                 if USE_FP8:
+                     k_sub = k_sub.to(q.dtype)
++                    if KV_SCALE_MODE == 1:
++                        k_sub = (k_sub * tl.load(k_scale_ptr)).to(q.dtype)
++                    elif KV_SCALE_MODE == 2:
++                        k_scale = tl.load(
++                            k_scale_ptr
++                            + pid_kh * stride_ks_h
++                            + (page * BLOCK_SIZE_K + off_sub) * stride_ks_t,
++                            mask=pos_mask_sub,
++                            other=1.0,
++                        )
++                        k_sub = (k_sub * k_scale[None, :]).to(q.dtype)
+                 off_q_sub = (
+                     tl.arange(0, BLOCK_SIZE_Q)[:, None]
+                     + pid_q_j * BLOCK_SIZE_Q
+@@ -187,14 +205,24 @@ def _gqa_sparse_fwd_kernel(
+                 acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+                 v_sub = tl.load(
+                     kv_base
+-                    + 1 * stride_kv_kv
+                     + off_sub[:, None] * stride_kv_pos
+-                    + off_d[None, :] * stride_kv_d,
++                    + (head_dim + off_d[None, :]) * stride_kv_d,
+                     mask=pos_mask_sub[:, None] & d_mask[None, :],
+                     other=0.0,
+                 )
+                 if USE_FP8:
+                     v_sub = v_sub.to(q.dtype)
++                    if KV_SCALE_MODE == 1:
++                        v_sub = (v_sub * tl.load(v_scale_ptr)).to(q.dtype)
++                    elif KV_SCALE_MODE == 2:
++                        v_scale = tl.load(
++                            v_scale_ptr
++                            + pid_kh * stride_vs_h
++                            + (page * BLOCK_SIZE_K + off_sub) * stride_vs_t,
++                            mask=pos_mask_sub,
++                            other=1.0,
++                        )
++                        v_sub = (v_sub * v_scale[:, None]).to(q.dtype)
+                 acc_o += tl.dot(p_sub.to(v_sub.dtype), v_sub)
+                 m_i = m_ij
+                 lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+@@ -214,7 +242,7 @@ def _gqa_sparse_fwd_kernel(
+ @torch.no_grad()
+ def minimax_m3_sparse_attn(
+     q: torch.Tensor,  # [total_q, num_heads, head_dim]
+-    kv_cache: torch.Tensor,  # [num_blocks, 2, 128, num_kv_heads, head_dim]
++    kv_cache: torch.Tensor,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
+     topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk]
+     block_table: torch.Tensor,  # [batch, max_blocks]
+     cu_seqlens_q: torch.Tensor,  # [batch+1] int32
+@@ -224,6 +252,8 @@ def minimax_m3_sparse_attn(
+     num_kv_heads: int,
+     sm_scale: float,
+     output: torch.Tensor,  # [total_q, num_heads, head_dim]
++    k_scale: torch.Tensor | None = None,
++    v_scale: torch.Tensor | None = None,
+ ) -> None:
+     """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
+     total_q, num_heads, head_dim = q.shape
+@@ -231,10 +261,33 @@ def minimax_m3_sparse_attn(
+     topk = topk_idx.shape[-1]
+     gqa_group_size = num_heads // num_kv_heads
+     use_fp8 = kv_cache.dtype in _FP8_DTYPES
++    (
++        k_scale_arg,
++        v_scale_arg,
++        stride_ks_h,
++        stride_ks_t,
++        stride_vs_h,
++        stride_vs_t,
++        kv_scale_mode,
++    ) = (
++        _kv_scale_args(output, num_kv_heads, k_scale, v_scale)
++        if use_fp8
++        else (
++            output,
++            output,
++            0,
++            0,
++            0,
++            0,
++            _KV_SCALE_NONE,
++        )
++    )
+     grid = (max_query_len, num_kv_heads, batch)
+     _gqa_sparse_fwd_kernel[grid](
+         q,
+         kv_cache,
++        k_scale_arg,
++        v_scale_arg,
+         topk_idx,
+         output,
+         block_table,
+@@ -255,7 +308,10 @@ def minimax_m3_sparse_attn(
+         kv_cache.stride(1),
+         kv_cache.stride(2),
+         kv_cache.stride(3),
+-        kv_cache.stride(4),
++        stride_ks_h,
++        stride_ks_t,
++        stride_vs_h,
++        stride_vs_t,
+         topk_idx.stride(0),
+         topk_idx.stride(1),
+         topk_idx.stride(2),
+@@ -266,6 +322,7 @@ def minimax_m3_sparse_attn(
+         BLOCK_SIZE_Q=1,
+         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+         USE_FP8=use_fp8,
++        KV_SCALE_MODE=kv_scale_mode,
+         SUB_K=_SPARSE_ATTN_SUB_K,
+         **_sparse_attn_prefill_kwargs(),
+     )
+diff --git a/vllm/models/minimax_m3/amd/ops/sparse_pa.py b/vllm/models/minimax_m3/amd/ops/sparse_pa.py
+new file mode 100644
+index 000000000000..bd290ea46acd
+--- /dev/null
++++ b/vllm/models/minimax_m3/amd/ops/sparse_pa.py
+@@ -0,0 +1,466 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""AITER page-16 sparse paged-attention helpers for MiniMax-M3 on ROCm."""
++
++import torch
++
++try:
++    from vllm.triton_utils import tl, triton
++except ModuleNotFoundError:
++    import triton
++    import triton.language as tl
++
++from vllm.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
++
++ASM_PAGE_SIZE = 16
++PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE
++
++_FP8_DTYPES = {
++    dtype
++    for dtype in (
++        getattr(torch, "float8_e4m3fn", None),
++        getattr(torch, "float8_e4m3fnuz", None),
++        getattr(torch, "float8_e5m2", None),
++        getattr(torch, "float8_e5m2fnuz", None),
++    )
++    if dtype is not None
++}
++
++
++def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
++    return kv_cache.dtype in _FP8_DTYPES
++
++
++@triton.jit
++def _build_sparse_block_table_kernel(
++    topk_ptr,  # [1, batch, topk] int32, selected logical 128-block ids
++    block_table_ptr,  # [batch, max_blocks] int32, logical 128-page table
++    seq_lens_ptr,  # [batch] int32
++    sparse_bt_ptr,  # [batch, topk * 8] int32, physical 16-page table
++    sparse_ctx_ptr,  # [batch] int32
++    max_topk,
++    stride_topk_n,
++    stride_topk_k,
++    stride_bt_b,
++    stride_sbt_b,
++    SPARSE_BLOCK_SIZE_C: tl.constexpr,
++    PAGES_PER_BLOCK: tl.constexpr,
++    BLOCK_SIZE_T: tl.constexpr,
++):
++    pid_b = tl.program_id(0)
++    seq_len = tl.load(seq_lens_ptr + pid_b)
++    last_blk = (seq_len - 1) // SPARSE_BLOCK_SIZE_C
++
++    topk_row = topk_ptr + pid_b * stride_topk_n
++    bt_row = block_table_ptr + pid_b * stride_bt_b
++    sbt_row = sparse_bt_ptr + pid_b * stride_sbt_b
++
++    off_t = tl.arange(0, BLOCK_SIZE_T)
++    blk = tl.load(topk_row + off_t * stride_topk_k, mask=off_t < max_topk, other=-1)
++    valid = blk >= 0
++    is_tail = valid & (blk == last_blk)
++    is_full = valid & (blk != last_blk)
++
++    n_full = tl.sum(is_full.to(tl.int32), axis=0)
++    n_valid = tl.sum(valid.to(tl.int32), axis=0)
++    earlier_full = tl.cumsum(is_full.to(tl.int32), axis=0) - is_full.to(tl.int32)
++    slot = tl.where(is_full, earlier_full, n_full)
++
++    logical_page = tl.load(bt_row + blk, mask=valid, other=0).to(tl.int32)
++    base_phys = logical_page * PAGES_PER_BLOCK
++    dst_base = slot * PAGES_PER_BLOCK
++
++    for j in tl.static_range(PAGES_PER_BLOCK):
++        tl.store(sbt_row + dst_base + j, base_phys + j, mask=valid)
++
++    n_used = n_valid * PAGES_PER_BLOCK
++    off_w = tl.arange(0, BLOCK_SIZE_T * PAGES_PER_BLOCK)
++    row_width = max_topk * PAGES_PER_BLOCK
++    tl.store(
++        sbt_row + off_w,
++        tl.zeros_like(off_w),
++        mask=(off_w >= n_used) & (off_w < row_width),
++    )
++
++    tail_tokens = seq_len - last_blk * SPARSE_BLOCK_SIZE_C
++    has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
++    ctx = n_full * SPARSE_BLOCK_SIZE_C + tl.where(has_tail, tail_tokens, 0)
++    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * SPARSE_BLOCK_SIZE_C, seq_len))
++    tl.store(sparse_ctx_ptr + pid_b, ctx)
++
++
++@torch.no_grad()
++def minimax_m3_build_sparse_block_table(
++    topk_idx: torch.Tensor,  # [1, batch, topk]
++    block_table: torch.Tensor,  # [batch, max_blocks]
++    seq_lens: torch.Tensor,  # [batch]
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Compact selected logical sparse blocks into physical page-16 tables."""
++    assert topk_idx.shape[0] == 1, "AITER sparse PA requires num_kv_heads == 1"
++    batch = topk_idx.shape[1]
++    topk = topk_idx.shape[-1]
++    width = topk * PAGES_PER_SPARSE_BLOCK
++    sparse_bt = torch.empty((batch, width), dtype=torch.int32, device=topk_idx.device)
++    sparse_ctx = torch.empty((batch,), dtype=torch.int32, device=topk_idx.device)
++    _build_sparse_block_table_kernel[(batch,)](
++        topk_idx,
++        block_table,
++        seq_lens,
++        sparse_bt,
++        sparse_ctx,
++        topk,
++        topk_idx.stride(1),
++        topk_idx.stride(2),
++        block_table.stride(0),
++        sparse_bt.stride(0),
++        SPARSE_BLOCK_SIZE_C=SPARSE_BLOCK_SIZE,
++        PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
++        BLOCK_SIZE_T=triton.next_power_of_2(topk),
++    )
++    return sparse_bt, sparse_ctx
++
++
++@triton.jit
++def _build_sparse_block_table_prefill_kernel(
++    topk_ptr,  # [1, total_q, topk]
++    block_table_ptr,  # [batch, max_blocks]
++    req_id_ptr,  # [total_q]
++    abs_pos_ptr,  # [total_q]
++    sparse_bt_ptr,  # [total_q, topk * 8]
++    sparse_ctx_ptr,  # [total_q]
++    max_topk,
++    stride_topk_n,
++    stride_topk_k,
++    stride_bt_b,
++    stride_sbt_n,
++    SPARSE_BLOCK_SIZE_C: tl.constexpr,
++    PAGES_PER_BLOCK: tl.constexpr,
++    BLOCK_SIZE_T: tl.constexpr,
++):
++    pid_n = tl.program_id(0)
++    req_id = tl.load(req_id_ptr + pid_n)
++    abs_pos = tl.load(abs_pos_ptr + pid_n)
++    causal_len = abs_pos + 1
++    self_blk = abs_pos // SPARSE_BLOCK_SIZE_C
++
++    topk_row = topk_ptr + pid_n * stride_topk_n
++    bt_row = block_table_ptr + req_id * stride_bt_b
++    sbt_row = sparse_bt_ptr + pid_n * stride_sbt_n
++
++    off_t = tl.arange(0, BLOCK_SIZE_T)
++    blk = tl.load(topk_row + off_t * stride_topk_k, mask=off_t < max_topk, other=-1)
++    valid = (blk >= 0) & (blk <= self_blk)
++    is_tail = valid & (blk == self_blk)
++    is_full = valid & (blk < self_blk)
++
++    n_full = tl.sum(is_full.to(tl.int32), axis=0)
++    n_valid = tl.sum(valid.to(tl.int32), axis=0)
++    earlier_full = tl.cumsum(is_full.to(tl.int32), axis=0) - is_full.to(tl.int32)
++    slot = tl.where(is_full, earlier_full, n_full)
++
++    logical_page = tl.load(bt_row + blk, mask=valid, other=0).to(tl.int32)
++    base_phys = logical_page * PAGES_PER_BLOCK
++    dst_base = slot * PAGES_PER_BLOCK
++
++    for j in tl.static_range(PAGES_PER_BLOCK):
++        tl.store(sbt_row + dst_base + j, base_phys + j, mask=valid)
++
++    n_used = n_valid * PAGES_PER_BLOCK
++    off_w = tl.arange(0, BLOCK_SIZE_T * PAGES_PER_BLOCK)
++    row_width = max_topk * PAGES_PER_BLOCK
++    tl.store(
++        sbt_row + off_w,
++        tl.zeros_like(off_w),
++        mask=(off_w >= n_used) & (off_w < row_width),
++    )
++
++    tail_tokens = causal_len - self_blk * SPARSE_BLOCK_SIZE_C
++    has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
++    ctx = n_full * SPARSE_BLOCK_SIZE_C + tl.where(has_tail, tail_tokens, 0)
++    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * SPARSE_BLOCK_SIZE_C, causal_len))
++    tl.store(sparse_ctx_ptr + pid_n, ctx)
++
++
++@torch.no_grad()
++def minimax_m3_build_sparse_block_table_prefill(
++    topk_idx: torch.Tensor,  # [1, total_q, topk]
++    block_table: torch.Tensor,  # [batch, max_blocks]
++    query_req_id: torch.Tensor,  # [total_q]
++    query_abs_pos: torch.Tensor,  # [total_q]
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Build one page-16 sparse block table row per prefill query token."""
++    assert topk_idx.shape[0] == 1, "AITER sparse PA requires num_kv_heads == 1"
++    total_q = topk_idx.shape[1]
++    topk = topk_idx.shape[-1]
++    width = topk * PAGES_PER_SPARSE_BLOCK
++    sparse_bt = torch.empty((total_q, width), dtype=torch.int32, device=topk_idx.device)
++    sparse_ctx = torch.empty((total_q,), dtype=torch.int32, device=topk_idx.device)
++    _build_sparse_block_table_prefill_kernel[(total_q,)](
++        topk_idx,
++        block_table,
++        query_req_id,
++        query_abs_pos,
++        sparse_bt,
++        sparse_ctx,
++        topk,
++        topk_idx.stride(1),
++        topk_idx.stride(2),
++        block_table.stride(0),
++        sparse_bt.stride(0),
++        SPARSE_BLOCK_SIZE_C=SPARSE_BLOCK_SIZE,
++        PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
++        BLOCK_SIZE_T=triton.next_power_of_2(topk),
++    )
++    return sparse_bt, sparse_ctx
++
++
++@triton.jit
++def _insert_index_cache_kernel(
++    index_k_ptr,  # [num_tokens, head_dim]
++    index_cache_ptr,  # [num_blocks, block_size, head_dim]
++    slot_mapping_ptr,  # [num_tokens]
++    stride_k_t,
++    stride_k_d,
++    stride_c_b,
++    stride_c_t,
++    stride_c_d,
++    stride_slot_t,
++    CACHE_BLOCK_SIZE: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    pid_t = tl.program_id(0)
++    offs_d = tl.arange(0, BLOCK_D)
++    slot = tl.load(slot_mapping_ptr + pid_t * stride_slot_t)
++    block_id = slot // CACHE_BLOCK_SIZE
++    block_off = slot - block_id * CACHE_BLOCK_SIZE
++
++    src = index_k_ptr + pid_t * stride_k_t + offs_d * stride_k_d
++    dst = (
++        index_cache_ptr
++        + block_id * stride_c_b
++        + block_off * stride_c_t
++        + offs_d * stride_c_d
++    )
++    mask = (slot >= 0) & (offs_d < HEAD_DIM)
++    value = tl.load(src, mask=offs_d < HEAD_DIM, other=0.0)
++    tl.store(dst, value, mask=mask)
++
++
++@torch.no_grad()
++def minimax_m3_insert_index_cache(
++    index_k: torch.Tensor,
++    index_cache: torch.Tensor,
++    index_slot_mapping: torch.Tensor,
++) -> None:
++    """Scatter index keys into MiniMax-M3's key-only side cache."""
++    if index_k.numel() == 0 or index_cache.numel() == 0:
++        return
++    if index_k.dim() != 2 or index_cache.dim() != 3:
++        raise ValueError("MiniMax-M3 index cache insert expects [N,D] and [B,T,D]")
++    if index_k.shape[1] != index_cache.shape[2]:
++        raise ValueError("MiniMax-M3 index key dim must match index cache head dim")
++    if index_slot_mapping.dim() != 1 or index_slot_mapping.shape[0] != index_k.shape[0]:
++        raise ValueError("MiniMax-M3 index slot mapping must be a length-N vector")
++    if index_cache.stride(2) != 1:
++        raise ValueError("MiniMax-M3 index cache requires contiguous head dimension")
++
++    head_dim = index_k.shape[1]
++    _insert_index_cache_kernel[(index_k.shape[0],)](
++        index_k,
++        index_cache,
++        index_slot_mapping,
++        index_k.stride(0),
++        index_k.stride(1),
++        index_cache.stride(0),
++        index_cache.stride(1),
++        index_cache.stride(2),
++        index_slot_mapping.stride(0),
++        CACHE_BLOCK_SIZE=index_cache.shape[1],
++        HEAD_DIM=head_dim,
++        BLOCK_D=triton.next_power_of_2(head_dim),
++        num_warps=4,
++    )
++
++
++def _gluon_scale_arg(
++    scale: torch.Tensor | None,
++    *,
++    num_phys_pages: int,
++    num_kv_heads: int,
++) -> torch.Tensor | None:
++    if scale is None:
++        return None
++    if scale.numel() == 1:
++        return scale
++    if scale.dim() != 2 or scale.shape[0] != num_kv_heads:
++        raise ValueError(
++            "MiniMax-M3 AITER sparse PA supports scalar KV scales or "
++            "[num_kv_heads, max_kv_tokens] scales"
++        )
++    max_tokens = num_phys_pages * ASM_PAGE_SIZE
++    if scale.shape[1] < max_tokens:
++        raise ValueError(
++            "MiniMax-M3 AITER sparse PA KV scale tensor is smaller than the "
++            f"cache token capacity ({scale.shape[1]} < {max_tokens})"
++        )
++    scale = scale[:, :max_tokens]
++    return (
++        scale.transpose(0, 1)
++        .contiguous()
++        .view(num_phys_pages, ASM_PAGE_SIZE, num_kv_heads)
++        .permute(0, 2, 1)
++        .contiguous()
++        .unsqueeze(-1)
++    )
++
++
++@torch.no_grad()
++def minimax_m3_sparse_attn_decode_aiter(
++    q: torch.Tensor,  # [batch, num_heads, head_dim]
++    k_cache: torch.Tensor,  # [phys16, num_kv_heads, head_dim // x, 16, x]
++    v_cache: torch.Tensor,  # [phys16, num_kv_heads, 16 // x, head_dim, x]
++    topk_idx: torch.Tensor,  # [1, batch, topk]
++    block_table: torch.Tensor,  # [batch, max_blocks]
++    seq_lens: torch.Tensor,  # [batch]
++    num_kv_heads: int,
++    sm_scale: float,
++    output: torch.Tensor,  # [batch, num_heads, head_dim]
++    k_scale: torch.Tensor | None = None,
++    v_scale: torch.Tensor | None = None,
++) -> None:
++    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
++        topk_idx, block_table, seq_lens
++    )
++    _run_gluon_decode(
++        q,
++        k_cache,
++        v_cache,
++        sparse_bt,
++        sparse_ctx,
++        num_kv_heads,
++        sm_scale,
++        output,
++        k_scale,
++        v_scale,
++    )
++
++
++@torch.no_grad()
++def minimax_m3_sparse_attn_prefill_aiter(
++    q: torch.Tensor,  # [total_q, num_heads, head_dim]
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    topk_idx: torch.Tensor,  # [1, total_q, topk]
++    block_table: torch.Tensor,
++    cu_seqlens_q: torch.Tensor,
++    prefix_lens: torch.Tensor,
++    num_kv_heads: int,
++    sm_scale: float,
++    output: torch.Tensor,
++    k_scale: torch.Tensor | None = None,
++    v_scale: torch.Tensor | None = None,
++) -> None:
++    total_q = q.shape[0]
++    pos = torch.arange(total_q, dtype=torch.int32, device=q.device)
++    query_req_id = torch.searchsorted(cu_seqlens_q[1:].contiguous(), pos, right=True)
++    query_req_id = query_req_id.to(torch.int32)
++    query_abs_pos = (prefix_lens[query_req_id] + (pos - cu_seqlens_q[query_req_id])).to(
++        torch.int32
++    )
++    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_prefill(
++        topk_idx, block_table, query_req_id, query_abs_pos
++    )
++    _run_gluon_decode(
++        q,
++        k_cache,
++        v_cache,
++        sparse_bt,
++        sparse_ctx,
++        num_kv_heads,
++        sm_scale,
++        output,
++        k_scale,
++        v_scale,
++    )
++
++
++def _run_gluon_decode(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    sparse_bt: torch.Tensor,
++    sparse_ctx: torch.Tensor,
++    num_kv_heads: int,
++    sm_scale: float,
++    output: torch.Tensor,
++    k_scale: torch.Tensor | None,
++    v_scale: torch.Tensor | None,
++) -> None:
++    from aiter import dtypes as aiter_dtypes
++    from aiter.ops.triton.gluon.pa_decode_gluon import (
++        get_recommended_splits,
++        pa_decode_gluon,
++    )
++
++    if not q.is_contiguous():
++        q = q.contiguous()
++    if not output.is_contiguous():
++        raise ValueError("MiniMax-M3 AITER sparse PA output must be contiguous")
++
++    total_q, num_q_heads, head_size = q.shape
++    if head_size != 128:
++        raise ValueError("MiniMax-M3 AITER sparse PA requires head_dim == 128")
++    group_size = num_q_heads // num_kv_heads
++
++    nphys16, hkv = k_cache.shape[0], k_cache.shape[1]
++    k_cache_view = k_cache.view(nphys16 * hkv, 1, *k_cache.shape[2:])
++    v_cache_view = v_cache.view(nphys16 * hkv, 1, *v_cache.shape[2:])
++    q_view = q.view(total_q * num_kv_heads, group_size, head_size)
++    out_view = output.view(total_q * num_kv_heads, group_size, head_size)
++
++    num_seqs = total_q * num_kv_heads
++    max_context_partition_num = get_recommended_splits(num_seqs, 1)
++    context_partition_size = 256
++    intermediate_shape = (num_seqs, 1, max_context_partition_num, group_size)
++    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
++    max_logits = torch.empty_like(exp_sums)
++    temporary_output = torch.empty(
++        *intermediate_shape, head_size, dtype=q.dtype, device=q.device
++    )
++
++    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
++    compute_type = aiter_dtypes.fp8 if is_fp8 else q.dtype
++    if is_fp8:
++        k_scale_arg = _gluon_scale_arg(
++            k_scale, num_phys_pages=nphys16, num_kv_heads=hkv
++        )
++        v_scale_arg = _gluon_scale_arg(
++            v_scale, num_phys_pages=nphys16, num_kv_heads=hkv
++        )
++    else:
++        k_scale_arg = v_scale_arg = None
++
++    pa_decode_gluon(
++        output=out_view,
++        query=q_view,
++        key_cache=k_cache_view,
++        value_cache=v_cache_view,
++        context_lengths=sparse_ctx,
++        block_tables=sparse_bt,
++        softmax_scale=sm_scale,
++        query_length=1,
++        max_context_partition_num=max_context_partition_num,
++        context_partition_size=context_partition_size,
++        compute_type=compute_type,
++        query_scale=None,
++        key_scale=k_scale_arg,
++        value_scale=v_scale_arg,
++        exp_sums=exp_sums,
++        max_logits=max_logits,
++        temporary_output=temporary_output,
++        alibi_slopes=None,
++        sinks=None,
++        sliding_window=-1,
++        ps=True,
++    )
+diff --git a/vllm/models/minimax_m3/amd/sparse_attention_msa.py b/vllm/models/minimax_m3/amd/sparse_attention_msa.py
+new file mode 100644
+index 000000000000..60a7ce0e77c8
+--- /dev/null
++++ b/vllm/models/minimax_m3/amd/sparse_attention_msa.py
+@@ -0,0 +1,94 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""MSA AITER block-sparse attend for MiniMax M3."""
++
++import torch
++
++from vllm.forward_context import get_forward_context
++from vllm.models.minimax_m3.common.sparse_attention import (
++    MiniMaxM3SparseImpl,
++    MiniMaxM3SparseMetadata,
++)
++from vllm.v1.attention.backend import (
++    AttentionLayer,
++)
++
++
++class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
++    """ROCm AITER page-16 SHUFFLE sparse paged attention."""
++
++    def forward(
++        self,
++        layer: AttentionLayer,
++        query: torch.Tensor,
++        kv_cache: torch.Tensor,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        from vllm.models.minimax_m3.amd.ops.sparse_pa import (
++            minimax_m3_sparse_attn_decode_aiter,
++            minimax_m3_sparse_attn_prefill_aiter,
++        )
++
++        attn_metadata = get_forward_context().attn_metadata
++        if not isinstance(attn_metadata, dict):
++            return output
++        main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
++        assert isinstance(main_md, MiniMaxM3SparseMetadata)
++
++        nd = main_md.num_decode_tokens
++        num_tokens = main_md.num_actual_tokens
++        topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
++        assert topk is not None
++        if self.num_kv_heads != 1:
++            raise NotImplementedError(
++                "MiniMax-M3 AITER sparse PA currently requires per-rank "
++                f"num_kv_heads == 1, got {self.num_kv_heads}"
++            )
++
++        hd = self.head_size
++        q = query[:num_tokens].view(-1, self.num_heads, hd)
++        out = output[:num_tokens].view(-1, self.num_heads, hd)
++        k_cache, v_cache = layer.get_aiter_sparse_pa_kv_cache()  # type: ignore[attr-defined]
++        k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
++        v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
++
++        if main_md.num_decodes > 0:
++            d = main_md.decode
++            assert d is not None
++            if d.decode_query_len != 1:
++                raise NotImplementedError(
++                    "MiniMax-M3 AITER sparse PA does not support speculative "
++                    f"decode_query_len={d.decode_query_len}"
++                )
++            minimax_m3_sparse_attn_decode_aiter(
++                q[:nd],
++                k_cache,
++                v_cache,
++                topk[:, :nd, :],
++                d.block_table,
++                d.seq_lens,
++                self.num_kv_heads,
++                self.scale,
++                out[:nd],
++                k_scale=k_scale,
++                v_scale=v_scale,
++            )
++
++        if main_md.num_prefills > 0:
++            p = main_md.prefill
++            assert p is not None
++            minimax_m3_sparse_attn_prefill_aiter(
++                q[nd:],
++                k_cache,
++                v_cache,
++                topk[:, nd:num_tokens, :],
++                p.block_table,
++                p.cu_seqlens_q,
++                p.context_lens,
++                self.num_kv_heads,
++                self.scale,
++                out[nd:],
++                k_scale=k_scale,
++                v_scale=v_scale,
++            )
++        return output
+diff --git a/vllm/models/minimax_m3/common/ops/sparse_attn.py b/vllm/models/minimax_m3/common/ops/sparse_attn.py
+index e32818c47622..af703c086226 100644
+--- a/vllm/models/minimax_m3/common/ops/sparse_attn.py
++++ b/vllm/models/minimax_m3/common/ops/sparse_attn.py
+@@ -52,6 +52,8 @@
+ def _gqa_sparse_fwd_kernel(
+     q_ptr,  # [total_q, num_heads, head_dim]
+     kv_cache_ptr,  # main cache: [num_blocks, num_kv_heads, 128, 2*head_dim]
++    k_scale_ptr,
++    v_scale_ptr,
+     t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+     o_ptr,  # [total_q, num_heads, head_dim]
+     block_table_ptr,  # [num_reqs, max_blocks]
+@@ -72,6 +74,10 @@ def _gqa_sparse_fwd_kernel(
+     stride_kv_h,
+     stride_kv_pos,
+     stride_kv_d,
++    stride_ks_h,
++    stride_ks_t,
++    stride_vs_h,
++    stride_vs_t,
+     stride_th,
+     stride_tn,
+     stride_tk,
+@@ -85,6 +91,7 @@ def _gqa_sparse_fwd_kernel(
+     BLOCK_SIZE_H: tl.constexpr,
+     BLOCK_SIZE_QH: tl.constexpr,
+     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
++    KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+ ):
+     sm_scale_log2e = sm_scale * 1.4426950409
+     pid_q = tl.program_id(0)
+@@ -148,6 +155,17 @@ def _gqa_sparse_fwd_kernel(
+             )
+             if USE_FP8:
+                 k = k.to(q.dtype)
++                if KV_SCALE_MODE == 1:
++                    k = (k * tl.load(k_scale_ptr)).to(q.dtype)
++                elif KV_SCALE_MODE == 2:
++                    k_scale = tl.load(
++                        k_scale_ptr
++                        + pid_kh * stride_ks_h
++                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
++                        mask=pos_mask,
++                        other=1.0,
++                    )
++                    k = (k * k_scale[None, :]).to(q.dtype)
+             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+             # causal: q_abs_pos - k_off >= block_start (c)
+             qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
+@@ -169,6 +187,17 @@ def _gqa_sparse_fwd_kernel(
+             )
+             if USE_FP8:
+                 v = v.to(q.dtype)
++                if KV_SCALE_MODE == 1:
++                    v = (v * tl.load(v_scale_ptr)).to(q.dtype)
++                elif KV_SCALE_MODE == 2:
++                    v_scale = tl.load(
++                        v_scale_ptr
++                        + pid_kh * stride_vs_h
++                        + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
++                        mask=pos_mask,
++                        other=1.0,
++                    )
++                    v = (v * v_scale[:, None]).to(q.dtype)
+             acc_o += tl.dot(p.to(v.dtype), v)
+             m_i = m_ij
+             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+@@ -205,6 +234,8 @@ def _gqa_sparse_fwd_kernel(
+ def _gqa_sparse_decode_kernel(
+     q_ptr,  # [total_q, num_heads, head_dim]
+     kv_cache_ptr,  # main cache: [num_blocks, num_kv_heads, 128, 2*head_dim]
++    k_scale_ptr,
++    v_scale_ptr,
+     t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+     o_ptr,  # partial out: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
+     lse_ptr,  # partial lse (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
+@@ -223,6 +254,10 @@ def _gqa_sparse_decode_kernel(
+     stride_kv_h,
+     stride_kv_pos,
+     stride_kv_d,
++    stride_ks_h,
++    stride_ks_t,
++    stride_vs_h,
++    stride_vs_t,
+     stride_th,
+     stride_tn,
+     stride_tk,
+@@ -239,6 +274,7 @@ def _gqa_sparse_decode_kernel(
+     BLOCK_SIZE_H: tl.constexpr,
+     BLOCK_SIZE_D: tl.constexpr,
+     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
++    KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+     USE_PDL: tl.constexpr,
+ ):
+     sm_scale_log2e = sm_scale * 1.4426950409
+@@ -305,6 +341,17 @@ def _gqa_sparse_decode_kernel(
+         )
+         if USE_FP8:
+             k = k.to(q.dtype)
++            if KV_SCALE_MODE == 1:
++                k = (k * tl.load(k_scale_ptr)).to(q.dtype)
++            elif KV_SCALE_MODE == 2:
++                k_scale = tl.load(
++                    k_scale_ptr
++                    + pid_kh * stride_ks_h
++                    + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
++                    mask=pos_mask,
++                    other=1.0,
++                )
++                k = (k * k_scale[None, :]).to(q.dtype)
+         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+         qk += tl.dot(q, k) * sm_scale_log2e
+@@ -323,6 +370,17 @@ def _gqa_sparse_decode_kernel(
+         )
+         if USE_FP8:
+             v = v.to(q.dtype)
++            if KV_SCALE_MODE == 1:
++                v = (v * tl.load(v_scale_ptr)).to(q.dtype)
++            elif KV_SCALE_MODE == 2:
++                v_scale = tl.load(
++                    v_scale_ptr
++                    + pid_kh * stride_vs_h
++                    + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
++                    mask=pos_mask,
++                    other=1.0,
++                )
++                v = (v * v_scale[:, None]).to(q.dtype)
+         acc_o += tl.dot(p.to(v.dtype), v)
+         m_i = m_ij
+         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+@@ -410,6 +468,48 @@ def _merge_topk_attn_out_kernel(
+ # ---------------------------------------------------------------------------
+ # Python wrappers
+ # ---------------------------------------------------------------------------
++_KV_SCALE_NONE = 0
++_KV_SCALE_SCALAR = 1
++_KV_SCALE_PER_TOKEN_HEAD = 2
++
++
++def _kv_scale_args(
++    output: torch.Tensor,
++    num_kv_heads: int,
++    k_scale: torch.Tensor | None,
++    v_scale: torch.Tensor | None,
++) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int, int]:
++    if k_scale is None and v_scale is None:
++        return output, output, 0, 0, 0, 0, _KV_SCALE_NONE
++    if k_scale is None or v_scale is None:
++        raise ValueError("k_scale and v_scale must be both provided or both None")
++    if k_scale.device != output.device or v_scale.device != output.device:
++        raise ValueError("k_scale and v_scale must be on the same device as output")
++    if k_scale.numel() == 1 and v_scale.numel() == 1:
++        return k_scale, v_scale, 0, 0, 0, 0, _KV_SCALE_SCALAR
++    if k_scale.dim() == 2 and v_scale.dim() == 2:
++        if k_scale.shape[0] != num_kv_heads or v_scale.shape[0] != num_kv_heads:
++            raise ValueError(
++                "per-token/head KV scales must have shape "
++                f"[{num_kv_heads}, max_kv_tokens]"
++            )
++        if k_scale.shape != v_scale.shape:
++            raise ValueError("k_scale and v_scale must have matching shapes")
++        return (
++            k_scale,
++            v_scale,
++            k_scale.stride(0),
++            k_scale.stride(1),
++            v_scale.stride(0),
++            v_scale.stride(1),
++            _KV_SCALE_PER_TOKEN_HEAD,
++        )
++    raise ValueError(
++        "MiniMax-M3 sparse attention supports scalar KV scales or "
++        "[num_kv_heads, max_kv_tokens] per-token/head scales"
++    )
++
++
+ @torch.no_grad()
+ def minimax_m3_sparse_attn(
+     q: torch.Tensor,  # [total_q, num_heads, head_dim]
+@@ -423,6 +523,8 @@ def minimax_m3_sparse_attn(
+     num_kv_heads: int,
+     sm_scale: float,
+     output: torch.Tensor,  # [total_q, num_heads, head_dim]
++    k_scale: torch.Tensor | None = None,
++    v_scale: torch.Tensor | None = None,
+ ) -> None:
+     """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
+     total_q, num_heads, head_dim = q.shape
+@@ -430,10 +532,33 @@ def minimax_m3_sparse_attn(
+     topk = topk_idx.shape[-1]
+     gqa_group_size = num_heads // num_kv_heads
+     use_fp8 = kv_cache.dtype in _FP8_DTYPES
++    (
++        k_scale_arg,
++        v_scale_arg,
++        stride_ks_h,
++        stride_ks_t,
++        stride_vs_h,
++        stride_vs_t,
++        kv_scale_mode,
++    ) = (
++        _kv_scale_args(output, num_kv_heads, k_scale, v_scale)
++        if use_fp8
++        else (
++            output,
++            output,
++            0,
++            0,
++            0,
++            0,
++            _KV_SCALE_NONE,
++        )
++    )
+     grid = (max_query_len, num_kv_heads, batch)
+     _gqa_sparse_fwd_kernel[grid](
+         q,
+         kv_cache,
++        k_scale_arg,
++        v_scale_arg,
+         topk_idx,
+         output,
+         block_table,
+@@ -454,6 +579,10 @@ def minimax_m3_sparse_attn(
+         kv_cache.stride(1),
+         kv_cache.stride(2),
+         kv_cache.stride(3),
++        stride_ks_h,
++        stride_ks_t,
++        stride_vs_h,
++        stride_vs_t,
+         topk_idx.stride(0),
+         topk_idx.stride(1),
+         topk_idx.stride(2),
+@@ -464,6 +593,7 @@ def minimax_m3_sparse_attn(
+         BLOCK_SIZE_Q=1,
+         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+         USE_FP8=use_fp8,
++        KV_SCALE_MODE=kv_scale_mode,
+     )
+ 
+ 
+@@ -478,6 +608,8 @@ def minimax_m3_sparse_attn_decode(
+     sm_scale: float,
+     output: torch.Tensor,  # [total_q, num_heads, head_dim]
+     decode_query_len: int,
++    k_scale: torch.Tensor | None = None,
++    v_scale: torch.Tensor | None = None,
+ ) -> None:
+     """GQA block-sparse attention for decode (split-K over the top-k blocks)."""
+     total_q, num_heads, head_dim = q.shape
+@@ -485,6 +617,27 @@ def minimax_m3_sparse_attn_decode(
+     max_topk = topk_idx.shape[-1]
+     gqa_group_size = num_heads // num_kv_heads
+     use_fp8 = kv_cache.dtype in _FP8_DTYPES
++    (
++        k_scale_arg,
++        v_scale_arg,
++        stride_ks_h,
++        stride_ks_t,
++        stride_vs_h,
++        stride_vs_t,
++        kv_scale_mode,
++    ) = (
++        _kv_scale_args(output, num_kv_heads, k_scale, v_scale)
++        if use_fp8
++        else (
++            output,
++            output,
++            0,
++            0,
++            0,
++            0,
++            _KV_SCALE_NONE,
++        )
++    )
+     use_pdl = current_platform.is_arch_support_pdl()
+     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
+     # SM9+); this ROCm Triton rejects it even when False ("Keyword argument
+@@ -505,6 +658,8 @@ def minimax_m3_sparse_attn_decode(
+     _gqa_sparse_decode_kernel[grid](
+         q,
+         kv_cache,
++        k_scale_arg,
++        v_scale_arg,
+         topk_idx,
+         o_partial,
+         lse_partial,
+@@ -523,6 +678,10 @@ def minimax_m3_sparse_attn_decode(
+         kv_cache.stride(1),
+         kv_cache.stride(2),
+         kv_cache.stride(3),
++        stride_ks_h,
++        stride_ks_t,
++        stride_vs_h,
++        stride_vs_t,
+         topk_idx.stride(0),
+         topk_idx.stride(1),
+         topk_idx.stride(2),
+@@ -537,6 +696,7 @@ def minimax_m3_sparse_attn_decode(
+         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+         NUM_TOPK_CHUNKS=num_topk_chunks,
+         USE_FP8=use_fp8,
++        KV_SCALE_MODE=kv_scale_mode,
+         USE_PDL=use_pdl,
+         **pdl_launch,
+     )
+diff --git a/vllm/models/minimax_m3/common/sparse_attention.py b/vllm/models/minimax_m3/common/sparse_attention.py
+index c87fe74c1700..f887f14b643b 100644
+--- a/vllm/models/minimax_m3/common/sparse_attention.py
++++ b/vllm/models/minimax_m3/common/sparse_attention.py
+@@ -20,6 +20,7 @@
+ 
+ import torch
+ 
++from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.config import VllmConfig
+ from vllm.config.cache import CacheDType
+ from vllm.forward_context import get_forward_context
+@@ -58,6 +59,21 @@
+ logger = init_logger(__name__)
+ 
+ 
++def _minimax_m3_aiter_sparse_pa_requested() -> bool:
++    return rocm_aiter_ops.is_enabled() and rocm_aiter_ops.is_shuffle_kv_cache_enabled()
++
++
++def minimax_m3_use_aiter_sparse_pa(num_kv_heads: int) -> bool:
++    """Whether to use the ROCm AITER page-16 sparse PA prototype."""
++    requested = _minimax_m3_aiter_sparse_pa_requested()
++    if requested and num_kv_heads != 1:
++        raise ValueError(
++            "MiniMax M3 AITER sparse paged attention requires "
++            f"num_kv_heads == 1 per tensor-parallel rank, got {num_kv_heads}."
++        )
++    return requested
++
++
+ class MiniMaxM3SparseBackend(AttentionBackend):
+     """Block-sparse GQA backend for MiniMax M3 sparse attention layers."""
+ 
+@@ -104,6 +120,12 @@ def get_kv_cache_shape(
+         head_size: int,
+         cache_dtype_str: str = "auto",
+     ) -> tuple[int, ...]:
++        if minimax_m3_use_aiter_sparse_pa(num_kv_heads):
++            # AITER's assembly paged-attention kernels require independently
++            # contiguous K and V storage. Keep that specialized layout behind
++            # the shuffle flag while every other implementation uses the
++            # packed-content contract introduced by #44455.
++            return (num_blocks, 2, block_size, num_kv_heads, head_size)
+         # K and V are packed into the content dim: logical (B, H, N, 2*hs).
+         return (num_blocks, num_kv_heads, block_size, 2 * head_size)
+ 
+@@ -116,6 +138,11 @@ def get_kv_cache_stride_order(
+         # layout we want.
+         if include_num_layers_dimension:
+             raise NotImplementedError  # no cross-layer KV blocks in M3
++        if _minimax_m3_aiter_sparse_pa_requested():
++            # The AITER page-16 sparse PA path reinterprets the K and V slices
++            # as separate SHUFFLE caches. Keep K/V physically separated so
++            # kv_cache[:, 0] and kv_cache[:, 1] are contiguous byte ranges.
++            return (1, 0, 2, 3, 4)
+         cache_layout = get_kv_cache_layout()
+         if cache_layout == "NHD":
+             # (num_blocks, block_size, num_kv_heads, 2*head_size)
+@@ -365,6 +392,8 @@ def forward(
+         kv_cache = (
+             kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
+         )
++        k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
++        v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
+ 
+         # Decode [:nd]: split-K over the selected blocks (request-major chunks).
+         if main_md.num_decodes > 0:
+@@ -380,6 +409,8 @@ def forward(
+                 self.scale,
+                 out[:nd],
+                 d.decode_query_len,
++                k_scale=k_scale,
++                v_scale=v_scale,
+             )
+ 
+         # Prefill [nd:]: cu_seqlens_q already rebased to 0.
+@@ -398,6 +429,8 @@ def forward(
+                 self.num_kv_heads,
+                 self.scale,
+                 out[nd:],
++                k_scale=k_scale,
++                v_scale=v_scale,
+             )
+         return output
+ 
+@@ -406,27 +439,38 @@ def select_main_impl_cls(
+     *,
+     topk_blocks: int,
+     kv_cache_dtype: str,
++    num_kv_heads: int,
+ ) -> type[MiniMaxM3SparseImpl]:
+     """Pick the main attend impl off the main KV-cache dtype.
+ 
+     Blackwell (SM100) uses the MSA attend for supported top-k block counts
+-    when the KV cache is BF16 or FP8 E4M3; non-Blackwell and FP8 E5M2 fall
+-    back to Triton. The MSA module is imported lazily so AMD/non-SM100 never
+-    import fmha_sm100.
++    when the KV cache is BF16 or FP8 E4M3; MI355 uses AITER sparse PA
++    with shuffle KV cache layout; Other platforms and FP8 E5M2 fall
++    back to Triton. The MSA modules are imported lazily avoid import errors
++    on unsupported platforms.
+     """
++    use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(num_kv_heads)
+     use_msa = (
+         current_platform.is_cuda()
+         and current_platform.is_device_capability_family(100)
+         and topk_blocks in (4, 8, 16, 32)
+         and kv_cache_dtype != "fp8_e5m2"
+     )
+-    selected = "MSA" if use_msa else "Triton"
++    selected = (
++        "AITER_SPARSE_PA" if use_aiter_sparse_pa else ("MSA" if use_msa else "Triton")
++    )
+     logger.info_once(
+         "MiniMax M3 sparse attention selected %s (kv_cache_dtype=%s, topk_blocks=%s)",
+         selected,
+         kv_cache_dtype,
+         topk_blocks,
+     )
++    if use_aiter_sparse_pa:
++        from vllm.models.minimax_m3.amd.sparse_attention_msa import (
++            MiniMaxM3SparseAiterPAImpl,
++        )
++
++        return MiniMaxM3SparseAiterPAImpl
+     if use_msa:
+         from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
+             MiniMaxM3SparseMSAImpl,
+diff --git a/vllm/models/minimax_m3/nvidia/model.py b/vllm/models/minimax_m3/nvidia/model.py
+index 66a0b67202cb..e29514ab9a32 100644
+--- a/vllm/models/minimax_m3/nvidia/model.py
++++ b/vllm/models/minimax_m3/nvidia/model.py
+@@ -25,6 +25,7 @@
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+ from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.layers.attention.attention import set_default_quant_scales
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
+     fused_allreduce_gemma_rms_norm,
+@@ -491,6 +492,11 @@ def __init__(
+         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+             self.kv_cache_dtype, vllm_config.model_config
+         )
++        # MiniMax-M3 sparse attention owns its KV-cache insert/read path instead
++        # of wrapping the generic Attention module. Keep the same runtime scale
++        # attributes so FP8 KV reads can honor vLLM's per-layer descale contract.
++        self.calculate_kv_scales = False
++        set_default_quant_scales(self, register_buffer=True)
+         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
+         # cache (--attention-config '{"indexer_kv_dtype": ...}').
+         self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
+@@ -506,6 +512,7 @@ def __init__(
+         self.impl: MiniMaxM3SparseImpl = select_main_impl_cls(  # type: ignore[assignment]
+             topk_blocks=sparse_cfg["sparse_topk_blocks"],
+             kv_cache_dtype=self.kv_cache_dtype,
++            num_kv_heads=self.num_kv_heads,
+         )(
+             self.num_heads,
+             self.head_dim,
+diff --git a/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py b/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
+index cf56fcf5e5d4..8666eaa28e70 100644
+--- a/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
++++ b/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
+@@ -49,6 +49,8 @@ def forward(
+         kv_cache = (
+             kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
+         )
++        k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
++        v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
+ 
+         # Decode [:nd]: Triton split-K placeholder (no MSA decode yet).
+         if main_md.num_decodes > 0:
+@@ -64,6 +66,8 @@ def forward(
+                 self.scale,
+                 out[:nd],
+                 d.decode_query_len,
++                k_scale=k_scale,
++                v_scale=v_scale,
+             )
+ 
+         # Prefill [nd:]: MSA sparse FMHA over the selected blocks.

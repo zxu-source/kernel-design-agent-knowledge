@@ -1,0 +1,440 @@
+diff --git a/csrc/custom_quickreduce.cu b/csrc/custom_quickreduce.cu
+index 33d0d4a7226e..d4e5d179a54e 100644
+--- a/csrc/custom_quickreduce.cu
++++ b/csrc/custom_quickreduce.cu
+@@ -97,18 +97,28 @@ int64_t qr_max_size() {
+                                                   cast_bf2half>;  \
+     template struct quickreduce::AllReduceTwoshot<T, Codec<T, 8>, cast_bf2half>;
+ 
++  // INT3 (CodecQ3) is restricted to TP2 only, so we only instantiate the
++  // world_size == 2 kernel for it.
++  #define INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(T, Codec, cast_bf2half) \
++    template struct quickreduce::AllReduceTwoshot<T, Codec<T, 2>, cast_bf2half>;
++
+ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, false)
+ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, false)
+ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, false)
+ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, false)
++INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(quickreduce::nv_bfloat16,
++                                   quickreduce::CodecQ3, false)
+ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, true)
+ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, true)
+ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, true)
+ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, true)
++INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(quickreduce::nv_bfloat16,
++                                   quickreduce::CodecQ3, true)
+ 
+ INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, false)
+ INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, false)
+ INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ6, false)
+ INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ8, false)
++INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(half, quickreduce::CodecQ3, false)
+ 
+ #endif  // USE_ROCM
+\ No newline at end of file
+diff --git a/csrc/quickreduce/base.h b/csrc/quickreduce/base.h
+index a2170e483207..6c3456d06f20 100644
+--- a/csrc/quickreduce/base.h
++++ b/csrc/quickreduce/base.h
+@@ -283,6 +283,29 @@ __quickreduce_device_inline__ int packed_rcp<nv_bfloat16>(int a) {
+   return R.i;
+ }
+ 
++template <typename T>
++__quickreduce_device_inline__ int packed_from_int16_pair(int16_t low,
++                                                         int16_t high);
++
++template <>
++__quickreduce_device_inline__ int packed_from_int16_pair<half>(int16_t low,
++                                                               int16_t high) {
++  // Convert two signed integers to one fp16x2 packed 32-bit lane.
++  half2 h = __halves2half2(__int2half_rn(static_cast<int>(low)),
++                           __int2half_rn(static_cast<int>(high)));
++  return __builtin_bit_cast(int, h);
++}
++
++template <>
++__quickreduce_device_inline__ int packed_from_int16_pair<nv_bfloat16>(
++    int16_t low, int16_t high) {
++  // Convert two signed integers to one bf16x2 packed 32-bit lane.
++  nv_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
++  nv_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
++  nv_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
++  return *reinterpret_cast<int*>(&bf2);
++}
++
+ // changes dtype
+ __quickreduce_device_inline__ float T2float_cast(half a) {
+   return __half2float(a);
+diff --git a/csrc/quickreduce/quick_reduce.h b/csrc/quickreduce/quick_reduce.h
+index 4cc35300bf87..7506329972ba 100644
+--- a/csrc/quickreduce/quick_reduce.h
++++ b/csrc/quickreduce/quick_reduce.h
+@@ -59,11 +59,30 @@ allreduce_prototype_twoshot(T const* A, T* B, uint32_t N, uint32_t num_blocks,
+                        flag_color, this->kMaxProblemSize);                  \
+   }
+ 
++// INT3 only retains good performance on TP2 (world_size == 2). On TP4/TP8
++// the 3-bit codec's pack/unpack overhead outweighs the reduced communication
++// volume, so INT3 is restricted to a TP2-only dispatch here.
++#define TWOSHOT_DISPATCH_TP2_ONLY(__codec)                                  \
++  if (world_size == 2) {                                                    \
++    using LineCodec = __codec<T, 2>;                                        \
++    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;   \
++    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),   \
++                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N, \
++                       num_blocks, rank, dbuffer_list, data_offset,         \
++                       flag_color, this->kMaxProblemSize);                  \
++  } else {                                                                  \
++    throw std::runtime_error(                                               \
++        "INT3 quick all-reduce is only supported for world_size == 2 "      \
++        "(TP2); use INT4/NONE for larger world sizes.");                    \
++  }
++
+ enum QuickReduceQuantLevel {
+-  F16 = 0,
+-  INT8 = 1,
+-  INT6 = 2,
+-  INT4 = 3,
++  // Keep these ids in sync with Python QuickReduceRegime enum.
++  F16 = 0,   // full-precision fp16/bf16 communication
++  INT8 = 1,  // symmetric int8 + per-block scale
++  INT6 = 2,  // symmetric int6 + per-block scale
++  INT4 = 3,  // symmetric int4 + per-block scale
++  INT3 = 4,  // symmetric int3 + per-block scale (TP2 only)
+ };
+ 
+ struct DeviceComms {
+@@ -184,6 +203,9 @@ struct DeviceComms {
+       case QuickReduceQuantLevel::INT4:
+         TWOSHOT_DISPATCH(CodecQ4)
+         break;
++      case QuickReduceQuantLevel::INT3:
++        TWOSHOT_DISPATCH_TP2_ONLY(CodecQ3)
++        break;
+       default:
+         TWOSHOT_DISPATCH(CodecFP)
+         break;
+diff --git a/csrc/quickreduce/quick_reduce_impl.cuh b/csrc/quickreduce/quick_reduce_impl.cuh
+index 38dc9938fc8a..e9586e40ff0d 100644
+--- a/csrc/quickreduce/quick_reduce_impl.cuh
++++ b/csrc/quickreduce/quick_reduce_impl.cuh
+@@ -2,6 +2,7 @@
+ 
+ #include <hip/hip_runtime.h>
+ #include "base.h"
++#include <hip/hip_fp16.h>
+ 
+ namespace quickreduce {
+ 
+@@ -206,6 +207,168 @@ struct CodecQ4 : public CodecBase {
+   }
+ };
+ 
++// Int3 symmetric quantization codec.
++// We quantize the FP16 data to block-scaled Int3 in blocks of 4 *
++// kThreadGroupSize. Uniform symmetric quantization (round-to-int + clip),
++// matching the structure of CodecQ4. Signed range is [-4, +3].
++template <typename T, int world_size>
++struct CodecQ3 : public CodecBase {
++  static constexpr int kWorldSize = world_size;
++
++  // Layout per quantization block (32 values = 8 threads * 4 fp16x2 lanes):
++  // - each thread owns 8 values and writes:
++  //   * q2 payload  : 8 * 2 bits  -> uint16 (2 bytes)
++  //   * q1 payload  : 8 * 1 bit   -> uint8  (1 byte)
++  // - one scale is shared per 32 values and written by group leader.
++  //
++  // kRankTileStride is split as:
++  // [0 .. 511]   : q2 payload region   (256 threads * 2 bytes)
++  // [512 .. 767] : q1 payload region   (256 threads * 1 byte)
++  // [768 .. 895] : scale region        (32 groups   * 4 bytes)
++  static constexpr int kRankAtoms = kAtoms / kWorldSize;
++  static constexpr int kRankTileStride = 896;
++  static constexpr int kRankTileQ1Offset = 512;
++  static constexpr int kRankTileScaleOffset = 768;
++  static constexpr int kRankTransmittedTileSize = kRankTileStride * kRankAtoms;
++  static_assert(kRankTransmittedTileSize % 16 == 0,
++                "kRankTransmittedTileSize must be 16B aligned.");
++
++  static constexpr int kRankBufferTileStride =
++      kRankTileStride / sizeof(int32x4_t);
++
++  static constexpr int kTransmittedTileSize =
++      kRankTransmittedTileSize * kWorldSize;
++
++  // {-1/4.0h, -1/4.0h}, f16x2_t / bf16x2_t. Sign-flipped so absmax maps
++  // to -4; the sign cancels with decoding_scale on the recv side.
++  static constexpr int kScaleFactor =
++      std::is_same<T, half>::value ? 0xB400B400 : 0xBE80BE80;
++
++  // {1e-7, 1e-7}, f16x2_t
++  static constexpr int kScaleEpsilon =
++      std::is_same<T, half>::value ? 0x00010001 : 0x33D733D7;
++
++  // {-4, -4}, f16x2_t / bf16x2_t
++  static constexpr int kRangeMin =
++      std::is_same<T, half>::value ? 0xC400C400 : 0xC080C080;
++
++  // {+3, +3}, f16x2_t / bf16x2_t
++  static constexpr int kRangeMax =
++      std::is_same<T, half>::value ? 0x42004200 : 0x40404040;
++
++  // {+4, +4}, int16x2_t -- shifts signed [-4, +3] to unsigned [0, 7].
++  static constexpr int kRangeBias = 0x00040004;
++
++  __quickreduce_device_inline__ CodecQ3(int thread, int rank)
++      : CodecBase(thread, rank) {}
++
++  __quickreduce_device_inline__ void send(int32x4_t* __restrict__ send_buffer,
++                                          const int32x4_t* __restrict__ data) {
++    for (int k = 0; k < kRankAtoms; k++) {
++      int32x4_t const atom = data[k];
++
++      // 1) Per-group dynamic scale (shared across 32 values).
++      int wblockmax = group_abs_max<T>(atom);
++      int decoding_scale = packed_mul<T>(wblockmax, kScaleFactor);
++      int encoding_scale = packed_add<T>(decoding_scale, kScaleEpsilon);
++      encoding_scale = packed_rcp<T>(encoding_scale);
++
++      // 2) Scale + clip to signed int3 range [-4, +3].
++      int32x4_t w;
++      for (int i = 0; i < 4; i++) {
++        w[i] = packed_mul<T>(atom[i], encoding_scale);
++        w[i] = packed_max<T>(w[i], kRangeMin);
++        w[i] = packed_min<T>(w[i], kRangeMax);
++      }
++
++      // 3) Round to integer and bias to unsigned domain [0, 7].
++      int32x4_t q;
++      {
++        int16_t* qi = reinterpret_cast<int16_t*>(&q);
++        T* wh = reinterpret_cast<T*>(&w);
++        for (int i = 0; i < 8; i++) qi[i] = (int16_t)rintf(T2float_cast(wh[i]));
++
++        for (int i = 0; i < 4; i++) {
++          q[i] = packed_add<int16_t>(q[i], kRangeBias);
++        }
++      }
++
++      // 4) Split each 3-bit unsigned value into low-2-bit and high-1-bit
++      //    halves, packed into one uint16 (low 2 bits per value) plus one
++      //    uint8 (high 1 bit per value).
++      uint16_t q2w = 0;
++      uint8_t q1w = 0;
++      {
++        int16_t* tw = reinterpret_cast<int16_t*>(&q);
++#pragma unroll
++        for (int i = 0; i < 8; i++) {
++          uint32_t v = static_cast<uint32_t>(tw[i]) & 0x7u;
++          q2w |= static_cast<uint16_t>((v & 0x3u) << (i * 2));
++          q1w |= static_cast<uint8_t>(((v >> 2) & 0x1u) << i);
++        }
++      }
++
++      uint8_t* atom_ptr =
++          reinterpret_cast<uint8_t*>(send_buffer + k * kRankBufferTileStride);
++      uint16_t* q2w_ptr = reinterpret_cast<uint16_t*>(atom_ptr) + thread;
++      uint8_t* q1w_ptr =
++          reinterpret_cast<uint8_t*>(atom_ptr + kRankTileQ1Offset) + thread;
++      int* qs_ptr = reinterpret_cast<int*>(atom_ptr + kRankTileScaleOffset) +
++                    (thread / 8);
++
++      __builtin_nontemporal_store(q2w, q2w_ptr);
++      *q1w_ptr = q1w;
++      if (threadIdx.x == group_leader) {
++        __builtin_nontemporal_store(decoding_scale, qs_ptr);
++      }
++    }
++  }
++
++  __quickreduce_device_inline__ void recv(int32x4_t** __restrict__ recv_buffer,
++                                          int32x4_t* __restrict__ data) {
++    for (int k = 0; k < kRankAtoms; k++) {
++      uint8_t* atom_ptr = reinterpret_cast<uint8_t*>(*recv_buffer);
++      uint16_t* q2w_ptr = reinterpret_cast<uint16_t*>(atom_ptr) + thread;
++      uint8_t* q1w_ptr =
++          reinterpret_cast<uint8_t*>(atom_ptr + kRankTileQ1Offset) + thread;
++      int* qs_ptr = reinterpret_cast<int*>(atom_ptr + kRankTileScaleOffset) +
++                    (thread / 8);
++
++      uint16_t q2w = __builtin_nontemporal_load(q2w_ptr);
++      uint8_t q1w = *q1w_ptr;
++      int qs = __builtin_nontemporal_load(qs_ptr);
++
++      *recv_buffer += kRankBufferTileStride;
++
++      // Unpack unsigned values [0, 7] then shift back to signed domain
++      // [-4, +3] by adding kRangeMin.
++      int32x4_t w;
++      {
++        int16_t qv[8];
++#pragma unroll
++        for (int i = 0; i < 8; i++) {
++          uint32_t low2 = (q2w >> (2 * i)) & 0x3u;
++          uint32_t high1 = (q1w >> i) & 0x1u;
++          qv[i] = static_cast<int16_t>(low2 | (high1 << 2));
++        }
++
++#pragma unroll
++        for (int i = 0; i < 4; i++) {
++          int qpack = packed_from_int16_pair<T>(qv[2 * i], qv[2 * i + 1]);
++          w[i] = packed_add<T>(qpack, kRangeMin);
++        }
++      }
++
++      // Apply decode scale to reconstruct fp16/bf16 lanes.
++      for (int i = 0; i < 4; i++) {
++        w[i] = packed_mul<T>(w[i], qs);
++      }
++
++      data[k] = w;
++    }
++  }
++};
++
+ // Int6 symmetric quantization codec.
+ // We quantize the FP16 data to block-scaled Int6 in blocks of 4 *
+ // kThreadGroupSize.
+@@ -377,7 +540,6 @@ struct CodecQ6 : public CodecBase {
+         w[i] = packed_mul<T>(w[i], qs);
+       }
+ 
+-      // That's pretty much it...
+       data[k] = w;
+     }
+   }
+diff --git a/tests/distributed/test_quick_all_reduce.py b/tests/distributed/test_quick_all_reduce.py
+index 86eb82c962e7..bfa28cc5c444 100644
+--- a/tests/distributed/test_quick_all_reduce.py
++++ b/tests/distributed/test_quick_all_reduce.py
+@@ -350,7 +350,7 @@ def bf16_cast_quickreduce(
+ @pytest.mark.skipif(
+     not current_platform.is_rocm(), reason="only test quick allreduce for rocm"
+ )
+-@pytest.mark.parametrize("quant_mode", ["FP", "INT8", "INT6", "INT4"])
++@pytest.mark.parametrize("quant_mode", ["FP", "INT8", "INT6", "INT4", "INT3"])
+ @pytest.mark.parametrize("tp_size", [2])
+ @pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
+ @pytest.mark.parametrize("test_target", [graph_quickreduce, eager_quickreduce])
+@@ -438,7 +438,7 @@ def qr_variable_input(rank, world_size):
+             s2 = 2048
+             inp1 = torch.ones((s1, s2), dtype=dtype, device=device_idx)
+         result = torch.empty_like(inp1)
+-        # FP = 0 INT8 = 1 INT6 = 2 INT4 = 3 NONE = 4
++        # FP = 0 INT8 = 1 INT6 = 2 INT4 = 3 INT3 = 4
+         ops.qr_all_reduce(_ptr, inp1, result, 3, cast_bf2half=True)
+         try:
+             if inp1[0, 0] == 0:
+diff --git a/vllm/distributed/device_communicators/quick_all_reduce.py b/vllm/distributed/device_communicators/quick_all_reduce.py
+index c54eaf7555d4..3c9d759dd7f1 100644
+--- a/vllm/distributed/device_communicators/quick_all_reduce.py
++++ b/vllm/distributed/device_communicators/quick_all_reduce.py
+@@ -28,11 +28,13 @@
+ 
+ 
+ class QuickReduceRegime(Enum):
++    # Keep integer ids aligned with csrc/quickreduce/quick_reduce.h
+     FP = 0
+     INT8 = 1
+     INT6 = 2
+     INT4 = 3
+-    NONE = 4
++    INT3 = 4
++    NONE = 5
+ 
+ 
+ KB = 1024
+@@ -43,14 +45,20 @@ class QuickAllReduce:
+     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
+     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
+     # The following data is based on kernel tests.
+-    # In this order [FP, INT8, INT6, INT4].
++    # In this order [FP, INT8, INT6, INT4, INT3].
+     _QR_MIN_SIZE = {
+-        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB],
+-        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB],
+-        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 2 * MB],
+-        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB],
+-        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB],
+-        (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
++        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB, 1 * MB],
++        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB, 2 * MB],
++        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 2 * MB, 2 * MB],
++        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB, 8 * MB],
++        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB, 16 * MB],
++        (torch.bfloat16, 8): [
++            16 * MB,
++            2048 * MB,
++            2048 * MB,
++            2048 * MB,
++            2048 * MB,
++        ],
+     }
+ 
+     def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
+@@ -59,8 +67,10 @@ def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> Non
+         available for CUDA and ROCm MI300 series.
+ 
+         Custom quick allreduce leverages quantization for further
+-        acceleration on ROCm. It currently supports Q8, Q6, and Q4
+-        quantization formats and FP(float16, bfloat16).
++        acceleration on ROCm. It currently supports Q8, Q6, Q4, and Q3
++        quantization formats and FP(float16, bfloat16). Q3 (INT3) is
++        restricted to TP2 (world_size == 2) due to poor performance on
++        larger world sizes.
+ 
+         Quick allreduce is designed as a complement to custom allreduce.
+         Its initialization requires even stricter conditions.
+@@ -178,6 +188,23 @@ def init_quick_all_reduce(self):
+             )
+             return
+         self.qr_quant_level = QuickReduceRegime[regime_str]
++
++        # INT3 is only enabled for TP2 (world_size == 2).
++        # Kernel benchmarks show INT3 all-reduce on TP4/TP8 has poor
++        # performance (the extra ranks make the 3-bit codec's pack/unpack
++        # overhead outweigh the reduced communication volume), so INT3 is
++        # restricted to 2-GPU tensor parallelism. For TP4/TP8 use a wider
++        # codec (e.g. INT4) or NONE instead.
++        if self.qr_quant_level == QuickReduceRegime.INT3 and self.world_size != 2:
++            logger.warning(
++                "Custom quick allreduce is disabled: INT3 quantization is "
++                "only supported for TP2 (world_size == 2), but world_size "
++                "is %d. INT3 on TP4/TP8 is disabled due to poor kernel "
++                "performance. Use INT4/NONE for this world size.",
++                self.world_size,
++            )
++            return
++
+         self.qr_quantization_min_size = self._get_qr_quantization_min_size()
+         vllm_config = get_current_vllm_config_or_none()
+         if (
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 40c93e9ae756..08314a8c88de 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -214,7 +214,7 @@
+     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
+     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
+-        "FP", "INT8", "INT6", "INT4", "NONE"
++        "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
+     ] = "NONE"
+     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
+     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
+@@ -1224,12 +1224,12 @@ def _resolve_rust_frontend_path() -> str | None:
+         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+     ),
+     # Custom quick allreduce kernel for MI3* cards
+-    # Choice of quantization level: FP, INT8, INT6, INT4 or NONE
++    # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
+     # Recommended for large models to get allreduce
+     "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION": env_with_choices(
+         "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION",
+         "NONE",
+-        ["FP", "INT8", "INT6", "INT4", "NONE"],
++        ["FP", "INT8", "INT6", "INT4", "INT3", "NONE"],
+     ),
+     # Custom quick allreduce kernel for MI3* cards
+     # Due to the lack of the bfloat16 asm instruction, bfloat16

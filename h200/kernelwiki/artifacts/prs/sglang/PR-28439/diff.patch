@@ -1,0 +1,659 @@
+diff --git a/python/sglang/jit_kernel/dsv4/compress.py b/python/sglang/jit_kernel/dsv4/compress.py
+index b5aa35136fba..ed9e772914f9 100644
+--- a/python/sglang/jit_kernel/dsv4/compress.py
++++ b/python/sglang/jit_kernel/dsv4/compress.py
+@@ -10,10 +10,30 @@
+     load_jit,
+     make_cpp_args,
+ )
+-from sglang.srt.utils import is_hip
++from sglang.srt.utils import is_hip, is_xpu
+ 
+ from .utils import make_name
+ 
++_is_xpu = is_xpu()
++if _is_xpu:
++    from sgl_kernel import compress_norm_rope_store as compress_norm_rope_store_xpu
++    from sgl_kernel import (
++        flash_compress4_decode,
++        flash_compress4_prefill,
++        flash_compress128_decode,
++        flash_compress128_prefill,
++        plan_compress_decode,
++        plan_compress_decode_legacy,
++        plan_compress_prefill,
++        plan_compress_prefill_legacy,
++    )
++
++    _XPU_COMPRESS_FNS = {
++        4: (flash_compress4_decode, flash_compress4_prefill),
++        128: (flash_compress128_decode, flash_compress128_prefill),
++    }
++
++
+ if TYPE_CHECKING:
+     from tvm_ffi.module import Module
+ 
+@@ -133,8 +153,13 @@ def generate(
+         swa_page_size: int,
+         ring_size: int,
+     ) -> CompressorDecodePlan:
+-        module = _jit_compress_plan_module()
+-        plan_d = module.plan_decode(
++        if _is_xpu:
++            fn = plan_compress_decode
++        else:
++            module = _jit_compress_plan_module()
++            fn = module.plan_decode
++
++        plan_d = fn(
+             req_pool_indices,
+             req_to_token,
+             full_to_state,
+@@ -151,8 +176,13 @@ def generate_legacy(
+         req_pool_indices: torch.Tensor,
+         seq_lens: torch.Tensor,
+     ) -> CompressorDecodePlan:
+-        module = _jit_compress_plan_module()
+-        plan_d = module.plan_decode_legacy(req_pool_indices, seq_lens, compress_ratio)
++        if _is_xpu:
++            fn = plan_compress_decode_legacy
++        else:
++            module = _jit_compress_plan_module()
++            fn = module.plan_decode_legacy
++
++        plan_d = fn(req_pool_indices, seq_lens, compress_ratio)
+         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
+ 
+     @staticmethod
+@@ -208,7 +238,7 @@ def generate(
+         num_q_tokens: int,
+         use_cuda_graph: bool = False,
+     ) -> CompressorPrefillPlan:
+-        is_gpu_input = seq_lens.device.type == "cuda"
++        is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
+         pin_buffer = torch.empty(
+             0 if is_gpu_input else num_q_tokens * _PREFILL_PLAN_BYTES,
+             dtype=torch.uint8,
+@@ -229,7 +259,13 @@ def generate(
+                 pin_buffer,
+             )
+         module = _jit_compress_plan_module()
+-        plan_c, plan_w = module.plan_prefill(
++        if _is_xpu:
++            fn = plan_compress_prefill
++        else:
++            module = _jit_compress_plan_module()
++            fn = module.plan_prefill
++
++        plan_c, plan_w = fn(
+             req_pool_indices,
+             req_to_token,
+             full_to_state,
+@@ -244,8 +280,8 @@ def generate(
+         )
+         return CompressorPrefillPlan(
+             compress_ratio,
+-            torch.from_dlpack(plan_c),
+-            torch.from_dlpack(plan_w),
++            torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
++            torch.from_dlpack(plan_w) if not _is_xpu else plan_w,
+             pin_buffer,
+         )
+ 
+@@ -264,8 +300,13 @@ def generate_legacy(
+             dtype=torch.uint8,
+             pin_memory=True,
+         )
+-        module = _jit_compress_plan_module()
+-        plan_c, plan_w = module.plan_prefill_legacy(
++        if _is_xpu:
++            fn = plan_compress_prefill_legacy
++        else:
++            module = _jit_compress_plan_module()
++            fn = module.plan_prefill_legacy
++
++        plan_c, plan_w = fn(
+             req_pool_indices,
+             seq_lens,
+             extend_lens,
+@@ -276,8 +317,8 @@ def generate_legacy(
+         )
+         return CompressorPrefillPlan(
+             compress_ratio,
+-            torch.from_dlpack(plan_c),
+-            torch.from_dlpack(plan_w),
++            torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
++            torch.from_dlpack(plan_w) if not _is_xpu else plan_w,
+             pin_buffer,
+         )
+ 
+@@ -346,11 +387,19 @@ def compress_forward(
+         assert compress_ratio == 128 and head_dim == 512
+         module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
+     else:
+-        dtype_in, dtype_out = kv_score_input.dtype, out.dtype
+-        module = _jit_compress_module(
+-            head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
+-        )
+-    fn = module.decode if plan.is_decode else module.prefill
++        if _is_xpu:
++            decode_fn, prefill_fn = _XPU_COMPRESS_FNS[compress_ratio]
++        else:
++            dtype_in, dtype_out = kv_score_input.dtype, out.dtype
++            module = _jit_compress_module(
++                head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
++            )
++
++    if _is_xpu:
++        fn = decode_fn if plan.is_decode else prefill_fn
++    else:
++        fn = module.decode if plan.is_decode else module.prefill
++
+     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
+     return out
+ 
+@@ -371,18 +420,33 @@ def compress_norm_rope_store(
+     if use_fp4:
+         assert kv.shape[-1] == 128
+     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+-    module = _jit_compress_norm_rope_module(
+-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+-    )
+-    fn = module.forward_fp4 if use_fp4 else module.forward
+-    fn(
+-        kv,
+-        plan[1],
+-        norm_weight,
+-        norm_eps,
+-        freq_cis,
+-        out_loc,
+-        kvcache,
+-        plan.is_decode,
+-        plan.compress_ratio,
+-    )
++    if _is_xpu:
++        compress_norm_rope_store_xpu(
++            kv,
++            plan[1],
++            norm_weight,
++            norm_eps,
++            freq_cis,
++            out_loc,
++            kvcache,
++            plan.is_decode,
++            plan.compress_ratio,
++            page_size,
++            use_fp4,
++        )
++    else:
++        module = _jit_compress_norm_rope_module(
++            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
++        )
++        fn = module.forward_fp4 if use_fp4 else module.forward
++        fn(
++            kv,
++            plan[1],
++            norm_weight,
++            norm_eps,
++            freq_cis,
++            out_loc,
++            kvcache,
++            plan.is_decode,
++            plan.compress_ratio,
++        )
+diff --git a/python/sglang/jit_kernel/tests/deepseek_v4/common.py b/python/sglang/jit_kernel/tests/deepseek_v4/common.py
+index 982745c67e6e..66ad4014ef44 100644
+--- a/python/sglang/jit_kernel/tests/deepseek_v4/common.py
++++ b/python/sglang/jit_kernel/tests/deepseek_v4/common.py
+@@ -6,6 +6,7 @@
+ import torch
+ 
+ from sglang.jit_kernel.dsv4 import CompressorDecodePlan, CompressorPrefillPlan
++from sglang.srt.utils import get_device
+ 
+ 
+ @dataclass
+@@ -46,7 +47,7 @@ def make_prefill_plan(
+             seq_lens=seq_lens_cpu,
+             extend_lens=extend_lens_cpu,
+             num_q_tokens=num_q_tokens,
+-            device=torch.device("cuda"),
++            device=torch.device(get_device()),
+         )
+ 
+     def make_decode_plan(self, seq_lens_gpu: torch.Tensor) -> CompressorDecodePlan:
+@@ -127,7 +128,7 @@ def make_legacy_context(
+     head_dim: int = 512,
+ ) -> LegacyContext:
+     pages_per_req = 2 if compress_ratio == 4 else 1
+-    req_pool_indices = torch.arange(bs, dtype=torch.int64, device="cuda")
++    req_pool_indices = torch.arange(bs, dtype=torch.int64, device=get_device())
+     return LegacyContext(
+         bs=bs,
+         head_dim=head_dim,
+@@ -171,9 +172,9 @@ def make_paged_context(
+         swa_page_size=swa_page_size,
+         ring_size=ring_size,
+         num_swa_pages_per_req=num_swa_pages_per_req,
+-        req_pool_indices=req_pool_indices.cuda(),
+-        req_to_token=req_to_token.cuda(),
+-        full_to_swa=full_to_swa.cuda(),
++        req_pool_indices=req_pool_indices.to(get_device()),
++        req_to_token=req_to_token.to(get_device()),
++        full_to_swa=full_to_swa.to(get_device()),
+     )
+ 
+ 
+@@ -182,7 +183,7 @@ def make_state_pool(num_pages: int, compress_ratio: int, head_dim: int) -> torch
+     return torch.zeros(
+         (num_pages, compress_ratio, last_dim),
+         dtype=torch.float32,
+-        device="cuda",
++        device=get_device(),
+     )
+ 
+ 
+diff --git a/test/registered/jit/deepseek_v4/test_c128_v2.py b/test/registered/jit/deepseek_v4/test_c128_v2.py
+index b051c98d8f2b..a15392e5c7c4 100644
+--- a/test/registered/jit/deepseek_v4/test_c128_v2.py
++++ b/test/registered/jit/deepseek_v4/test_c128_v2.py
+@@ -16,6 +16,7 @@
+     make_state_pool,
+     to_seq_extend,
+ )
++from sglang.srt.utils import get_device
+ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+ 
+ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+@@ -113,7 +114,12 @@ def test_prefill_no_context(mode: str, seq_len: int) -> None:
+ 
+     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
+     out = _run_prefill(
+-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
++        ctx,
++        pool,
++        kv_in_cpu.to(get_device()),
++        ape_cpu.to(get_device()),
++        seq_lens_cpu,
++        extend_lens_cpu,
+     )
+ 
+     # Compact prefill output: row per compress plan, in CPU-planner order.
+@@ -145,8 +151,8 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
+         _run_prefill(
+             ctx,
+             pool,
+-            kv_full_cpu[:prefix_len].cuda(),
+-            ape_cpu.cuda(),
++            kv_full_cpu[:prefix_len].to(get_device()),
++            ape_cpu.to(get_device()),
+             seq_lens_cpu,
+             extend_lens_cpu,
+         )
+@@ -154,9 +160,11 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
+     final_out = None
+     for k in range(RATIO):
+         cur_seq_len = prefix_len + k + 1
+-        seq_lens_gpu = torch.tensor([cur_seq_len], dtype=torch.int64, device="cuda")
+-        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].cuda()
+-        out = _run_decode(ctx, pool, kv_step, ape_cpu.cuda(), seq_lens_gpu)
++        seq_lens_gpu = torch.tensor(
++            [cur_seq_len], dtype=torch.int64, device=get_device()
++        )
++        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].to(get_device())
++        out = _run_decode(ctx, pool, kv_step, ape_cpu.to(get_device()), seq_lens_gpu)
+         if cur_seq_len % RATIO == 0:
+             final_out = out
+ 
+@@ -167,13 +175,16 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
+ 
+ 
+ @pytest.mark.parametrize("mode", ["legacy", "paged"])
+-@pytest.mark.parametrize("prefix_len", [128, 256])
+-def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
+-    """Prefill once, then a second prefill that extends across one compress event.
+-
+-    First prefill ends at a 128-boundary so the second prefill starts fresh.
++@pytest.mark.parametrize("prefix_len", [128, 120, 256])
++@pytest.mark.parametrize("extend_len", [128, 256])
++def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> None:
++    """Prefill once, then a second prefill that extends across compress event(s).
++
++    A prefix that is not a multiple of the ratio (e.g. 120) makes the first
++    compress event land at extend index j < window_size, so its buffer_len is
++    nonzero (window_size - min(j+1, window_size)) and the overlap must be read
++    out of the state buffer. Every compress event in the extend is checked.
+     """
+-    extend_len = RATIO
+     seq_len = prefix_len + extend_len
+ 
+     if mode == "legacy":
+@@ -190,8 +201,8 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
+     _run_prefill(
+         ctx,
+         pool,
+-        kv_full_cpu[:prefix_len].cuda(),
+-        ape_cpu.cuda(),
++        kv_full_cpu[:prefix_len].to(get_device()),
++        ape_cpu.to(get_device()),
+         seq_lens_cpu,
+         extend_lens_cpu,
+     )
+@@ -200,16 +211,19 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
+     out = _run_prefill(
+         ctx,
+         pool,
+-        kv_full_cpu[prefix_len:].cuda(),
+-        ape_cpu.cuda(),
++        kv_full_cpu[prefix_len:].to(get_device()),
++        ape_cpu.to(get_device()),
+         seq_lens_cpu,
+         extend_lens_cpu,
+     )
+ 
+-    P = seq_len - 1
+-    gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
+-    # Single compress event in this extend; compact plan_id 0.
+-    triton.testing.assert_close(out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
++    # One compact output row per compress event in the extend, position-ascending.
++    first_event = ((prefix_len // RATIO) + 1) * RATIO - 1
++    for plan_id, P in enumerate(range(first_event, seq_len, RATIO)):
++        gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
++        triton.testing.assert_close(
++            out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL, err_msg=f"{plan_id=}, {P=}"
++        )
+ 
+ 
+ @pytest.mark.parametrize("mode", ["legacy", "paged"])
+@@ -228,7 +242,12 @@ def test_prefill_multibatch(mode: str) -> None:
+     kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99)
+     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
+     out = _run_prefill(
+-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
++        ctx,
++        pool,
++        kv_in_cpu.to(get_device()),
++        ape_cpu.to(get_device()),
++        seq_lens_cpu,
++        extend_lens_cpu,
+     )
+ 
+     # Compact: walk batches in order, then positions in order; matches the
+diff --git a/test/registered/jit/deepseek_v4/test_c4_v2.py b/test/registered/jit/deepseek_v4/test_c4_v2.py
+index 845bc33a2e54..f88852a34c39 100644
+--- a/test/registered/jit/deepseek_v4/test_c4_v2.py
++++ b/test/registered/jit/deepseek_v4/test_c4_v2.py
+@@ -16,6 +16,7 @@
+     make_state_pool,
+     to_seq_extend,
+ )
++from sglang.srt.utils import get_device
+ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+ 
+ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+@@ -137,14 +138,25 @@ def test_prefill_no_context(mode: str, seq_len: int) -> None:
+ 
+     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
+     out = _run_prefill(
+-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
++        ctx,
++        pool,
++        kv_in_cpu.to(get_device()),
++        ape_cpu.to(get_device()),
++        seq_lens_cpu,
++        extend_lens_cpu,
+     )
+ 
+     # Compact prefill output: row per compress plan, in CPU-planner order
+     # (batch-major, position-ascending).
+     for plan_id, P in enumerate(range(RATIO - 1, seq_len, RATIO)):
+         gt = _gt_compress(kv_in_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
+-        triton.testing.assert_close(out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL)
++        triton.testing.assert_close(
++            out[plan_id].cpu(),
++            gt,
++            atol=ATOL,
++            rtol=RTOL,
++            err_msg=f"{plan_id=}, {P=} failed",
++        )
+ 
+ 
+ @pytest.mark.parametrize("mode", ["legacy", "paged"])
+@@ -171,8 +183,8 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
+     _run_prefill(
+         ctx,
+         pool,
+-        kv_full_cpu[:prefix_len].cuda(),
+-        ape_cpu.cuda(),
++        kv_full_cpu[:prefix_len].to(get_device()),
++        ape_cpu.to(get_device()),
+         seq_lens_cpu,
+         extend_lens_cpu,
+     )
+@@ -181,9 +193,11 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
+     final_out = None
+     for k in range(extend_decode):
+         cur_seq_len = prefix_len + k + 1
+-        seq_lens_gpu = torch.tensor([cur_seq_len], dtype=torch.int64, device="cuda")
+-        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].cuda()
+-        out = _run_decode(ctx, pool, kv_step, ape_cpu.cuda(), seq_lens_gpu)
++        seq_lens_gpu = torch.tensor(
++            [cur_seq_len], dtype=torch.int64, device=get_device()
++        )
++        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].to(get_device())
++        out = _run_decode(ctx, pool, kv_step, ape_cpu.to(get_device()), seq_lens_gpu)
+         if cur_seq_len % RATIO == 0:
+             final_out = out
+ 
+@@ -196,14 +210,16 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
+ 
+ @pytest.mark.parametrize("mode", ["legacy", "paged"])
+ @pytest.mark.parametrize("prefix_len", [256, 512, 768])
+-def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
+-    """Prefill once, then prefill an extend that crosses one compress event.
++@pytest.mark.parametrize("extend_len", [4, 32])
++def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> None:
++    """Prefill once, then prefill an extend that crosses one or more compress events.
+ 
+     The first prefill ends at a swa_page boundary (only relevant for paged),
+-    so the second prefill's overlap must be read out of the buffer.
++    so the second prefill's overlap must be read out of the buffer. With
++    extend_len > window_size the extend spans several compress events whose
++    buffer_len decreases per event (window_size - min(j+1, window_size)), so
++    every event is checked, not just the first.
+     """
+-    extend_len = 4
+-
+     if mode == "legacy":
+         ctx: Context = make_legacy_context(
+             bs=1, compress_ratio=RATIO, head_dim=HEAD_DIM
+@@ -220,8 +236,8 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
+     _run_prefill(
+         ctx,
+         pool,
+-        kv_full_cpu[:prefix_len].cuda(),
+-        ape_cpu.cuda(),
++        kv_full_cpu[:prefix_len].to(get_device()),
++        ape_cpu.to(get_device()),
+         seq_lens_cpu,
+         extend_lens_cpu,
+     )
+@@ -231,16 +247,19 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
+     out = _run_prefill(
+         ctx,
+         pool,
+-        kv_full_cpu[prefix_len:].cuda(),
+-        ape_cpu.cuda(),
++        kv_full_cpu[prefix_len:].to(get_device()),
++        ape_cpu.to(get_device()),
+         seq_lens_cpu,
+         extend_lens_cpu,
+     )
+ 
+-    P = seq_len - 1
+-    gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
+-    # Single compress event in this extend; compact plan_id 0.
+-    triton.testing.assert_close(out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
++    # One compact output row per compress event in the extend, position-ascending.
++    first_event = ((prefix_len // RATIO) + 1) * RATIO - 1
++    for plan_id, P in enumerate(range(first_event, seq_len, RATIO)):
++        gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
++        triton.testing.assert_close(
++            out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL, err_msg=f"{plan_id=}, {P=}"
++        )
+ 
+ 
+ def test_paged_buffer_intermediate() -> None:
+@@ -264,7 +283,12 @@ def test_paged_buffer_intermediate() -> None:
+ 
+     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
+     _run_prefill(
+-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
++        ctx,
++        pool,
++        kv_in_cpu.to(get_device()),
++        ape_cpu.to(get_device()),
++        seq_lens_cpu,
++        extend_lens_cpu,
+     )
+ 
+     pool_cpu = pool.cpu()
+@@ -305,7 +329,12 @@ def test_prefill_multibatch(mode: str) -> None:
+     kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99)
+     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
+     out = _run_prefill(
+-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
++        ctx,
++        pool,
++        kv_in_cpu.to(get_device()),
++        ape_cpu.to(get_device()),
++        seq_lens_cpu,
++        extend_lens_cpu,
+     )
+ 
+     # Compact: walk batches in order, then positions in order; matches the
+diff --git a/test/registered/jit/deepseek_v4/test_fp4_indexer.py b/test/registered/jit/deepseek_v4/test_fp4_indexer.py
+index df58a008192d..243209e796ae 100644
+--- a/test/registered/jit/deepseek_v4/test_fp4_indexer.py
++++ b/test/registered/jit/deepseek_v4/test_fp4_indexer.py
+@@ -10,7 +10,6 @@
+     compress_norm_rope_store,
+     fused_q_indexer_rope_hadamard_fp4_quant,
+ )
+-from sglang.jit_kernel.hadamard import hadamard_transform
+ from sglang.kernels.ops.attention.deepseek_v4_rope import (
+     apply_rotary_emb_triton,
+     precompute_freqs_cis,
+@@ -19,10 +18,17 @@
+     quantize_fp4_indexer_tensor,
+     store_fp4_index_k_cache,
+ )
++from sglang.srt.utils import get_device, is_xpu
+ from sglang.test.ci.ci_register import register_cuda_ci
+ 
+ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+ 
++_is_xpu = is_xpu()
++if _is_xpu:
++    from sgl_kernel import hadamard_transform
++else:
++    from sglang.jit_kernel.hadamard import hadamard_transform
++
+ HEAD_DIM = 128
+ FP4_DIM = HEAD_DIM // 2
+ GROUP_SIZE = 32
+@@ -96,10 +102,10 @@ def _ref_store_fp4_index_cache(
+ @pytest.mark.parametrize("num_tokens", [1, 7, 96])
+ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
+     torch.manual_seed(num_tokens)
+-    x = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
++    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+     x[0, :8] = torch.tensor(
+         [-8.0, -6.0, -3.0, -1.5, 0.0, 0.5, 2.0, 8.0],
+-        device="cuda",
++        device=get_device(),
+         dtype=torch.bfloat16,
+     )
+ 
+@@ -114,14 +120,14 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
+ def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
+     torch.manual_seed(num_tokens)
+     num_pages = max(1, (num_tokens + PAGE_SIZE - 1) // PAGE_SIZE)
+-    x = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+-    loc = torch.randperm(num_pages * PAGE_SIZE, device="cuda")[:num_tokens].to(
++    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
++    loc = torch.randperm(num_pages * PAGE_SIZE, device=get_device())[:num_tokens].to(
+         torch.int64
+     )
+     cache = torch.zeros(
+         num_pages,
+         PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
+-        device="cuda",
++        device=get_device(),
+         dtype=torch.uint8,
+     )
+ 
+@@ -137,24 +143,24 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
+     torch.manual_seed(num_tokens + 100)
+     num_pages = max(1, (num_tokens + PAGE_SIZE - 1) // PAGE_SIZE)
+     compress_ratio = 4
+-    kv = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+-    norm_weight = torch.randn(HEAD_DIM, device="cuda", dtype=torch.bfloat16)
++    kv = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
++    norm_weight = torch.randn(HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+     seq_lens = (
+-        torch.arange(1, num_tokens + 1, device="cuda", dtype=torch.int64)
++        torch.arange(1, num_tokens + 1, device=get_device(), dtype=torch.int64)
+         * compress_ratio
+     )
+-    req_pool_indices = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
++    req_pool_indices = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
+     plan = CompressorDecodePlan.generate_legacy(
+         compress_ratio, req_pool_indices, seq_lens
+     )
+-    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
++    loc = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
+     freqs_cis = precompute_freqs_cis(
+         64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
+-    ).to("cuda")
++    ).to(get_device())
+     cache = torch.zeros(
+         num_pages,
+         PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
+-        device="cuda",
++        device=get_device(),
+         dtype=torch.uint8,
+     )
+ 
+@@ -194,6 +200,10 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
+     torch.testing.assert_close(cache, expected)
+ 
+ 
++@pytest.mark.skipif(
++    _is_xpu,
++    reason="fused_q_indexer_rope_hadamard_fp4_quant is not supported by Intel GPU",
++)
+ @pytest.mark.parametrize("batch_size", [1, 5, 17])
+ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
+     torch.manual_seed(batch_size + 200)
+@@ -201,11 +211,15 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
+     rope_dim = 64
+     weight_scale = HEAD_DIM**-0.5 * num_heads**-0.5
+     q = torch.randn(
+-        batch_size, num_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
++        batch_size, num_heads, HEAD_DIM, device=get_device(), dtype=torch.bfloat16
++    )
++    weight = torch.randn(
++        batch_size, num_heads, device=get_device(), dtype=torch.bfloat16
+     )
+-    weight = torch.randn(batch_size, num_heads, device="cuda", dtype=torch.bfloat16)
+-    positions = (torch.arange(batch_size, device="cuda", dtype=torch.int32) * 7) % 63
+-    freqs_cis = precompute_freqs_cis(rope_dim, 64, 0, 10000, 1, 32, 1).to("cuda")
++    positions = (
++        torch.arange(batch_size, device=get_device(), dtype=torch.int32) * 7
++    ) % 63
++    freqs_cis = precompute_freqs_cis(rope_dim, 64, 0, 10000, 1, 32, 1).to(get_device())
+ 
+     (q_fp4, q_sf), weights_out = fused_q_indexer_rope_hadamard_fp4_quant(
+         q, weight, weight_scale, freqs_cis, positions

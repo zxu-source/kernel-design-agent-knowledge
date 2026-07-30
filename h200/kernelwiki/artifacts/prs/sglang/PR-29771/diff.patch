@@ -1,0 +1,1239 @@
+diff --git a/python/sglang/jit_kernel/csrc/moe/grouped_topk.cuh b/python/sglang/jit_kernel/csrc/moe/grouped_topk.cuh
+deleted file mode 100644
+index 69c8d3b5735f..000000000000
+--- a/python/sglang/jit_kernel/csrc/moe/grouped_topk.cuh
++++ /dev/null
+@@ -1,260 +0,0 @@
+-/*
+- * Fused grouped top-k kernel for MoE routing.
+- * Adapted from vLLM's grouped_topk_kernels.cu (Apache-2.0).
+- *
+- * Handles single-group (num_expert_group=1) and multi-group cases with
+- * sigmoid scoring, bias correction, renormalization and scaling factor.
+- * Supports up to 512 experts and topk up to 8.
+- */
+-#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+-#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
+-
+-#include <sgl_kernel/utils.cuh>  // For LaunchKernel, fp32_t
+-
+-#include <dlpack/dlpack.h>
+-#include <tvm/ffi/container/tensor.h>
+-
+-#include <cfloat>
+-#include <cstdint>
+-
+-namespace {
+-
+-static constexpr int WARP_SIZE = 32;
+-static constexpr int MAX_TOPK = 8;
+-
+-// Pack (value, index) into a single uint64_t for warp-level max reduction.
+-// Transform IEEE 754 bits into an unsigned ordering that is monotonic for the
+-// full float range; correction bias can make sigmoid(score) + bias negative.
+-__device__ __forceinline__ uint64_t pack_val_idx(float val, int32_t idx) {
+-  uint32_t val_bits = __float_as_uint(val);
+-  val_bits ^= (val_bits & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+-  // Use (65535 - idx) so that smaller indices win ties
+-  uint32_t idx_bits = static_cast<uint32_t>(65535 - idx);
+-  return (static_cast<uint64_t>(val_bits) << 32) | idx_bits;
+-}
+-
+-__device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int32_t& idx) {
+-  uint32_t idx_bits = static_cast<uint32_t>(packed & 0xFFFFFFFF);
+-  idx = static_cast<int32_t>(65535 - idx_bits);
+-  uint32_t val_bits = static_cast<uint32_t>(packed >> 32);
+-  val_bits ^= (val_bits & 0x80000000u) ? 0x80000000u : 0xffffffffu;
+-  val = __uint_as_float(val_bits);
+-}
+-
+-__device__ __forceinline__ uint64_t warp_max_u64(uint64_t val) {
+-#pragma unroll
+-  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+-    uint64_t other = __shfl_xor_sync(0xffffffff, val, mask);
+-    val = max(val, other);
+-  }
+-  return val;
+-}
+-
+-__device__ __forceinline__ float warp_sum_f32(float val) {
+-#pragma unroll
+-  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+-    val += __shfl_xor_sync(0xffffffff, val, mask);
+-  }
+-  return val;
+-}
+-
+-__device__ __forceinline__ float fast_sigmoid(float x) {
+-  return 1.0f / (1.0f + __expf(-x));
+-}
+-
+-// ─────────────────────────────────────────────────────────────────────────────
+-// Kernel: one block per token, MaxExperts threads per block.
+-// Each thread handles one expert (or is idle if threadIdx.x >= numExperts).
+-//
+-// Phase 1: All threads load score → sigmoid → +bias → shared memory.
+-// Phase 2: Warp 0 iteratively selects top-k via packed warp-level max reduce.
+-// Phase 3: Warp 0 renormalizes and writes output.
+-// ─────────────────────────────────────────────────────────────────────────────
+-template <int MaxExperts>
+-__global__ void grouped_topk_single_group_kernel(
+-    const float* __restrict__ scores,
+-    float* __restrict__ topk_values,
+-    int32_t* __restrict__ topk_indices,
+-    const float* __restrict__ bias,
+-    int64_t num_tokens,
+-    int64_t num_experts,
+-    int64_t topk,
+-    bool renormalize,
+-    float scaling_factor) {
+-  __shared__ float smem_sigmoid[MaxExperts];
+-  __shared__ float smem_biased[MaxExperts];
+-
+-  int64_t token_id = blockIdx.x;
+-  if (token_id >= num_tokens) return;
+-
+-  int tid = threadIdx.x;
+-  const float* token_scores = scores + token_id * num_experts;
+-
+-  // Phase 1: load → sigmoid → bias → shared memory
+-  float score_sig = -FLT_MAX;
+-  float score_biased = -FLT_MAX;
+-  if (tid < num_experts) {
+-    float raw = token_scores[tid];
+-    score_sig = fast_sigmoid(raw);
+-    score_biased = score_sig + bias[tid];
+-  }
+-  smem_sigmoid[tid] = score_sig;
+-  smem_biased[tid] = score_biased;
+-  __syncthreads();
+-
+-  // Phase 2 & 3: warp 0 selects top-k
+-  int warp_id = tid / WARP_SIZE;
+-  int lane_id = tid % WARP_SIZE;
+-
+-  if (warp_id != 0) return;
+-
+-  float* out_vals = topk_values + token_id * topk;
+-  int32_t* out_ids = topk_indices + token_id * topk;
+-
+-  // Each lane scans ceil(num_experts/32) experts per iteration
+-  float selected_weights[MAX_TOPK];
+-  int32_t selected_ids[MAX_TOPK];
+-
+-  for (int k = 0; k < topk; k++) {
+-    // Each lane finds its local max among its assigned experts
+-    float my_max_val = -FLT_MAX;
+-    int32_t my_max_idx = 0;
+-    for (int i = lane_id; i < num_experts; i += WARP_SIZE) {
+-      float v = smem_biased[i];
+-      if (v > my_max_val) {
+-        my_max_val = v;
+-        my_max_idx = i;
+-      }
+-    }
+-
+-    // Warp-level max reduction using packed value+index
+-    uint64_t packed = pack_val_idx(my_max_val, my_max_idx);
+-    uint64_t best = warp_max_u64(packed);
+-
+-    float best_val;
+-    int32_t best_idx;
+-    unpack_val_idx(best, best_val, best_idx);
+-
+-    selected_ids[k] = best_idx;
+-    selected_weights[k] = smem_sigmoid[best_idx];
+-
+-    // Mark selected expert so it won't be picked again
+-    if (lane_id == best_idx % WARP_SIZE && (best_idx / WARP_SIZE) == 0) {
+-      smem_biased[best_idx] = -FLT_MAX;
+-    }
+-    // Handle indices >= 32: the owning lane must clear it
+-    if (best_idx >= WARP_SIZE) {
+-      if (lane_id == 0) {
+-        smem_biased[best_idx] = -FLT_MAX;
+-      }
+-    } else {
+-      if (lane_id == best_idx) {
+-        smem_biased[best_idx] = -FLT_MAX;
+-      }
+-    }
+-    __syncwarp();
+-  }
+-
+-  // Phase 3: renormalize and write output. All lanes named by the full-warp
+-  // shuffle mask must execute warp_sum_f32 together; inactive lanes contribute
+-  // the additive identity.
+-  float weight = (lane_id < topk) ? selected_weights[lane_id] : 0.0f;
+-  float divisor = renormalize ? warp_sum_f32(weight) + 1e-20f : 1.0f;
+-
+-  if (lane_id < topk) {
+-    out_ids[lane_id] = selected_ids[lane_id];
+-    out_vals[lane_id] = weight * scaling_factor / divisor;
+-  }
+-}
+-
+-// ─────────────────────────────────────────────────────────────────────────────
+-// Launcher
+-// ─────────────────────────────────────────────────────────────────────────────
+-void grouped_topk(
+-    tvm::ffi::TensorView scores,
+-    tvm::ffi::TensorView bias,
+-    tvm::ffi::TensorView topk_values,
+-    tvm::ffi::TensorView topk_indices,
+-    int64_t num_expert_group,
+-    int64_t topk_group,
+-    int64_t topk,
+-    bool renormalize,
+-    double scaling_factor) {
+-  using namespace host;
+-
+-  SymbolicSize N{"num_tokens"};
+-  SymbolicSize E{"num_experts"};
+-  SymbolicDevice device_;
+-  device_.set_options<kDLCUDA>();
+-
+-  TensorMatcher({N, E}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(scores);
+-
+-  TensorMatcher({E}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(bias);
+-
+-  SymbolicSize K{"topk"};
+-  TensorMatcher({N, K}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(topk_values);
+-
+-  TensorMatcher({N, K}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk_indices);
+-
+-  int64_t num_tokens = N.unwrap();
+-  int64_t num_experts = E.unwrap();
+-  DLDevice device = device_.unwrap();
+-
+-  RuntimeCheck(num_expert_group == 1 && topk_group == 1, "This kernel only supports num_expert_group=1, topk_group=1");
+-  RuntimeCheck(topk <= MAX_TOPK, "topk must be <= ", MAX_TOPK);
+-  RuntimeCheck(num_experts <= 512, "num_experts must be <= 512");
+-
+-  if (num_tokens == 0) return;
+-
+-  float scale_f = static_cast<float>(scaling_factor);
+-
+-  auto* score_ptr = static_cast<const float*>(scores.data_ptr());
+-  auto* bias_ptr = static_cast<const float*>(bias.data_ptr());
+-  auto* val_ptr = static_cast<float*>(topk_values.data_ptr());
+-  auto* idx_ptr = static_cast<int32_t*>(topk_indices.data_ptr());
+-
+-  // Select template based on expert count (round up to next tier)
+-  int num_threads;
+-  if (num_experts <= 128) {
+-    num_threads = 128;
+-    LaunchKernel(static_cast<uint32_t>(num_tokens), num_threads, device)(
+-        grouped_topk_single_group_kernel<128>,
+-        score_ptr,
+-        val_ptr,
+-        idx_ptr,
+-        bias_ptr,
+-        num_tokens,
+-        num_experts,
+-        topk,
+-        renormalize,
+-        scale_f);
+-  } else if (num_experts <= 256) {
+-    num_threads = 256;
+-    LaunchKernel(static_cast<uint32_t>(num_tokens), num_threads, device)(
+-        grouped_topk_single_group_kernel<256>,
+-        score_ptr,
+-        val_ptr,
+-        idx_ptr,
+-        bias_ptr,
+-        num_tokens,
+-        num_experts,
+-        topk,
+-        renormalize,
+-        scale_f);
+-  } else {
+-    num_threads = 512;
+-    LaunchKernel(static_cast<uint32_t>(num_tokens), num_threads, device)(
+-        grouped_topk_single_group_kernel<512>,
+-        score_ptr,
+-        val_ptr,
+-        idx_ptr,
+-        bias_ptr,
+-        num_tokens,
+-        num_experts,
+-        topk,
+-        renormalize,
+-        scale_f);
+-  }
+-}
+-
+-}  // namespace
+diff --git a/python/sglang/jit_kernel/grouped_topk.py b/python/sglang/jit_kernel/grouped_topk.py
+deleted file mode 100644
+index dae4b5a7b00a..000000000000
+--- a/python/sglang/jit_kernel/grouped_topk.py
++++ /dev/null
+@@ -1,89 +0,0 @@
+-"""Fused grouped top-k kernel for MoE routing (single-group, sigmoid scoring)."""
+-
+-from __future__ import annotations
+-
+-from typing import TYPE_CHECKING, Tuple
+-
+-import torch
+-
+-from sglang.jit_kernel.utils import cache_once, load_jit
+-from sglang.srt.utils.custom_op import register_custom_op
+-
+-if TYPE_CHECKING:
+-    from tvm_ffi.module import Module
+-
+-
+-@cache_once
+-def _jit_grouped_topk_module() -> Module:
+-    return load_jit(
+-        "grouped_topk",
+-        cuda_files=["moe/grouped_topk.cuh"],
+-        cuda_wrappers=[("grouped_topk", "grouped_topk")],
+-    )
+-
+-
+-@register_custom_op(mutates_args=["topk_values", "topk_indices"])
+-def _jit_grouped_topk_op(
+-    scores: torch.Tensor,
+-    bias: torch.Tensor,
+-    topk_values: torch.Tensor,
+-    topk_indices: torch.Tensor,
+-    num_expert_group: int,
+-    topk_group: int,
+-    topk: int,
+-    renormalize: bool,
+-    scaling_factor: float,
+-) -> None:
+-    module = _jit_grouped_topk_module()
+-    module.grouped_topk(
+-        scores,
+-        bias,
+-        topk_values,
+-        topk_indices,
+-        num_expert_group,
+-        topk_group,
+-        topk,
+-        renormalize,
+-        scaling_factor,
+-    )
+-
+-
+-def grouped_topk(
+-    scores: torch.Tensor,
+-    bias: torch.Tensor,
+-    num_expert_group: int,
+-    topk_group: int,
+-    topk: int,
+-    renormalize: bool,
+-    scaling_factor: float,
+-) -> Tuple[torch.Tensor, torch.Tensor]:
+-    """
+-    Fused sigmoid + bias + top-k + renormalize for MoE routing.
+-
+-    Replaces the naive PyTorch path that uses 3x torch.topk + scatter + masked_fill.
+-    Currently supports num_expert_group=1, topk_group=1, num_experts<=512, topk<=8.
+-    """
+-    num_tokens = scores.shape[0]
+-
+-    topk_values = torch.empty(
+-        (num_tokens, topk), dtype=torch.float32, device=scores.device
+-    )
+-    topk_indices = torch.empty(
+-        (num_tokens, topk), dtype=torch.int32, device=scores.device
+-    )
+-
+-    if num_tokens == 0:
+-        return topk_values, topk_indices
+-
+-    _jit_grouped_topk_op(
+-        scores.contiguous(),
+-        bias.contiguous(),
+-        topk_values,
+-        topk_indices,
+-        num_expert_group,
+-        topk_group,
+-        topk,
+-        renormalize,
+-        scaling_factor,
+-    )
+-    return topk_values, topk_indices
+diff --git a/python/sglang/jit_kernel/moe_fused_gate.py b/python/sglang/jit_kernel/moe_fused_gate.py
+index 23dfa1dc7b13..50c9124d828a 100644
+--- a/python/sglang/jit_kernel/moe_fused_gate.py
++++ b/python/sglang/jit_kernel/moe_fused_gate.py
+@@ -17,6 +17,7 @@
+ _SCORING_FUNC_MAP = {
+     "sigmoid": 0,
+     "sqrtsoftplus": 1,
++    "softmax": 2,
+ }
+ 
+ 
+@@ -93,12 +94,19 @@ def _router_triton_kernel(
+     out_indices_ptr,  # [M, K] int32
+     M,
+     routed_scaling_factor,
++    moe_softcapping,
+     N: tl.constexpr,
+     K: tl.constexpr,  # total topk (includes fused shared experts)
+     K_ROUTED: tl.constexpr,  # K - num_fused_shared_experts
++    BLOCK_M: tl.constexpr,  # rows processed per program (row tiling)
+     BLOCK_N: tl.constexpr,  # >= N, power of 2
+     BLOCK_K: tl.constexpr,  # >= K, power of 2
+-    SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus
++    N_GROUP: tl.constexpr,  # expert groups (1 = ungrouped)
++    TOPK_GROUP: tl.constexpr,  # groups kept per token (grouped routing)
++    EXPERTS_PER_GROUP: tl.constexpr,  # N // N_GROUP
++    BLOCK_G: tl.constexpr,  # >= N_GROUP, power of 2
++    SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus, 2 = softmax
++    HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
+     RENORMALIZE: tl.constexpr,
+     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
+     USE_PDL: tl.constexpr,
+@@ -109,61 +117,114 @@ def _router_triton_kernel(
+     stride_im,
+     stride_ik,
+ ) -> None:
++    # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
++    # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
++    # rather than launch-bound at small N (many tiny 1-warp CTAs otherwise).
+     pid = tl.program_id(0)
+-    if pid >= M:
+-        return
+-
+-    offs_n = tl.arange(0, BLOCK_N)
++    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
++    offs_n = tl.arange(0, BLOCK_N)  # [BLOCK_N]
++    mask_m = offs_m < M
+     mask_n = offs_n < N
++
+     # prefetch bias before PDL wait
+-    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
++    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(
++        tl.float32
++    )  # [BLOCK_N]
+ 
+     if USE_PDL:
+         tl.extra.cuda.gdc_wait()
+ 
+-    row_ptr = scores_ptr + pid * stride_sm + offs_n * stride_sn
+-    scores = tl.load(row_ptr, mask=mask_n, other=0.0).to(tl.float32)
++    row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
++    mask2d = mask_m[:, None] & mask_n[None, :]
++    scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
++        tl.float32
++    )  # [BLOCK_M, BLOCK_N]
+ 
+     if SCORING_FUNC == 0:
+-        # sigmoid(x) = 1 / (1 + exp(-x))
++        # sigmoid(x) = 1 / (1 + exp(-x)); bias is for ranking only, weight is bias-free.
+         activated = tl.sigmoid(scores)
+-    else:
+-        # sqrt(softplus(x)) = sqrt(log1p(exp(x))); guard against overflow when x is large
+-        sp = tl.where(
+-            scores > 20.0,
+-            scores,  # log1p(exp(big)) = big
+-            tl.log(1.0 + tl.exp(scores)),
+-        )
++        biased = activated + bias[None, :]
++    elif SCORING_FUNC == 1:
++        # sqrt(softplus(x)) = sqrt(log1p(exp(x))); guard against overflow when x is large.
++        sp = tl.where(scores > 20.0, scores, tl.log(1.0 + tl.exp(scores)))
+         activated = tl.sqrt(sp)
+-    biased = activated + bias
+-
+-    biased = tl.where(mask_n, biased, -float("inf"))
+-    offs_k = tl.arange(0, BLOCK_K)
++        biased = activated + bias[None, :]
++    else:
++        # softmax over the row: weight is the softmax probability (bias kept), with
++        # optional tanh softcapping. Ranking by the (softcapped, biased) logit is
++        # monotonic with the softmax prob, so the topk loop below ranks on `biased`.
++        logit = scores
++        if HAS_SOFTCAP:
++            # tanh(z) = 2*sigmoid(2z) - 1 (avoids relying on tl.math.tanh availability).
++            z = logit / moe_softcapping
++            logit = moe_softcapping * (2.0 * tl.sigmoid(2.0 * z) - 1.0)
++        biased = logit + bias[None, :]
++        biased = tl.where(mask_n[None, :], biased, -float("inf"))
++        row_max = tl.max(biased, axis=1)[:, None]  # [BLOCK_M, 1]
++        exp_row = tl.where(mask_n[None, :], tl.exp(biased - row_max), 0.0)
++        row_sum = tl.sum(exp_row, axis=1)[:, None]  # [BLOCK_M, 1]
++        activated = exp_row / row_sum
++
++    biased = tl.where(mask_n[None, :], biased, -float("inf"))  # [BLOCK_M, BLOCK_N]
++
++    # Grouped routing (DeepSeek-V3 noaux_tc): per-group score = sum of the top-2
++    # biased values; keep TOPK_GROUP groups (lowest group id wins ties); mask the
++    # experts of dropped groups to -inf before the top-k below. Weight is still the
++    # bias-free `activated`. Constexpr N_GROUP <= 1 skips this entirely (ungrouped).
++    if N_GROUP > 1:
++        offs_g = tl.arange(0, BLOCK_G)  # [BLOCK_G]
++        group_of_n = offs_n // EXPERTS_PER_GROUP  # [BLOCK_N]
++        group_score = tl.full([BLOCK_M, BLOCK_G], -float("inf"), dtype=tl.float32)
++        for g in tl.static_range(N_GROUP):
++            in_g = (group_of_n[None, :] == g) & mask_n[None, :]
++            vals = tl.where(in_g, biased, -float("inf"))
++            top1 = tl.max(vals, axis=1)[:, None]  # [BLOCK_M, 1]
++            vals2 = tl.where(vals >= top1, -float("inf"), vals)
++            top2 = tl.max(vals2, axis=1)[:, None]  # [BLOCK_M, 1]
++            group_score = tl.where(offs_g[None, :] == g, top1 + top2, group_score)
++
++        gcur = group_score
++        keep = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
++        for _i in tl.static_range(TOPK_GROUP):
++            gmax = tl.max(gcur, axis=1)[:, None]  # [BLOCK_M, 1]
++            glane = tl.where(gcur == gmax, offs_g[None, :], N_GROUP + 1)
++            win_g = tl.min(glane, axis=1)[:, None]  # [BLOCK_M, 1] lowest-id on ties
++            keep = tl.where(group_of_n[None, :] == win_g, 1.0, keep)
++            gcur = tl.where(offs_g[None, :] == win_g, -float("inf"), gcur)
++        biased = tl.where(keep > 0.0, biased, -float("inf"))
++
++    offs_k = tl.arange(0, BLOCK_K)  # [BLOCK_K]
+     mask_k_total = offs_k < K
+     mask_k_routed = offs_k < K_ROUTED
+-    selected_vals = tl.zeros([BLOCK_K], dtype=tl.float32)
+-    selected_idx = tl.zeros([BLOCK_K], dtype=tl.int32)
++    selected_vals = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
++    selected_idx = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.int32)
+ 
+-    cur = biased
++    cur = biased  # [BLOCK_M, BLOCK_N]
+     for k in tl.static_range(K_ROUTED):
+-        max_val = tl.max(cur, axis=0)
++        max_val = tl.max(cur, axis=1)[:, None]  # [BLOCK_M, 1]
+         is_max = cur == max_val
+-        lane_id = tl.where(is_max, offs_n, N + 1)
+-        win_lane = tl.min(lane_id, axis=0).to(tl.int32)
+-        win_activated = tl.sum(tl.where(offs_n == win_lane, activated, 0.0), axis=0)
+-        slot = offs_k == k
++        lane_id = tl.where(is_max, offs_n[None, :], N + 1)  # lowest expert id wins ties
++        win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)  # [BLOCK_M, 1]
++        win_activated = tl.sum(
++            tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
++        )[
++            :, None
++        ]  # [BLOCK_M, 1]
++        slot = offs_k[None, :] == k  # [1, BLOCK_K]
+         selected_vals = tl.where(slot, win_activated, selected_vals)
+         selected_idx = tl.where(slot, win_lane, selected_idx)
+-        cur = tl.where(offs_n == win_lane, -float("inf"), cur)
++        cur = tl.where(offs_n[None, :] == win_lane, -float("inf"), cur)
+ 
+-    routed_sum = tl.sum(tl.where(mask_k_routed, selected_vals, 0.0), axis=0)
++    routed_sum = tl.sum(tl.where(mask_k_routed[None, :], selected_vals, 0.0), axis=1)[
++        :, None
++    ]  # [BLOCK_M, 1]
+ 
+     # Fill fused-shared-expert slots: weight = routed_sum / routed_scaling_factor,
+     # id = num_experts + (slot - K_ROUTED).
+     if K_ROUTED < K:
+-        is_shared = (offs_k >= K_ROUTED) & mask_k_total
+-        shared_weight = routed_sum / routed_scaling_factor
+-        shared_idx = N + (offs_k - K_ROUTED)
++        is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
++        shared_weight = routed_sum / routed_scaling_factor  # [BLOCK_M, 1]
++        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]  # [1, BLOCK_K]
+         selected_vals = tl.where(is_shared, shared_weight, selected_vals)
+         selected_idx = tl.where(is_shared, shared_idx, selected_idx)
+ 
+@@ -171,15 +232,20 @@ def _router_triton_kernel(
+         tl.extra.cuda.gdc_launch_dependents()
+ 
+     if RENORMALIZE:
+-        norm = tl.where(routed_sum > 0.0, routed_sum, 1.0)
++        norm = tl.where(routed_sum > 0.0, routed_sum, 1.0)  # [BLOCK_M, 1]
+         selected_vals = selected_vals / norm
+     if APPLY_SCALE:
+         selected_vals = selected_vals * routed_scaling_factor
+ 
+-    out_w_ptr = out_weights_ptr + pid * stride_wm + offs_k * stride_wk
+-    out_i_ptr = out_indices_ptr + pid * stride_im + offs_k * stride_ik
+-    tl.store(out_w_ptr, selected_vals, mask=mask_k_total)
+-    tl.store(out_i_ptr, selected_idx, mask=mask_k_total)
++    out_w_ptr = (
++        out_weights_ptr + offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk
++    )
++    out_i_ptr = (
++        out_indices_ptr + offs_m[:, None] * stride_im + offs_k[None, :] * stride_ik
++    )
++    store_mask = mask_m[:, None] & mask_k_total[None, :]
++    tl.store(out_w_ptr, selected_vals, mask=store_mask)
++    tl.store(out_i_ptr, selected_idx, mask=store_mask)
+ 
+ 
+ @debug_kernel_api
+@@ -192,18 +258,27 @@ def moe_fused_gate(
+     renormalize: bool = True,
+     routed_scaling_factor: float = 1.0,
+     apply_routed_scaling_factor_on_output: bool = False,
++    moe_softcapping: float = 0.0,
++    num_expert_group: int = 1,
++    topk_group: int = 1,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
+ 
+-    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel)
+-    for the ungrouped case (``num_expert_group == 1``). The first argument is
+-    named ``scores`` (raw GEMM logits) to match the existing call sites.
++    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel).
++    With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
++    (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
++    within). The first argument is named ``scores`` (raw GEMM logits) to match
++    the existing call sites.
+     """
+     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
+     assert (
+         scoring_func_int is not None
+     ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+-    assert scores.dtype == torch.float32, "scores must be float32"
++    assert scores.dtype in (
++        torch.float32,
++        torch.float16,
++        torch.bfloat16,
++    ), "scores must be float32/float16/bfloat16"
+     assert bias.dtype == torch.float32, "bias must be float32"
+     assert scores.ndim == 2, "scores must be 2D"
+     assert bias.ndim == 1, "bias must be 1D"
+@@ -213,16 +288,26 @@ def moe_fused_gate(
+     M, N = scores.shape
+     K = topk
+     K_routed = topk - num_fused_shared_experts
++    if num_expert_group > 1:
++        assert N % num_expert_group == 0, "num_experts must be divisible by group count"
++        assert 1 <= topk_group <= num_expert_group, "invalid topk_group"
++    experts_per_group = N // num_expert_group
++    BLOCK_G = triton.next_power_of_2(num_expert_group)
+ 
+     weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
+     indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
+ 
+     BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
+     BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
+-    grid = (M,)
++    # Single warp per program keeps the per-row top-k reductions on cheap warp
++    # shuffles; pack a few rows per program only when N is small so tiny launches
++    # stay occupancy-bound. Swept on H100/B200: this beats the AOT kernels across
++    # shapes, whereas larger tiles / more warps regress (register pressure).
++    BLOCK_M = max(1, min(4, 256 // BLOCK_N))
++    num_warps = 1
++    grid = (triton.cdiv(M, BLOCK_M),)
+     use_pdl = is_arch_support_pdl()
+     extra = {"launch_pdl": True} if use_pdl else {}
+-    # A single warp keeps the per-row reductions cheap to synchronize.
+     _router_triton_kernel[grid](
+         scores,
+         bias,
+@@ -230,12 +315,19 @@ def moe_fused_gate(
+         indices,
+         M,
+         float(routed_scaling_factor),
++        float(moe_softcapping),
+         N=N,
+         K=K,
+         K_ROUTED=K_routed,
++        BLOCK_M=BLOCK_M,
+         BLOCK_N=BLOCK_N,
+         BLOCK_K=BLOCK_K,
++        N_GROUP=num_expert_group,
++        TOPK_GROUP=topk_group,
++        EXPERTS_PER_GROUP=experts_per_group,
++        BLOCK_G=BLOCK_G,
+         SCORING_FUNC=scoring_func_int,
++        HAS_SOFTCAP=bool(moe_softcapping != 0.0),
+         RENORMALIZE=bool(renormalize),
+         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
+         USE_PDL=use_pdl,
+@@ -245,7 +337,7 @@ def moe_fused_gate(
+         stride_wk=weights.stride(1),
+         stride_im=indices.stride(0),
+         stride_ik=indices.stride(1),
+-        num_warps=1,
++        num_warps=num_warps,
+         **extra,
+     )
+     return weights, indices
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index a9166094e2d1..3db04e424017 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -888,6 +888,11 @@ class Envs:
+     # TopK
+     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
+     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
++    # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
++    # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
++    # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
++    # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
++    SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
+     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+ 
+     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index d373df266d58..e294a95f3e9c 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -789,6 +789,24 @@ def fused_topk(
+                 num_token_non_padded=num_token_non_padded,
+             )
+         # ===== END TO BE REFACTORED ====
++        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
++            # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
++            from sglang.jit_kernel.moe_fused_gate import (
++                moe_fused_gate as _jit_moe_fused_gate,
++            )
++
++            zero_bias = torch.zeros(
++                gating_output.shape[1],
++                dtype=torch.float32,
++                device=gating_output.device,
++            )
++            topk_weights, topk_ids = _jit_moe_fused_gate(
++                gating_output,
++                zero_bias,
++                topk,
++                scoring_func="softmax",
++                renormalize=renormalize,
++            )
+         else:
+             topk_softmax(
+                 topk_weights,
+@@ -807,6 +825,28 @@ def fused_topk(
+                 topk_group=1,
+                 need_renorm=renormalize,
+             )
++        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
++            # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
++            from sglang.jit_kernel.moe_fused_gate import (
++                moe_fused_gate as _jit_moe_fused_gate,
++            )
++
++            bias_fp32 = (
++                correction_bias.to(torch.float32)
++                if correction_bias is not None
++                else torch.zeros(
++                    gating_output.shape[1],
++                    dtype=torch.float32,
++                    device=gating_output.device,
++                )
++            )
++            topk_weights, topk_ids = _jit_moe_fused_gate(
++                gating_output,
++                bias_fp32,
++                topk,
++                scoring_func="sigmoid",
++                renormalize=renormalize,
++            )
+         else:
+             topk_sigmoid(
+                 topk_weights,
+@@ -1360,6 +1400,33 @@ def biased_grouped_topk_gpu(
+ 
+     # topk for routed experts only (shared experts are appended separately below)
+     topk_routed = topk - num_fused_shared_experts
++    if (
++        _is_cuda
++        and num_expert_group
++        and num_expert_group > 1
++        and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
++    ):
++        # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
++        # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
++        # experts-per-group (no <=32 cap). Off by default — see the env-var comment.
++        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_grouped_gate
++
++        return jit_grouped_gate(
++            gating_output.to(dtype=torch.float32),
++            correction_bias.to(dtype=torch.float32),
++            topk,
++            scoring_func="sigmoid",
++            num_fused_shared_experts=num_fused_shared_experts,
++            renormalize=renormalize,
++            routed_scaling_factor=(
++                routed_scaling_factor if routed_scaling_factor is not None else 1.0
++            ),
++            apply_routed_scaling_factor_on_output=bool(
++                apply_routed_scaling_factor_on_output
++            ),
++            num_expert_group=num_expert_group,
++            topk_group=topk_group,
++        )
+     if (
+         _is_cuda
+         and fused_topk_deepseek is not None
+@@ -1518,21 +1585,20 @@ def biased_grouped_topk_gpu(
+             and num_experts <= 512
+             and topk <= 8
+         ):
+-            from sglang.jit_kernel.grouped_topk import grouped_topk as jit_grouped_topk
++            # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
++            # router, which subsumes the jit grouped_topk.cuh kernel here.
++            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
+ 
+-            scaling = (
+-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+-            )
+-            if not apply_routed_scaling_factor_on_output:
+-                scaling = 1.0
+-            return jit_grouped_topk(
+-                gating_output.to(dtype=torch.float32),
+-                correction_bias.to(dtype=torch.float32),
+-                num_expert_group,
+-                topk_group,
++            return jit_gate(
++                gating_output,
++                correction_bias.to(torch.float32),
+                 topk,
+-                renormalize,
+-                scaling,
++                scoring_func="sigmoid",
++                renormalize=renormalize,
++                routed_scaling_factor=(
++                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
++                ),
++                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+             )
+         elif (
+             _is_xpu
+diff --git a/test/registered/jit/test_grouped_topk.py b/test/registered/jit/test_grouped_topk.py
+deleted file mode 100644
+index be15b65c91c4..000000000000
+--- a/test/registered/jit/test_grouped_topk.py
++++ /dev/null
+@@ -1,210 +0,0 @@
+-import itertools
+-import sys
+-
+-import pytest
+-import torch
+-
+-from sglang.jit_kernel.grouped_topk import grouped_topk as jit_grouped_topk
+-from sglang.jit_kernel.utils import get_ci_test_range
+-from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
+-from sglang.test.ci.ci_register import register_cuda_ci
+-
+-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+-
+-
+-CORRECTNESS_CASES = get_ci_test_range(
+-    full_range=list(
+-        itertools.product(
+-            [1, 17, 128],
+-            [16, 32, 64, 128, 192, 256, 384, 512],
+-            [1, 2, 3, 4, 5, 6, 7, 8],
+-        )
+-    ),
+-    ci_range=[
+-        (1, 16, 3),  # smallest non-power-of-two topk
+-        (17, 128, 6),  # Nemotron-3-Nano shape that exposed the bug
+-        (128, 192, 8),  # Hunyuan-3 shape, power-of-two topk sanity case
+-        (33, 512, 7),  # largest expert-count tier with non-power-of-two topk
+-    ],
+-)
+-
+-
+-def _make_inputs(num_tokens: int, num_experts: int, seed: int):
+-    torch.manual_seed(seed)
+-    hidden_states = torch.empty((num_tokens, 1), dtype=torch.float32, device="cuda")
+-    gating_output = torch.randn(
+-        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+-    )
+-    correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+-    return hidden_states, gating_output, correction_bias
+-
+-
+-def _scatter_by_expert(
+-    weights: torch.Tensor, ids: torch.Tensor, num_experts: int
+-) -> torch.Tensor:
+-    dense = torch.zeros(
+-        (weights.shape[0], num_experts), dtype=torch.float32, device=weights.device
+-    )
+-    dense.scatter_(1, ids.long(), weights)
+-    return dense
+-
+-
+-@pytest.mark.parametrize("num_tokens,num_experts,topk", CORRECTNESS_CASES)
+-def test_grouped_topk_renormalize_matches_reference(
+-    num_tokens: int, num_experts: int, topk: int
+-) -> None:
+-    hidden_states, gating_output, correction_bias = _make_inputs(
+-        num_tokens, num_experts, seed=1000 + num_experts * 10 + topk
+-    )
+-    scaling_factor = 2.826 if (num_experts, topk) == (192, 8) else 1.0
+-
+-    topk_weights, topk_ids = jit_grouped_topk(
+-        gating_output,
+-        correction_bias,
+-        1,
+-        1,
+-        topk,
+-        True,
+-        scaling_factor,
+-    )
+-    ref_weights, ref_ids = biased_grouped_topk_impl(
+-        hidden_states,
+-        gating_output,
+-        correction_bias,
+-        topk,
+-        True,
+-        1,
+-        1,
+-        routed_scaling_factor=scaling_factor,
+-        apply_routed_scaling_factor_on_output=True,
+-    )
+-    torch.cuda.synchronize()
+-
+-    torch.testing.assert_close(
+-        _scatter_by_expert(topk_weights, topk_ids, num_experts),
+-        _scatter_by_expert(ref_weights, ref_ids, num_experts),
+-        rtol=1e-5,
+-        atol=1e-6,
+-    )
+-    torch.testing.assert_close(
+-        topk_weights.sum(dim=-1),
+-        torch.full((num_tokens,), scaling_factor, dtype=torch.float32, device="cuda"),
+-        rtol=1e-5,
+-        atol=1e-6,
+-    )
+-
+-
+-@pytest.mark.parametrize("topk", [3, 5, 6, 7])
+-def test_grouped_topk_non_power_of_two_renormalize(topk: int) -> None:
+-    hidden_states, gating_output, correction_bias = _make_inputs(
+-        num_tokens=64, num_experts=128, seed=2000 + topk
+-    )
+-
+-    topk_weights, topk_ids = jit_grouped_topk(
+-        gating_output,
+-        correction_bias,
+-        1,
+-        1,
+-        topk,
+-        True,
+-        1.0,
+-    )
+-    ref_weights, ref_ids = biased_grouped_topk_impl(
+-        hidden_states,
+-        gating_output,
+-        correction_bias,
+-        topk,
+-        True,
+-        1,
+-        1,
+-        routed_scaling_factor=1.0,
+-        apply_routed_scaling_factor_on_output=True,
+-    )
+-    torch.cuda.synchronize()
+-
+-    torch.testing.assert_close(
+-        _scatter_by_expert(topk_weights, topk_ids, 128),
+-        _scatter_by_expert(ref_weights, ref_ids, 128),
+-        rtol=1e-5,
+-        atol=1e-6,
+-    )
+-    torch.testing.assert_close(
+-        topk_weights.sum(dim=-1),
+-        torch.ones((64,), dtype=torch.float32, device="cuda"),
+-        rtol=1e-5,
+-        atol=1e-6,
+-    )
+-
+-
+-def test_grouped_topk_negative_choice_scores_match_reference() -> None:
+-    hidden_states, gating_output, correction_bias = _make_inputs(
+-        num_tokens=64, num_experts=128, seed=23758
+-    )
+-    correction_bias.fill_(-2.0)
+-
+-    topk_weights, topk_ids = jit_grouped_topk(
+-        gating_output,
+-        correction_bias,
+-        1,
+-        1,
+-        6,
+-        True,
+-        1.0,
+-    )
+-    ref_weights, ref_ids = biased_grouped_topk_impl(
+-        hidden_states,
+-        gating_output,
+-        correction_bias,
+-        6,
+-        True,
+-        1,
+-        1,
+-        routed_scaling_factor=1.0,
+-        apply_routed_scaling_factor_on_output=True,
+-    )
+-    torch.cuda.synchronize()
+-
+-    torch.testing.assert_close(
+-        _scatter_by_expert(topk_weights, topk_ids, 128),
+-        _scatter_by_expert(ref_weights, ref_ids, 128),
+-        rtol=1e-5,
+-        atol=1e-6,
+-    )
+-
+-
+-def test_grouped_topk_without_renormalize_matches_reference() -> None:
+-    hidden_states, gating_output, correction_bias = _make_inputs(
+-        num_tokens=64, num_experts=128, seed=3006
+-    )
+-
+-    topk_weights, topk_ids = jit_grouped_topk(
+-        gating_output,
+-        correction_bias,
+-        1,
+-        1,
+-        6,
+-        False,
+-        1.0,
+-    )
+-    ref_weights, ref_ids = biased_grouped_topk_impl(
+-        hidden_states,
+-        gating_output,
+-        correction_bias,
+-        6,
+-        False,
+-        1,
+-        1,
+-    )
+-    torch.cuda.synchronize()
+-
+-    torch.testing.assert_close(
+-        _scatter_by_expert(topk_weights, topk_ids, 128),
+-        _scatter_by_expert(ref_weights, ref_ids, 128),
+-        rtol=1e-5,
+-        atol=1e-6,
+-    )
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+diff --git a/test/registered/jit/test_moe_fused_gate.py b/test/registered/jit/test_moe_fused_gate.py
+index 6716be58250f..65d5b77560bd 100644
+--- a/test/registered/jit/test_moe_fused_gate.py
++++ b/test/registered/jit/test_moe_fused_gate.py
+@@ -254,5 +254,219 @@ def test_moe_fused_gate_shapes_and_dtypes() -> None:
+     )
+ 
+ 
++def _reference_softmax(
++    gating: torch.Tensor, topk: int, renormalize: bool
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Plain-softmax topk reference (the AOT ``topk_softmax`` semantics)."""
++    num_experts = gating.size(1)
++    probs = torch.softmax(gating.float(), dim=-1)
++    work = gating.float().clone()
++    arange = torch.arange(num_experts, device=gating.device).unsqueeze(0)
++    M = gating.size(0)
++    idx = torch.empty(M, topk, dtype=torch.int32, device=gating.device)
++    wgt = torch.empty(M, topk, dtype=torch.float32, device=gating.device)
++    for k in range(topk):
++        vals, _ = work.max(dim=1, keepdim=True)
++        lane = torch.where(work == vals, arange, num_experts + 1)
++        winner = lane.min(dim=1).values.to(torch.int32)
++        idx[:, k] = winner
++        wgt[:, k] = probs.gather(1, winner.long().unsqueeze(1)).squeeze(1)
++        work.scatter_(1, winner.long().unsqueeze(1), float("-inf"))
++    if renormalize:
++        wgt = wgt / wgt.sum(dim=1, keepdim=True)
++    return wgt, idx
++
++
++@pytest.mark.parametrize("M", [1, 200, 1024])
++@pytest.mark.parametrize("num_experts,topk", [(128, 4), (256, 8), (512, 6)])
++@pytest.mark.parametrize("renormalize", [True, False])
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++def test_moe_fused_gate_softmax_matches_aot(
++    M: int, num_experts: int, topk: int, renormalize: bool, dtype: torch.dtype
++) -> None:
++    """Triton softmax path matches the AOT ``topk_softmax`` it replaces in fused_topk."""
++    sgl_kernel = pytest.importorskip("sgl_kernel")
++    torch.manual_seed(num_experts * 13 + topk)
++    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
++    zero_bias = torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
++
++    tri_w, tri_i = moe_fused_gate(
++        gating, zero_bias, topk=topk, scoring_func="softmax", renormalize=renormalize
++    )
++    ref_w, ref_i = _reference_softmax(gating, topk, renormalize)
++
++    aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
++    aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
++    sgl_kernel.topk_softmax(aot_w, aot_i, gating, renormalize)
++    torch.cuda.synchronize()
++
++    dense_tri = _scatter_by_expert(tri_w, tri_i, num_experts)
++    torch.testing.assert_close(
++        dense_tri, _scatter_by_expert(ref_w, ref_i, num_experts), rtol=1e-3, atol=1e-3
++    )
++    torch.testing.assert_close(
++        dense_tri, _scatter_by_expert(aot_w, aot_i, num_experts), rtol=1e-3, atol=1e-3
++    )
++
++
++@pytest.mark.parametrize("M", [1, 200, 1024])
++@pytest.mark.parametrize("num_experts,topk", [(128, 4), (256, 8)])
++@pytest.mark.parametrize("renormalize", [True, False])
++@pytest.mark.parametrize("with_bias", [True, False])
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++def test_moe_fused_gate_sigmoid_matches_aot(
++    M: int,
++    num_experts: int,
++    topk: int,
++    renormalize: bool,
++    with_bias: bool,
++    dtype: torch.dtype,
++) -> None:
++    """Triton sigmoid path matches the AOT ``topk_sigmoid`` it replaces in fused_topk."""
++    sgl_kernel = pytest.importorskip("sgl_kernel")
++    torch.manual_seed(num_experts * 17 + topk)
++    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
++    bias = (
++        torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
++        if with_bias
++        else torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
++    )
++
++    tri_w, tri_i = moe_fused_gate(
++        gating, bias, topk=topk, scoring_func="sigmoid", renormalize=renormalize
++    )
++    aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
++    aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
++    sgl_kernel.topk_sigmoid(
++        aot_w, aot_i, gating, renormalize, bias if with_bias else None
++    )
++    torch.cuda.synchronize()
++
++    torch.testing.assert_close(
++        _scatter_by_expert(tri_w, tri_i, num_experts),
++        _scatter_by_expert(aot_w, aot_i, num_experts),
++        rtol=1e-3,
++        atol=1e-3,
++    )
++
++
++@pytest.mark.parametrize(
++    "num_experts,num_expert_group,topk_group,topk",
++    [
++        (256, 8, 4, 8),  # DeepSeek-V3
++        (128, 8, 4, 6),
++        (256, 4, 2, 8),
++    ],
++)
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++def test_moe_fused_gate_grouped_matches_production_impl(
++    num_experts: int,
++    num_expert_group: int,
++    topk_group: int,
++    topk: int,
++    dtype: torch.dtype,
++) -> None:
++    """Grouped Triton routing must match the definitional biased_grouped_topk_impl.
++
++    The kernel adds DeepSeek-V3 grouped routing (per-group top-2-sum group scores,
++    keep topk_group groups, then top-k within). biased_grouped_topk_impl is the
++    eager reference the production grouped path is defined against.
++    """
++    M = 256
++    torch.manual_seed(num_experts * 7 + num_expert_group * 13 + topk)
++    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
++    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
++    hidden = torch.randn(M, 16, dtype=dtype, device=DEVICE)
++
++    tri_w, tri_i = moe_fused_gate(
++        gating,
++        bias,
++        topk=topk,
++        scoring_func="sigmoid",
++        renormalize=True,
++        num_expert_group=num_expert_group,
++        topk_group=topk_group,
++    )
++    ref_w, ref_i = biased_grouped_topk_impl(
++        hidden,
++        gating,
++        bias,
++        topk,
++        True,
++        num_expert_group=num_expert_group,
++        topk_group=topk_group,
++        num_fused_shared_experts=0,
++        routed_scaling_factor=1.0,
++        apply_routed_scaling_factor_on_output=False,
++    )
++    torch.cuda.synchronize()
++
++    torch.testing.assert_close(
++        _scatter_by_expert(tri_w, tri_i, num_experts),
++        _scatter_by_expert(ref_w, ref_i, num_experts),
++        rtol=1e-3,
++        atol=1e-3,
++    )
++
++
++@pytest.mark.parametrize(
++    "num_experts,num_expert_group,topk_group,topk,num_fused_shared_experts",
++    [
++        (256, 8, 4, 8, 0),  # DeepSeek-V3
++        (256, 8, 4, 9, 1),  # DeepSeek-V3 + one fused shared expert
++    ],
++)
++def test_grouped_dispatch_flag_matches_default(
++    num_experts: int,
++    num_expert_group: int,
++    topk_group: int,
++    topk: int,
++    num_fused_shared_experts: int,
++) -> None:
++    """The opt-in SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK dispatch must match the
++    default grouped path (flashinfer/AOT) that biased_grouped_topk_gpu selects when
++    the flag is off. This covers the wiring, not just the raw kernel — validated
++    bit-exact on DeepSeek-V3.2 e2e; here we assert parity against the default path.
++    """
++    from sglang.srt.environ import envs
++    from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu
++
++    M = 256
++    torch.manual_seed(num_experts * 3 + num_expert_group * 5 + topk)
++    # fp32 gating: both the default (flashinfer upcasts to fp32) and the Triton
++    # dispatch (also upcasts) operate on the same fp32 scores, so no bf16
++    # borderline-expert divergence is expected.
++    gating = torch.randn(M, num_experts, dtype=torch.float32, device=DEVICE) * 2.0
++    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
++    hidden = torch.randn(M, 16, dtype=torch.float32, device=DEVICE)
++
++    kwargs = dict(
++        num_expert_group=num_expert_group,
++        topk_group=topk_group,
++        num_fused_shared_experts=num_fused_shared_experts,
++        routed_scaling_factor=2.5,
++        apply_routed_scaling_factor_on_output=False,
++    )
++    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False):
++        def_w, def_i = biased_grouped_topk_gpu(
++            hidden, gating, bias, topk, True, **kwargs
++        )
++    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(True):
++        jit_w, jit_i = biased_grouped_topk_gpu(
++            hidden, gating, bias, topk, True, **kwargs
++        )
++    torch.cuda.synchronize()
++
++    # Compare routed experts only (shared-expert slot ids are placeholders the
++    # downstream fusion overwrites; the routed selection + weights are what matter).
++    topk_routed = topk - num_fused_shared_experts
++    torch.testing.assert_close(
++        _scatter_by_expert(def_w[:, :topk_routed], def_i[:, :topk_routed], num_experts),
++        _scatter_by_expert(jit_w[:, :topk_routed], jit_i[:, :topk_routed], num_experts),
++        rtol=1e-3,
++        atol=1e-3,
++    )
++
++
+ if __name__ == "__main__":
+     sys.exit(pytest.main([__file__, "-v"]))

@@ -1,0 +1,379 @@
+diff --git a/python/sglang/srt/layers/radix_attention.py b/python/sglang/srt/layers/radix_attention.py
+index 854a9eef4e42..e1fa412164da 100644
+--- a/python/sglang/srt/layers/radix_attention.py
++++ b/python/sglang/srt/layers/radix_attention.py
+@@ -30,11 +30,8 @@
+ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+     get_tc_piecewise_forward_context,
+ )
+-from sglang.srt.utils import is_hip
+ from sglang.srt.utils.custom_op import register_custom_op
+ 
+-_is_hip = is_hip()
+-
+ 
+ def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
+     """Zero the padded tail ``buf`` leaves as torch.empty garbage under PCG
+@@ -226,12 +223,10 @@ def unified_attention_with_output(
+     if value is not None:
+         value = value[:real_num_tokens]
+ 
+-    # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
+-    # attn_mha) that share the same layer_id. The attention_layers list only
+-    # stores attn_mqa. When the MHA path is active (save_kv_cache=False), use
+-    # the companion attn_mha so the backend sees correct head/dim metadata.
+-    if _is_hip and not save_kv_cache and hasattr(attention_layer, "_pcg_mha_companion"):
+-        attention_layer = attention_layer._pcg_mha_companion
++    if not save_kv_cache and context.mha_companion_layers is not None:
++        mha_companion_layer = context.mha_companion_layers[layer_id]
++        if mha_companion_layer is not None:
++            attention_layer = mha_companion_layer
+ 
+     kwargs = {}
+     if q_rope is not None:
+diff --git a/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py b/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
+index b8a6ff1e8dc2..b9d70c6b918a 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
++++ b/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
+@@ -222,6 +222,7 @@ def capture_prefill_graph(
+         model_runner.moe_layers,
+         model_runner.moe_fusions,
+         model_runner.dsa_indexers,
++        model_runner.mha_companion_layers,
+     ) = compute_attention_and_moe_layers(layer_model)
+ 
+     if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
+diff --git a/python/sglang/srt/model_executor/model_runner_components/layer_setup.py b/python/sglang/srt/model_executor/model_runner_components/layer_setup.py
+index caffe8ce45c8..7528a768b2aa 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/layer_setup.py
++++ b/python/sglang/srt/model_executor/model_runner_components/layer_setup.py
+@@ -4,20 +4,17 @@
+ 
+ import msgspec
+ 
+-from sglang.srt.utils import is_hip
+-
+ if TYPE_CHECKING:
+     from sglang.srt.configs.model_config import ModelConfig
+     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+ 
+-_is_hip = is_hip()
+-
+ 
+ class AttentionAndMoeLayers(NamedTuple):
+     attention_layers: list[Any]
+     moe_layers: list[Any]
+     moe_fusions: list[Any]
+     dsa_indexers: list[Any]
++    mha_companion_layers: list[Any]
+ 
+ 
+ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
+@@ -25,16 +22,18 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
+     moe_layers: list[Any] = []
+     moe_fusions: list[Any] = []
+     dsa_indexers: list[Any] = []
++    mha_companion_layers: list[Any] = []
+     for layer in layer_model.layers:
+         attn_layer = None
++        mha_companion_layer = None
+         if hasattr(layer, "self_attn"):
+             if hasattr(layer.self_attn, "attn"):
+                 attn_layer = layer.self_attn.attn
+             elif hasattr(layer.self_attn, "attn_mqa"):
+                 # For DeepSeek model
+                 attn_layer = layer.self_attn.attn_mqa
+-                if _is_hip and hasattr(layer.self_attn, "attn_mha"):
+-                    attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
++                if hasattr(layer.self_attn, "attn_mha"):
++                    mha_companion_layer = layer.self_attn.attn_mha
+         # For hybrid model
+         elif hasattr(layer, "attn"):
+             attn_layer = layer.attn
+@@ -57,8 +56,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
+ 
+         if attn_layer is not None:
+             attention_layers.append(attn_layer)
++            mha_companion_layers.append(mha_companion_layer)
+         elif hasattr(layer, "mixer"):
+             attention_layers.append(None)
++            mha_companion_layers.append(None)
+ 
+         moe_block = None
+         moe_fusion = None
+@@ -86,7 +87,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
+         dsa_indexers.append(dsa_indexer)
+ 
+     return AttentionAndMoeLayers(
+-        attention_layers, moe_layers, moe_fusions, dsa_indexers
++        attention_layers,
++        moe_layers,
++        moe_fusions,
++        dsa_indexers,
++        mha_companion_layers,
+     )
+ 
+ 
+diff --git a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+index bdd430d601f7..dcd5f1435222 100644
+--- a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+@@ -237,6 +237,10 @@ def __init__(self, model_runner: ModelRunner):
+         )
+ 
+         self.attention_layers = self.model_runner.attention_layers
++        self.mha_companion_layers = self.model_runner.mha_companion_layers
++        self.has_mha_companion_layers = any(
++            layer is not None for layer in self.mha_companion_layers
++        )
+         self.moe_layers = self.model_runner.moe_layers
+         self.moe_fusions = self.model_runner.moe_fusions
+         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
+@@ -492,6 +496,7 @@ def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
+                 self.moe_layers,
+                 self.moe_fusions,
+                 dsa_indexers=self.dsa_indexers,
++                mha_companion_layers=self.mha_companion_layers,
+             ),
+         ):
+             if self.layer_model is not None:
+@@ -605,6 +610,21 @@ def _prepare_forward_metadata_for_replay(
+             static_forward_batch=static_forward_batch,
+         )
+ 
++    def _has_unsupported_mha_prefix(self, forward_batch: ForwardBatch) -> bool:
++        return (
++            self.prefill_backend_name == Backend.BREAKABLE
++            and self.has_mha_companion_layers
++            and forward_batch.extend_prefix_lens_cpu is not None
++            and any(forward_batch.extend_prefix_lens_cpu)
++        )
++
++    @staticmethod
++    def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
++        """Restore Python state omitted from breakable graph segments."""
++        forward_batch.mha_one_shot = True
++        forward_batch.mha_return_lse = False
++        forward_batch.set_attn_attend_prefix_cache(False)
++
+     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
+             return False
+@@ -612,11 +632,7 @@ def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+             return False
+         if forward_batch.replace_embeds is not None:
+             return False
+-        # The captured graph embeds from input_ids only; multimodal batches
+-        # merge mm embeddings in the outer wrapper, which capture bypasses.
+-        if forward_batch.mm_inputs is not None and any(
+-            x is not None for x in forward_batch.mm_inputs
+-        ):
++        if self._has_unsupported_mha_prefix(forward_batch):
+             return False
+         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
+         if forward_batch.forward_mode.is_target_verify():
+@@ -732,17 +748,8 @@ def _slot(name):
+                 forward_mode=ForwardMode.EXTEND,
+                 batch_size=bs,
+                 input_ids=_slot("input_ids"),
+-                # BCG's graph is text-only, so it forces input_embeds=None;
+-                # tc_piecewise keeps the slot so multimodal prefill keeps its
+-                # image embeds (else NaN logits).
+                 input_embeds=(
+-                    None
+-                    if self.prefill_backend_name == Backend.BREAKABLE
+-                    else (
+-                        _slot("input_embeds")
+-                        if registry.has_slot("input_embeds")
+-                        else None
+-                    )
++                    _slot("input_embeds") if registry.has_slot("input_embeds") else None
+                 ),
+                 req_pool_indices=shape_inputs["req_pool_indices"],
+                 seq_lens=shape_inputs["seq_lens"],
+@@ -908,13 +915,8 @@ def _slot(name):
+         )
+ 
+         input_ids = _slot("input_ids")
+-        # BCG's graph is text-only, so it forces input_embeds=None; tc_piecewise
+-        # keeps the slot so multimodal prefill keeps its image embeds (else NaN
+-        # logits).
+         input_embeds = (
+-            None
+-            if self.prefill_backend_name == Backend.BREAKABLE
+-            else (_slot("input_embeds") if registry.has_slot("input_embeds") else None)
++            _slot("input_embeds") if registry.has_slot("input_embeds") else None
+         )
+         positions = _slot("positions")
+         out_cache_loc = _slot("out_cache_loc")
+@@ -1003,6 +1005,12 @@ def _slot(name):
+             ),
+         )
+ 
++        if (
++            isinstance(self.backend, BreakableCudaGraphBackend)
++            and self.has_mha_companion_layers
++        ):
++            self._restore_mha_capture_state(static_forward_batch)
++
+         # Under Breakable / Full, copy serving-time values into the static
+         # buffers so the addresses captured segments hold stay live with
+         # current data.
+@@ -1105,6 +1113,7 @@ def replay_layer_forward(*args, **layer_kwargs):
+                             self.moe_layers,
+                             self.moe_fusions,
+                             dsa_indexers=self.dsa_indexers,
++                            mha_companion_layers=self.mha_companion_layers,
+                             num_tokens=static_num_tokens,
+                             raw_num_tokens=raw_num_tokens,
+                         ),
+@@ -1133,6 +1142,7 @@ def replay_layer_forward(*args, **layer_kwargs):
+                         self.moe_layers,
+                         self.moe_fusions,
+                         dsa_indexers=self.dsa_indexers,
++                        mha_companion_layers=self.mha_companion_layers,
+                         num_tokens=static_num_tokens,
+                         raw_num_tokens=raw_num_tokens,
+                     ),
+diff --git a/python/sglang/srt/model_executor/runner_backend_utils/tc_piecewise_cuda_graph/context_manager.py b/python/sglang/srt/model_executor/runner_backend_utils/tc_piecewise_cuda_graph/context_manager.py
+index ec7e2cbfbf63..39b2491a145d 100644
+--- a/python/sglang/srt/model_executor/runner_backend_utils/tc_piecewise_cuda_graph/context_manager.py
++++ b/python/sglang/srt/model_executor/runner_backend_utils/tc_piecewise_cuda_graph/context_manager.py
+@@ -69,6 +69,7 @@ def enable_tc_piecewise_cuda_graph():
+ class TcPiecewiseForwardContext:
+     forward_batch: Optional[ForwardBatch] = None
+     attention_layers: Optional[List[Any]] = field(default=None)
++    mha_companion_layers: Optional[List[Any]] = field(default=None)
+     quant_config: Any = None
+     moe_layers: Optional[List[Any]] = field(default=None)
+     moe_fusions: Optional[List[Any]] = field(default=None)
+@@ -92,6 +93,7 @@ def set_tc_piecewise_forward_context(
+     moe_layers: List[Any],
+     moe_fusions: List[Any],
+     dsa_indexers: Optional[List[Any]] = None,
++    mha_companion_layers: Optional[List[Any]] = None,
+     num_tokens: Optional[int] = None,
+     raw_num_tokens: Optional[int] = None,
+ ):
+@@ -99,6 +101,7 @@ def set_tc_piecewise_forward_context(
+     _tc_piecewise_forward_context = TcPiecewiseForwardContext(
+         forward_batch=forward_batch,
+         attention_layers=attention_layers,
++        mha_companion_layers=mha_companion_layers,
+         quant_config=quant_config,
+         moe_layers=moe_layers,
+         moe_fusions=moe_fusions,
+diff --git a/test/registered/unit/configs/test_multimodal_piecewise_cuda_graph.py b/test/registered/unit/configs/test_multimodal_piecewise_cuda_graph.py
+index 3b7d99221de7..11371393e68d 100644
+--- a/test/registered/unit/configs/test_multimodal_piecewise_cuda_graph.py
++++ b/test/registered/unit/configs/test_multimodal_piecewise_cuda_graph.py
+@@ -12,6 +12,13 @@
+     CudaGraphConfig,
+     PhaseConfig,
+ )
++from sglang.srt.model_executor.forward_batch_info import (
++    CaptureHiddenMode,
++    ForwardMode,
++)
++from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
++    PrefillCudaGraphRunner,
++)
+ from sglang.srt.server_args import ServerArgs
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+@@ -20,6 +27,29 @@
+ 
+ 
+ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
++    def _make_prefill_runner(self, backend):
++        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
++        runner._is_full_backend = False
++        runner.prefill_backend_name = backend
++        runner.has_mha_companion_layers = backend == Backend.BREAKABLE
++        runner.capture_hidden_mode = CaptureHiddenMode.NULL
++        runner.max_num_tokens = 16
++        return runner
++
++    def _make_multimodal_forward_batch(self):
++        return SimpleNamespace(
++            batch_size=1,
++            input_embeds=None,
++            replace_embeds=None,
++            mm_inputs=[object()],
++            forward_mode=ForwardMode.EXTEND,
++            capture_hidden_mode=CaptureHiddenMode.NULL,
++            global_num_tokens_cpu=None,
++            return_logprob=False,
++            input_ids=[1, 2, 3, 4],
++            extend_prefix_lens_cpu=[0],
++        )
++
+     def test_kimi_k25_lm_prefill_is_opted_in(self):
+         self.assertTrue(
+             is_multimodal_piecewise_cuda_graph_supported(
+@@ -52,6 +82,23 @@ def test_supported_multimodal_model_upgrades_default_to_tc_piecewise(self):
+         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
+         disable_if_incompatible.assert_called_once()
+ 
++    def test_multimodal_inputs_keep_tc_piecewise_prefill_enabled(self):
++        runner = self._make_prefill_runner(Backend.TC_PIECEWISE)
++
++        self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
++
++    def test_multimodal_inputs_keep_breakable_prefill_enabled(self):
++        runner = self._make_prefill_runner(Backend.BREAKABLE)
++
++        self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
++
++    def test_breakable_prefill_rejects_nonzero_prefix(self):
++        runner = self._make_prefill_runner(Backend.BREAKABLE)
++        forward_batch = self._make_multimodal_forward_batch()
++        forward_batch.extend_prefix_lens_cpu = [1]
++
++        self.assertFalse(runner.can_run_graph(forward_batch))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/unit/model_executor/model_runner_components/test_layer_setup.py b/test/registered/unit/model_executor/model_runner_components/test_layer_setup.py
+new file mode 100644
+index 000000000000..0cbaa41a0324
+--- /dev/null
++++ b/test/registered/unit/model_executor/model_runner_components/test_layer_setup.py
+@@ -0,0 +1,36 @@
++"""Unit tests for model-runner layer discovery."""
++
++import unittest
++from types import SimpleNamespace
++
++from sglang.srt.model_executor.model_runner_components.layer_setup import (
++    compute_attention_and_moe_layers,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=1, suite="base-a-test-cpu")
++
++
++class TestComputeAttentionAndMoeLayers(unittest.TestCase):
++    def test_deepseek_mla_registers_mha_companion(self):
++        attn_mqa = SimpleNamespace()
++        attn_mha = SimpleNamespace()
++        layer_model = SimpleNamespace(
++            layers=[
++                SimpleNamespace(
++                    self_attn=SimpleNamespace(attn_mqa=attn_mqa, attn_mha=attn_mha)
++                )
++            ]
++        )
++
++        attention_layers, _, _, _, mha_companion_layers = (
++            compute_attention_and_moe_layers(layer_model)
++        )
++
++        self.assertEqual(attention_layers, [attn_mqa])
++        self.assertEqual(mha_companion_layers, [attn_mha])
++        self.assertNotIn("_pcg_mha_companion", vars(attn_mqa))
++
++
++if __name__ == "__main__":
++    unittest.main()

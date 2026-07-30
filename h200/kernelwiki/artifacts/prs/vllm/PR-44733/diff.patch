@@ -1,0 +1,178 @@
+diff --git a/tests/v1/kv_offload/test_file_mapper.py b/tests/v1/kv_offload/test_file_mapper.py
+index 920eea92d96d..0e462f8de2bb 100644
+--- a/tests/v1/kv_offload/test_file_mapper.py
++++ b/tests/v1/kv_offload/test_file_mapper.py
+@@ -4,6 +4,14 @@
+ 
+ from unittest.mock import MagicMock
+ 
++import torch
++
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheGroupSpec,
++    MLAAttentionSpec,
++    SlidingWindowSpec,
++)
+ from vllm.v1.kv_offload.base import (
+     OffloadingSpec,
+     make_offload_key,
+@@ -58,7 +66,7 @@ def make_mapper_from_offloading_spec(**kwargs) -> FileMapper:
+     mock_vllm_config.parallel_config.rank = kwargs.get("rank", 0)
+ 
+     mock_kv_cache_config = MagicMock()
+-    mock_kv_cache_config.kv_cache_groups = []
++    mock_kv_cache_config.kv_cache_groups = kwargs.get("kv_cache_groups", [])
+ 
+     mock_offloading_spec = MagicMock(spec=OffloadingSpec)
+     mock_offloading_spec.vllm_config = mock_vllm_config
+@@ -69,6 +77,7 @@ def make_mapper_from_offloading_spec(**kwargs) -> FileMapper:
+         root_dir=kwargs.get("root_dir", "/tmp/cache"),
+         offloading_spec=mock_offloading_spec,
+         gpu_blocks_per_file=mock_offloading_spec.block_size_factor,
++        parallel_agnostic=kwargs.get("parallel_agnostic", False),
+     )
+ 
+ 
+@@ -125,3 +134,79 @@ def test_get_config_file_path():
+     fm = make_mapper_from_offloading_spec()
+     config_path = fm.get_config_file_path()
+     assert config_path == f"{fm.base_path}/config.json"
++
++
++# ---------------------------------------------------------------------------
++# parallel_agnostic: honored only for a single non-MLA full-attention group
++# ---------------------------------------------------------------------------
++
++
++def _full_attention_group() -> KVCacheGroupSpec:
++    return KVCacheGroupSpec(
++        layer_names=["layer0"],
++        kv_cache_spec=FullAttentionSpec(
++            block_size=16, num_kv_heads=4, head_size=128, dtype=torch.float32
++        ),
++    )
++
++
++def _sliding_window_group() -> KVCacheGroupSpec:
++    return KVCacheGroupSpec(
++        layer_names=["layer0"],
++        kv_cache_spec=SlidingWindowSpec(
++            block_size=16,
++            num_kv_heads=4,
++            head_size=128,
++            dtype=torch.float32,
++            sliding_window=128,
++        ),
++    )
++
++
++def test_parallel_agnostic_enabled_for_single_full_attention():
++    # tp/rank are collapsed out of the namespace so the cache is shared
++    # across tensor-parallel sizes.
++    fm = make_mapper_from_offloading_spec(
++        tp_size=2,
++        rank=1,
++        kv_cache_groups=[_full_attention_group()],
++        parallel_agnostic=True,
++    )
++    assert fm.fields["tp_size"] == 1
++    assert fm.rank == 0
++
++
++def test_parallel_agnostic_disabled_for_multiple_groups():
++    # More than one KV-cache group (hybrid model) => keep per-layout namespacing.
++    fm = make_mapper_from_offloading_spec(
++        tp_size=2,
++        kv_cache_groups=[_full_attention_group(), _full_attention_group()],
++        parallel_agnostic=True,
++    )
++    assert fm.fields["tp_size"] == 2
++
++
++def test_parallel_agnostic_disabled_for_non_full_attention():
++    # Single group but not full attention (sliding window) => keep namespacing.
++    fm = make_mapper_from_offloading_spec(
++        tp_size=2,
++        kv_cache_groups=[_sliding_window_group()],
++        parallel_agnostic=True,
++    )
++    assert fm.fields["tp_size"] == 2
++
++
++def test_parallel_agnostic_excludes_mla():
++    # MLA latent KV is replicated per rank, so its offloaded blocks are not
++    # parallelism-invariant: the opt-in must not collapse tp/rank.
++    group = KVCacheGroupSpec(
++        layer_names=["layer0"],
++        kv_cache_spec=MLAAttentionSpec(
++            block_size=16, num_kv_heads=1, head_size=576, dtype=torch.float32
++        ),
++    )
++    fm = make_mapper_from_offloading_spec(
++        tp_size=2, rank=1, kv_cache_groups=[group], parallel_agnostic=True
++    )
++    assert fm.fields["tp_size"] == 2
++    assert fm.rank == 1
+diff --git a/vllm/v1/kv_offload/file_mapper.py b/vllm/v1/kv_offload/file_mapper.py
+index 7184a5d1ce13..c19f07ff514a 100644
+--- a/vllm/v1/kv_offload/file_mapper.py
++++ b/vllm/v1/kv_offload/file_mapper.py
+@@ -4,6 +4,7 @@
+ import hashlib
+ import json
+ 
++from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
+ from vllm.v1.kv_offload.base import (
+     OffloadingSpec,
+     OffloadKey,
+@@ -81,6 +82,15 @@ def from_offloading_spec(
+             }
+             for group in kv_cache_config.kv_cache_groups
+         ]
++        # Only a single full-attention group is parallelism-invariant. MLA is
++        # excluded: its latent KV is replicated per rank, never head-sharded.
++        groups = kv_cache_config.kv_cache_groups
++        spec = groups[0].kv_cache_spec if len(groups) == 1 else None
++        parallel_agnostic = (
++            parallel_agnostic
++            and isinstance(spec, FullAttentionSpec)
++            and not isinstance(spec, MLAAttentionSpec)
++        )
+         return cls(
+             root_dir=root_dir,
+             model_name=vllm_config.model_config.model,
+diff --git a/vllm/v1/kv_offload/tiering/fs/manager.py b/vllm/v1/kv_offload/tiering/fs/manager.py
+index 265d32fcd99d..a5ab61a81898 100644
+--- a/vllm/v1/kv_offload/tiering/fs/manager.py
++++ b/vllm/v1/kv_offload/tiering/fs/manager.py
+@@ -107,11 +107,12 @@ def __init__(
+         )
+         self._block_size: int = primary_kv_view.strides[0]
+ 
+-        # Create file mapper
++        # Opt in; FileMapper enables it only for a parallelism-invariant block.
+         self.file_mapper = FileMapper.from_offloading_spec(
+             root_dir=root_dir,
+             offloading_spec=offloading_spec,
+             gpu_blocks_per_file=offloading_spec.block_size_factor,
++            parallel_agnostic=True,
+         )
+ 
+         # Write config file
+diff --git a/vllm/v1/kv_offload/tiering/obj/manager.py b/vllm/v1/kv_offload/tiering/obj/manager.py
+index 8798b7a3872c..ac2371356f50 100644
+--- a/vllm/v1/kv_offload/tiering/obj/manager.py
++++ b/vllm/v1/kv_offload/tiering/obj/manager.py
+@@ -108,7 +108,10 @@ def __init__(
+         self._primary_reg = None
+         self._block_size_bytes: int = 0
+         root_dir = f"{prefix}/" if prefix else ""
+-        self._file_mapper = FileMapper.from_offloading_spec(root_dir, offloading_spec)
++        # Opt in; FileMapper enables it only for a parallelism-invariant block.
++        self._file_mapper = FileMapper.from_offloading_spec(
++            root_dir, offloading_spec, parallel_agnostic=True
++        )
+         self._next_obj_dev_id: int = 1  # dev_id=0 is reserved for _exists() probes
+ 
+         self._probe_connectivity()

@@ -1,0 +1,590 @@
+diff --git a/.buildkite/hardware_tests/cpu.yaml b/.buildkite/hardware_tests/cpu.yaml
+index dd85400f2f1f..6f1bd3445408 100644
+--- a/.buildkite/hardware_tests/cpu.yaml
++++ b/.buildkite/hardware_tests/cpu.yaml
+@@ -91,11 +91,13 @@ steps:
+   - vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+   - tests/quantization/test_compressed_tensors.py
+   - tests/quantization/test_cpu_wna16.py
++  - tests/quantization/test_cpu_w8a8.py
+   commands:
+     - |
+       bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 45m "
+       pytest -x -v -s tests/quantization/test_compressed_tensors.py::test_compressed_tensors_w8a8_logprobs
+-      pytest -x -v -s tests/quantization/test_cpu_wna16.py"
++      pytest -x -v -s tests/quantization/test_cpu_wna16.py
++      pytest -x -v -s tests/quantization/test_cpu_w8a8.py"
+       
+ - label: CPU-Distributed Tests (PP+TP)
+   depends_on: []
+diff --git a/tests/kernels/moe/test_cpu_quant_fused_moe.py b/tests/kernels/moe/test_cpu_quant_fused_moe.py
+index d8c1b9f2cb61..e0e0203c6b23 100644
+--- a/tests/kernels/moe/test_cpu_quant_fused_moe.py
++++ b/tests/kernels/moe/test_cpu_quant_fused_moe.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Tests for CPU quantized fused MoE kernels (FP8 W8A16 and MXFP4 W4A16)."""
++"""Tests for CPU quantized fused MoE kernels."""
+ 
+ import math
+ import sys
+@@ -31,7 +31,10 @@ def _prepack_experts(w: torch.Tensor) -> torch.Tensor:
+     return torch.ops._C.convert_weight_packed(w)
+ 
+ 
+-# FP8 W8A16 block-scaled fused MoE
++# ===========================================================================
++# FP8 W8A16 MoE
++# ===========================================================================
++
+ 
+ BLOCK_SIZE = [128, 128]  # [block_n, block_k]
+ 
+@@ -216,7 +219,9 @@ def test_w8a16_block_fp8_cpu_fused_moe(M, N, K, E, topk, seed):
+     torch.testing.assert_close(out_inplace, out, atol=0, rtol=0)
+ 
+ 
+-# MXFP4 W4A16 fused MoE
++# ===========================================================================
++# MXFP4 W4A16 MoE
++# ===========================================================================
+ 
+ 
+ class MXFP4QuantizeUtil:
+@@ -496,7 +501,9 @@ def test_mxfp4_cpu_fused_moe_bias_swiglu(M, N, K, E, topk, seed):
+     torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
+ 
+ 
+-# INT4 W4A16 group-quantized MoE
++# ===========================================================================
++# INT4 W4A16 MoE
++# ===========================================================================
+ 
+ 
+ def _pack_int4_gptq(w_int4: torch.Tensor) -> torch.Tensor:
+@@ -749,5 +756,133 @@ def test_int4_w4a16_cpu_fused_moe(M, N, K, E, topk, group_size, quant_algo, seed
+     torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
+ 
+ 
++# ===========================================================================
++# INT8 W8A8 MoE
++# ===========================================================================
++
++
++def _quantize_per_channel(w):
++    """Symmetric per-channel INT8 quantisation. w: [N, K] -> (int8, scale)."""
++    amax = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
++    scale = amax / 127.0
++    w_q = (w / scale).round().clamp(-128, 127).to(torch.int8)
++    return w_q, scale.float()
++
++
++def _quantize_per_token(x):
++    """Symmetric per-token INT8 quantisation. x: [M, K] -> (int8, scale)."""
++    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
++    scale = amax / 127.0
++    x_q = (x / scale).round().clamp(-128, 127).to(torch.int8)
++    return x_q, scale.float()
++
++
++def _ref_int8_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids):
++    """Reference INT8 W8A8 per-channel fused MoE in pure torch."""
++    B, D = a.shape
++    topk = topk_ids.size(1)
++
++    out = torch.zeros(B, topk, w2.shape[1], dtype=torch.float32)
++    for b in range(B):
++        for t in range(topk):
++            eid = topk_ids[b, t].item()
++
++            x = a[b : b + 1].float()
++            x_q, x_s = _quantize_per_token(x)
++            ic = torch.matmul(x_q.float(), w1[eid].float().t())
++            ic = ic * x_s * w1_s[eid].view(1, -1)
++            ic = _silu_and_mul(ic)
++
++            ic_q, ic_s = _quantize_per_token(ic)
++            oc = torch.matmul(ic_q.float(), w2[eid].float().t())
++            oc = oc * ic_s * w2_s[eid].view(1, -1)
++            out[b, t] = oc.squeeze(0)
++
++    result = (out * topk_weight.unsqueeze(-1)).sum(dim=1)
++    return result.to(a.dtype)
++
++
++def _make_int8_moe_weights(E, N, K):
++    factor = 1e-2
++    w1_f = (torch.randn(E, 2 * N, K) - 0.5) * 2
++    w2_f = (torch.randn(E, K, N) - 0.5) * 2
++
++    w1_q_list, w1_s_list = [], []
++    w2_q_list, w2_s_list = [], []
++    for e in range(E):
++        q, s = _quantize_per_channel(w1_f[e])
++        w1_q_list.append(q)
++        w1_s_list.append(s)
++        q, s = _quantize_per_channel(w2_f[e])
++        w2_q_list.append(q)
++        w2_s_list.append(s)
++
++    return (
++        torch.stack(w1_q_list),
++        torch.stack(w2_q_list),
++        torch.stack(w1_s_list) * factor,
++        torch.stack(w2_s_list) * factor,
++    )
++
++
++INT8_NUM_TOKENS = [1, 2, 64, 121]
++INT8_MOE_CONFIGS = [
++    # (N, K, E, topk)
++    (256, 512, 8, 2),
++    (512, 256, 8, 2),
++    (512, 512, 8, 4),
++    (768, 2048, 8, 2),
++]
++
++
++@pytest.mark.parametrize("M", INT8_NUM_TOKENS)
++@pytest.mark.parametrize("N,K,E,topk", INT8_MOE_CONFIGS)
++@pytest.mark.parametrize("seed", [0])
++@pytest.mark.parametrize("is_vnni", [False, True])
++@pytest.mark.parametrize("inplace", [False, True])
++def test_int8_w8a8_cpu_fused_moe(M, N, K, E, topk, seed, is_vnni, inplace):
++    """Test fused_experts_cpu INT8 W8A8 against torch reference."""
++    set_random_seed(seed)
++
++    a = torch.randn(M, K, dtype=torch.bfloat16) / (0.5 * K**0.5)
++    w1_q, w2_q, w1_s, w2_s = _make_int8_moe_weights(E, N, K)
++
++    score = torch.randn(M, E, dtype=torch.bfloat16)
++    score = torch.softmax(score, dim=-1, dtype=torch.float32)
++    topk_weight, topk_ids = torch.topk(score, topk)
++    topk_ids = topk_ids.to(torch.int32)
++
++    ref_out = _ref_int8_moe(a, w1_q, w2_q, w1_s, w2_s, topk_weight, topk_ids)
++
++    w1 = _prepack_experts(w1_q) if is_vnni else w1_q
++    w2 = _prepack_experts(w2_q) if is_vnni else w2_q
++
++    out = ops.fused_experts_cpu(
++        a.clone(),
++        w1,
++        w2,
++        topk_weight,
++        topk_ids,
++        inplace,
++        ops.CPUQuantMethod.INT8_W8A8,
++        w1_s,
++        w2_s,
++        None,  # w1_zero
++        None,  # w2_zero
++        None,  # block_size
++        None,  # w1_bias
++        None,  # w2_bias
++        None,  # alpha
++        None,  # limit
++        is_vnni,
++    )
++    torch.testing.assert_close(
++        ref_out.bfloat16(),
++        out,
++        atol=2e-1,
++        rtol=2e-1,
++    )
++
++
+ if __name__ == "__main__":
+     sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/quantization/test_cpu_w8a8.py b/tests/quantization/test_cpu_w8a8.py
+new file mode 100644
+index 000000000000..457aba2c6de1
+--- /dev/null
++++ b/tests/quantization/test_cpu_w8a8.py
+@@ -0,0 +1,22 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import pytest
++
++from vllm.platforms import current_platform
++
++if not current_platform.is_cpu():
++    pytest.skip("skipping CPU-only tests", allow_module_level=True)
++
++MODELS = [
++    "RedHatAI/Qwen3-30B-A3B-Instruct-2507-quantized.w8a8",  # INT8 W8A8 MoE
++]
++DTYPE = ["bfloat16"]
++
++
++@pytest.mark.parametrize("model", MODELS)
++@pytest.mark.parametrize("dtype", DTYPE)
++def test_cpu_w8a8(vllm_runner, model, dtype):
++    with vllm_runner(model, dtype=dtype) as llm:
++        output = llm.generate_greedy(["The capital of France is"], max_tokens=32)
++    assert output
++    print(output)
+diff --git a/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+index cd67207b7100..3ed1734cb915 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""CPU FP8 W8A16 and MXFP4 W4A16 fused MoE experts."""
++"""CPU quantized fused MoE experts."""
+ 
+ import torch
+ 
+@@ -23,10 +23,16 @@
+     kFp8Dynamic128Sym,
+     kFp8Static128BlockSym,
+     kInt4Static,
++    kInt8DynamicTokenSym,
++    kInt8StaticChannelSym,
+     kMxfp4Static,
+ )
+ from vllm.platforms import current_platform
+ 
++# ===========================================================================
++# FP8 W8A16 MoE
++# ===========================================================================
++
+ 
+ def prepare_fp8_moe_layer_for_cpu(
+     w13: torch.Tensor,
+@@ -177,6 +183,11 @@ def apply(
+         )
+ 
+ 
++# ===========================================================================
++# MXFP4 W4A16 MoE
++# ===========================================================================
++
++
+ def prepare_mxfp4_moe_layer_for_cpu(
+     w13: torch.Tensor,
+     w2: torch.Tensor,
+@@ -326,6 +337,11 @@ def apply(
+         )
+ 
+ 
++# ===========================================================================
++# INT4 W4A16 MoE
++# ===========================================================================
++
++
+ def prepare_int4_moe_layer_for_cpu(
+     w13_packed: torch.Tensor,
+     w2_packed: torch.Tensor,
+@@ -529,3 +545,159 @@ def apply(
+             None,  # limit
+             True,  # is_vnni
+         )
++
++
++# ===========================================================================
++# INT8 W8A8 MoE
++# ===========================================================================
++
++
++def prepare_int8_moe_layer_for_cpu(
++    w13: torch.Tensor,
++    w2: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """VNNI-prepack INT8 MoE weights for CPU kernel."""
++    packed_w13 = torch.ops._C.convert_weight_packed(w13)
++    packed_w2 = torch.ops._C.convert_weight_packed(w2)
++    return packed_w13, packed_w2
++
++
++class CPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
++    """CPU INT8 W8A8 per-channel weight / dynamic per-token activation
++    monolithic MoE experts."""
++
++    def __init__(
++        self,
++        moe_config: FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++    ):
++        super().__init__(
++            moe_config,
++            quant_config,
++        )
++
++    @property
++    def expects_unquantized_inputs(self) -> bool:
++        return True
++
++    @staticmethod
++    def activation_format() -> mk.FusedMoEActivationFormat:
++        return mk.FusedMoEActivationFormat.Standard
++
++    @staticmethod
++    def _supports_current_device() -> bool:
++        return current_platform.is_cpu()
++
++    @staticmethod
++    def _supports_no_act_and_mul() -> bool:
++        return False
++
++    @staticmethod
++    def _supports_activation(activation: MoEActivation) -> bool:
++        return activation == MoEActivation.SILU
++
++    @staticmethod
++    def _supports_parallel_config(
++        moe_parallel_config: FusedMoEParallelConfig,
++    ) -> bool:
++        return True
++
++    @staticmethod
++    def _supports_quant_scheme(
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        SUPPORTED_W_A = [
++            (kInt8StaticChannelSym, kInt8DynamicTokenSym),
++        ]
++        return (weight_key, activation_key) in SUPPORTED_W_A
++
++    @staticmethod
++    def _supports_routing_method(
++        routing_method: RoutingMethodType,
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        return routing_method in [
++            RoutingMethodType.Default,
++            RoutingMethodType.Renormalize,
++            RoutingMethodType.RenormalizeNaive,
++        ]
++
++    @staticmethod
++    def _supports_router_logits_dtype(
++        router_logits_dtype: torch.dtype | None,
++        routing_method: RoutingMethodType,
++    ) -> bool:
++        return True
++
++    def supports_expert_map(self) -> bool:
++        return False
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        """VNNI-prepack INT8 MoE weights for CPU kernel."""
++        from vllm.model_executor.utils import replace_parameter
++
++        w13, w2 = prepare_int8_moe_layer_for_cpu(layer.w13_weight, layer.w2_weight)
++        replace_parameter(layer, "w13_weight", w13)
++        replace_parameter(layer, "w2_weight", w2)
++
++    def apply(
++        self,
++        hidden_states: torch.Tensor,
++        w1: torch.Tensor,
++        w2: torch.Tensor,
++        router_logits: torch.Tensor,
++        activation: MoEActivation,
++        global_num_experts: int,
++        expert_map: torch.Tensor | None,
++        a1q_scale: torch.Tensor | None,
++        apply_router_weight_on_input: bool,
++        # grouped topk + fused topk bias parameters
++        num_expert_group: int | None = None,
++        e_score_correction_bias: torch.Tensor | None = None,
++        routed_scaling_factor: float | None = None,
++        topk_group: int | None = None,
++    ) -> torch.Tensor:
++        from vllm.model_executor.layers.fused_moe.cpu_fused_moe import (
++            select_experts,
++        )
++
++        topk_weights, topk_ids = select_experts(
++            hidden_states=hidden_states,
++            router_logits=router_logits,
++            use_grouped_topk=num_expert_group is not None,
++            top_k=self.moe_config.experts_per_token,
++            renormalize=self.moe_config.routing_method
++            in (
++                RoutingMethodType.Renormalize,
++                RoutingMethodType.RenormalizeNaive,
++            ),
++            topk_group=topk_group,
++            num_expert_group=num_expert_group,
++            scoring_func="softmax",
++            routed_scaling_factor=(
++                routed_scaling_factor if routed_scaling_factor is not None else 1.0
++            ),
++            e_score_correction_bias=e_score_correction_bias,
++        )
++
++        return fused_experts_cpu(
++            hidden_states,
++            w1,
++            w2,
++            topk_weights,
++            topk_ids,
++            False,  # inplace
++            CPUQuantMethod.INT8_W8A8,
++            self.w1_scale,
++            self.w2_scale,
++            None,  # w1_zero
++            None,  # w2_zero
++            None,  # block_size (per-channel, no block)
++            None,  # w1_bias
++            None,  # w2_bias
++            None,  # alpha
++            None,  # limit
++            True,  # is_vnni
++        )
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int8.py b/vllm/model_executor/layers/fused_moe/oracle/int8.py
+index 6d50a3ba0ee9..e31a3ca07ee3 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int8.py
+@@ -22,12 +22,14 @@
+     kInt8DynamicTokenSym,
+     kInt8StaticChannelSym,
+ )
++from vllm.platforms import current_platform
+ 
+ logger = init_logger(__name__)
+ 
+ 
+ class Int8MoeBackend(Enum):
+     TRITON = "TRITON"
++    CPU = "CPU"
+ 
+ 
+ def _get_priority_backends(
+@@ -36,7 +38,18 @@ def _get_priority_backends(
+     """
+     Get available backends in priority order based on platform and config.
+     """
+-    return [Int8MoeBackend.TRITON]
++    _AVAILABLE_BACKENDS = [
++        Int8MoeBackend.TRITON,
++        Int8MoeBackend.CPU,
++    ]
++
++    def _move_to_front(backends: list[Int8MoeBackend], backend: Int8MoeBackend) -> None:
++        backends.insert(0, backends.pop(backends.index(backend)))
++
++    if current_platform.is_cpu():
++        _move_to_front(_AVAILABLE_BACKENDS, Int8MoeBackend.CPU)
++
++    return _AVAILABLE_BACKENDS
+ 
+ 
+ def backend_to_kernel_cls(
+@@ -49,6 +62,13 @@ def backend_to_kernel_cls(
+ 
+         return [TritonExperts]
+ 
++    elif backend == Int8MoeBackend.CPU:
++        from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
++            CPUExpertsInt8,
++        )
++
++        return [CPUExpertsInt8]
++
+     else:
+         raise ValueError(f"Unknown Int8 MoE backend: {backend.value}")
+ 
+@@ -176,6 +196,24 @@ def make_int8_moe_quant_config(
+     )
+ 
+ 
++def convert_to_int8_moe_kernel_format(
++    int8_backend: Int8MoeBackend,
++    w13: torch.Tensor,
++    w2: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Convert INT8 MoE weights to backend-specific kernel format."""
++    if int8_backend == Int8MoeBackend.CPU:
++        from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
++            prepare_int8_moe_layer_for_cpu,
++        )
++
++        w13, w2 = prepare_int8_moe_layer_for_cpu(w13, w2)
++    elif int8_backend != Int8MoeBackend.TRITON:
++        raise ValueError(f"Unsupported Int8 MoE backend: {int8_backend.value}")
++
++    return w13, w2
++
++
+ def make_int8_moe_kernel(
+     moe_quant_config: FusedMoEQuantConfig,
+     moe_config: FusedMoEConfig,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py
+index 74bf8a3546e0..c29472cfc6b2 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py
+@@ -1,7 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-
+ import torch
+ from compressed_tensors.quantization import (
+     QuantizationArgs,
+@@ -20,6 +19,7 @@
+     FusedMoEQuantConfig,
+ )
+ from vllm.model_executor.layers.fused_moe.oracle.int8 import (
++    convert_to_int8_moe_kernel_format,
+     make_int8_moe_kernel,
+     make_int8_moe_quant_config,
+     select_int8_moe_backend,
+@@ -31,7 +31,7 @@
+     kInt8DynamicTokenSym,
+     kInt8StaticChannelSym,
+ )
+-from vllm.model_executor.utils import set_weight_attrs
++from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+ 
+ logger = init_logger(__name__)
+ 
+@@ -142,6 +142,14 @@ def create_weights(
+         layer.w2_input_scale = None
+ 
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
++        w13, w2 = convert_to_int8_moe_kernel_format(
++            int8_backend=self.int8_backend,
++            w13=layer.w13_weight,
++            w2=layer.w2_weight,
++        )
++        replace_parameter(layer, "w13_weight", w13)
++        replace_parameter(layer, "w2_weight", w2)
++
+         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+         assert self.experts_cls is not None
+         self.moe_kernel = make_int8_moe_kernel(
+@@ -193,3 +201,27 @@ def apply(
+             shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
++
++    def apply_monolithic(
++        self,
++        layer: RoutedExperts,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++        input_ids: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        assert self.is_monolithic
++        assert self.moe_kernel is not None
++        return self.moe_kernel.apply_monolithic(
++            x,
++            layer.w13_weight,
++            layer.w2_weight,
++            router_logits,
++            activation=layer.activation,
++            global_num_experts=layer.global_num_experts,
++            expert_map=layer.expert_map,
++            apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            num_expert_group=layer.num_expert_group,
++            topk_group=layer.topk_group,
++            e_score_correction_bias=layer.e_score_correction_bias,
++            routed_scaling_factor=layer.routed_scaling_factor,
++        )

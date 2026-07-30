@@ -1,0 +1,543 @@
+diff --git a/.buildkite/hardware_tests/cpu.yaml b/.buildkite/hardware_tests/cpu.yaml
+index 911b6c45e0ef..dd85400f2f1f 100644
+--- a/.buildkite/hardware_tests/cpu.yaml
++++ b/.buildkite/hardware_tests/cpu.yaml
+@@ -53,7 +53,7 @@ steps:
+   - tests/models/language/pooling/
+   commands:
+     - |
+-      bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 40m "
++      bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 50m "
+       pytest -x -v -s tests/models/language/generation -m cpu_model
+       pytest -x -v -s tests/models/language/pooling -m cpu_model"
+ 
+@@ -68,13 +68,15 @@ steps:
+   - vllm/v1/sample/ops/topk_topp_triton.py
+   - vllm/v1/sample/ops/topk_topp_sampler.py
+   - tests/v1/sample/test_topk_topp_sampler.py
++  - tests/v1/e2e/test_cpu_linear_attn_chunked_prefix.py
+   commands:
+     - |
+       bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 45m "
+       uv pip install git+https://github.com/triton-lang/triton-cpu.git@270e696d
+       VLLM_USE_V2_MODEL_RUNNER=1 pytest -x -v -s tests/models/language/generation/test_granite.py -m cpu_model
+       # TODO: move to CPU-Kernel Tests once triton-cpu has a pre-built wheel
+-      pytest -x -v -s tests/v1/sample/test_topk_topp_sampler.py::TestTritonTopkTopp"
++      pytest -x -v -s tests/v1/sample/test_topk_topp_sampler.py::TestTritonTopkTopp
++      pytest -x -v -s tests/v1/e2e/test_cpu_linear_attn_chunked_prefix.py"
+ 
+ - label: CPU-Quantization Model Tests
+   depends_on: []
+diff --git a/csrc/cpu/sgl-kernels/conv.cpp b/csrc/cpu/sgl-kernels/conv.cpp
+index 15114732aac1..b918aed8bff8 100644
+--- a/csrc/cpu/sgl-kernels/conv.cpp
++++ b/csrc/cpu/sgl-kernels/conv.cpp
+@@ -289,19 +289,18 @@ void causal_conv1d_fwd_kernel_impl(
+   }
+ }
+ 
+-#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                   \
+-  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply( \
+-      input + batch_offset * dim + mb_start * dim + nb_start,       \
+-      weight + nb_start * width,                                    \
+-      out + batch_offset * dim + mb_start * dim + nb_start,         \
+-      has_bias ? bias + nb_start : nullptr,                         \
+-      nullptr,                                                      \
+-      false,                                                        \
+-      mb_size,                                                      \
+-      dim,                                                          \
++#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                                                   \
++  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                                 \
++      input + batch_offset * dim + mb_start * dim + nb_start,                                       \
++      weight + nb_start * width,                                                                    \
++      out + batch_offset * dim + mb_start * dim + nb_start,                                         \
++      has_bias ? bias + nb_start : nullptr,                                                         \
++      has_conv_states ? conv_states + conv_state_index * conv_state_slot_stride + nb_start : nullptr, \
++      has_initial_states_value,                                                                     \
++      mb_size,                                                                                      \
++      dim,                                                                                          \
+       mb_start == 0);
+ 
+-// TODO: add `has_initial_state` support for varlen kernel
+ template <typename scalar_t>
+ void causal_conv1d_fwd_varlen_kernel_impl(
+     scalar_t* __restrict__ out,
+@@ -343,6 +342,9 @@ void causal_conv1d_fwd_varlen_kernel_impl(
+         int64_t nb_start = nb * BLOCK_N;
+         int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
+ 
++        const bool has_initial_states_value = has_conv_states ? has_initial_state[bs] : false;
++        int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
++
+         switch (width << 4 | nb_size >> 4) {
+           case 0x42:
+             LAUNCH_TINYGEMM_VARLEN_KERNEL(4, 32);
+@@ -373,7 +375,7 @@ void causal_conv1d_fwd_varlen_kernel_impl(
+             width,
+             dim,
+             seqlen,
+-            /* has_initial_state */ false);
++            has_initial_state[bs]);
+       }
+     });
+   }
+diff --git a/tests/kernels/mamba/cpu/test_cpu_gdn_ops.py b/tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
+index 4b800b192b26..bd30bc4f1ce0 100644
+--- a/tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
++++ b/tests/kernels/mamba/cpu/test_cpu_gdn_ops.py
+@@ -25,6 +25,8 @@
+     (64, 32),
+ ]
+ CHUNK_SIZE = 64
++CONV_DIM = 128
++CONV_KERNEL = 4
+ PREFILL_SEQ_LENS = [
+     [1],
+     [1, 2, 3],
+@@ -312,3 +314,225 @@ def test_chunk_gated_delta_rule_cpu(
+         atol=1e-2,
+         rtol=1e-2,
+     )
++
++
++# (total_tokens, split) pairs mimicking where chunked prefill breaks a sequence
++# across two scheduler steps: chunk-aligned and non-aligned splits.
++TWO_CALL_SPLITS = [
++    (2 * CHUNK_SIZE, CHUNK_SIZE),
++    (2 * CHUNK_SIZE + 17, CHUNK_SIZE),
++    (2 * CHUNK_SIZE + 17, CHUNK_SIZE + 9),
++    (4 * CHUNK_SIZE + 17, 2 * CHUNK_SIZE),
++    (3 * CHUNK_SIZE, CHUNK_SIZE + 1),
++]
++
++
++@pytest.mark.parametrize("total_tokens, split", TWO_CALL_SPLITS)
++@pytest.mark.parametrize("num_heads", NUM_HEADS)
++@pytest.mark.parametrize("head_dims", HEAD_DIMS)
++@torch.inference_mode()
++def test_chunk_gated_delta_rule_cpu_two_call_split(
++    total_tokens: int,
++    split: int,
++    num_heads: tuple[int, int],
++    head_dims: tuple[int, int],
++) -> None:
++    """A prefill split into two calls (the second seeded with the first's
++    ``final_state`` and a rebased ``cu_seqlens``) must match the single-call
++    result, mimicking the cross-scheduler-step handoff in
++    ``cpu_gdn_attention_core``.
++    """
++    q, k, v, a, b, A_log, dt_bias = gdn_inputs(
++        num_tokens=total_tokens,
++        num_heads=num_heads,
++        head_dims=head_dims,
++    )
++    _, num_v_heads = num_heads
++    head_dim, v_head_dim = head_dims
++
++    g, beta = ref_gdn_gating(A_log, a, b, dt_bias)
++    g = g.unsqueeze(0)  # [1, T, HV]
++    beta = beta.unsqueeze(0)
++
++    zero_state = torch.zeros(1, num_v_heads, head_dim, v_head_dim, dtype=torch.float32)
++
++    # Reference: whole sequence in one call, no initial state.
++    out_full, final_full = ops.chunk_gated_delta_rule_cpu(
++        query=q,
++        key=k,
++        value=v,
++        g=g,
++        beta=beta,
++        initial_state=zero_state,
++        output_final_state=True,
++        cu_seqlens=torch.tensor([0, total_tokens], dtype=torch.int32),
++        head_first=False,
++        use_qk_l2norm_in_kernel=True,
++    )
++
++    # Call 1: tokens [0:split], no initial state, capture final state.
++    out1, state1 = ops.chunk_gated_delta_rule_cpu(
++        query=q[:, :split],
++        key=k[:, :split],
++        value=v[:, :split],
++        g=g[:, :split],
++        beta=beta[:, :split],
++        initial_state=zero_state,
++        output_final_state=True,
++        cu_seqlens=torch.tensor([0, split], dtype=torch.int32),
++        head_first=False,
++        use_qk_l2norm_in_kernel=True,
++    )
++    # Call 2: tokens [split:T] seeded with call 1's final state and a cu_seqlens
++    # rebased to start at 0, as cpu_gdn_attention_core continues a prefill chunk.
++    tail = total_tokens - split
++    out2, state2 = ops.chunk_gated_delta_rule_cpu(
++        query=q[:, split:],
++        key=k[:, split:],
++        value=v[:, split:],
++        g=g[:, split:],
++        beta=beta[:, split:],
++        initial_state=state1.to(torch.float32),
++        output_final_state=True,
++        cu_seqlens=torch.tensor([0, tail], dtype=torch.int32),
++        head_first=False,
++        use_qk_l2norm_in_kernel=True,
++    )
++
++    out_split = torch.cat([out1, out2], dim=1)
++
++    # State must be near-exact; output allows a looser bound for the bf16 round-trip.
++    torch.testing.assert_close(state2, final_full, atol=1e-3, rtol=1e-3)
++    torch.testing.assert_close(out_split, out_full, atol=2e-2, rtol=2e-2)
++
++
++def _conv_inputs(total_tokens: int):
++    x = tensor_cache(total_tokens * CONV_DIM, torch.bfloat16).view(
++        total_tokens, CONV_DIM
++    )
++    weight = tensor_cache(CONV_DIM * CONV_KERNEL, torch.bfloat16).view(
++        CONV_DIM, CONV_KERNEL
++    )
++    bias = tensor_cache(CONV_DIM, torch.bfloat16)
++    return x, weight, bias
++
++
++@pytest.mark.parametrize("total_tokens, split", TWO_CALL_SPLITS)
++@torch.inference_mode()
++def test_causal_conv1d_torch_two_call_split(total_tokens: int, split: int) -> None:
++    """Non-AMX conv-state handoff: a two-call split (the second seeded via
++    ``has_initial_state=True`` from the conv_states the first wrote back) must
++    match the single-call result.
++    """
++    from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
++        causal_conv1d_torch,
++    )
++
++    x, weight, bias = _conv_inputs(total_tokens)
++    state_len = CONV_KERNEL - 1
++    # [num_slots, conv_dim, state_len]; slot 0 used here.
++    conv_states_full = torch.zeros(1, CONV_DIM, state_len, dtype=x.dtype)
++    conv_states_split = torch.zeros(1, CONV_DIM, state_len, dtype=x.dtype)
++
++    # x is [conv_dim, T] for causal_conv1d_torch.
++    xt = x.transpose(0, 1).contiguous()
++
++    out_full = causal_conv1d_torch(
++        x=xt,
++        weight=weight,
++        bias=bias,
++        conv_states=conv_states_full,
++        query_start_loc=torch.tensor([0, total_tokens], dtype=torch.int32),
++        cache_indices=torch.tensor([0], dtype=torch.int32),
++        has_initial_state=torch.tensor([False]),
++        activation="silu",
++    )
++
++    out1 = causal_conv1d_torch(
++        x=xt[:, :split],
++        weight=weight,
++        bias=bias,
++        conv_states=conv_states_split,
++        query_start_loc=torch.tensor([0, split], dtype=torch.int32),
++        cache_indices=torch.tensor([0], dtype=torch.int32),
++        has_initial_state=torch.tensor([False]),
++        activation="silu",
++    )
++    out2 = causal_conv1d_torch(
++        x=xt[:, split:],
++        weight=weight,
++        bias=bias,
++        conv_states=conv_states_split,
++        query_start_loc=torch.tensor([0, total_tokens - split], dtype=torch.int32),
++        cache_indices=torch.tensor([0], dtype=torch.int32),
++        has_initial_state=torch.tensor([True]),
++        activation="silu",
++    )
++    out_split = torch.cat([out1, out2], dim=1)
++
++    torch.testing.assert_close(out_split, out_full, atol=1e-2, rtol=1e-2)
++
++
++@pytest.mark.skipif(
++    not torch.cpu._is_amx_tile_supported(),
++    reason="causal_conv1d_fwd_cpu requires AMX/AVX512",
++)
++@pytest.mark.parametrize("total_tokens, split", TWO_CALL_SPLITS)
++@torch.inference_mode()
++def test_causal_conv1d_fwd_cpu_two_call_split(total_tokens: int, split: int) -> None:
++    """AMX prefill conv op must honor ``has_initial_state`` so a two-call split
++    matches the single-call result.
++
++    Regression test for ``causal_conv1d_fwd_varlen_kernel_impl`` (``conv.cpp``)
++    ignoring the carried conv state on continued chunks.
++    """
++    state_len = CONV_KERNEL - 1
++    x, weight, bias = _conv_inputs(total_tokens)
++
++    def amx(x_seg, conv_states, has_init):
++        seq = x_seg.shape[0]
++        return ops.causal_conv1d_fwd_cpu(
++            x=x_seg.transpose(0, 1),  # [dim, seq]; stride(-2)==1 (view of [seq,dim])
++            weight=weight,
++            bias=bias,
++            conv_states=conv_states,
++            query_start_loc=torch.tensor([0, seq], dtype=torch.int32),
++            cache_indices=torch.tensor([0], dtype=torch.int32),
++            has_initial_state=torch.tensor([has_init]),
++            silu_activation=True,
++            is_vnni=False,
++        ).contiguous()
++
++    # conv_state layout passed by the AMX branch: [num_slots, dim, state_len].
++    cs_full = torch.zeros(1, CONV_DIM, state_len, dtype=x.dtype)
++    out_full = amx(x, cs_full, False)
++
++    cs_split = torch.zeros(1, CONV_DIM, state_len, dtype=x.dtype)
++    out1 = amx(x[:split], cs_split, False)
++    out2 = amx(x[split:], cs_split, True)
++    out_split = torch.cat([out1, out2], dim=1)
++
++    torch.testing.assert_close(out_split, out_full, atol=1e-2, rtol=1e-2)
++
++
++@torch.inference_mode()
++def test_batch_memcpy_cpu_fallback() -> None:
++    """The ctypes batch_memcpy fallback (used when triton-cpu is absent) must
++    copy each src into its dst, validating the (src_ptrs, dst_ptrs, sizes)
++    argument order against ctypes.memmove(dst, src, size).
++    """
++    from vllm.utils.cpu_triton_utils import batch_memcpy_kernel
++
++    # Varied byte sizes, including a non-power-of-two run.
++    sizes_bytes = [256, 1024, 17 * 4, 4096]
++    srcs = [torch.rand(n // 4, dtype=torch.float32) for n in sizes_bytes]
++    dsts = [torch.zeros_like(s) for s in srcs]
++
++    src_ptrs = torch.tensor([s.data_ptr() for s in srcs], dtype=torch.uint64)
++    dst_ptrs = torch.tensor([d.data_ptr() for d in dsts], dtype=torch.uint64)
++    sizes = torch.tensor(sizes_bytes, dtype=torch.int32)
++
++    batch_memcpy_kernel[(len(srcs),)](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=1024)
++
++    for src, dst in zip(srcs, dsts):
++        torch.testing.assert_close(dst, src)
+diff --git a/tests/v1/e2e/test_cpu_linear_attn_chunked_prefix.py b/tests/v1/e2e/test_cpu_linear_attn_chunked_prefix.py
+new file mode 100644
+index 000000000000..71484d3b05c0
+--- /dev/null
++++ b/tests/v1/e2e/test_cpu_linear_attn_chunked_prefix.py
+@@ -0,0 +1,112 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU chunked-prefill / prefix-caching correctness for linear-attention models."""
++
++import os
++
++import pytest
++
++from tests.models.utils import check_logprobs_close
++from vllm import LLM, SamplingParams
++from vllm.platforms import current_platform
++
++if not current_platform.is_cpu():
++    pytest.skip("skipping CPU-only tests", allow_module_level=True)
++
++# Bound the KV cache so the run does not scale with host memory; these engines
++# only need a few thousand tokens.
++os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "1")
++
++MODEL = "Qwen/Qwen3.5-0.8B"
++CHUNK_TOKENS = 128  # max_num_batched_tokens for the chunked engine
++NUM_LOGPROBS = 5
++SP = SamplingParams(max_tokens=32, temperature=0, logprobs=NUM_LOGPROBS)
++
++
++def _long_prompt(repeat: int) -> str:
++    return "Solve the following arithmetic step by step. " * repeat + "What is 7*8?"
++
++
++# Prompts long enough to span several CHUNK_TOKENS-sized chunks; a single-chunk
++# prompt is bit-identical to full prefill regardless of the bug.
++PROMPTS = [_long_prompt(r) for r in (40, 60, 80)]
++# Spans several full cache blocks; prefix caching only reuses complete blocks.
++PREFIX_PROMPT = "You are a helpful assistant. " * 230 + " Now answer: what is 2+2?"
++
++
++def _make_llm(**overrides) -> LLM:
++    base = dict(
++        model=MODEL,
++        dtype="bfloat16",
++        max_model_len=2048,
++        enforce_eager=True,
++        trust_remote_code=True,
++    )
++    base.update(overrides)
++    return LLM(**base)
++
++
++def _tuples(outputs) -> list[tuple[list[int], str, object]]:
++    """(token_ids, text, sample_logprobs) per request, for check_logprobs_close."""
++    return [
++        (list(o.outputs[0].token_ids), o.outputs[0].text, o.outputs[0].logprobs)
++        for o in outputs
++    ]
++
++
++@pytest.fixture(scope="module")
++def full_prefill_refs():
++    """Reference (ids, text, logprobs) for PROMPTS and PREFIX_PROMPT, full prefill."""
++    llm = _make_llm(enable_chunked_prefill=False, enable_prefix_caching=False)
++    refs = _tuples(llm.generate(PROMPTS, SP))
++    prefix_ref = _tuples(llm.generate([PREFIX_PROMPT], SP))[0]
++    del llm
++    return refs, prefix_ref
++
++
++def test_chunked_prefill_matches_full_prefill(full_prefill_refs):
++    """Batched multi-chunk prefill must stay close to per-prompt full prefill.
++
++    Prompts are scheduled together so the scheduler interleaves prefill chunks
++    across requests (the cross-request path where the accuracy gap was strongest).
++    """
++    refs, _ = full_prefill_refs
++    llm = _make_llm(
++        enable_chunked_prefill=True,
++        max_num_batched_tokens=CHUNK_TOKENS,
++        enable_prefix_caching=False,
++    )
++    got = _tuples(llm.generate(PROMPTS, SP))
++    del llm
++
++    check_logprobs_close(
++        outputs_0_lst=refs,
++        outputs_1_lst=got,
++        name_0="full_prefill",
++        name_1="chunked_prefill",
++    )
++
++
++def test_prefix_cache_hit_matches_cold_cache(full_prefill_refs):
++    """A prefix-cache hit must stay close to the cold-cache (reference) output.
++
++    The warm run continues prefill from the restored GDN state; the
++    num_cached_tokens check guards against a vacuous (no-hit) pass.
++    """
++    _, ref = full_prefill_refs
++    llm = _make_llm(enable_prefix_caching=True)
++    llm.generate([PREFIX_PROMPT], SP)  # prime the cache
++    warm_out = llm.generate([PREFIX_PROMPT], SP)[0]
++    warm = _tuples([warm_out])[0]
++    del llm
++
++    assert warm_out.num_cached_tokens > 0, (
++        "expected a prefix-cache hit but num_cached_tokens=0; "
++        "PREFIX_PROMPT may be shorter than one cache block"
++    )
++    check_logprobs_close(
++        outputs_0_lst=[ref],
++        outputs_1_lst=[warm],
++        name_0="cold_cache",
++        name_1="warm_cache",
++    )
+diff --git a/vllm/platforms/cpu.py b/vllm/platforms/cpu.py
+index 31960ee8e6f3..c5d7ec2fe71b 100644
+--- a/vllm/platforms/cpu.py
++++ b/vllm/platforms/cpu.py
+@@ -157,20 +157,6 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+             logger.warning_once("Dual-Batch Overlap is not supported on CPU, disabled.")
+             parallel_config.enable_dbo = False
+ 
+-        if torch.cpu._is_amx_tile_supported() and (
+-            model_config is not None
+-            and model_config.get_num_layers_by_block_type(
+-                parallel_config, "linear_attention"
+-            )
+-            > 0
+-        ):
+-            cache_config.enable_prefix_caching = False
+-            scheduler_config.enable_chunked_prefill = False
+-            logger.warning_once(
+-                "Disabled unsupported prefix caching and chunked prefill "
+-                "for linear attention on AMX CPU platforms."
+-            )
+-
+         # Note: workaround for v1 gpu_model_runner
+         from vllm.config import CompilationMode
+ 
+diff --git a/vllm/utils/cpu_triton_utils.py b/vllm/utils/cpu_triton_utils.py
+index 657afad838bf..c3cedf9a7ba7 100644
+--- a/vllm/utils/cpu_triton_utils.py
++++ b/vllm/utils/cpu_triton_utils.py
+@@ -5,6 +5,7 @@
+ Contains replacement functions to fallback Triton usages in CPU backend
+ """
+ 
++import ctypes
+ from collections.abc import Callable
+ 
+ import torch
+@@ -336,3 +337,12 @@ def _sample_recovered_tokens_kernel_impl(
+ rejection_random_sample_kernel = _FuncWrapper(_rejection_random_sample_kernel_impl)
+ expand_kernel = _FuncWrapper(_expand_kernel_impl)
+ sample_recovered_tokens_kernel = _FuncWrapper(_sample_recovered_tokens_kernel_impl)
++
++
++def _batch_memcpy_impl(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=None):
++    # BLOCK_SIZE is unused; kept for signature parity with the Triton kernel.
++    for src, dst, size in zip(src_ptrs.tolist(), dst_ptrs.tolist(), sizes.tolist()):
++        ctypes.memmove(dst, src, size)
++
++
++batch_memcpy_kernel = _FuncWrapper(_batch_memcpy_impl)
+diff --git a/vllm/v1/worker/cpu_model_runner.py b/vllm/v1/worker/cpu_model_runner.py
+index 87b7a9ad2200..45ebe8a4da5e 100644
+--- a/vllm/v1/worker/cpu_model_runner.py
++++ b/vllm/v1/worker/cpu_model_runner.py
+@@ -12,7 +12,7 @@
+ from vllm.model_executor.model_loader import get_model
+ from vllm.tracing import instrument
+ from vllm.v1.core.sched.output import SchedulerOutput
+-from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+ 
+@@ -103,6 +103,10 @@ def _postprocess_triton(self) -> None:
+             cpu_tl.sample_recovered_tokens_kernel
+         )
+ 
++        import vllm.v1.worker.mamba_utils
++
++        vllm.v1.worker.mamba_utils.batch_memcpy_kernel = cpu_tl.batch_memcpy_kernel
++
+     @instrument(span_name="Loading (CPU)")
+     def load_model(self, load_dummy_weights: bool = False) -> None:
+         if load_dummy_weights:
+@@ -153,9 +157,25 @@ def _sync_device(self) -> None:
+         pass
+ 
+     def _zero_block_ids(self, block_ids: list[int]) -> None:
+-        # CPU attention assigns -INF to logits at invalid positions,
+-        # so stale KV cache data never affects computation.
+-        pass
++        # Zero full-attention blocks to prevent stale data corruption on partial writes.
++        # Encoder-only (runner-only) layers are not FullAttentionSpec, so the
++        # spec filter below already excludes them; no runner-only skip needed.
++        seen_ptrs: set[int] = set()
++        for group in self.kv_cache_config.kv_cache_groups:
++            if not isinstance(group.kv_cache_spec, FullAttentionSpec):
++                continue
++            for layer_name in group.layer_names:
++                ctx = self.compilation_config.static_forward_context.get(layer_name)
++                if ctx is None:
++                    continue
++                kv = ctx.kv_cache
++                if not isinstance(kv, torch.Tensor):
++                    continue
++                if kv.data_ptr() in seen_ptrs:
++                    continue
++                seen_ptrs.add(kv.data_ptr())
++                for block_id in block_ids:
++                    kv[block_id].zero_()
+ 
+     # =========================================================================
+     # CPU-safe overrides for speculative decoding methods

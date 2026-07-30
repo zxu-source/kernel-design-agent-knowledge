@@ -1,0 +1,422 @@
+diff --git a/docs_new/docs/hardware-platforms/xpu.mdx b/docs_new/docs/hardware-platforms/xpu.mdx
+index 36fa064caac1..1fc3fbb5a922 100644
+--- a/docs_new/docs/hardware-platforms/xpu.mdx
++++ b/docs_new/docs/hardware-platforms/xpu.mdx
+@@ -147,9 +147,18 @@ SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
+ 
+ | Phase | Backend | Mechanism | Default |
+ |---|---|---|---|
+-| Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **On** |
++| Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **Off** (opt-in) |
+ | Prefill | `tc_piecewise` | `torch.compile` + XPU graph, one graph segment per token-length bucket | **Off** (opt-in) |
+ 
++### Enable Decode Graph
++
++Decode graph capture is **opt-in** on XPU. Enable it explicitly:
++
++```bash
++python -m sglang.launch_server --model-path <MODEL> --device xpu \
++    --cuda-graph-backend-decode full
++```
++
+ ### Enable Prefill Graph
+ 
+ Prefill graph capture is **opt-in** on XPU and requires `torch.compile`
+@@ -195,10 +204,10 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
+ 
+ ### Disable XPU Graph
+ 
+-To opt out of one or both phases:
++Both phases are disabled by default. To explicitly disable them anyway:
+ 
+ ```bash
+-# Disable decode graph
++# Disable decode graph (already off by default; explicit form)
+ python -m sglang.launch_server --model-path <MODEL> --device xpu \
+     --cuda-graph-backend-decode=disabled
+ 
+@@ -236,7 +245,7 @@ python -m sglang.launch_server \
+ 
+ | Argument | XPU allowed values | Default | Description |
+ |---|---|---|---|
+-| `--cuda-graph-backend-decode` | `full`, `disabled` | `full` | Backend for the decode phase. Only `full` is supported on XPU. |
++| `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Only `full` is supported on XPU. Set to `full` to enable. |
+ | `--cuda-graph-backend-prefill` | `tc_piecewise`, `disabled` | `disabled`* | Backend for the prefill phase. Must be set to `tc_piecewise` explicitly to enable. |
+ | `--cuda-graph-tc-compiler` | `eager`, `inductor` | `eager` | Compiler for `tc_piecewise` prefill subgraphs. `inductor` produces more optimized code but has longer startup. |
+ | `--cuda-graph-bs-prefill` | list of ints | auto | Explicit token-length buckets to capture for prefill. |
+diff --git a/python/sglang/multimodal_gen/runtime/platforms/xpu.py b/python/sglang/multimodal_gen/runtime/platforms/xpu.py
+index 68740566f642..5668eebfd809 100644
+--- a/python/sglang/multimodal_gen/runtime/platforms/xpu.py
++++ b/python/sglang/multimodal_gen/runtime/platforms/xpu.py
+@@ -103,12 +103,23 @@ def get_available_gpu_memory(
+         if empty_cache:
+             torch.xpu.empty_cache()
+ 
+-        used_memory = float(torch.xpu.memory_allocated(device_id))
+-        total_gpu_memory = float(
+-            torch.xpu.get_device_properties(device_id).total_memory
+-        )
+-
+-        free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
++        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
++        # on drivers that incorrectly return total memory as free memory.
++        # Consistent with the fallback: free = max(0, total - allocated).
++        try:
++            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(device_id)
++            used_memory = float(torch.xpu.memory_allocated(device_id))
++            free_gpu_memory = min(
++                float(free_gpu_memory),
++                max(0.0, float(total_gpu_memory) - used_memory),
++            )
++        except Exception:
++            # Fallback for devices/drivers that do not support querying free memory
++            used_memory = float(torch.xpu.memory_allocated(device_id))
++            total_gpu_memory = float(
++                torch.xpu.get_device_properties(device_id).total_memory
++            )
++            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+ 
+         if distributed:
+             import torch.distributed as dist
+diff --git a/python/sglang/srt/hardware_backend/xpu/graph_runner/xpu_graph_runner.py b/python/sglang/srt/hardware_backend/xpu/graph_runner/xpu_graph_runner.py
+index 1b53564eb1f8..01e479dffe51 100644
+--- a/python/sglang/srt/hardware_backend/xpu/graph_runner/xpu_graph_runner.py
++++ b/python/sglang/srt/hardware_backend/xpu/graph_runner/xpu_graph_runner.py
+@@ -22,7 +22,6 @@
+ from torch.profiler import ProfilerActivity, profile
+ 
+ from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+ from sglang.srt.utils import register_xpu_device_properties_for_dynamo
+ 
+ logger = logging.getLogger(__name__)
+@@ -144,9 +143,6 @@ def __init__(self, model_runner: ModelRunner):
+         assert (
+             not self.require_gathered_buffer
+         ), "XPUGraphRunner does not support gathered buffer yet."
+-        assert (
+-            model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
+-        ), "XPUGraphRunner does not support speculative inference yet."
+ 
+     def _init_profile_context_and_memory_record(self):
+         profile_context = profile(
+diff --git a/python/sglang/srt/hardware_backend/xpu/xpu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/xpu/xpu_cudagraph_backend.py
+deleted file mode 100644
+index ff884f73f315..000000000000
+--- a/python/sglang/srt/hardware_backend/xpu/xpu_cudagraph_backend.py
++++ /dev/null
+@@ -1,106 +0,0 @@
+-# Copyright 2023-2026 SGLang Team
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-# ==============================================================================
+-"""XPUCudaGraphBackend — Intel XPU full-graph capture (torch.xpu.XPUGraph)."""
+-
+-from __future__ import annotations
+-
+-from contextlib import contextmanager
+-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+-
+-import torch
+-
+-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+-    BaseCudaGraphBackend,
+-)
+-
+-if TYPE_CHECKING:
+-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+-    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+-        BaseCudaGraphRunner,
+-    )
+-
+-
+-class XPUCudaGraphBackend(BaseCudaGraphBackend):
+-    """One torch.xpu.XPUGraph per shape; attention metadata is
+-    captured inside the graph.
+-    """
+-
+-    def __init__(
+-        self,
+-        cuda_graph_runner: BaseCudaGraphRunner,
+-    ) -> None:
+-        self._graphs: Dict[Any, torch.xpu.XPUGraph] = {}
+-        self._outputs: Dict[Any, Any] = {}
+-        self._pool = None
+-        self._device_module = cuda_graph_runner.device_module
+-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+-        self._capture_stream: Optional[torch.xpu.Stream] = None
+-
+-    @contextmanager
+-    def capture_session(self, stream: torch.xpu.Stream):
+-        if self._pool is None:
+-            self._pool = self._device_module.graph_pool_handle()
+-        self._capture_stream = stream
+-        try:
+-            yield
+-        finally:
+-            self._capture_stream = None
+-
+-    def capture_one(
+-        self,
+-        shape_key: Any,
+-        forward_fn: Callable[[], Any],
+-        dummies: Optional[Any] = None,
+-        post_warmup_hook: Optional[Callable[[], None]] = None,
+-    ) -> None:
+-        # Two warmups so kernels are loaded and one-time setup is paid before capture.
+-        # post_warmup_hook lets the attention backend reset state that warmup mutated.
+-        for _ in range(2):
+-            self._device_module.synchronize()
+-            self._tp_group.barrier()
+-            forward_fn()
+-            if post_warmup_hook is not None:
+-                post_warmup_hook()
+-
+-        graph = torch.xpu.XPUGraph()
+-
+-        # graph_ctx: Callable[..., AbstractContextManager]
+-        graph_ctx = self._device_module.graph
+-
+-        with graph_ctx(graph, pool=self._pool, stream=self._capture_stream):
+-            out = forward_fn()
+-
+-        self._graphs[shape_key] = graph
+-        self._outputs[shape_key] = out
+-
+-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+-        return shape_key in self._graphs
+-
+-    @contextmanager
+-    def replay_session(self):
+-        yield
+-
+-    def replay(
+-        self,
+-        shape_key: Any,
+-        static_forward_batch: ForwardBatch,
+-        **kwargs,
+-    ) -> Any:
+-        self._graphs[shape_key].replay()
+-        return self._outputs[shape_key]
+-
+-    def cleanup(self) -> None:
+-        self._graphs.clear()
+-        self._outputs.clear()
+-        self._pool = None
+diff --git a/python/sglang/srt/model_executor/runner_backend/utils.py b/python/sglang/srt/model_executor/runner_backend/utils.py
+index ac11a8670fd1..f2eb8f31c0d3 100644
+--- a/python/sglang/srt/model_executor/runner_backend/utils.py
++++ b/python/sglang/srt/model_executor/runner_backend/utils.py
+@@ -72,13 +72,6 @@ def resolve_decode_backend(
+             cuda_graph_runner, enable_memory_saver=enable_memory_saver
+         )
+     elif model_runner.device == "xpu":
+-        from sglang.srt.hardware_backend.xpu.xpu_cudagraph_backend import (
+-            XPUCudaGraphBackend,
+-        )
+-
+-        return XPUCudaGraphBackend(cuda_graph_runner)
+-
+-    if model_runner.device == "xpu":
+         if backend_name not in (Backend.FULL, Backend.DISABLED):
+             raise ValueError(
+                 f"XPU only supports cuda_graph_config decode backend 'full', got '{backend_name}'"
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index dc0945a6b8dd..4fbdb575afc0 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -3054,6 +3054,22 @@ def _handle_mps_backends(self):
+ 
+     def _handle_xpu_backends(self):
+         if self.device == "xpu":
++            # Decode graph is opt-in on XPU: unless the user explicitly set
++            # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
++            # disabled so the default startup doesn't require graph capture.
++            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
++                self.cuda_graph_config.decode.backend = Backend.DISABLED
++            elif self.cuda_graph_config.decode.backend not in (
++                Backend.DISABLED,
++                Backend.FULL,
++            ):
++                logger.warning(
++                    "XPU platform only supports decode backend 'full'; "
++                    "disabling unsupported decode backend '%s'.",
++                    self.cuda_graph_config.decode.backend,
++                )
++                self.cuda_graph_config.decode.backend = Backend.DISABLED
++
+             if self.cuda_graph_config.prefill.backend not in (
+                 Backend.DISABLED,
+                 Backend.TC_PIECEWISE,
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index c1a73c5ace23..2d33a1710b7f 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -621,9 +621,23 @@ def get_available_gpu_memory(
+ 
+         if empty_cache:
+             empty_device_cache(torch.xpu)
+-        # Use mem_get_info() to reflect true OS-level free memory
+-        # including graph pool reservations; avoids KV-cache over-allocation.
+-        free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
++        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
++        # on drivers that incorrectly return total memory as free memory.
++        # Consistent with the fallback: free = max(0, total - allocated).
++        try:
++            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
++            used_memory = float(torch.xpu.memory_allocated(gpu_id))
++            free_gpu_memory = min(
++                float(free_gpu_memory),
++                max(0.0, float(total_gpu_memory) - used_memory),
++            )
++        except Exception:
++            # Fallback for devices/drivers that do not support querying free memory
++            used_memory = float(torch.xpu.memory_allocated(gpu_id))
++            total_gpu_memory = float(
++                torch.xpu.get_device_properties(gpu_id).total_memory
++            )
++            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+ 
+     elif device == "hpu":
+         num_gpus = torch.hpu.device_count()
+diff --git a/test/registered/spec/eagle/test_spec_eagle_parity.py b/test/registered/spec/eagle/test_spec_eagle_parity.py
+index 281d6f0e15a8..9c00d7bf7835 100644
+--- a/test/registered/spec/eagle/test_spec_eagle_parity.py
++++ b/test/registered/spec/eagle/test_spec_eagle_parity.py
+@@ -42,6 +42,10 @@ class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
+ 
+     disable_overlap = False
+     attention_backend = "triton"
++    # Decode full-graph was active by default when this test was added
++    # (via XPUCudaGraphBackend). Opt in explicitly now that it is disabled
++    # by default so the coverage is preserved.
++    extra_args = ("--cuda-graph-config", '{"decode":{"backend":"full"}}')
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/test/registered/xpu/test_deepseek_ocr.py b/test/registered/xpu/test_deepseek_ocr.py
+index ff8f6cc1ee30..33e38c789c1e 100644
+--- a/test/registered/xpu/test_deepseek_ocr.py
++++ b/test/registered/xpu/test_deepseek_ocr.py
+@@ -38,7 +38,6 @@ def setUpClass(cls):
+             "xpu",
+             "--attention-backend",
+             "intel_xpu",
+-            "--disable-decode-cuda-graph",
+         ]
+         os.environ["SGLANG_USE_SGL_XPU"] = "1"
+         cls.process = popen_launch_server(
+diff --git a/test/registered/xpu/test_deepseek_ocr_triton.py b/test/registered/xpu/test_deepseek_ocr_triton.py
+index c34062e414d3..b17c29710e56 100644
+--- a/test/registered/xpu/test_deepseek_ocr_triton.py
++++ b/test/registered/xpu/test_deepseek_ocr_triton.py
+@@ -41,7 +41,6 @@ def setUpClass(cls):
+             "xpu",
+             "--attention-backend",
+             "intel_xpu",
+-            "--disable-decode-cuda-graph",
+         ]
+         os.environ["SGLANG_USE_SGL_XPU"] = "0"
+         cls.process = popen_launch_server(
+diff --git a/test/registered/xpu/test_encoder_attention_backend.py b/test/registered/xpu/test_encoder_attention_backend.py
+index 9dfc69fda38a..1f64c15df932 100644
+--- a/test/registered/xpu/test_encoder_attention_backend.py
++++ b/test/registered/xpu/test_encoder_attention_backend.py
+@@ -39,7 +39,6 @@ def setUpClass(cls):
+             "xpu",
+             "--mm-attention-backend",
+             "xpu_attn",
+-            "--disable-decode-cuda-graph",
+         ]
+         os.environ["SGLANG_USE_SGL_XPU"] = "1"
+         cls.process = popen_launch_server(
+@@ -128,7 +127,6 @@ def setUpClass(cls):
+             "xpu",
+             "--mm-attention-backend",
+             "triton_attn",
+-            "--disable-decode-cuda-graph",
+         ]
+         os.environ["SGLANG_USE_SGL_XPU"] = "0"
+         cls.process = popen_launch_server(
+diff --git a/test/registered/xpu/test_gemma_4_e2b.py b/test/registered/xpu/test_gemma_4_e2b.py
+index 45a85c1c9218..ebe1e2dd2e6c 100644
+--- a/test/registered/xpu/test_gemma_4_e2b.py
++++ b/test/registered/xpu/test_gemma_4_e2b.py
+@@ -53,7 +53,6 @@
+     "intel_xpu",
+     "--model-impl",
+     "sglang",
+-    "--disable-decode-cuda-graph",
+ ]
+ 
+ # Standard sglang e2e Q&A prompt (see test_openai_server.py::run_chat_completion).
+diff --git a/test/registered/xpu/test_intel_xpu_backend.py b/test/registered/xpu/test_intel_xpu_backend.py
+index cf6ec0077c8a..b38c5798490c 100644
+--- a/test/registered/xpu/test_intel_xpu_backend.py
++++ b/test/registered/xpu/test_intel_xpu_backend.py
+@@ -34,7 +34,6 @@ def wrapper(self):
+                 "1",
+                 "--device",
+                 "xpu",
+-                "--disable-decode-cuda-graph",
+             ]
+             ci_args = ["--input", "64", "--output", "4"] if is_in_ci() else []
+             full_args = common_args + ci_args + (extra_args or [])
+diff --git a/test/registered/xpu/test_triton_attention_backend.py b/test/registered/xpu/test_triton_attention_backend.py
+index 4288fd81c8ac..72e0a99e7778 100644
+--- a/test/registered/xpu/test_triton_attention_backend.py
++++ b/test/registered/xpu/test_triton_attention_backend.py
+@@ -31,7 +31,6 @@ def wrapper(self):
+                 "2050",
+                 "--attention-backend",
+                 "triton",
+-                "--disable-decode-cuda-graph",
+             ]
+             full_args = common_args + (extra_args or [])
+ 
+diff --git a/test/registered/xpu/test_xpu_basic.py b/test/registered/xpu/test_xpu_basic.py
+index 024fd7809f7c..c1e4c30eaf83 100644
+--- a/test/registered/xpu/test_xpu_basic.py
++++ b/test/registered/xpu/test_xpu_basic.py
+@@ -33,7 +33,6 @@ def test_basic_generation(self):
+             "0.6",
+             "--batch-size",
+             "1",
+-            "--disable-decode-cuda-graph",
+         ]
+         if is_in_ci():
+             args += ["--input", "64", "--output", "4"]
+diff --git a/test/registered/xpu/test_xpu_embedding.py b/test/registered/xpu/test_xpu_embedding.py
+index c07d9d3e4f43..fcdb1615df21 100644
+--- a/test/registered/xpu/test_xpu_embedding.py
++++ b/test/registered/xpu/test_xpu_embedding.py
+@@ -38,7 +38,6 @@ def setUpClass(cls):
+                 "--is-embedding",
+                 "--device",
+                 "xpu",
+-                "--disable-decode-cuda-graph",
+             ],
+         )
+         cls.openai_url = cls.base_url + "/v1"
+diff --git a/test/registered/xpu/test_xpu_serving_features.py b/test/registered/xpu/test_xpu_serving_features.py
+index 2f4746a9ad28..1ea21b6d557e 100644
+--- a/test/registered/xpu/test_xpu_serving_features.py
++++ b/test/registered/xpu/test_xpu_serving_features.py
+@@ -43,7 +43,7 @@ def setUpClass(cls):
+             cls.model,
+             cls.base_url,
+             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+-            other_args=["--device", "xpu", "--disable-decode-cuda-graph"],
++            other_args=["--device", "xpu"],
+         )
+         cls.openai_url = cls.base_url + "/v1"
+ 

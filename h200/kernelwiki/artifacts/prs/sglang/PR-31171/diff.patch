@@ -1,0 +1,491 @@
+diff --git a/python/sglang/srt/model_executor/cpu_graph_runner.py b/python/sglang/srt/model_executor/cpu_graph_runner.py
+index 74a1433c29a6..76a990fb33de 100644
+--- a/python/sglang/srt/model_executor/cpu_graph_runner.py
++++ b/python/sglang/srt/model_executor/cpu_graph_runner.py
+@@ -490,6 +490,15 @@ def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
+         a = mixed_ba.new_empty(batch, num_heads_v)
+         return mixed_qkv, z, b, a
+ 
++    @register_cpu_compile_fake("fused_input_proj_cpu")
++    def _(hidden_states, qkvz_weight, ba_weight, is_vnni):
++        batch = hidden_states.shape[0]
++        qkvz_dim = qkvz_weight.shape[0]
++        ba_dim = ba_weight.shape[0]
++        return hidden_states.new_empty(batch, qkvz_dim), hidden_states.new_empty(
++            batch, ba_dim
++        )
++
+     @register_cpu_compile_fake("fused_sigmoid_gating_delta_rule_update_cpu")
+     def _(
+         A_log,
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index e5d386f90df9..40d2814ecd96 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -112,6 +112,7 @@
+     is_xpu,
+     make_layers,
+     set_weight_attrs,
++    use_intel_amx_backend,
+ )
+ from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
+ 
+@@ -152,6 +153,9 @@ def _disable_shared_experts_fusion() -> bool:
+     fused_qk_gemma_rmsnorm_with_gate = (
+         torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu
+     )
++    fused_qkvzba_split_reshape_cat_contiguous = (
++        torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu
++    )
+ 
+ if _is_npu:
+     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+@@ -233,6 +237,17 @@ def __init__(
+         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
+         self._bind_packed_weight_loaders(self.in_proj_qkvz)
+         self._bind_packed_weight_loaders(self.in_proj_ba)
++        self._fused_input_proj_cpu_enabled = LazyValue(
++            lambda: (
++                _is_cpu
++                and self.in_proj_qkvz.weight.dtype == torch.bfloat16
++                and self.in_proj_ba.weight.dtype == torch.bfloat16
++                and self.in_proj_qkvz.bias is None
++                and self.in_proj_ba.bias is None
++                and use_intel_amx_backend(self.in_proj_qkvz)
++                and use_intel_amx_backend(self.in_proj_ba)
++            )
++        )
+ 
+         # Conv1d weight loader setup
+         query_key_settings = (self.key_dim, 0, False)
+@@ -497,6 +512,15 @@ def _forward_input_proj(self, hidden_states: torch.Tensor):
+             with torch.cuda.stream(self.alt_stream):
+                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
+             current_stream.wait_stream(self.alt_stream)
++        elif self._fused_input_proj_cpu_enabled.value:
++            projected_states_qkvz, projected_states_ba = (
++                torch.ops.sgl_kernel.fused_input_proj_cpu(
++                    hidden_states,
++                    self.in_proj_qkvz.weight,
++                    self.in_proj_ba.weight,
++                    True,
++                )
++            )
+         else:
+             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+             projected_states_ba, _ = self.in_proj_ba(hidden_states)
+@@ -517,30 +541,21 @@ def forward(
+             hidden_states
+         )
+ 
+-        if (
+-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+-            and not _is_cpu
+-            and not _is_npu
+-        ):
++        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
++            if _is_cpu:
++                num_k_heads_tp = self.num_k_heads // self.attn_tp_size
++                num_v_heads_tp = self.num_v_heads // self.attn_tp_size
++            else:
++                num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
++                num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                 projected_states_qkvz,
+                 projected_states_ba,
+-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
+-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
++                num_k_heads_tp,
++                num_v_heads_tp,
+                 self.head_k_dim,
+                 self.head_v_dim,
+             )
+-        elif _is_cpu and _is_amx_available:
+-            mixed_qkv, z, b, a = (
+-                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
+-                    projected_states_qkvz,
+-                    projected_states_ba,
+-                    self.num_k_heads // self.attn_tp_size,
+-                    self.num_v_heads // self.attn_tp_size,
+-                    self.head_k_dim,
+-                    self.head_v_dim,
+-                )
+-            )
+         else:
+             query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                 projected_states_qkvz, projected_states_ba
+diff --git a/sgl-kernel/csrc/cpu/model/qwen3.cpp b/sgl-kernel/csrc/cpu/model/qwen3.cpp
+index 1095d5da2f22..ff6db97dce5a 100644
+--- a/sgl-kernel/csrc/cpu/model/qwen3.cpp
++++ b/sgl-kernel/csrc/cpu/model/qwen3.cpp
+@@ -1,4 +1,5 @@
+ #include "common.h"
++#include "gemm.h"
+ #include "vec.h"
+ namespace {
+ 
+@@ -71,7 +72,6 @@ void fused_qkvzba_split_reshape_cat_contiguous_impl(
+     scalar_t* __restrict__ b,
+     scalar_t* __restrict__ a,
+     int64_t batch,
+-    int64_t k_tp,
+     int64_t v_tp,
+     int64_t num_heads_v,
+     int64_t qkv_dim,
+@@ -96,6 +96,60 @@ void fused_qkvzba_split_reshape_cat_contiguous_impl(
+   });
+ }
+ 
++template <typename scalar_t>
++void fused_input_proj_kernel_impl(
++    scalar_t* __restrict__ out,
++    scalar_t* __restrict__ out2,
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ weight,
++    const scalar_t* __restrict__ weight2,
++    int64_t M,
++    int64_t N,
++    int64_t N2,
++    int64_t K) {
++  constexpr int64_t BLOCK_M = block_size_m();
++  constexpr int64_t BLOCK_N = block_size_n();
++  const int64_t MB = div_up(M, BLOCK_M);
++  const int64_t NB = div_up(N + N2, BLOCK_N);
++
++  const bool use_brgemm = can_use_brgemm<scalar_t>(M);
++
++  // parallel on [MB, NB]
++  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
++    // for brgemm, use float32 for accumulate
++    alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
++
++    loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
++      int64_t mb_start = mb * BLOCK_M;
++      int64_t mb_size = std::min(M - mb_start, BLOCK_M);
++      int64_t nb_start = nb * BLOCK_N;
++      const bool is_first = nb_start < N;
++      int64_t local_nb_start = is_first ? nb_start : nb_start - N;
++      int64_t nb_size = std::min((is_first ? N : N2) - local_nb_start, BLOCK_N);
++      scalar_t* __restrict__ curr_out = is_first ? out : out2;
++      const scalar_t* __restrict__ curr_weight = is_first ? weight : weight2;
++      int64_t local_out_strideM = is_first ? N : N2;
++
++      tinygemm_kernel<scalar_t>(
++          /*   A */ input + mb_start * K,
++          /*   B */ curr_weight + local_nb_start * K,
++          /*   C */ curr_out + mb_start * local_out_strideM + local_nb_start,
++          /* Ctmp*/ Ctmp,
++          /*   M */ mb_size,
++          /*   N */ nb_size,
++          /*   K */ K,
++          /* lda */ K,
++          /* ldb */ nb_size,
++          /* ldc */ local_out_strideM,
++          /* brg */ use_brgemm);
++    });
++
++    if (use_brgemm) {
++      at::native::cpublas::brgemm_release();
++    }
++  });
++}
++
+ }  // anonymous namespace
+ 
+ // mixed_qkvz: [batch, num_heads_qk * head_qk * 2 + num_heads_v * head_v * 2]
+@@ -107,18 +161,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
+     int64_t num_heads_v,
+     int64_t head_qk,
+     int64_t head_v) {
+-  CHECK_DIM(2, mixed_qkvz);
+-  CHECK_DIM(2, mixed_ba);
+-  CHECK_INPUT(mixed_qkvz);
+-  CHECK_INPUT(mixed_ba);
+   int64_t batch = mixed_qkvz.size(0);
+   int64_t qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v;
+   int64_t ba_dim = num_heads_v * 2;
+   int64_t expected_dim = qkv_dim + num_heads_v * head_v;
+-  CHECK_EQ(mixed_qkvz.size(1), expected_dim);
+-  CHECK_EQ(mixed_ba.size(0), batch);
+-  CHECK_EQ(mixed_ba.size(1), ba_dim);
+-  TORCH_CHECK(mixed_ba.scalar_type() == mixed_qkvz.scalar_type(), "mixed_ba and mixed_qkvz must share same dtype");
++  CHECK_INPUT_SHAPE_DTYPE<false>(mixed_qkvz, {batch, expected_dim}, mixed_qkvz.scalar_type());
++  CHECK_INPUT_SHAPE_DTYPE<false>(mixed_ba, {batch, ba_dim}, mixed_qkvz.scalar_type());
+   CHECK_EQ(num_heads_v % num_heads_qk, 0);
+   at::Tensor mixed_qkv = at::empty({batch, qkv_dim}, mixed_qkvz.options());
+   at::Tensor z = at::empty({batch, num_heads_v, head_v}, mixed_qkvz.options());
+@@ -158,20 +206,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
+     int64_t num_heads_v,
+     int64_t head_qk,
+     int64_t head_v) {
+-  CHECK_DIM(2, mixed_qkvz);
+-  CHECK_DIM(2, mixed_ba);
+-  CHECK_INPUT(mixed_qkvz);
+-  CHECK_INPUT(mixed_ba);
+   int64_t batch = mixed_qkvz.size(0);
+   int64_t k_tp = num_heads_qk * head_qk;
+   int64_t v_tp = num_heads_v * head_v;
+   int64_t qkv_dim = k_tp * 2 + v_tp;
+   int64_t ba_dim = num_heads_v * 2;
+   int64_t expected_dim = qkv_dim + v_tp;
+-  CHECK_EQ(mixed_qkvz.size(1), expected_dim);
+-  CHECK_EQ(mixed_ba.size(0), batch);
+-  CHECK_EQ(mixed_ba.size(1), ba_dim);
+-  TORCH_CHECK(mixed_ba.scalar_type() == mixed_qkvz.scalar_type(), "mixed_ba and mixed_qkvz must share same dtype");
++  CHECK_INPUT_SHAPE_DTYPE<false>(mixed_qkvz, {batch, expected_dim}, mixed_qkvz.scalar_type());
++  CHECK_INPUT_SHAPE_DTYPE<false>(mixed_ba, {batch, ba_dim}, mixed_qkvz.scalar_type());
+   at::Tensor mixed_qkv = at::empty({batch, qkv_dim}, mixed_qkvz.options());
+   at::Tensor z = at::empty({batch, num_heads_v, head_v}, mixed_qkvz.options());
+   at::Tensor b = at::empty({batch, num_heads_v}, mixed_ba.options());
+@@ -188,7 +230,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
+         b.data_ptr<scalar_t>(),
+         a.data_ptr<scalar_t>(),
+         batch,
+-        k_tp,
+         v_tp,
+         num_heads_v,
+         qkv_dim,
+@@ -198,3 +239,49 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
+   });
+   return std::make_tuple(mixed_qkv, z, b, a);
+ }
++
++// [projected_states_qkvz |projected_states_ba]
++//   = hidden_states @ [qkvz_weight.T | ba_weight.T]
++//
++//   hidden_states         : [batch, hidden_size]
++//   qkvz_weight           : [qkvz_dim, hidden_size]
++//   ba_weight             : [ba_dim, hidden_size]
++//   projected_states_qkvz : [batch, qkvz_dim]
++//   projected_states_ba   : [batch, ba_dim]
++//
++std::tuple<at::Tensor, at::Tensor>
++fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Tensor& ba_weight, bool is_vnni) {
++  const auto st = hidden_states.scalar_type();
++  TORCH_CHECK(st == at::ScalarType::BFloat16, "fused_input_proj_cpu only supports BFloat16");
++
++  int64_t batch = hidden_states.size(0);
++  int64_t hidden_size = hidden_states.size(1);
++  int64_t qkvz_dim = qkvz_weight.size(0);
++  int64_t ba_dim = ba_weight.size(0);
++  CHECK_INPUT(hidden_states);
++  CHECK_INPUT_SHAPE_DTYPE<false>(qkvz_weight, {qkvz_dim, hidden_size}, st);
++  CHECK_INPUT_SHAPE_DTYPE<false>(ba_weight, {ba_dim, hidden_size}, st);
++  TORCH_CHECK(qkvz_dim % block_size_n() == 0, "qkvz_weight out features must be divisible by ", block_size_n());
++  TORCH_CHECK(ba_dim % block_size_n() == 0, "ba_weight out features must be divisible by ", block_size_n());
++  TORCH_CHECK(hidden_size % TILE_K == 0, "hidden_size must be divisible by ", TILE_K);
++
++  // weight prepacking if necessary
++  at::Tensor packed_w = is_vnni ? qkvz_weight : convert_weight_packed(qkvz_weight);
++  at::Tensor packed_w2 = is_vnni ? ba_weight : convert_weight_packed(ba_weight);
++
++  at::Tensor projected_states_qkvz = at::empty({batch, qkvz_dim}, hidden_states.options());
++  at::Tensor projected_states_ba = at::empty({batch, ba_dim}, hidden_states.options());
++  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_input_proj_cpu", [&] {
++    fused_input_proj_kernel_impl<scalar_t>(
++        projected_states_qkvz.data_ptr<scalar_t>(),
++        projected_states_ba.data_ptr<scalar_t>(),
++        hidden_states.data_ptr<scalar_t>(),
++        packed_w.data_ptr<scalar_t>(),
++        packed_w2.data_ptr<scalar_t>(),
++        batch,
++        qkvz_dim,
++        ba_dim,
++        hidden_size);
++  });
++  return std::make_tuple(projected_states_qkvz, projected_states_ba);
++}
+diff --git a/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp b/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
+index a147d1fc23a9..b522bf7d3db1 100644
+--- a/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
++++ b/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
+@@ -502,6 +502,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
+     int64_t head_qk,
+     int64_t head_v);
+ 
++// fused_input_proj_cpu
++std::tuple<at::Tensor, at::Tensor>
++fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Tensor& ba_weight, bool is_vnni);
++
+ // image preprocessor
+ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
+     at::TensorList images,
+@@ -844,6 +848,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+       "num_heads_v, int "
+       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
+   m.impl("fused_qkvzba_split_reshape_cat_contiguous_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_contiguous_cpu);
++  // fused_input_proj_cpu
++  m.def(
++      "fused_input_proj_cpu(Tensor hidden_states, Tensor qkvz_weight, Tensor ba_weight, bool is_vnni) -> (Tensor, "
++      "Tensor)");
++  m.impl("fused_input_proj_cpu", torch::kCPU, &fused_input_proj_cpu);
+ 
+   // image preprocessor
+   m.def(
+diff --git a/test/registered/cpu/test_qwen3.py b/test/registered/cpu/test_qwen3.py
+index 602144fecea3..a626d1d51314 100644
+--- a/test/registered/cpu/test_qwen3.py
++++ b/test/registered/cpu/test_qwen3.py
+@@ -1,10 +1,11 @@
+-import unittest
++import sys
+ 
++import pytest
+ import torch
+ from utils import precision
+ 
++from sglang.srt.utils import is_host_cpu_arm64
+ from sglang.test.ci.ci_register import register_cpu_ci
+-from sglang.test.test_utils import CustomTestCase
+ 
+ register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+ register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
+@@ -85,69 +86,92 @@ def fix_query_key_value_ordering_reshape_cat_contiguous(
+     return mixed_qkv, z, b, a
+ 
+ 
+-class TestQwen3(CustomTestCase):
+-    def test_fused_qkvzba_split_reshape_cat(self):
+-        mixed_qkvz = torch.rand(1024, 12288, dtype=torch.bfloat16)
+-        mixed_ba = torch.rand(1024, 64, dtype=torch.bfloat16)
+-        head_k_dim = 128
+-        head_v_dim = 128
+-        num_v_heads = 32
+-        num_k_heads = 16
+-        attn_tp_size = 1
+-        mixed_qkv_ref, z_ref, b_ref, a_ref = fix_query_key_value_ordering_reshape_cat(
++@pytest.mark.skipif(
++    is_host_cpu_arm64(), reason="fused_input_proj_cpu is an x86 AMX kernel"
++)
++def test_fused_input_proj():
++    batch = 7
++    hidden_size = 256
++    qkvz_dim = 128
++    ba_dim = 64
++    hidden_states = torch.randn(batch, hidden_size, dtype=torch.bfloat16)
++    qkvz_weight = torch.randn(qkvz_dim, hidden_size, dtype=torch.bfloat16)
++    ba_weight = torch.randn(ba_dim, hidden_size, dtype=torch.bfloat16)
++
++    qkvz_ref = torch.nn.functional.linear(hidden_states, qkvz_weight)
++    ba_ref = torch.nn.functional.linear(hidden_states, ba_weight)
++    qkvz, ba = torch.ops.sgl_kernel.fused_input_proj_cpu(
++        hidden_states, qkvz_weight, ba_weight, False
++    )
++
++    atol = rtol = precision[qkvz.dtype]
++    torch.testing.assert_close(qkvz, qkvz_ref, atol=atol, rtol=rtol)
++    torch.testing.assert_close(ba, ba_ref, atol=atol, rtol=rtol)
++
++
++def test_fused_qkvzba_split_reshape_cat():
++    mixed_qkvz = torch.rand(1024, 12288, dtype=torch.bfloat16)
++    mixed_ba = torch.rand(1024, 64, dtype=torch.bfloat16)
++    head_k_dim = 128
++    head_v_dim = 128
++    num_v_heads = 32
++    num_k_heads = 16
++    attn_tp_size = 1
++    mixed_qkv_ref, z_ref, b_ref, a_ref = fix_query_key_value_ordering_reshape_cat(
++        mixed_qkvz,
++        mixed_ba,
++        num_k_heads,
++        num_v_heads,
++        attn_tp_size,
++        head_k_dim,
++        head_v_dim,
++    )
++    num_heads_qk = num_k_heads // attn_tp_size
++    num_heads_v = num_v_heads // attn_tp_size
++    mixed_qkv, z, b, a = torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
++        mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_k_dim, head_v_dim
++    )
++    atol = rtol = precision[mixed_qkv.dtype]
++    torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
++    torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
++    torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
++    torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
++
++
++def test_fused_qkvzba_split_reshape_cat_contiguous():
++    mixed_qkvz = torch.rand(1, 12288, dtype=torch.bfloat16)
++    mixed_ba = torch.rand(1, 64, dtype=torch.bfloat16)
++    head_k_dim = 128
++    head_v_dim = 128
++    num_v_heads = 32
++    num_k_heads = 16
++    attn_tp_size = 1
++    key_dim = head_k_dim * num_k_heads
++    value_dim = head_v_dim * num_v_heads
++    mixed_qkv_ref, z_ref, b_ref, a_ref = (
++        fix_query_key_value_ordering_reshape_cat_contiguous(
+             mixed_qkvz,
+             mixed_ba,
+-            num_k_heads,
++            key_dim,
++            value_dim,
+             num_v_heads,
+-            attn_tp_size,
+-            head_k_dim,
+             head_v_dim,
++            attn_tp_size,
+         )
+-        num_heads_qk = num_k_heads // attn_tp_size
+-        num_heads_v = num_v_heads // attn_tp_size
+-        mixed_qkv, z, b, a = torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
++    )
++    num_heads_qk = num_k_heads // attn_tp_size
++    num_heads_v = num_v_heads // attn_tp_size
++    mixed_qkv, z, b, a = (
++        torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
+             mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_k_dim, head_v_dim
+         )
+-        atol = rtol = precision[mixed_qkv.dtype]
+-        torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
+-        torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
+-        torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
+-        torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
+-
+-    def test_fused_qkvzba_split_reshape_cat_contiguous(self):
+-        mixed_qkvz = torch.rand(1, 12288, dtype=torch.bfloat16)
+-        mixed_ba = torch.rand(1, 64, dtype=torch.bfloat16)
+-        head_k_dim = 128
+-        head_v_dim = 128
+-        num_v_heads = 32
+-        num_k_heads = 16
+-        attn_tp_size = 1
+-        key_dim = head_k_dim * num_k_heads
+-        value_dim = head_v_dim * num_v_heads
+-        mixed_qkv_ref, z_ref, b_ref, a_ref = (
+-            fix_query_key_value_ordering_reshape_cat_contiguous(
+-                mixed_qkvz,
+-                mixed_ba,
+-                key_dim,
+-                value_dim,
+-                num_v_heads,
+-                head_v_dim,
+-                attn_tp_size,
+-            )
+-        )
+-        num_heads_qk = num_k_heads // attn_tp_size
+-        num_heads_v = num_v_heads // attn_tp_size
+-        mixed_qkv, z, b, a = (
+-            torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
+-                mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_k_dim, head_v_dim
+-            )
+-        )
+-        atol = rtol = precision[mixed_qkv.dtype]
+-        torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
+-        torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
+-        torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
+-        torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
++    )
++    atol = rtol = precision[mixed_qkv.dtype]
++    torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
++    torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
++    torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
++    torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
+ 
+ 
+ if __name__ == "__main__":
+-    unittest.main()
++    sys.exit(pytest.main([__file__]))

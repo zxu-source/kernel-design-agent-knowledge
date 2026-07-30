@@ -1,0 +1,309 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 9c47af75de79..82a0ffe15a13 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -2152,9 +2152,10 @@ def select_experts(
+                 **_fused_topk_kwargs,
+             )
+     else:
+-        assert (
+-            num_token_non_padded is None
+-        ), "num_token_non_padded is not yet supported in custom_routing_function"
++        # custom_routing_function itself is padding-unaware; its output on
++        # padded rows is garbage. That is fine because _post_process_topk_ids
++        # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
++        # weights on HIP) after the logical->physical remap.
+         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+         topk_weights, topk_ids = custom_routing_function(
+             hidden_states=hidden_states,
+diff --git a/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py b/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py
+index 7216b7156fbf..338dae157218 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py
++++ b/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py
+@@ -789,6 +789,8 @@ def build_prefill_registry(
+     embed_dtype: Optional[torch.dtype] = None,
+     enable_mamba_track: bool = False,
+     enable_num_token_non_padded: bool = False,
++    require_gathered_buffer: bool = False,
++    enable_prefill_cp: bool = False,
+     register_input_embeds: bool = True,
+     share_pool: bool = True,
+     source: Optional[Any] = None,
+@@ -878,12 +880,32 @@ def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
+         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
+         slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
+     if enable_num_token_non_padded:
++        from sglang.srt.model_executor.forward_batch_info import (
++            compute_local_num_token_non_padded_cpu,
++        )
++
++        def _prefill_num_token_non_padded_post_fill(buf, fb, ctx):
++            # The FB tensor was attn-TP-localized against the RAW length, but
++            # replay pads rows up to the capture bucket, moving the shard
++            # boundary — copying it verbatim would make the in-graph pad mask
++            # blank real tokens whenever raw < bucket. Recompute the local
++            # count against the padded bucket from the batch's un-adjusted
++            # global count, mirroring the decode registry's post_fill.
++            if require_gathered_buffer and not enable_prefill_cp:
++                buf.fill_(
++                    compute_local_num_token_non_padded_cpu(
++                        global_num_token_non_padded=fb.num_token_non_padded_cpu,
++                        num_tokens_per_dp=ctx.padded_num_tokens,
++                    )
++                )
++
+         slots.append(
+             GraphSlot(
+                 "num_token_non_padded",
+                 lambda _bs2, _mt: (1,),
+                 torch.int32,
+                 axis="none",
++                post_fill=_prefill_num_token_non_padded_post_fill,
+             )
+         )
+ 
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index d3c884fbf871..58ccdebf27c8 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -218,6 +218,13 @@ def __lt__(self, other):
+         return self.value < other.value
+ 
+ 
++def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
++    """(tokens_per_rank, rank_offset) of this attn-TP rank's contiguous shard."""
++    parallel = get_parallel()
++    tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
++    return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
++
++
+ def compute_local_num_token_non_padded(
+     global_num_token_non_padded: torch.Tensor,
+     num_tokens_per_dp: int,
+@@ -227,17 +234,29 @@ def compute_local_num_token_non_padded(
+     Converts a global count (across all TP ranks) to a local count for this rank.
+     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
+     """
+-    attn_tp_rank = get_parallel().attn_tp_rank
+-    attn_tp_size = get_parallel().attn_tp_size
+-    tokens_per_rank = num_tokens_per_dp // attn_tp_size
+-
++    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
+     return torch.clamp(
+-        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
++        global_num_token_non_padded - rank_offset,
+         0,
+         tokens_per_rank,
+     )
+ 
+ 
++def compute_local_num_token_non_padded_cpu(
++    global_num_token_non_padded: int,
++    num_tokens_per_dp: int,
++) -> int:
++    """Int-scalar twin of ``compute_local_num_token_non_padded``.
++
++    Replay-time hooks hold the global count as a host int
++    (``num_token_non_padded_cpu``) and write the localized result into a
++    device buffer; keeping the math on ints lets them use ``Tensor.fill_``
++    instead of staging a CPU tensor through a host-to-device copy per replay.
++    """
++    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
++    return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
++
++
+ @dataclass
+ class DSV4OutCacheLoc:
+     """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
+diff --git a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+index aa07a2754dab..6523f7a0226c 100644
+--- a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+@@ -47,6 +47,7 @@
+ import tqdm
+ 
+ from sglang.srt.distributed.parallel_state import graph_capture
++from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+ from sglang.srt.layers.dp_attention import (
+     DpPaddingMode,
+     set_dp_buffer_len,
+@@ -54,6 +55,7 @@
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
++from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+     CudaGraphBufferRegistry,
+     build_prefill_registry,
+@@ -232,6 +234,10 @@ def __init__(self, model_runner: ModelRunner):
+             embed_dtype=self.model_runner.dtype,
+             enable_mamba_track=self.mamba_track_enabled,
+             enable_num_token_non_padded=enable_num_token_non_padded(),
++            require_gathered_buffer=require_gathered_buffer(model_runner.server_args),
++            enable_prefill_cp=(
++                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
++            ),
+             source=self.buffers,
+         )
+ 
+diff --git a/test/registered/moe/test_topk_padded_region.py b/test/registered/moe/test_topk_padded_region.py
+index 616802cf6240..3dc446825ca8 100644
+--- a/test/registered/moe/test_topk_padded_region.py
++++ b/test/registered/moe/test_topk_padded_region.py
+@@ -190,5 +190,63 @@ def test_flag_skips_masking(self):
+             topk_mod._skip_hip_pad_mask = orig
+ 
+ 
++@unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")
++@unittest.skipIf(_IS_HIP, "HIP keeps the pre-mask routing contract (AITER/MORI)")
++class TestSelectExpertsCustomRoutingPadMask(CustomTestCase):
++    """``select_experts`` must accept ``num_token_non_padded`` together with a
++    ``custom_routing_function`` and mask the padded region to -1.
++
++    Bug regression (EP MoE dispatch overflow): DP-attention/SP pad rows
++    carry garbage router input; a custom routing function can emit the same
++    expert id in every top-k slot for them (the masked argmax degenerates on
++    non-finite scores), which overflows an EP dispatch pool's
++    min(top_k, experts_per_rank) distinct-ids sizing bound. The fix routes
++    padded-region masking through the shared post-process; previously this
++    combination was rejected with ``assert num_token_non_padded is None``,
++    so no model with a custom router could mask its pad rows at all.
++    """
++
++    DEVICE = "cuda"
++
++    def test_padded_tail_masked_after_custom_routing(self):
++        from sglang.srt.layers.moe.topk import select_experts
++
++        num_tokens, num_experts, top_k, n_valid = 12, 32, 8, 10
++        hidden = torch.randn((num_tokens, 64), device=self.DEVICE, dtype=torch.bfloat16)
++        router_logits = torch.randn(
++            (num_tokens, num_experts), device=self.DEVICE, dtype=torch.float32
++        )
++        # Pad rows carry non-finite router input, like real DP-pad rows.
++        router_logits[n_valid:] = float("nan")
++
++        def _degenerate_router(hidden_states, gating_output, topk, renormalize):
++            # Mimic the incident: NaN rows collapse to one expert id x top_k.
++            weights = torch.softmax(gating_output.nan_to_num(0.0), dim=-1).topk(
++                topk, dim=-1
++            )
++            ids = weights.indices.to(torch.int32)
++            ids[gating_output.isnan().any(dim=-1)] = 7
++            return weights.values.float(), ids
++
++        out = select_experts(
++            hidden_states=hidden,
++            router_logits=router_logits,
++            topk_config=TopKConfig(
++                top_k=top_k,
++                renormalize=True,
++                custom_routing_function=_degenerate_router,
++            ),
++            layer_id=0,
++            num_token_non_padded=torch.tensor(
++                n_valid, device=self.DEVICE, dtype=torch.int32
++            ),
++        )
++        # Padded tail fully -1 (skipped by every EP dispatch path)...
++        self.assertTrue(torch.all(out.topk_ids[n_valid:] == -1))
++        # ...and real rows untouched (in-range, no -1 leakage).
++        self.assertTrue(torch.all(out.topk_ids[:n_valid] >= 0))
++        self.assertTrue(torch.all(out.topk_ids[:n_valid] < num_experts))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py b/test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py
+index 18d964f41541..3ef7f5a10720 100644
+--- a/test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py
++++ b/test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py
+@@ -45,6 +45,7 @@ class _MiniForwardBatch:
+     encoder_lens: Optional[torch.Tensor] = None
+     mrope_positions: Optional[torch.Tensor] = None
+     num_token_non_padded: Optional[torch.Tensor] = None
++    num_token_non_padded_cpu: Optional[int] = None
+     global_num_tokens_gpu: Optional[torch.Tensor] = None
+     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+     ngram_embedding_info: Optional[object] = None
+@@ -1248,6 +1249,80 @@ def test_register_input_embeds_false_keeps_mrope_carries_embeds(self):
+         self.assertIs(fb_view.input_embeds, embeds)
+ 
+ 
++class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
++    """The prefill registry must re-derive the attn-TP-local pad boundary from
++    the CAPTURE BUCKET, not trust the FB tensor.
++
++    Bug regression: breakable-graph replay pads ``raw`` tokens up to the
++    capture bucket, moving the attn-TP shard boundary to ``bucket/attn_tp``
++    rows — but the FB ``num_token_non_padded`` tensor was localized against
++    the RAW length on the eager prep path. Copying it verbatim made every
++    ``raw < bucket`` replay mask the last ``(bucket - raw)/attn_tp`` shard
++    rows of attn-TP rank 0 — REAL tokens — zeroing their MoE output
++    in-graph. The slot's post_fill must instead recompute the local count
++    against ``ctx.padded_num_tokens`` from the batch's un-adjusted global
++    count (``num_token_non_padded_cpu``), exactly like the decode registry's
++    post_fill does.
++    """
++
++    def _fill(self, *, attn_tp_rank, attn_tp_size, require_gathered_buffer=True):
++        from unittest import mock
++
++        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
++            build_prefill_registry,
++        )
++
++        reg = build_prefill_registry(
++            device=torch.device("cpu"),
++            max_bs=4,
++            max_num_token=2048,
++            cache_loc_dtype=torch.int64,
++            enable_num_token_non_padded=True,
++            require_gathered_buffer=require_gathered_buffer,
++        )
++        # FB tensor carries the RAW-length-localized (stale) value; the CPU
++        # field carries the un-adjusted global count.
++        fb = _MiniForwardBatch(
++            batch_size=1,
++            num_token_non_padded=torch.tensor([509], dtype=torch.int32),
++            num_token_non_padded_cpu=1018,
++        )
++        with mock.patch(
++            "sglang.srt.model_executor.forward_batch_info.get_parallel",
++            return_value=SimpleNamespace(
++                attn_tp_rank=attn_tp_rank, attn_tp_size=attn_tp_size
++            ),
++        ):
++            reg.fill_from(
++                fb,
++                raw_bs=1,
++                padded_bs=1,
++                raw_num_tokens=1018,
++                padded_num_tokens=1024,
++            )
++        return int(reg.get_slot("num_token_non_padded").buffer.item())
++
++    def test_rank0_uses_bucket_shard_not_raw_localized_value(self):
++        # bucket 1024 / attn_tp 2 -> 512-row shards. Rank 0's shard is fully
++        # real (global rows [0, 512)); the raw-localized FB value (509) would
++        # mask 3 real rows.
++        self.assertEqual(self._fill(attn_tp_rank=0, attn_tp_size=2), 512)
++
++    def test_rank1_masks_exactly_the_true_pads(self):
++        # Rank 1's shard holds global rows [512, 1024): 506 real + 6 bucket
++        # pads. local = clamp(1018 - 512, 0, 512).
++        self.assertEqual(self._fill(attn_tp_rank=1, attn_tp_size=2), 506)
++
++    def test_non_gathered_keeps_plain_fb_copy(self):
++        # Without a gathered buffer there is no attn-TP scatter; the plain FB
++        # copy must be preserved (post_fill no-op), mirroring the decode
++        # registry's contract.
++        self.assertEqual(
++            self._fill(attn_tp_rank=0, attn_tp_size=2, require_gathered_buffer=False),
++            509,
++        )
++
++
+ class TestFillOncePolicy(unittest.TestCase):
+     """FILL_ONCE initializes the whole buffer at alloc and never resets the
+     padded tail per iter (unlike FILL_SENTINEL)."""

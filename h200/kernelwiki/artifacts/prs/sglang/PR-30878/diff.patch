@@ -1,0 +1,135 @@
+diff --git a/python/sglang/srt/layers/attention/vision.py b/python/sglang/srt/layers/attention/vision.py
+index 526a85aa490e..4970251ae8e8 100644
+--- a/python/sglang/srt/layers/attention/vision.py
++++ b/python/sglang/srt/layers/attention/vision.py
+@@ -458,8 +458,19 @@ def forward(
+         else:
+             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+-            max_seqlen = seq_lens.max().item()
++            # Some vision encoders precompute this scalar once per encoder
++            # forward and share it across all of their attention blocks.  Use
++            # that value when available: deriving it here requires a
++            # GPU-to-host sync, so repeating it per block serializes the ViT
++            # launch stream for variable-size images.
++            max_seqlen = kwargs.get("max_seqlen")
++            if max_seqlen is None:
++                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
++                max_seqlen = int(seq_lens.max().item())
++            elif isinstance(max_seqlen, torch.Tensor):
++                max_seqlen = int(max_seqlen.item())
++            else:
++                max_seqlen = int(max_seqlen)
+ 
+             fa_kwargs = dict(
+                 cu_seqlens_q=cu_seqlens,
+diff --git a/python/sglang/srt/models/kimi_k25.py b/python/sglang/srt/models/kimi_k25.py
+index 022d1aee2893..60f0f5fd095a 100644
+--- a/python/sglang/srt/models/kimi_k25.py
++++ b/python/sglang/srt/models/kimi_k25.py
+@@ -150,6 +150,7 @@ def forward(
+             hidden_states,
+             cu_seqlens=cu_seqlens,
+             position_embeddings=rope_freqs_cis,
++            max_seqlen=max_seqlen,
+         )
+ 
+         hidden_states = residual + hidden_states
+@@ -469,7 +470,10 @@ def forward(
+             )
+         )
+ 
+-        max_seqlen = lengths.max()
++        # FlashAttention needs a host integer.  Compute it once per MoonViT
++        # forward and pass it to every encoder block instead of synchronizing
++        # once per block inside the attention backend.
++        max_seqlen = int(lengths.max().item())
+         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
+ 
+         for block in self.blocks:
+diff --git a/test/registered/unit/layers/attention/test_vision_max_seqlen.py b/test/registered/unit/layers/attention/test_vision_max_seqlen.py
+new file mode 100644
+index 000000000000..80e020e59041
+--- /dev/null
++++ b/test/registered/unit/layers/attention/test_vision_max_seqlen.py
+@@ -0,0 +1,79 @@
++import sys
++
++import torch
++from torch import nn
++
++from sglang.srt.layers.attention import vision
++from sglang.srt.models.kimi_k25 import MoonViTEncoderLayer
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=1, suite="base-a-test-cpu")
++
++
++def test_vision_flash3_uses_precomputed_max_seqlen(monkeypatch):
++    """A vision encoder can provide one host max-seqlen for all its blocks."""
++
++    recorded = {}
++
++    def fake_flash_attn(q, k, v, **kwargs):
++        recorded.update(kwargs)
++        return q
++
++    monkeypatch.setattr(vision, "_is_cuda", True)
++    # This symbol is imported only on CUDA/MUSA hosts; inject the stub on the
++    # CPU CI path too so the backend-selection behavior stays unit-testable.
++    monkeypatch.setattr(
++        vision, "flash_attn_varlen_func", fake_flash_attn, raising=False
++    )
++
++    attention = vision.VisionFlash3Attention(use_data_parallel=True)
++    q = torch.zeros(3, 1, 8)
++    cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int32)
++    output = attention(
++        q,
++        q,
++        q,
++        cu_seqlens=cu_seqlens,
++        bsz=1,
++        seq_len=3,
++        max_seqlen=17,
++    )
++
++    assert output is q
++    assert recorded["max_seqlen_q"] == 17
++    assert recorded["max_seqlen_k"] == 17
++
++
++def test_kimi_moonvit_forwards_one_precomputed_max_seqlen():
++    """MoonViT must share its encoder-level scalar with each attention block."""
++
++    recorded = {}
++
++    class CapturingAttention(nn.Module):
++        def forward(self, hidden_states, **kwargs):
++            recorded.update(kwargs)
++            return hidden_states
++
++    layer = MoonViTEncoderLayer.__new__(MoonViTEncoderLayer)
++    nn.Module.__init__(layer)
++    layer.norm0 = nn.Identity()
++    layer.norm1 = nn.Identity()
++    layer.attn = CapturingAttention()
++    layer.mlp = nn.Identity()
++
++    hidden_states = torch.ones(3, 4)
++    output = layer(
++        hidden_states,
++        cu_seqlens=torch.tensor([0, 3], dtype=torch.int32),
++        max_seqlen=19,
++        rope_freqs_cis=torch.ones(3, 2, dtype=torch.complex64),
++    )
++
++    assert torch.equal(output, hidden_states * 4)
++    assert recorded["max_seqlen"] == 19
++
++
++if __name__ == "__main__":
++    import pytest
++
++    sys.exit(pytest.main([__file__, "-v"]))

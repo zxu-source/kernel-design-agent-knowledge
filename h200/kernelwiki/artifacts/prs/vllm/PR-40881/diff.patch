@@ -1,0 +1,627 @@
+diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
+index 8503a0a59e97..33ff55a64e66 100644
+--- a/vllm/distributed/device_communicators/all2all.py
++++ b/vllm/distributed/device_communicators/all2all.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import threading
++from dataclasses import dataclass
+ from typing import Any
+ 
+ import torch
+@@ -324,15 +325,21 @@ def max_sms_used(self) -> int | None:
+         return 0
+ 
+ 
++@dataclass
++class _NixlEPBufferState:
++    buffer: Any
++    connected_ep_size: int
++    active_ep_size: int
++
++
+ class NixlEPAll2AllManager(All2AllManagerBase):
+     """
+     All2All communication based on NIXL EP kernels.
+     This backend supports elastic EP with dynamic rank connection/disconnection.
+     """
+ 
+-    # (nixl_ep_buffer, ep_size)
+-    _buffer: tuple[Any, int] | None = None
+-    _lock = threading.Lock()
++    _buffer: _NixlEPBufferState | None = None
++    _lock = threading.RLock()
+ 
+     def __init__(self, cpu_group, tcp_store_group=None):
+         assert tcp_store_group is not None
+@@ -367,47 +374,103 @@ def _init_buffer(
+             num_experts_per_rank=num_experts_per_rank,
+             num_rdma_bytes=num_rdma_bytes,
+         )
+-        ranks_to_connect = list(range(self.cpu_group.size()))
++        ranks_to_connect = list(range(self.world_size))
+         buffer.connect_ranks(ranks_to_connect)
+-        NixlEPAll2AllManager._buffer = (buffer, self.cpu_group.size())
++        NixlEPAll2AllManager._buffer = _NixlEPBufferState(
++            buffer=buffer,
++            connected_ep_size=self.world_size,
++            active_ep_size=self.world_size,
++        )
++
++    def _connect_to_ep_size(self, ep_size: int, *, make_active: bool) -> None:
++        assert NixlEPAll2AllManager._buffer is not None
++        state = NixlEPAll2AllManager._buffer
++        if ep_size <= state.connected_ep_size:
++            return
++
++        state.buffer.set_tcp_store_group(self.tcp_store_group.store)
++        ranks_to_connect = list(range(state.connected_ep_size, ep_size))
++        state.buffer.connect_ranks(ranks_to_connect, activate=make_active)
++        state.connected_ep_size = ep_size
++        if make_active:
++            state.active_ep_size = ep_size
++
++    def _disconnect_to_ep_size(self, ep_size: int) -> None:
++        assert NixlEPAll2AllManager._buffer is not None
++        state = NixlEPAll2AllManager._buffer
++        if ep_size >= state.connected_ep_size:
++            return
++
++        state.buffer.set_tcp_store_group(self.tcp_store_group.store)
++        ranks_to_disconnect = list(range(ep_size, state.connected_ep_size))
++        state.buffer.disconnect_ranks(ranks_to_disconnect)
++        state.connected_ep_size = ep_size
++        state.active_ep_size = min(state.active_ep_size, ep_size)
++
++    def _unmask_connected_ranks(self, target_ep_size: int) -> None:
++        assert NixlEPAll2AllManager._buffer is not None
++        state = NixlEPAll2AllManager._buffer
++        state.buffer.set_tcp_store_group(self.tcp_store_group.store)
++        if target_ep_size <= state.active_ep_size:
++            return
++        assert state.connected_ep_size >= target_ep_size
++
++        for rank in range(state.active_ep_size, target_ep_size):
++            state.buffer.update_mask_buffer(rank, mask=False)
++        state.active_ep_size = target_ep_size
+ 
+-    def _update_buffer(self):
++    def _stage_ep_size(self) -> None:
+         assert NixlEPAll2AllManager._buffer is not None
+-        buffer, current_ep_size = NixlEPAll2AllManager._buffer
+-        current_ranks = list(range(current_ep_size))
+-        new_ep_size = self.cpu_group.size()
+-        buffer.set_tcp_store_group(self.tcp_store_group.store)
+-        if new_ep_size > len(current_ranks):
+-            ranks_to_connect = list(range(len(current_ranks), new_ep_size))
+-            buffer.connect_ranks(ranks_to_connect)
++        state = NixlEPAll2AllManager._buffer
++        target_ep_size = self.world_size
++
++        # Scale-up can safely connect standby ranks while leaving them masked.
++        # Scale-down must not disconnect active ranks until commit.
++        if target_ep_size > state.connected_ep_size:
++            self._connect_to_ep_size(target_ep_size, make_active=False)
++
++    def commit_staged_state(self) -> None:
++        """Commit staged NIXL EP state to the active communication set."""
++        with NixlEPAll2AllManager._lock:
++            assert NixlEPAll2AllManager._buffer is not None
++            state = NixlEPAll2AllManager._buffer
++            target_ep_size = self.world_size
++
++            if target_ep_size < state.connected_ep_size:
++                self._disconnect_to_ep_size(target_ep_size)
++            elif target_ep_size > state.connected_ep_size:
++                self._connect_to_ep_size(target_ep_size, make_active=True)
++
++            self._unmask_connected_ranks(target_ep_size)
++
++    def _ensure_ep_size(self, *, stage: bool) -> None:
++        if stage:
++            self._stage_ep_size()
+         else:
+-            ranks_to_disconnect = current_ranks[new_ep_size:]
+-            buffer.disconnect_ranks(ranks_to_disconnect)
+-        NixlEPAll2AllManager._buffer = (buffer, new_ep_size)
++            self.commit_staged_state()
+ 
+     def get_handle(self, kwargs):
+         with NixlEPAll2AllManager._lock:
+-            if (
+-                NixlEPAll2AllManager._buffer is not None
+-                and NixlEPAll2AllManager._buffer[1] == self.cpu_group.size()
+-            ):
+-                return NixlEPAll2AllManager._buffer[0]
+-
+-            num_experts_per_rank = (
+-                kwargs["num_global_experts"] // kwargs["num_ep_ranks"]
+-            )
+-            nixl_kwargs = dict(
+-                max_num_tokens_per_dp_rank=kwargs["max_num_tokens_per_dp_rank"],
+-                token_hidden_size=kwargs["token_hidden_size"],
+-                num_experts_per_rank=num_experts_per_rank,
+-            )
+-            if NixlEPAll2AllManager._buffer is None:
+-                self._init_buffer(**nixl_kwargs)
++            stage = bool(kwargs.get("stage", False))
++            state = NixlEPAll2AllManager._buffer
++            if state is None:
++                assert not stage, (
++                    "NIXL EP staged initialization requires an existing buffer"
++                )
++                max_num_tokens_per_dp_rank = kwargs["max_num_tokens_per_dp_rank"]
++                num_experts_per_rank = (
++                    kwargs["num_global_experts"] // kwargs["num_ep_ranks"]
++                )
++                self._init_buffer(
++                    max_num_tokens_per_dp_rank=max_num_tokens_per_dp_rank,
++                    token_hidden_size=kwargs["token_hidden_size"],
++                    num_experts_per_rank=num_experts_per_rank,
++                )
+             else:
+-                self._update_buffer()
++                self._ensure_ep_size(stage=stage)
+ 
+             assert NixlEPAll2AllManager._buffer is not None
+-            handle = NixlEPAll2AllManager._buffer[0]
++            handle = NixlEPAll2AllManager._buffer.buffer
+             return handle
+ 
+     def dispatch(
+@@ -432,7 +495,7 @@ def destroy(self):
+         # NOTE(yongji): NIXLEPAll2AllManager instance is recreated during
+         # scale-up/down, so we cannot destroy the persistent buffer here.
+         assert NixlEPAll2AllManager._buffer is not None
+-        buffer = NixlEPAll2AllManager._buffer[0]
++        buffer = NixlEPAll2AllManager._buffer.buffer
+         buffer.set_tcp_store_group(None)
+ 
+     # NIXL EP uses RDMA so no SMs are used for communication
+diff --git a/vllm/distributed/elastic_ep/elastic_execute.py b/vllm/distributed/elastic_ep/elastic_execute.py
+index 163cec47e4dd..2cd6decb3a58 100644
+--- a/vllm/distributed/elastic_ep/elastic_execute.py
++++ b/vllm/distributed/elastic_ep/elastic_execute.py
+@@ -4,6 +4,8 @@
+ import gc
+ import weakref
+ from collections.abc import Iterable, Sequence
++from dataclasses import replace
++from typing import TYPE_CHECKING
+ 
+ import torch
+ import torch.nn as nn
+@@ -37,7 +39,10 @@
+ )
+ from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
+ from vllm.logger import init_logger
+-from vllm.model_executor.layers.fused_moe.layer import FusedMoEParallelConfig
++from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
++from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
++    make_eep_staged_quant_method,
++)
+ from vllm.utils import is_moe_layer
+ from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
+ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+@@ -45,6 +50,11 @@
+ 
+ logger = init_logger(__name__)
+ 
++if TYPE_CHECKING:
++    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
++        FusedMoEMethodBase,
++    )
++
+ 
+ def batch_transfer_weights(
+     model: nn.Module,
+@@ -134,6 +144,7 @@ class ElasticEPScalingExecutor:
+     def __init__(self, worker):
+         self.worker_ref = weakref.ref(worker)
+         self.reconfig_request = None
++        self._staged_moe_quant_methods: dict[nn.Module, FusedMoEMethodBase] = {}
+ 
+     @property
+     def worker(self):
+@@ -196,6 +207,8 @@ def create_standby_groups(
+             )
+         if new_dp_size > old_dp_size:
+             self._set_eplb_suppressed(True)
++        elif new_dp_size < old_dp_size:
++            self._stage_standby_moe_quant_methods()
+ 
+     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
+         standby_dp_group = get_standby_dp_group()
+@@ -262,6 +275,58 @@ def broadcast_expert_mapping(self) -> None:
+             src_rank=0,
+             device=self.worker.device,
+         )
++        # New workers enter load_model after receiving the expert mapping.
++        # Stage replacement MoE kernels before returning to the state machine
++        # so existing ranks can participate in collective EP comm creation.
++        self._stage_standby_moe_quant_methods()
++
++    def _make_eep_moe_config(self, module, dp_group, ep_group):
++        parallel_config = self.worker.vllm_config.parallel_config
++        tp_size = get_tp_group().world_size
++        sp_size = tp_size if parallel_config.use_sequence_parallel_moe else 1
++        moe_parallel_config = FusedMoEParallelConfig.make(
++            tp_size_=tp_size,
++            pcp_size_=get_pcp_group().world_size,
++            dp_size_=dp_group.world_size,
++            sp_size_=sp_size,
++            vllm_parallel_config=parallel_config,
++        )
++        return replace(
++            module.moe_config,
++            num_experts=module.moe_config.num_local_experts * ep_group.world_size,
++            moe_parallel_config=moe_parallel_config,
++        )
++
++    def _stage_standby_moe_quant_methods(self) -> None:
++        standby_dp_group = get_standby_dp_group()
++        standby_ep_group = get_standby_ep_group()
++        model = self.worker.model_runner.get_model()
++        moe_modules = [module for module in model.modules() if is_moe_layer(module)]
++        self._staged_moe_quant_methods.clear()
++        with set_current_vllm_config(self.worker.vllm_config):
++            for module in moe_modules:
++                staged_quant_method = make_eep_staged_quant_method(
++                    module,
++                    self._make_eep_moe_config(
++                        module,
++                        standby_dp_group,
++                        standby_ep_group,
++                    ),
++                )
++                if staged_quant_method is not None:
++                    self._staged_moe_quant_methods[module] = staged_quant_method
++
++    def _commit_staged_moe_quant_methods(self) -> None:
++        model = self.worker.model_runner.get_model()
++        moe_modules = [module for module in model.modules() if is_moe_layer(module)]
++        for module in moe_modules:
++            staged_quant_method = self._staged_moe_quant_methods.pop(module, None)
++            if staged_quant_method is None:
++                continue
++            assert staged_quant_method.moe_kernel is not None
++            module._replace_quant_method(staged_quant_method)
++            staged_quant_method.moe_kernel.prepare_finalize.on_commit()
++        self._staged_moe_quant_methods.clear()
+ 
+     def _release_cuda_graphs(self) -> None:
+         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
+@@ -327,19 +392,13 @@ def switch_and_prepare(self) -> None:
+             module.moe_config.num_local_experts == num_local_experts
+             for module in moe_modules
+         ), "All MoE modules must have the same number of experts"
++        dp_group = get_dp_group()
++        ep_group = get_ep_group()
+         for module in moe_modules:
+-            module.moe_config.num_experts = num_local_experts * new_ep_size
++            new_moe_config = self._make_eep_moe_config(module, dp_group, ep_group)
++            module.moe_config.num_experts = new_moe_config.num_experts
+             module.global_num_experts = module.moe_config.num_experts
+-            tp_size = get_tp_group().world_size
+-            is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+-            sp_size = tp_size if is_sequence_parallel else 1
+-            module.moe_parallel_config = FusedMoEParallelConfig.make(
+-                tp_size_=tp_size,
+-                pcp_size_=get_pcp_group().world_size,
+-                dp_size_=get_dp_group().world_size,
+-                sp_size_=sp_size,
+-                vllm_parallel_config=parallel_config,
+-            )
++            module.moe_parallel_config = new_moe_config.moe_parallel_config
+             module.moe_config.moe_parallel_config = module.moe_parallel_config
+ 
+         # Update EPLB state
+@@ -404,10 +463,10 @@ def switch_and_prepare(self) -> None:
+                 num_physical_experts=num_physical_experts,
+                 num_local_physical_experts=num_local_experts,
+             )
+-            # Force re-creation of the modular kernel (and all2all manager)
+-            # for the new EP size by resetting quant_method to base
++            self._commit_staged_moe_quant_methods()
++            # Legacy modular methods need to be recreated for the new EP size.
+             for module in moe_modules:
+-                if hasattr(module.quant_method, "old_quant_method"):
++                if getattr(module.quant_method, "wraps_legacy_quant_method", False):
+                     module._replace_quant_method(module.quant_method.old_quant_method)
+             prepare_communication_buffer_for_model(self.worker.model_runner.model)
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/all2all_utils.py b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+index 2a6f0c71d936..6d4822146437 100644
+--- a/vllm/model_executor/layers/fused_moe/all2all_utils.py
++++ b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+@@ -49,6 +49,22 @@
+         )
+ 
+ 
++def _get_ep_all2all_manager(eep_stage: bool = False) -> Any:
++    if eep_stage:
++        from vllm.distributed.elastic_ep.standby_state import get_standby_ep_group
++
++        ep_group = get_standby_ep_group()
++        assert ep_group is not None
++        device_communicator = ep_group.device_communicator
++    else:
++        device_communicator = get_ep_group().device_communicator
++
++    assert device_communicator is not None
++    all2all_manager = device_communicator.all2all_manager
++    assert all2all_manager is not None
++    return all2all_manager
++
++
+ def maybe_roundup_layer_hidden_size(
+     hidden_size: int,
+     act_dtype: torch.dtype,
+@@ -92,6 +108,7 @@ def maybe_make_prepare_finalize(
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+     allow_new_interface: bool = False,
+     use_monolithic: bool = False,
++    eep_stage: bool = False,
+ ) -> FusedMoEPrepareAndFinalize | None:
+     # NOTE(rob): we are migrating each quant_method to hold the MK
+     # in all cases. The allow_new_interface=False flag allow us to fall
+@@ -117,21 +134,16 @@ def maybe_make_prepare_finalize(
+                 "Detected DP deployment with no --enable-expert-parallel. "
+                 "Falling back to AllGather+ReduceScatter dispatch/combine."
+             )
+-            device_communicator = get_ep_group().device_communicator
+-            assert device_communicator is not None
+-            assert device_communicator.all2all_manager is not None
++            all2all_manager = _get_ep_all2all_manager(eep_stage)
+             return make_moe_prepare_and_finalize_naive_dp_ep(
+                 is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
+-                num_dispatchers=(device_communicator.all2all_manager.world_size),
++                num_dispatchers=all2all_manager.world_size,
+                 use_monolithic=use_monolithic,
+             )
+         else:
+             return make_moe_prepare_and_finalize_no_dp_ep(use_monolithic)
+ 
+-    device_communicator = get_ep_group().device_communicator
+-    assert device_communicator is not None
+-    all2all_manager = device_communicator.all2all_manager
+-    assert all2all_manager is not None
++    all2all_manager = _get_ep_all2all_manager(eep_stage)
+ 
+     prepare_finalize: FusedMoEPrepareAndFinalize | None = None
+ 
+@@ -283,6 +295,7 @@ def maybe_make_prepare_finalize(
+             num_ep_ranks=all2all_manager.world_size,
+             num_global_experts=moe.num_experts,
+             num_local_experts=moe.num_experts // all2all_manager.world_size,
++            stage=eep_stage,
+         )
+         handle = all2all_manager.get_handle(all_to_all_args)
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/eep_reconfigure.py b/vllm/model_executor/layers/fused_moe/eep_reconfigure.py
+new file mode 100644
+index 000000000000..6d40c6749f41
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/eep_reconfigure.py
+@@ -0,0 +1,123 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from inspect import signature
++from typing import TYPE_CHECKING, Any
++
++import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.model_executor.layers.fused_moe.all2all_utils import (
++    maybe_make_prepare_finalize,
++)
++from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
++from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
++    FusedMoEMethodBase,
++)
++from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
++    FusedMoEModularMethod,
++)
++from vllm.model_executor.layers.fused_moe.modular_kernel import (
++    FusedMoEExpertsModular,
++    FusedMoEPrepareAndFinalizeModular,
++)
++
++if TYPE_CHECKING:
++    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
++
++
++def _make_eep_experts(
++    quant_method: FusedMoEMethodBase,
++    source_experts: FusedMoEExpertsModular,
++    prepare_finalize: FusedMoEPrepareAndFinalizeModular,
++    moe_config: FusedMoEConfig,
++) -> FusedMoEExpertsModular:
++    experts_cls = source_experts.__class__
++    assert quant_method.moe_quant_config is not None
++    experts_kwargs: dict[str, Any] = {
++        "moe_config": moe_config,
++        "quant_config": quant_method.moe_quant_config,
++    }
++    if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
++        max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
++        assert max_num_tokens is not None
++        experts_kwargs.update(
++            max_num_tokens=max_num_tokens,
++            num_dispatchers=prepare_finalize.num_dispatchers(),
++        )
++
++    # Expert kernels with extra init params need explicit EEP support.
++    generic_arg_names = set(signature(mk.FusedMoEExperts.__init__).parameters)
++    ctor_arg_names = set(signature(experts_cls.__init__).parameters)
++    unsupported_args = ctor_arg_names - generic_arg_names
++    missing_args = set(experts_kwargs) - ctor_arg_names
++    if unsupported_args or missing_args:
++        raise NotImplementedError(
++            f"{experts_cls.__name__} experts do not support Elastic EP."
++        )
++
++    return experts_cls(**experts_kwargs)
++
++
++def make_eep_staged_quant_method(
++    module: "FusedMoE",
++    moe_config: FusedMoEConfig,
++) -> FusedMoEMethodBase | None:
++    quant_method = module.quant_method
++    if not quant_method.supports_internal_mk:
++        return None
++    if getattr(quant_method, "wraps_legacy_quant_method", False):
++        return None
++
++    old_batched_format = (
++        module.moe_config.moe_parallel_config.use_batched_activation_format
++    )
++    new_batched_format = moe_config.moe_parallel_config.use_batched_activation_format
++    assert old_batched_format == new_batched_format
++
++    moe_kernel = quant_method.moe_kernel
++    if moe_kernel is None:
++        return None
++    if moe_kernel.is_monolithic:
++        raise NotImplementedError(
++            "Elastic EP full modular-kernel staging is not supported for "
++            "monolithic fused MoE kernels."
++        )
++    if quant_method.moe_quant_config is None:
++        raise ValueError(
++            "Elastic EP full modular-kernel staging requires initialized "
++            "MoE quant config."
++        )
++
++    prepare_finalize = maybe_make_prepare_finalize(
++        moe_config,
++        quant_method.moe_quant_config,
++        routing_tables=None,
++        allow_new_interface=True,
++        use_monolithic=quant_method.is_monolithic,
++        eep_stage=True,
++    )
++    assert prepare_finalize is not None
++    assert isinstance(prepare_finalize, FusedMoEPrepareAndFinalizeModular)
++
++    source_experts = moe_kernel.fused_experts
++    assert isinstance(source_experts, FusedMoEExpertsModular)
++
++    experts = _make_eep_experts(
++        quant_method,
++        source_experts,
++        prepare_finalize,
++        moe_config,
++    )
++
++    if isinstance(quant_method, FusedMoEModularMethod):
++        base_quant_method = quant_method.old_quant_method
++    else:
++        base_quant_method = quant_method
++
++    return FusedMoEModularMethod(
++        base_quant_method,
++        mk.FusedMoEKernel(
++            prepare_finalize,
++            experts,
++            inplace=moe_kernel.inplace,
++        ),
++    )
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
+index e8300b5f6af2..bbf06df8e472 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
+@@ -31,7 +31,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
+     def __init__(
+         self, old_quant_method: FusedMoEMethodBase, moe_kernel: FusedMoEKernel
+     ):
+-        super().__init__(old_quant_method.moe)
++        super().__init__(moe_kernel.moe_config)
+         self.moe_quant_config = old_quant_method.moe_quant_config
+         self.moe_kernel = moe_kernel
+         self.disable_expert_map = getattr(
+@@ -42,6 +42,10 @@ def __init__(
+         self.old_quant_method = old_quant_method
+         logger.debug("Swapping out %s", self.old_quant_method.__class__.__name__)
+ 
++    @property
++    def wraps_legacy_quant_method(self) -> bool:
++        return not self.old_quant_method.supports_internal_mk
++
+     @staticmethod
+     def make(
+         moe_layer: torch.nn.Module,
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index c222220e31c6..6d9e63278abd 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -246,6 +246,13 @@ def supports_async(self) -> bool:
+         """
+         return False
+ 
++    def on_commit(self) -> None:
++        """
++        Runs after this prepare/finalize has been committed to the active
++        MoE kernel.
++        """
++        return
++
+ 
+ # TODO: pass FusedMoEParallelConfig in as ctor parameter?
+ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
+@@ -1542,6 +1549,12 @@ def can_overlap_shared_experts(self) -> bool:
+         else:
+             return False
+ 
++    @property
++    def inplace(self) -> bool:
++        if isinstance(self.impl, FusedMoEKernelModularImpl):
++            return self.impl.inplace
++        return False
++
+     @property
+     def is_monolithic(self) -> bool:
+         return isinstance(self.impl, FusedMoEKernelMonolithicImpl)
+@@ -1554,6 +1567,10 @@ def prepare_finalize(self) -> FusedMoEPrepareAndFinalize:
+     def fused_experts(self) -> FusedMoEExperts:
+         return self.impl.fused_experts
+ 
++    @property
++    def moe_config(self) -> FusedMoEConfig:
++        return self.fused_experts.moe_config
++
+     def supports_lora(self) -> bool:
+         return self.fused_experts.supports_lora()
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/nixl_ep.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/nixl_ep.py
+index a1068a752427..977d4556f132 100644
+--- a/vllm/model_executor/layers/fused_moe/prepare_finalize/nixl_ep.py
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/nixl_ep.py
+@@ -7,6 +7,8 @@
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm import envs
++from vllm.distributed import get_ep_group
++from vllm.distributed.device_communicators.all2all import NixlEPAll2AllManager
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+@@ -138,6 +140,17 @@ def activation_format(self) -> mk.FusedMoEActivationFormat:
+     def max_num_tokens_per_rank(self) -> int | None:
+         return self.max_tokens_per_rank
+ 
++    def on_commit(self) -> None:
++        device_communicator = get_ep_group().device_communicator
++        assert device_communicator is not None
++        all2all_manager = device_communicator.all2all_manager
++        assert isinstance(all2all_manager, NixlEPAll2AllManager)
++        # maybe_make_prepare_finalize(..., eep_stage=True) initializes self.buffer
++        # with get_handle(..., stage=True), which stages global NIXL state for the
++        # new config but leaves it inactive while the old config remains active.
++        # When EEP commit switches to this P/F, this P/F needs to commit that state.
++        all2all_manager.commit_staged_state()
++
+     def topk_indices_dtype(self) -> torch.dtype | None:
+         return torch.int64
+ 

@@ -1,0 +1,152 @@
+diff --git a/python/sglang/srt/layers/moe/utils.py b/python/sglang/srt/layers/moe/utils.py
+index 67dbe70e3194..3e1c62c4d242 100644
+--- a/python/sglang/srt/layers/moe/utils.py
++++ b/python/sglang/srt/layers/moe/utils.py
+@@ -446,6 +446,12 @@ def should_skip_post_experts_all_reduce(
+       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
+         the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
+         the post-experts TP all-reduce. Not relevant to the EP all-reduce.
++      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
++        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
++        MoE outputs back to the source rank, so any further EP/TP all-reduce
++        would double-count and overflow BF16. Mirrors TRTLLM's
++        ``not enable_alltoall`` gate
++        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
+ 
+     The first two args are layer-context flags from ``LayerCommunicator`` and
+     default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
+@@ -457,6 +463,8 @@ def should_skip_post_experts_all_reduce(
+         return True
+     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+         return True
++    if get_moe_a2a_backend().is_flashinfer():
++        return True
+     return False
+ 
+ 
+diff --git a/sgl-kernel/csrc/moe/moe_topk_softmax_kernels.cu b/sgl-kernel/csrc/moe/moe_topk_softmax_kernels.cu
+index 44cf9b3148c9..c0582eda09b1 100644
+--- a/sgl-kernel/csrc/moe/moe_topk_softmax_kernels.cu
++++ b/sgl-kernel/csrc/moe/moe_topk_softmax_kernels.cu
+@@ -753,6 +753,14 @@ void topk_softmax(
+   const int num_tokens = static_cast<int>(gating_output.size(0));
+   const int topk = static_cast<int>(topk_weights.size(-1));
+ 
++  // No tokens on this DP rank, no need to do anything
++  if (num_tokens == 0) {
++    return;
++  }
++
++  TORCH_CHECK(num_experts > 0, "num_experts must be greater than 0");
++  TORCH_CHECK(topk > 0, "topk must be greater than 0");
++
+   const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
+   const bool needs_workspace = !is_pow_2 || num_experts > 512;
+   const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
+@@ -822,4 +830,7 @@ void topk_softmax(
+   } else {
+     TORCH_CHECK(false, "Unsupported gating_output dtype: ", dtype);
+   }
++
++  auto launch_error = cudaGetLastError();
++  TORCH_CHECK(launch_error == cudaSuccess, "topk_softmax launch error: ", cudaGetErrorString(launch_error));
+ }
+diff --git a/test/registered/moe/test_flashinfer_a2a_cutlass.py b/test/registered/moe/test_flashinfer_a2a_cutlass.py
+new file mode 100644
+index 000000000000..1e4cddc9247c
+--- /dev/null
++++ b/test/registered/moe/test_flashinfer_a2a_cutlass.py
+@@ -0,0 +1,93 @@
++"""Test FlashInfer Cutlass BF16 MoE + FlashInfer alltoall on B200 with DP attention.
++
++Config: Qwen3-30B-A3B, B200x4, EP=4 DP=4, flashinfer cutlass + flashinfer a2a.
++"""
++
++import os
++import unittest
++from types import SimpleNamespace
++
++import torch
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.run_eval import run_eval
++from sglang.test.test_utils import (
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    popen_launch_server,
++)
++
++register_cuda_ci(
++    est_time=600,
++    stage="extra-b",
++    runner_config="4-gpu-b200",
++    disabled="Waived until sgl-kernel fix is released",
++)
++
++MODEL = os.environ.get("QWEN3_30B_A3B_MODEL_PATH", "Qwen/Qwen3-30B-A3B")
++
++SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
++SKIP_REASON = "Requires Blackwell (B200, sm_100a) or above."
++
++
++@unittest.skipIf(SKIP_TEST, SKIP_REASON)
++class TestFlashinferCutlassFlashinferA2A(CustomTestCase):
++    """FlashInfer Cutlass BF16 MoE + FlashInfer one-sided alltoall + DP4 EP4 on B200."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls.model = MODEL
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
++            other_args=[
++                "--trust-remote-code",
++                "--tp",
++                "4",
++                "--ep-size",
++                "4",
++                "--dp",
++                "4",
++                "--enable-dp-attention",
++                "--enable-dp-lm-head",
++                "--moe-runner-backend",
++                "flashinfer_cutlass",
++                "--moe-a2a-backend",
++                "flashinfer",
++                "--max-prefill-tokens",
++                "4096",
++                "--disable-radix-cache",
++                "--disable-flashinfer-autotune",
++                "--watchdog-timeout",
++                "900",
++            ],
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        kill_process_tree(cls.process.pid)
++
++    def test_gsm8k(self):
++        args = SimpleNamespace(
++            base_url=self.base_url,
++            eval_name="gsm8k",
++            num_examples=1319,
++            max_tokens=10240,
++            repeat=1,
++            num_threads=1319,
++            num_shots=8,
++            temperature=0.6,
++            top_p=0.95,
++            top_k=20,
++        )
++        metrics = run_eval(args)
++        print(metrics)
++        self.assertGreater(metrics["score"], 0.90)
++
++
++if __name__ == "__main__":
++    unittest.main()

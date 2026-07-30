@@ -1,0 +1,423 @@
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 316f4268506e..2ce9cf4fd0c2 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -68,7 +68,7 @@
+     read_ragged_verify_mode,
+     resolve_ragged_verify_layout,
+ )
+-from sglang.srt.utils import ceil_align, is_xpu
++from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+ from sglang.srt.utils.common import is_sm120_supported
+ 
+ if TYPE_CHECKING:
+@@ -79,6 +79,7 @@
+     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+ 
+ _is_sm120 = is_sm120_supported()
++_is_cuda = is_cuda()
+ _is_xpu = is_xpu()
+ 
+ logger = logging.getLogger(__name__)
+@@ -497,6 +498,7 @@ def __init__(
+         super().__init__()
+         self.model_runner = model_runner
+         self.device = torch.device(model_runner.device)
++        self.max_context_len = model_runner.model_config.context_len
+         head_dim = model_runner.model_config.head_dim
+         assert (
+             head_dim == 512
+@@ -553,15 +555,13 @@ def __init__(
+             DSV4RawDecodeMetadata,
+         ] = None
+         self.online_c128_mtp = OnlineC128MTPController(self)
+-        # Draft-extend and online-c128 verify metadata are host-planned, so
+-        # spec runs keep the relay publish (the mirror only exists under
+-        # spec-v2; without spec the flag has no consumer either way).
+-        # DSPARK is the exception: its draft path carries its own host lens
+-        # (reserved_seq_lens_cpu) and its verify prep is device-side.
+-        spec_alg = model_runner.spec_algorithm
+-        if not spec_alg.is_none() and not spec_alg.is_dspark():
+-            self.needs_cpu_seq_lens = True
+         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
++        spec_alg = model_runner.spec_algorithm
++        self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
++            not _is_cuda
++            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
++            or self.online_c128_mtp.enabled()
++        )
+ 
+         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+ 
+@@ -610,7 +610,7 @@ def _make_target_verify_c128_metadata(
+         self,
+         req_pool_indices: torch.Tensor,
+         seq_lens: torch.Tensor,
+-        seq_lens_cpu: List[int],
++        seq_lens_cpu: Optional[List[int]],
+         extend_seq_lens: torch.Tensor,
+         use_prefill_cuda_graph: bool,
+         online_c128_state_slot_offset: int,
+@@ -618,6 +618,7 @@ def _make_target_verify_c128_metadata(
+         if not self.online_c128_mtp.enabled():
+             return None
+ 
++        assert seq_lens_cpu is not None
+         num_draft_tokens = self.speculative_num_draft_tokens
+         seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
+         extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
+@@ -800,9 +801,11 @@ def init_forward_metadata_target_verify(
+         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+             assert out_cache_loc is not None
+             bs = len(seq_lens)
+-            seq_lens_cpu_list = (
+-                seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
+-            )
++            if self.needs_cpu_seq_lens:
++                assert seq_lens_cpu is not None
++                seq_lens_cpu_list = seq_lens_cpu.tolist()
++            else:
++                seq_lens_cpu_list = None
+             if ragged_layout is None:
+                 self.extend_seq_lens_buffer[:bs].fill_(
+                     self.speculative_num_draft_tokens
+@@ -838,12 +841,14 @@ def init_forward_metadata_target_verify(
+                 total_verify_tokens=total_verify_tokens,
+             )
+         else:
+-            seq_lens_cpu = seq_lens.tolist()
++            seq_lens_cpu_list = (
++                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
++            )
+             return self.init_forward_metadata_target_verify_old(
+                 max_seq_len=max_seq_len,
+                 req_pool_indices=req_pool_indices,
+                 seq_lens=seq_lens,
+-                seq_lens_cpu=seq_lens_cpu,
++                seq_lens_cpu=seq_lens_cpu_list,
+                 out_cache_loc=out_cache_loc,
+                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                 online_c128_state_slot_offset=online_c128_state_slot_offset,
+@@ -1039,32 +1044,38 @@ def make_forward_metadata_from_raw_decode(
+ 
+     def init_forward_metadata_draft_extend(
+         self,
+-        max_seq_len: int,
+         req_pool_indices: torch.Tensor,
+         seq_lens: torch.Tensor,
+-        seq_lens_cpu: List[int],
+         num_tokens_per_req: int,
+         out_cache_loc: Optional[torch.Tensor] = None,
+-        use_prefill_cuda_graph: bool = False,
+     ) -> DSV4Metadata:
+         batch_size = len(seq_lens)
+-        extend_seq_lens_cpu = [num_tokens_per_req] * batch_size
+-        extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
+         num_tokens = num_tokens_per_req * batch_size
+         if out_cache_loc is None:
+             out_cache_loc = seq_lens.new_zeros(num_tokens)
+-        return self.init_forward_metadata_prefill(
+-            seq_lens=seq_lens,
+-            max_seq_len=max_seq_len,
+-            req_pool_indices=req_pool_indices,
+-            seq_lens_cpu=seq_lens_cpu,
+-            out_cache_loc=out_cache_loc,
+-            num_tokens=num_tokens,
+-            extend_seq_lens=extend_seq_lens,
+-            extend_seq_lens_cpu=extend_seq_lens_cpu,
+-            extend_start_loc=None,
++
++        seq_lens_casual, req_pool_indices_repeated = (
++            self.expand_extend_with_same_length(
++                bs=batch_size,
++                qo_len=num_tokens_per_req,
++                seq_lens=seq_lens,
++                req_pool_indices=req_pool_indices,
++            )
++        )
++        core_attn_metadata = self.make_core_attn_metadata(
++            req_to_token=self.req_to_token,
++            req_pool_indices_repeated=req_pool_indices_repeated,
++            seq_lens_casual=seq_lens_casual,
++            # Draft extend is SWA-only. Keep the required 2-D page-table
++            # placeholder narrow instead of materializing the full context.
++            max_seq_len=self.page_size,
++            out_loc=out_cache_loc,
+             need_compress=False,
+-            use_prefill_cuda_graph=use_prefill_cuda_graph,
++            is_prefill=True,
++        )
++        return DSV4Metadata(
++            core_attn_metadata=core_attn_metadata,
++            indexer_metadata=None,
+         )
+ 
+     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+@@ -1149,6 +1160,7 @@ def init_forward_metadata_out_graph(
+         bs = forward_batch.batch_size
+         req_pool_indices = forward_batch.req_pool_indices
+         seq_lens = forward_batch.seq_lens
++        uses_cpu_seq_lens = self.needs_cpu_seq_lens or self.is_dspark_draft
+ 
+         if in_capture:
+             # Captured graph does no real cache writes, so synthesize a dummy
+@@ -1164,14 +1176,14 @@ def init_forward_metadata_out_graph(
+                 out_cache_loc = None
+             actual_forward_mode = forward_batch.forward_mode
+             seq_lens_sum = int(seq_lens.sum().item())
+-            seq_lens_cpu = seq_lens.cpu()
++            seq_lens_cpu = seq_lens.cpu() if uses_cpu_seq_lens else None
+         else:
+             out_cache_loc = forward_batch.out_cache_loc
+             actual_forward_mode = getattr(
+                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
+             )
+             seq_lens_sum = forward_batch.seq_lens_sum
+-            seq_lens_cpu = forward_batch.seq_lens_cpu
++            seq_lens_cpu = forward_batch.seq_lens_cpu if uses_cpu_seq_lens else None
+ 
+         if actual_forward_mode == ForwardMode.IDLE:
+             logger.debug(
+@@ -1181,7 +1193,8 @@ def init_forward_metadata_out_graph(
+             )
+             device = seq_lens.device
+             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
+-            seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
++            if uses_cpu_seq_lens:
++                seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
+             seq_lens_sum = bs
+             req_pool_indices = torch.zeros(
+                 bs, dtype=req_pool_indices.dtype, device=device
+@@ -1297,17 +1310,11 @@ def init_forward_metadata_out_graph(
+                     mode="constant",
+                     value=0,
+                 )
+-            draft_extend_seq_lens_cpu = (
+-                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
+-            )
+             temp_metadata = self.init_forward_metadata_draft_extend(
+-                max_seq_len=chosen_max_seq_len,
+                 req_pool_indices=req_pool_indices,
+                 seq_lens=seq_lens,
+-                seq_lens_cpu=draft_extend_seq_lens_cpu,
+                 num_tokens_per_req=num_tokens_per_req,
+                 out_cache_loc=out_cache_loc,
+-                use_prefill_cuda_graph=True,
+             )
+         else:
+             self.online_c128_mtp.clear()
+@@ -1348,6 +1355,9 @@ def _build_forward_metadata(
+         logical_forward_mode = _get_logical_forward_mode(forward_batch)
+         req_pool_indices = forward_batch.req_pool_indices
+         seq_lens = forward_batch.seq_lens.to(torch.int32)
++        # Regular prefill batches already carry scheduler-maintained CPU lengths.
++        # Keep using those when present; needs_cpu_seq_lens only controls whether
++        # speculative overlap must publish a new GPU-to-CPU mirror each step.
+         seq_lens_cpu = forward_batch.seq_lens_cpu
+         assert self.req_to_token_pool.req_to_token is self.req_to_token
+ 
+@@ -1359,7 +1369,7 @@ def _build_forward_metadata(
+         elif seq_lens_cpu is not None:
+             max_seq_len = int(seq_lens_cpu.max().item())
+         else:
+-            max_seq_len = int(seq_lens.max().item())
++            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+         verify_bs = _get_target_verify_bs(forward_batch)
+         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
+             logical_forward_mode,
+@@ -1406,29 +1416,35 @@ def _build_forward_metadata(
+                 online_c128_state_slot_offset=online_c128_state_slot_offset,
+                 ragged_layout=ragged_layout,
+             )
+-        elif logical_forward_mode.is_prefill(include_draft_extend_v2=True):
++        elif logical_forward_mode.is_draft_extend_v2():
++            num_tokens_per_req = self.speculative_num_draft_tokens
++            assert num_tokens_per_req > 0
++            metadata = self.init_forward_metadata_draft_extend(
++                req_pool_indices=req_pool_indices,
++                seq_lens=seq_lens,
++                num_tokens_per_req=num_tokens_per_req,
++                out_cache_loc=forward_batch.out_cache_loc,
++            )
++        elif logical_forward_mode.is_prefill():
+             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+             extend_seq_lens = forward_batch.extend_seq_lens
+             assert (
+                 seq_lens is not None
++                and seq_lens_cpu is not None
+                 and extend_seq_lens is not None
+                 and extend_seq_lens_cpu is not None
+             )
+-            is_draft = forward_batch.forward_mode.is_draft_extend_v2()
+-            prefill_seq_lens_cpu = (
+-                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
+-            )
+             metadata = self.init_forward_metadata_prefill(
+                 max_seq_len=max_seq_len,
+                 req_pool_indices=req_pool_indices,
+                 seq_lens=seq_lens,
+-                seq_lens_cpu=prefill_seq_lens_cpu,
++                seq_lens_cpu=seq_lens_cpu.tolist(),
+                 out_cache_loc=forward_batch.out_cache_loc,
+                 num_tokens=sum(extend_seq_lens_cpu),
+                 extend_seq_lens=extend_seq_lens,
+                 extend_seq_lens_cpu=extend_seq_lens_cpu,
+                 extend_start_loc=forward_batch.extend_start_loc,
+-                need_compress=not is_draft,
++                need_compress=True,
+                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+             )
+         else:
+diff --git a/python/sglang/test/kits/attention_unittest/attention_methods/dsv4_attention.py b/python/sglang/test/kits/attention_unittest/attention_methods/dsv4_attention.py
+index 2f4ea4555751..9c4b7a4769c2 100644
+--- a/python/sglang/test/kits/attention_unittest/attention_methods/dsv4_attention.py
++++ b/python/sglang/test/kits/attention_unittest/attention_methods/dsv4_attention.py
+@@ -1486,6 +1486,7 @@ def run_dsv4_target_verify_attention_case(
+     fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
+     runner = fixture.runner
+     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
++    testcase.assertEqual(fixture.backend.max_context_len, max_context_len)
+ 
+     _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
+     if case.compress_ratio in (4, 128):
+@@ -1526,6 +1527,7 @@ def run_dsv4_draft_extend_attention_case(
+     *,
+     dtype: torch.dtype = torch.bfloat16,
+     device: str = "cuda",
++    force_gpu_only_seq_lens: bool = False,
+ ) -> None:
+     """Math-faithful EAGLE `DRAFT_EXTEND` test for DSV4.
+ 
+@@ -1563,6 +1565,10 @@ def run_dsv4_draft_extend_attention_case(
+         fixture.forward_batch,
+         device=device,
+     )
++    if force_gpu_only_seq_lens:
++        fixture.forward_batch.seq_lens_cpu = None
++        fixture.forward_batch.seq_lens_sum = None
++        fixture.forward_batch.spec_info.seq_lens_cpu = None
+ 
+     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
+     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+diff --git a/python/sglang/test/kits/attention_unittest/runner_modes/speculative_draft_runner.py b/python/sglang/test/kits/attention_unittest/runner_modes/speculative_draft_runner.py
+index 1b724c4eb78d..e90576627e87 100644
+--- a/python/sglang/test/kits/attention_unittest/runner_modes/speculative_draft_runner.py
++++ b/python/sglang/test/kits/attention_unittest/runner_modes/speculative_draft_runner.py
+@@ -1484,6 +1484,7 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
+     vocab_size: int = 64,
+     dtype: torch.dtype = torch.bfloat16,
+     device: str = "cuda",
++    force_gpu_only_seq_lens: bool = False,
+ ):
+     settings = EagleDraftRunnerSettings(
+         topk=topk,
+@@ -1498,12 +1499,20 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
+         atol=DSV4_ATOL,
+         rtol=DSV4_RTOL,
+     )
++
++    def _make_forward_batch(case, draft_inputs, settings):
++        batch = _make_dsv4_eagle_draft_forward_batch(case, draft_inputs, settings)
++        if force_gpu_only_seq_lens:
++            batch.seq_lens_cpu = None
++            batch.seq_lens_sum = None
++        return batch
++
+     adapter = EagleDraftCudaGraphRunnerAdapter(
+         build_fixture=build_dsv4_attention_fixture,
+         make_model_forward=_make_dsv4_model_forward,
+         make_draft_inputs=_make_dsv4_draft_inputs,
+         prepare_replay_state=_prepare_dsv4_draft_replay_state,
+-        make_forward_batch=_make_dsv4_eagle_draft_forward_batch,
++        make_forward_batch=_make_forward_batch,
+         check_case=_check_dsv4_draft_cache_layout,
+         init_eager_metadata=_init_dsv4_eager_metadata,
+     )
+diff --git a/python/sglang/test/kits/attention_unittest/runner_modes/speculative_target_verify_runner.py b/python/sglang/test/kits/attention_unittest/runner_modes/speculative_target_verify_runner.py
+index b7b0389ff79a..6f45af8a3c8c 100644
+--- a/python/sglang/test/kits/attention_unittest/runner_modes/speculative_target_verify_runner.py
++++ b/python/sglang/test/kits/attention_unittest/runner_modes/speculative_target_verify_runner.py
+@@ -890,6 +890,7 @@ def run_dsv4_eagle_verify_cuda_graph_case(
+     dtype: torch.dtype = torch.bfloat16,
+     device: str = "cuda",
+     cuda_graph_capture_batch_size: int = 2,
++    force_gpu_only_seq_lens: bool = False,
+ ):
+     """DSV4 EAGLE target_verify CUDA-graph capture/replay. Chain only —
+     `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at
+@@ -936,6 +937,11 @@ def _prepare_dsv4_verify_batch(spec_case, batch):
+         batch.spec_info = _make_eagle_verify_input(
+             spec_case, batch, topk=topk, device=device
+         )
++        if force_gpu_only_seq_lens:
++            batch.seq_lens_cpu = None
++            batch.seq_lens_sum = None
++            batch.spec_info.seq_lens_cpu = None
++            batch.spec_info.seq_lens_sum = None
+ 
+     def _make_capture_case(base, name, capture_prefix_len: int, bs: int):
+         # Capture uses uniform prefixes per request; each request still
+diff --git a/test/registered/attention/unittests/dsv4/test_deepseek_v4.py b/test/registered/attention/unittests/dsv4/test_deepseek_v4.py
+index 3f0737df744a..afc19f73e1d5 100644
+--- a/test/registered/attention/unittests/dsv4/test_deepseek_v4.py
++++ b/test/registered/attention/unittests/dsv4/test_deepseek_v4.py
+@@ -26,7 +26,10 @@
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ 
+-_FLASH_MLA_AVAILABLE = importlib.util.find_spec("flash_mla") is not None
++_FLASH_MLA_AVAILABLE = (
++    importlib.util.find_spec("sgl_kernel") is not None
++    and importlib.util.find_spec("sgl_kernel.flash_mla") is not None
++)
+ 
+ from sglang.test.ci.ci_register import register_cuda_ci
+ from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
+@@ -35,6 +38,7 @@
+     make_dsv4_cases,
+     run_dsv4_attention_case,
+     run_dsv4_compress_attention_case,
++    run_dsv4_draft_extend_attention_case,
+     run_dsv4_target_verify_attention_case,
+ )
+ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
+@@ -254,7 +258,25 @@ def test_runner_mode_eagle_verify_cuda_graph_cases(self):
+                 backend=case.backend,
+                 compress_ratio=case.compress_ratio,
+             ):
+-                run_dsv4_eagle_verify_cuda_graph_case(self, case, topk=1)
++                run_dsv4_eagle_verify_cuda_graph_case(
++                    self, case, topk=1, force_gpu_only_seq_lens=True
++                )
++
++    def test_eagle_draft_extend_without_cpu_seq_lens(self):
++        case = DSV4AttentionCase(
++            name="dsv4_swa_eagle_draft_extend_gpu_only_seq_lens",
++            backend="dsv4",
++            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
++            num_heads=64,
++            page_size=DSV4_PAGE_SIZE,
++            prefix_lens=(64, 96),
++            extend_lens=(4, 4),
++        )
++        run_dsv4_draft_extend_attention_case(
++            self,
++            case,
++            force_gpu_only_seq_lens=True,
++        )
+ 
+     # Production EAGLE draft graph runner (chain only, SWA only). The runner
+     # routes through `DeepseekV4MultiStepBackend` (one `DeepseekV4AttnBackend`
+@@ -275,7 +297,11 @@ def test_runner_mode_eagle_verify_cuda_graph_cases(self):
+     def test_runner_mode_production_eagle_draft_cuda_graph_runner_cases(self):
+         for case in self.PRODUCTION_EAGLE_DRAFT_RUNNER_CASES:
+             with self.subTest(case=case.name, backend=case.backend):
+-                run_dsv4_eagle_draft_cuda_graph_runner_case(self, case)
++                run_dsv4_eagle_draft_cuda_graph_runner_case(
++                    self,
++                    case,
++                    force_gpu_only_seq_lens=True,
++                )
+ 
+ 
+ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):

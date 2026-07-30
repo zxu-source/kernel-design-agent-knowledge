@@ -1,0 +1,118 @@
+diff --git a/python/sglang/jit_kernel/csrc/moe/moe_align_kernel.cu b/python/sglang/jit_kernel/csrc/moe/moe_align_kernel.cu
+index 0050dc0b1d37..15e23b6b6908 100644
+--- a/python/sglang/jit_kernel/csrc/moe/moe_align_kernel.cu
++++ b/python/sglang/jit_kernel/csrc/moe/moe_align_kernel.cu
+@@ -43,7 +43,19 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
+ 
+ namespace moe {
+ 
+-__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
++#ifdef USE_ROCM
++// ROCm's templated __shfl_*_sync builtins require an 8-byte mask
++// (static_assert(sizeof(MaskT) == 8)) because AMD wavefront width varies by
++// arch (32 on RDNA, 64 on CDNA).
++using warp_mask_t = uint64_t;
++#define WARP_FULL_MASK 0xffffffffffffffffull
++#else
++// CUDA: 32-lane warps take a plain 32-bit mask
++using warp_mask_t = unsigned;
++#define WARP_FULL_MASK 0xffffffffu
++#endif
++
++__device__ __forceinline__ int warp_exclusive_scan(int v, warp_mask_t mask = WARP_FULL_MASK) {
+   int original = v;
+ #pragma unroll
+   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py
+index 5d6f45666993..12c44272273c 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py
+@@ -6,7 +6,7 @@
+ import triton
+ 
+ from sglang.srt.environ import envs
+-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu
++from sglang.srt.utils import is_cuda, is_hip, is_musa, is_rdna_supported, is_xpu
+ 
+ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+ 
+@@ -14,6 +14,7 @@
+ _is_hip = is_hip()
+ _is_xpu = is_xpu()
+ _is_musa = is_musa()
++_is_rdna = _is_hip and is_rdna_supported()
+ 
+ if _is_cuda or _is_hip or _is_xpu or _is_musa:
+     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+@@ -78,11 +79,16 @@ def moe_align_block_size(
+     )
+ 
+     # ===== TO BE REFACTORED ====
++    # RDNA (gfx11xx/gfx12xx) always uses the JIT kernel: it hardcodes WARP_SIZE=32
++    # for both host and device compile passes, avoiding the host/device WARP_SIZE
++    # split that the sgl-kernel C++ moe_align_kernel.cu has on RDNA fat builds.
+     use_jit_align = False
+     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+ 
+         use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
++    if _is_rdna:
++        use_jit_align = True
+     if use_jit_align:
+         from sglang.jit_kernel.moe_align import (
+             moe_align_block_size as jit_moe_align_block_size,
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index b104e40d7437..f2e21b18e9bb 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -109,6 +109,7 @@ def routing(
+     is_hip,
+     is_musa,
+     is_npu,
++    is_rdna_supported,
+     is_xpu,
+ )
+ from sglang.srt.utils.patch_torch import register_fake_if_exists
+@@ -129,6 +130,7 @@ def routing(
+ _is_xpu = is_xpu()
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+ _is_musa = is_musa()
++_is_rdna = _is_hip and is_rdna_supported()
+ 
+ if _is_cuda:
+     from sgl_kernel import moe_fused_gate
+@@ -500,7 +502,10 @@ def forward_cuda(
+                 expert_location_dispatch_info=expert_location_dispatch_info,
+             )
+         else:
+-            self.topk_config.torch_native = False
++            # WARP_SIZE in the sgl-kernel topk_softmax/topk_sigmoid kernels resolves
++            # differently for host vs. device compile passes on RDNA (wave32) fat
++            # builds, so route RDNA through the pure-PyTorch fallback instead.
++            self.topk_config.torch_native = _is_rdna
+             with use_symmetric_memory(
+                 get_tp_group(), disabled=not is_allocation_symmetric()
+             ):
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index 4556d06b16f8..2f2d870fbaec 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -3654,6 +3654,18 @@ def is_gfx942_supported():
+         return False
+ 
+ 
++@lru_cache(maxsize=1)
++def is_rdna_supported():
++    """
++    Returns whether the current platform is AMD RDNA (gfx11xx / gfx12xx — Radeon consumer/workstation GPUs).
++    """
++    if torch.version.hip:
++        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
++        return any(gfx in gcn_arch for gfx in ["gfx11", "gfx12"])
++    else:
++        return False
++
++
+ def get_hip_version():
+     if torch.version.hip:
+         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))

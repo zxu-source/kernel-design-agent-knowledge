@@ -1,0 +1,613 @@
+diff --git a/cmake/external_projects/fmha_sm100.cmake b/cmake/external_projects/fmha_sm100.cmake
+index 3897f8e1b3f6..052966b27552 100644
+--- a/cmake/external_projects/fmha_sm100.cmake
++++ b/cmake/external_projects/fmha_sm100.cmake
+@@ -17,7 +17,7 @@ else()
+   FetchContent_Declare(
+     fmha_sm100
+     GIT_REPOSITORY https://github.com/vllm-project/MSA.git
+-    GIT_TAG fee783153f3efe57e3e933c5cb7e267a7cebcfb5
++    GIT_TAG 2e63ec37a0fc29bc20f39cd1a52e0f5affc33a73
+     GIT_PROGRESS TRUE
+     CONFIGURE_COMMAND ""
+     BUILD_COMMAND ""
+diff --git a/tests/kernels/attention/test_minimax_m3.py b/tests/kernels/attention/test_minimax_m3.py
+index 0340ca9a477c..01405a0e5d12 100644
+--- a/tests/kernels/attention/test_minimax_m3.py
++++ b/tests/kernels/attention/test_minimax_m3.py
+@@ -150,7 +150,7 @@ def _reference_index_topk(
+         num_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+         pages = block_table[req_id, :num_blocks]
+         k = index_kv_cache[pages].reshape(num_blocks * BLOCK_SIZE, -1)
+-        score = torch.einsum("qhd,kd->hqk", q.float(), k.float()) * sm_scale
++        score = sm_scale * torch.einsum("qhd,kd->hqk", q.float(), k.float())
+ 
+         q_pos = prefix_len + torch.arange(q_len, device=idx_q.device)
+         k_pos = torch.arange(k.shape[0], device=idx_q.device)
+@@ -621,11 +621,12 @@ def test_decode_index_topk_fp8(num_idx_heads: int):
+         init_blocks=init_blocks,
+         local_blocks=local_blocks,
+         num_kv_heads=num_idx_heads,
+-        sm_scale=head_dim**-0.5,
+         decode_query_len=decode_query_len,
++        max_decode_query_len=decode_query_len,
+     )
+     # Reference from the DEQUANTIZED fp8 values (the kernel computes the fp8 QK
+-    # in fp32, so it must match an fp32 matmul of the same e4m3 values).
++    # in fp32 with no scaling, so it must match an unscaled fp32 matmul of the
++    # same e4m3 values).
+     expected = _reference_index_topk(
+         idx_q.float(),
+         index_kv_cache.float(),
+@@ -636,7 +637,6 @@ def test_decode_index_topk_fp8(num_idx_heads: int):
+         topk,
+         init_blocks,
+         local_blocks,
+-        head_dim**-0.5,
+     )
+     _assert_topk_indices_equal_unordered(actual, expected)
+ 
+diff --git a/vllm/models/minimax_m3/common/indexer.py b/vllm/models/minimax_m3/common/indexer.py
+index bb1ed619320e..c66e7ce5267e 100644
+--- a/vllm/models/minimax_m3/common/indexer.py
++++ b/vllm/models/minimax_m3/common/indexer.py
+@@ -256,6 +256,13 @@ def __init__(
+             dtype=torch.int32,
+             device=device,
+         )
++        # Stable per-token causal page-count buffer for decode cudagraph replays
++        # (consumed by the MSA top-k path's sparse_topk_select num_valid_pages).
++        self.num_valid_pages_buffer = torch.empty(
++            vllm_config.scheduler_config.max_num_batched_tokens,
++            dtype=torch.int32,
++            device=device,
++        )
+ 
+ 
+ class MiniMaxM3IndexerTritonMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
+diff --git a/vllm/models/minimax_m3/common/ops/__init__.py b/vllm/models/minimax_m3/common/ops/__init__.py
+index b3a7c2d9f6ec..1fb6fa222554 100644
+--- a/vllm/models/minimax_m3/common/ops/__init__.py
++++ b/vllm/models/minimax_m3/common/ops/__init__.py
+@@ -4,6 +4,7 @@
+ 
+ from .index_topk import (
+     minimax_m3_index_decode,
++    minimax_m3_index_decode_score,
+     minimax_m3_index_score,
+     minimax_m3_index_topk,
+ )
+@@ -11,6 +12,7 @@
+ 
+ __all__ = [
+     "minimax_m3_index_decode",
++    "minimax_m3_index_decode_score",
+     "minimax_m3_index_score",
+     "minimax_m3_index_topk",
+     "minimax_m3_sparse_attn",
+diff --git a/vllm/models/minimax_m3/common/ops/index_topk.py b/vllm/models/minimax_m3/common/ops/index_topk.py
+index 28becf7bfec4..ed677fd871ec 100644
+--- a/vllm/models/minimax_m3/common/ops/index_topk.py
++++ b/vllm/models/minimax_m3/common/ops/index_topk.py
+@@ -757,25 +757,26 @@ def minimax_m3_index_topk(
+ 
+ 
+ @torch.no_grad()
+-def minimax_m3_index_decode(
++def minimax_m3_index_decode_score(
+     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
+     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
+     block_table: torch.Tensor,  # [num_reqs, max_blocks]
+     seq_lens: torch.Tensor,  # [num_reqs] int32
+     max_seq_len: int,
+-    topk: int,
+     init_blocks: int,
+     local_blocks: int,
+     num_kv_heads: int,
+     decode_query_len: int,
+     max_decode_query_len: int,
+-    out: torch.Tensor | None = None,
++    score_out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    """Decode index block-score + top-k, both split-K (cudagraph-safe).
++    """Decode index block-score (split-K, cudagraph-safe); no top-k.
+ 
+-    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
+-    When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
+-    ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
++    Returns score [num_kv_heads, total_q, >=max_block] (fp32; init/local blocks
++    forced to 1e30/1e29). When ``score_out`` is given the scores are written into
++    it (read/written by strides, so a transposed view of a unified buffer is
++    accepted) instead of a fresh tensor -- used to share a unified score buffer
++    with the prefill side and run a single top-k over both.
+     """
+     total_q, num_idx_heads, head_dim = idx_q.shape
+     assert num_idx_heads == num_kv_heads, (
+@@ -783,7 +784,6 @@ def minimax_m3_index_decode(
+     )
+     assert decode_query_len <= max_decode_query_len
+     assert total_q == seq_lens.shape[0] * decode_query_len
+-    batch = total_q
+     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+     use_pdl = current_platform.is_arch_support_pdl()
+     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
+@@ -800,13 +800,16 @@ def minimax_m3_index_decode(
+     if num_idx_heads > 1 and max_decode_query_len > 1:
+         score_kwargs.update({"num_warps": 4, "num_stages": 2})
+ 
+-    # Keep score strides 16-divisible to avoid Triton recompiles.
+-    score_block_stride = round_up(max_block, 16)
+-    score = torch.empty(
+-        (num_idx_heads, total_q, score_block_stride),
+-        dtype=torch.float32,
+-        device=idx_q.device,
+-    )
++    if score_out is not None:
++        score = score_out
++    else:
++        # Keep score strides 16-divisible to avoid Triton recompiles.
++        score_block_stride = round_up(max_block, 16)
++        score = torch.empty(
++            (num_idx_heads, total_q, score_block_stride),
++            dtype=torch.float32,
++            device=idx_q.device,
++        )
+     # split-K over seq blocks; chunk count depends only on shape constants so
+     # the grid is fixed within a cuda graph.
+     TARGET_GRID = 512
+@@ -848,6 +851,55 @@ def minimax_m3_index_decode(
+         USE_PDL=use_pdl,
+         **score_kwargs,
+     )
++    return score
++
++
++@torch.no_grad()
++def minimax_m3_index_decode(
++    idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
++    index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
++    block_table: torch.Tensor,  # [num_reqs, max_blocks]
++    seq_lens: torch.Tensor,  # [num_reqs] int32
++    max_seq_len: int,
++    topk: int,
++    init_blocks: int,
++    local_blocks: int,
++    num_kv_heads: int,
++    decode_query_len: int,
++    max_decode_query_len: int,
++    out: torch.Tensor | None = None,
++    score_out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Decode index block-score + top-k, both split-K (cudagraph-safe).
++
++    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
++    When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
++    ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
++    When ``score_out`` ([num_kv_heads, total_q, >=max_block]) is given, the block
++    scores are written into it (read back by the top-k) instead of a fresh
++    tensor -- used to share a unified score buffer with the prefill side. Reads
++    via strides, so a transposed view of a block-major buffer is accepted.
++    """
++    total_q, num_idx_heads, _ = idx_q.shape
++    batch = total_q
++    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
++    use_pdl = current_platform.is_arch_support_pdl()
++    pdl_kwargs: dict[str, bool | int] = {}
++    if use_pdl:
++        pdl_kwargs.update({"launch_pdl": True})
++    score = minimax_m3_index_decode_score(
++        idx_q,
++        index_kv_cache,
++        block_table,
++        seq_lens,
++        max_seq_len,
++        init_blocks,
++        local_blocks,
++        num_kv_heads,
++        decode_query_len,
++        max_decode_query_len,
++        score_out=score_out,
++    )
+ 
+     if out is not None:
+         topk_idx = out[:, :total_q, :]
+diff --git a/vllm/models/minimax_m3/common/ops/sparse_attn.py b/vllm/models/minimax_m3/common/ops/sparse_attn.py
+index f04652c89a3b..08d375dc6109 100644
+--- a/vllm/models/minimax_m3/common/ops/sparse_attn.py
++++ b/vllm/models/minimax_m3/common/ops/sparse_attn.py
+@@ -43,7 +43,6 @@
+     {
+         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+         "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
+-        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
+         "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
+         * triton.next_power_of_2(args["gqa_group_size"]),
+     }
+@@ -84,7 +83,6 @@ def _gqa_sparse_fwd_kernel(
+     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+     BLOCK_SIZE_D: tl.constexpr,
+     BLOCK_SIZE_H: tl.constexpr,
+-    BLOCK_SIZE_T: tl.constexpr,
+     BLOCK_SIZE_QH: tl.constexpr,
+     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
+ ):
+@@ -109,9 +107,10 @@ def _gqa_sparse_fwd_kernel(
+     for j in range(real_q_loop):
+         pid_q_j = pid_q * num_q_loop + j
+         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
+-        off_t = tl.arange(0, BLOCK_SIZE_T)
+-        topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
+-        real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
++        # Valid block count from seq position (no sentinel): block_size_q == 1.
++        q_abs = prefix_len + pid_q_j * BLOCK_SIZE_Q
++        valid_blocks = (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
++        real_topk = tl.minimum(max_topk, valid_blocks)
+         q_ptrs = tl.make_block_ptr(
+             base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+             shape=(q_len, gqa_group_size, head_dim),
+@@ -202,7 +201,6 @@ def _gqa_sparse_fwd_kernel(
+             16, triton.next_power_of_2(args["gqa_group_size"])
+         ),
+         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+-        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
+     }
+ )
+ @triton.jit(do_not_specialize=["decode_query_len"])
+@@ -243,7 +241,6 @@ def _gqa_sparse_decode_kernel(
+     NUM_TOPK_CHUNKS: tl.constexpr,
+     BLOCK_SIZE_H: tl.constexpr,
+     BLOCK_SIZE_D: tl.constexpr,
+-    BLOCK_SIZE_T: tl.constexpr,
+     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
+     USE_PDL: tl.constexpr,
+ ):
+@@ -268,11 +265,10 @@ def _gqa_sparse_decode_kernel(
+     # attention range instead of letting padded rows produce negative lengths.
+     kv_len = tl.maximum(query_pos + 1, 0)
+ 
+-    # number of valid (non-padded) selected blocks for this query token
+-    off_t = tl.arange(0, BLOCK_SIZE_T)
++    # Valid block count from seq_len (no sentinel): min(topk, cdiv(kv_len, blk)).
+     idx_base = t_ptr + pid_kh * stride_th + pid_b * stride_tn
+-    topk_idx = tl.load(idx_base + off_t * stride_tk, mask=off_t < max_topk, other=-1)
+-    real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
++    num_blocks = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
++    real_topk = tl.minimum(max_topk, num_blocks)
+     chunk_end_topk = tl.minimum(chunk_end_compiletime, real_topk)
+ 
+     off_n = tl.arange(0, BLOCK_SIZE_K)
+diff --git a/vllm/models/minimax_m3/nvidia/indexer_msa.py b/vllm/models/minimax_m3/nvidia/indexer_msa.py
+index 432c8bb790df..16a9277d11af 100644
+--- a/vllm/models/minimax_m3/nvidia/indexer_msa.py
++++ b/vllm/models/minimax_m3/nvidia/indexer_msa.py
+@@ -2,16 +2,21 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """MSA (SM100/Blackwell) indexer impl for MiniMax M3.
+ 
+-Prefill scores with ``fmha_sm100``'s score-only (``OnlyScore``) path then selects
+-top-k blocks with the Triton ``minimax_m3_index_topk`` kernel -- fmha is much
+-faster than Triton for the wide prefill score (benchmarked ~3-5x).
+-
+-Decode uses the Triton fused ``minimax_m3_index_decode`` (the same kernel the
+-Triton indexer impl uses): for q_len==1 it is a purpose-built vector x matrix
+-score (no wasted tensor-core tiles) with a 256-way split-K and a fused split-K
+-top-k, which beats fmha's OnlyScore (wasted MMA on a single query, 64-split cap)
+-by ~1.1-3.7x. It is cudagraph-safe by construction (shape-constant split grids)
+-and writes the shared ``topk_indices_buffer`` via ``out=``.
++Both sides write block scores into one unified token-major buffer
++``[total_q, H, max_k_tiles]``, then a single ``fmha_sm100.sparse_topk_select``
++selects the top-k blocks for the whole batch (decode ``[:nd]`` + prefill
++``[nd:]``) into the shared ``topk_indices_buffer``. It bounds each row by its
++causal page count and force-includes the init/local blocks, so the unwritten
++tail of the buffer is pre-filled with ``-inf``.
++
++Prefill scores with ``fmha_sm100``'s score-only (``OnlyScore``) path (much faster
++than Triton for the wide prefill score, benchmarked ~3-5x), writing its
++``max_score`` straight into the buffer's prefill region (stride-aware, no copy).
++
++Decode scores with the Triton split-K ``minimax_m3_index_decode_score`` (a
++purpose-built vector x matrix score, no wasted tensor-core tiles, 256-way
++split-K, cudagraph-safe by shape-constant grids), writing into the decode
++region. Its tuning heuristics are kept; only the top-k is shared with prefill.
+ 
+ ``fmha_sm100`` imports are function-local so this module is import-safe on
+ AMD / non-SM100.
+@@ -22,6 +27,7 @@
+ 
+ import torch
+ 
++from vllm.config import VllmConfig
+ from vllm.forward_context import get_forward_context
+ from vllm.models.minimax_m3.common.indexer import (
+     MiniMaxM3IndexerBackend,
+@@ -31,8 +37,7 @@
+     MiniMaxM3IndexerMetadataBuilder,
+ )
+ from vllm.models.minimax_m3.common.ops.index_topk import (
+-    minimax_m3_index_decode,
+-    minimax_m3_index_topk,
++    minimax_m3_index_decode_score,
+ )
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+@@ -40,10 +45,22 @@
+     CommonAttentionMetadata,
+ )
+ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
++from vllm.v1.kv_cache_interface import AttentionSpec
+ 
+ # Page size == sparse block size == index-K block; fmha tile id == M3 block id.
+ PAGE_SIZE = 128
+ 
++# Fill for unwritten score tiles: -inf so they never win the top-k (score kernels
++# only write causally-valid blocks).
++_SCORE_SENTINEL = float("-inf")
++
++# Tile (KV-block) dim of the unified score buffer, hardcoded as a cudagraph
++# capture-time constant so the decode score kernel's buffer shape is frozen
++# across replays. 8192 tiles == 1M tokens of context; -inf padding +
++# num_valid_pages bound each row to its causal range, so shorter replays reuse
++# the same buffer safely.
++MAX_K_TILES = 8192
++
+ 
+ class MiniMaxM3IndexerMSABackend(MiniMaxM3IndexerBackend):
+     """Indexer side-cache backend selecting the MSA builder."""
+@@ -71,6 +88,25 @@ class MiniMaxM3IndexerMSAMetadata(MiniMaxM3IndexerMetadata):
+     (the base ``prefill`` field is unused on this path)."""
+ 
+     prefill_msa: MiniMaxM3IndexerMSAPrefillMetadata | None = None
++    # Per-forward view (``[:num_tokens]``) of the builder's persistent unified
++    # score buffer ``[total_q, H, MAX_K_TILES]``, shared by decode and prefill
++    # and reused across all layers. Pre-filled with the -inf sentinel in
++    # ``build()``; each layer overwrites its valid tiles before its own top-k.
++    unified_scores: torch.Tensor | None = None
++    # Tile (KV-block) dim of the unified score buffer (== ``MAX_K_TILES``).
++    # Forced as the fmha plan's ``max_k_tiles`` so prefill writes its max_score
++    # straight into the shared buffer.
++    max_k_tiles: int = 0
++    # Batch-wide inputs for the single top-k over the unified buffer (decode +
++    # prefill in one call). ``cu_seqlens_q`` is the per-request query-start
++    # offsets (== query_start_loc, a stable view for cudagraph); ``prefix_lens``
++    # is the per-request context length (== context_lens).
++    topk_cu_seqlens_q: torch.Tensor | None = None
++    topk_prefix_lens: torch.Tensor | None = None
++    topk_max_query_len: int = 0
++    # Per-token causal page count cdiv(seq_pos+1, PAGE_SIZE), [total_q] int32:
++    # drives sparse_topk_select force_end_blocks + -1 out-of-range clamp.
++    topk_num_valid_pages: torch.Tensor | None = None
+ 
+ 
+ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
+@@ -79,6 +115,28 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
+ 
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+ 
++    def __init__(
++        self,
++        kv_cache_spec: AttentionSpec,
++        layer_names: list[str],
++        vllm_config: VllmConfig,
++        device: torch.device,
++    ) -> None:
++        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        # Persistent unified score buffer [T, H, MAX_K_TILES] shared by all
++        # indexer layers and reused across forwards. Stable address (required
++        # for the captured decode path) + fixed tile dim so the decode score
++        # kernel's shape is frozen at capture. Filled with -inf per forward in
++        # build(); the valid/padding partition is a per-forward constant, so
++        # every layer overwrites the same valid tiles before its own top-k.
++        self.unified_scores_buffer = torch.empty(
++            vllm_config.scheduler_config.max_num_batched_tokens,
++            self.num_index_heads,
++            MAX_K_TILES,
++            dtype=torch.float32,
++            device=device,
++        )
++
+     def build(
+         self,
+         common_prefix_len: int,
+@@ -107,6 +165,19 @@ def build(
+             common_attn_metadata.compute_num_computed_tokens(), non_blocking=True
+         )
+ 
++        # Per-token causal page count for the top-k, into the stable cg buffer.
++        positions = common_attn_metadata.positions
++        assert positions is not None
++        num_valid_pages = self.num_valid_pages_buffer[:num_tokens]
++        num_valid_pages.copy_(positions[:num_tokens] // PAGE_SIZE + 1)
++
++        # Unified score buffer: a per-forward view of the persistent buffer,
++        # reset to the -inf sentinel once here and shared by every layer (the
++        # tile dim is the capture-time constant MAX_K_TILES).
++        max_k_tiles = MAX_K_TILES
++        unified_scores = self.unified_scores_buffer[:num_tokens]
++        unified_scores.fill_(_SCORE_SENTINEL)
++
+         decode: MiniMaxM3IndexerDecodeMetadata | None = None
+         if num_decodes > 0:
+             qsl_cpu = common_attn_metadata.query_start_loc_cpu
+@@ -148,6 +219,11 @@ def build(
+                 causal=True,
+                 num_kv_splits=1,
+             )
++            # Force the plan's tile dim to the unified buffer's so prefill writes
++            # its max_score straight into unified[:, :, nd:] (the stride-aware
++            # binding shape-matches the tile dim exactly). max_k_tiles >= the
++            # plan's natural value, so the extra tiles are simply never written.
++            plan["max_k_tiles"] = max_k_tiles
+             cols = torch.arange(block_table.shape[1], device=block_table.device)
+             valid = cols[None, :] < nvp[lo:hi].to(block_table.device)[:, None]
+             prefill = MiniMaxM3IndexerMSAPrefillMetadata(
+@@ -171,6 +247,12 @@ def build(
+             num_prefill_tokens=num_prefill_tokens,
+             decode=decode,
+             prefill_msa=prefill,
++            unified_scores=unified_scores,
++            max_k_tiles=max_k_tiles,
++            topk_cu_seqlens_q=query_start_loc[: num_reqs + 1],
++            topk_prefix_lens=context_lens,
++            topk_max_query_len=common_attn_metadata.max_query_len,
++            topk_num_valid_pages=num_valid_pages,
+         )
+ 
+ 
+@@ -195,36 +277,49 @@ def forward(
+             -1, self.num_index_heads, self.index_head_dim
+         )
+         kv = self.index_cache.kv_cache
+-        # Both sides write into the single shared persistent topk_indices_buffer:
+-        # decode at [:, :nd], prefill at [:, nd:] (each kernel writes [:, :total_q]).
++        # Shared persistent top-k output buffer; the unified top-k below writes
++        # the selected block ids into buf[:num_tokens].
+         buf = self.topk_indices_buffer
+-
+-        decode_topk: torch.Tensor | None = None
++        assert buf is not None
++
++        # Unified token-major score buffer [total_q, H, MAX_K_TILES]: the tile
++        # dim is innermost/contiguous, so both fmha writes (native [T,H,K]) and
++        # the block-iterating top-k reads hit contiguous tiles. Each side gets a
++        # contiguous slice on dim 0: decode [:nd], prefill [nd:]; the kernels
++        # read/write by strides. The builder allocates it once (persistent,
++        # shared by all layers) and resets it to the sentinel each forward, so
++        # the top-k never picks an unwritten tile.
++        unified_scores = md.unified_scores
++        assert unified_scores is not None
++
++        # Decode scores -> unified[:nd] (transposed [H, nd, MK] view; the kernel
++        # writes by strides). Top-k is deferred to the single unified call below.
+         if md.decode is not None:
+             d = md.decode
+-            decode_topk = minimax_m3_index_decode(
++            minimax_m3_index_decode_score(
+                 index_q[:nd],
+                 kv,
+                 d.block_table,
+                 d.seq_lens,
+                 d.max_seq_len,
+-                self.topk_blocks,
+                 self.init_blocks,
+                 self.local_blocks,
+                 self.num_kv_heads,
+                 d.decode_query_len,
+                 d.max_decode_query_len,
+-                out=buf,
++                score_out=unified_scores[:nd].transpose(0, 1),
+             )
+ 
+-        prefill_topk: torch.Tensor | None = None
+         if md.prefill_msa is not None:
+             from vllm.third_party.fmha_sm100.api import _fmha_sm100
+ 
+             p = md.prefill_msa
+             # Index-K cache (num_blocks, 128, D) -> paged MQA (num_blocks,1,128,D).
+             k_pages = kv.view(kv.shape[0], 1, PAGE_SIZE, self.index_head_dim)
+-            _, max_score = _fmha_sm100(
++            # fmha writes its max_score natively as [nnz_p, H, max_k_tiles] into
++            # the prefill region (stride-aware; plan max_k_tiles forced to
++            # md.max_k_tiles so the shape matches exactly -> no copy).
++            _fmha_sm100(
+                 index_q[nd:],
+                 k_pages,
+                 k_pages,  # V placeholder; not read in OnlyScore
+@@ -233,19 +328,24 @@ def forward(
+                 output_o=False,
+                 output_maxscore=True,
+                 sm_scale=self.scale,
++                max_score=unified_scores[nd:],
+             )
+-            # Triton top-k wants [num_index_heads, num_tokens, max_block]; the
+-            # transpose is a strided view (the kernel reads via strides).
+-            out = buf[:, nd:, :] if buf is not None else None
+-            prefill_topk = minimax_m3_index_topk(
+-                max_score.transpose(1, 2),
+-                p.cu_seqlens_q,
+-                p.prefix_lens,
+-                p.max_query_len,
+-                self.topk_blocks,
+-                self.init_blocks,
+-                self.local_blocks,
+-                out=out,
+-            )
+ 
+-        return decode_topk, prefill_topk
++        # Single top-k over the unified buffer via fmha_sm100 sparse_topk_select
++        # (THK, no transpose) into ``buf``. num_valid_pages drives force_end_blocks
++        # (always keep each token's local block; fmha OnlyScore won't) + the -1
++        # out-of-range clamp.
++        from vllm.third_party.fmha_sm100.api import sparse_topk_select
++
++        sparse_topk_select(
++            unified_scores,
++            self.topk_blocks,
++            num_valid_pages=md.topk_num_valid_pages,
++            force_begin_blocks=self.init_blocks,
++            force_end_blocks=self.local_blocks,
++            output=buf[:num_tokens],
++            max_score_layout="THK",
++        )
++
++        # The attend reads ``buf`` directly; this return is vestigial.
++        return None, None
+diff --git a/vllm/models/minimax_m3/nvidia/model.py b/vllm/models/minimax_m3/nvidia/model.py
+index 2c59fb0af39f..ed6e751d435e 100644
+--- a/vllm/models/minimax_m3/nvidia/model.py
++++ b/vllm/models/minimax_m3/nvidia/model.py
+@@ -769,8 +769,9 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+ 
+         # Reserved top-k indices buffer shared by all sparse-attention indexer
+         # layers (mirrors DeepseekV4); kept at a stable address so the indexer's
+-        # top-k output survives cudagraph capture/replay. Shape matches the
+-        # per-head index top-k output [num_index_heads, total_q, topk].
++        # top-k output survives cudagraph capture/replay. Token-major
++        # [total_q, num_index_heads, topk] so the indexer writes its native
++        # [token, head, topk] top-k; the attend transposes to [H, tokens, topk].
+         sparse_cfg = getattr(config, "sparse_attention_config", None)
+         if sparse_cfg is not None:
+             tp_size = get_tensor_model_parallel_world_size()
+@@ -780,8 +781,8 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+             padded_num_tokens = (max_num_batched_tokens + 3) // 4 * 4
+             self.topk_indices_buffer = torch.empty(
+-                num_index_heads,
+                 padded_num_tokens,
++                num_index_heads,
+                 sparse_cfg["sparse_topk_blocks"],
+                 dtype=torch.int32,
+             )
+diff --git a/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py b/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
+index 0df2ed85bbd1..545667c8cfe4 100644
+--- a/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
++++ b/vllm/models/minimax_m3/nvidia/sparse_attention_msa.py
+@@ -39,7 +39,8 @@ def forward(
+ 
+         nd = main_md.num_decode_tokens
+         num_tokens = main_md.num_actual_tokens
+-        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
++        # Indexer top-k from the shared token-major buffer [total_q, H, MK]; the
++        # kernels want [H, tokens, MK], so slice tokens on dim 0 then transpose.
+         topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
+         assert topk is not None
+         hd = self.head_size
+@@ -56,7 +57,7 @@ def forward(
+             minimax_m3_sparse_attn_decode(
+                 q[:nd],
+                 kv_cache,
+-                topk[:, :nd, :],
++                topk[:nd].transpose(0, 1),
+                 d.block_table,
+                 d.seq_lens,
+                 self.num_kv_heads,
+@@ -74,7 +75,9 @@ def forward(
+ 
+             p = main_md.prefill
+             assert p is not None
+-            prefill_topk = topk[:, nd:num_tokens, :]
++            # [H, prefill, MK] transposed view; build_k2q_csr consumes the
++            # strided view directly (topK stays innermost-contiguous).
++            prefill_topk = topk[nd:num_tokens].transpose(0, 1)
+             qp = q[nd:]
+             k_cache = kv_cache[:, 0].transpose(1, 2)
+             v_cache = kv_cache[:, 1].transpose(1, 2)

@@ -1,0 +1,1167 @@
+diff --git a/python/sglang/srt/configs/update_config.py b/python/sglang/srt/configs/update_config.py
+index 7bb6aab35725..b7b3a3c3b51f 100644
+--- a/python/sglang/srt/configs/update_config.py
++++ b/python/sglang/srt/configs/update_config.py
+@@ -17,19 +17,24 @@ def may_get_weight_block_size(model_config, load_config):
+ 
+     if quant_config is not None and hasattr(quant_config, "weight_block_size"):
+         return getattr(quant_config, "weight_block_size")
++
++    if quant_config is not None and hasattr(quant_config, "group_size"):
++        return [getattr(quant_config, "group_size")]
++
+     return None
+ 
+ 
+ def get_moe_padding_size(weight_block_size):
+     if weight_block_size is not None:
+         # See NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+-        assert (
+-            len(weight_block_size) == 2
+-        ), "Only len(weight_block_size) == 2 is supported"
+-        assert (
+-            weight_block_size[0] == weight_block_size[1]
+-        ), "Only weight_block_size[0] == weight_block_size[1] is supported"
+-
++        assert len(weight_block_size) in [
++            1,
++            2,
++        ], "Only len(weight_block_size) in [1, 2] is supported"
++        if len(weight_block_size) == 2:
++            assert (
++                weight_block_size[0] == weight_block_size[1]
++            ), "Only weight_block_size[0] == weight_block_size[1] is supported"
+         return weight_block_size[0]
+ 
+     return DEFAULT_MOE_PADDING_SIZE
+diff --git a/python/sglang/srt/layers/amx_utils.py b/python/sglang/srt/layers/amx_utils.py
+old mode 100644
+new mode 100755
+index 81a455976637..d69e71060646
+--- a/python/sglang/srt/layers/amx_utils.py
++++ b/python/sglang/srt/layers/amx_utils.py
+@@ -16,6 +16,11 @@ class CPUQuantMethod(IntEnum):
+     INT4_W4A8 = 3
+ 
+ 
++class CPUQuantAlgo(IntEnum):
++    AWQ = 0
++    GPTQ = 1
++
++
+ def amx_process_weight_after_loading(weight, is_conv=False):
+     if weight.device != torch.device("cpu"):
+         return weight
+@@ -74,7 +79,7 @@ def _init_amx_conv_state(conv_state):
+ 
+ 
+ def _amx_process_weight_after_loading(
+-    module, weight_names, transpose_dims=None
++    module, weight_names, transpose_dims=None, qweight_packed_method=None
+ ) -> None:
+     # Pack weight for get better performance on CPU
+     devices = {getattr(module, weight_name).device for weight_name in weight_names}
+@@ -86,40 +91,69 @@ def _amx_process_weight_after_loading(
+             transpose_dims
+         ), "len(weight_names) should be equal to len(transpose_dims)"
+ 
+-    for i, weight_name in enumerate(weight_names):
+-        weight_tensor = getattr(module, weight_name)
+-
+-        if transpose_dims and transpose_dims[i]:
+-            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+-        is_conv_weight = is_dim_conv_weight(weight_tensor)
+-        # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
+-        if (
+-            (not dim_is_supported(weight_tensor))
+-            or not dtype_is_supported(weight_tensor)
+-        ) and (not is_conv_weight):
+-            logger.warning(
+-                f"Unsupported dimension or dtype for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} and dtype {weight_tensor.dtype} in {module}. "
+-                f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
+-            )
+-            module.use_intel_amx_backend = False
+-            return
+-
+-        packed_weight = torch.nn.Parameter(
+-            amx_process_weight_after_loading(weight_tensor, is_conv_weight),
+-            requires_grad=False,
+-        )
+-        packed_weight.__dict__ = weight_tensor.__dict__
+-        setattr(module, weight_name, packed_weight)
+-        if is_conv_weight:
+-            # need to use inplace copy for conv weight amx packing,
+-            # as its usage in radix_linear_attention will use the original conv weight.
+-            weight_tensor = weight_tensor.view(-1, weight_tensor.size(-1))
+-            weight_tensor.copy_(packed_weight)
+-
+     module.use_intel_amx_backend = (
+         device == torch.device("cpu") and cpu_has_amx_support()
+     )
+ 
++    if qweight_packed_method is None:
++        for i, weight_name in enumerate(weight_names):
++            weight_tensor = getattr(module, weight_name)
++
++            if transpose_dims and transpose_dims[i]:
++                weight_tensor = weight_tensor.transpose(*transpose_dims[i])
++            is_conv_weight = is_dim_conv_weight(weight_tensor)
++            # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
++            if (
++                (not dim_is_supported(weight_tensor))
++                or not dtype_is_supported(weight_tensor)
++            ) and (not is_conv_weight):
++                logger.warning(
++                    f"Unsupported dimension or dtype for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} and dtype {weight_tensor.dtype} in {module}. "
++                    f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
++                )
++                module.use_intel_amx_backend = False
++                return
++
++            packed_weight = torch.nn.Parameter(
++                amx_process_weight_after_loading(weight_tensor, is_conv_weight),
++                requires_grad=False,
++            )
++            packed_weight.__dict__ = weight_tensor.__dict__
++            setattr(module, weight_name, packed_weight)
++            if is_conv_weight:
++                # need to use inplace copy for conv weight amx packing,
++                # as its usage in radix_linear_attention will use the original conv weight.
++                weight_tensor = weight_tensor.view(-1, weight_tensor.size(-1))
++                weight_tensor.copy_(packed_weight)
++    else:
++        assert qweight_packed_method in ["awq", "gptq"]
++        qweight_tensor = getattr(module, weight_names[0])
++        qzeros_tensor = getattr(module, weight_names[1])
++        scales_tensor = getattr(module, weight_names[2])
++        qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
++            qweight_tensor,
++            qzeros_tensor,
++            scales_tensor,
++            CPUQuantAlgo.AWQ if qweight_packed_method == "awq" else CPUQuantAlgo.GPTQ,
++        )
++        packed_qweight = torch.nn.Parameter(
++            qweight.detach(),
++            requires_grad=False,
++        )
++        packed_qzeros = torch.nn.Parameter(
++            qzeros.detach(),
++            requires_grad=False,
++        )
++        packed_scales = torch.nn.Parameter(
++            scales.detach(),
++            requires_grad=False,
++        )
++        packed_qweight.__dict__ = qweight_tensor.__dict__
++        packed_qzeros.__dict__ = qzeros_tensor.__dict__
++        packed_scales.__dict__ = scales_tensor.__dict__
++        setattr(module, weight_names[0], packed_qweight)
++        setattr(module, weight_names[1], packed_qzeros)
++        setattr(module, weight_names[2], packed_scales)
+     if (
+         module.use_intel_amx_backend
+         and hasattr(module, "bias")
+diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
+index 74d9a727101f..f0baf579e1a8 100644
+--- a/python/sglang/srt/layers/linear.py
++++ b/python/sglang/srt/layers/linear.py
+@@ -57,6 +57,7 @@
+     "AWQMarlinLinearMethod",
+     "AWQLinearMethod",
+     "AWQLinearAscendMethod",
++    "AWQLinearIntelAMXMethod",
+     "GPTQMarlinLinearMethod",
+     "Fp8LinearMethod",
+     "BlockInt8LinearMethod",
+@@ -67,7 +68,9 @@
+     "GPTQLinearMethod",
+     "FBGEMMFp8LinearMethod",
+     "GPTQLinearAscendMethod",
++    "GPTQLinearIntelAMXMethod",
+     "GPTQMoEAscendMethod",
++    "GPTQMoEIntelAMXMethod",
+     "ModelOptFp8LinearMethod",
+     "ModelOptFp4LinearMethod",
+     "IPEXAWQLinearMethod",
+diff --git a/python/sglang/srt/layers/quantization/__init__.py b/python/sglang/srt/layers/quantization/__init__.py
+index 8a6b1b06e193..3538fdc829a2 100644
+--- a/python/sglang/srt/layers/quantization/__init__.py
++++ b/python/sglang/srt/layers/quantization/__init__.py
+@@ -18,6 +18,7 @@ def override_quantization_method(self, *args, **kwargs):
+ 
+ from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+ from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
++from sglang.srt.layers.quantization.awq_cpu import CPUAWQConfig
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
+ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
+@@ -28,6 +29,7 @@ def override_quantization_method(self, *args, **kwargs):
+ from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
+ from sglang.srt.layers.quantization.gguf import GGUFConfig
+ from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
++from sglang.srt.layers.quantization.gptq_cpu import CPUGPTQConfig
+ from sglang.srt.layers.quantization.modelopt_quant import (
+     ModelOptFp4Config,
+     ModelOptFp8Config,
+@@ -43,7 +45,13 @@ def override_quantization_method(self, *args, **kwargs):
+ from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+ from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+ from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+-from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
++from sglang.srt.utils import (
++    cpu_has_amx_support,
++    is_cuda,
++    is_hip,
++    is_npu,
++    mxfp_supported,
++)
+ 
+ _is_mxfp_supported = mxfp_supported()
+ 
+@@ -87,6 +95,15 @@ def override_quantization_method(self, *args, **kwargs):
+         }
+     )
+ 
++# subset of above quant methods, supported on CPU
++CPU_QUANTIZATION_METHODS = {
++    "fp8": Fp8Config,
++    "w8a8_int8": W8A8Int8Config,
++    "compressed-tensors": CompressedTensorsConfig,
++    "awq": CPUAWQConfig,
++    "gptq": CPUGPTQConfig,
++}
++
+ QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}
+ 
+ 
+@@ -96,6 +113,16 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
+             f"Invalid quantization method: {quantization}. "
+             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
+         )
++    from sglang.srt.utils import is_cpu
++
++    if is_cpu() and cpu_has_amx_support():
++        if quantization not in CPU_QUANTIZATION_METHODS:
++            raise ValueError(
++                f"Invalid quantization method on CPU: {quantization}. "
++                f"Available methods on CPU: {list(QUANTIZATION_METHODS.keys())}"
++            )
++        else:
++            return CPU_QUANTIZATION_METHODS[quantization]
+ 
+     return QUANTIZATION_METHODS[quantization]
+ 
+diff --git a/python/sglang/srt/layers/quantization/awq.py b/python/sglang/srt/layers/quantization/awq.py
+old mode 100644
+new mode 100755
+diff --git a/python/sglang/srt/layers/quantization/awq_cpu.py b/python/sglang/srt/layers/quantization/awq_cpu.py
+new file mode 100755
+index 000000000000..20d64bf07361
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/awq_cpu.py
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier: Apache-2.0
++from __future__ import annotations
++
++import logging
++from typing import TYPE_CHECKING, List, Optional
++
++import torch
++
++from sglang.srt.layers.moe import (
++    MoeRunnerConfig,
++)
++from sglang.srt.layers.quantization.base_config import (
++    LinearMethodBase,
++)
++from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
++from sglang.srt.layers.quantization.utils import get_scalar_types
++
++from .awq import AWQConfig, AWQLinearMethod, AWQMoEMethod
++
++if TYPE_CHECKING:
++    from sglang.srt.layers.moe.token_dispatcher import (
++        StandardDispatchOutput,
++    )
++
++from sglang.srt.layers.amx_utils import (
++    CPUQuantMethod,
++    _amx_process_weight_after_loading,
++)
++
++logger = logging.getLogger(__name__)
++
++
++ScalarType, scalar_types = get_scalar_types()
++
++
++def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
++    return any(module_name in prefix for module_name in modules_to_not_convert)
++
++
++class CPUAWQConfig(AWQConfig):
++    """CPU Config class for AWQ, inherit from AWQConfig"""
++
++    def get_supported_act_dtypes(self) -> List[torch.dtype]:
++        return [torch.float16, torch.bfloat16]
++
++    def get_quant_method(
++        self, layer: torch.nn.Module, prefix: str
++    ) -> Optional[LinearMethodBase]:
++        from sglang.srt.layers.linear import LinearBase
++        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
++
++        if isinstance(layer, LinearBase):
++            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
++                return UnquantizedLinearMethod()
++            return AWQLinearIntelAMXMethod(self)
++        elif isinstance(layer, FusedMoE):
++            return AWQMoEIntelAMXMethod(self)
++        return None
++
++
++class AWQLinearIntelAMXMethod(AWQLinearMethod):
++    """Linear method for AWQ on Intel CPU with AMX."""
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        _amx_process_weight_after_loading(
++            layer, ["qweight", "qzeros", "scales"], None, "awq"
++        )
++        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
++        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
++        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++
++        return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
++            x,
++            layer.qweight,
++            layer.qzeros,
++            layer.scales,
++            bias,
++        )
++
++
++class AWQMoEIntelAMXMethod(AWQMoEMethod):
++    """MoE method for AWQ on Intel CPU with AMX."""
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        _amx_process_weight_after_loading(
++            layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "awq"
++        )
++        _amx_process_weight_after_loading(
++            layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "awq"
++        )
++
++    def create_moe_runner(
++        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
++    ):
++        self.moe_runner_config = moe_runner_config
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        dispatch_output: StandardDispatchOutput,
++    ) -> torch.Tensor:
++        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
++
++        assert (
++            self.moe_runner_config.activation == "silu"
++        ), "Only SiLU activation is supported."
++
++        x = dispatch_output.hidden_states
++        topk_output = dispatch_output.topk_output
++        topk_weights, topk_ids, _ = topk_output
++        output = torch.ops.sgl_kernel.fused_experts_cpu(
++            x,
++            layer.w13_qweight,
++            layer.w2_qweight,
++            topk_weights,
++            topk_ids,
++            False,  # inplace See [Note] inplace should be False in fused_experts.
++            CPUQuantMethod.INT4_W4A8,
++            layer.w13_scales,  # w1_scale
++            layer.w2_scales,  # w2_scale
++            layer.w13_qzeros,
++            layer.w2_qzeros,
++            None,  # block_size
++            True,  # is_vnni
++        )
++        return StandardCombineInput(hidden_states=output)
+diff --git a/python/sglang/srt/layers/quantization/gptq.py b/python/sglang/srt/layers/quantization/gptq.py
+index 9e5c2945f70a..b13d843b4b70 100644
+--- a/python/sglang/srt/layers/quantization/gptq.py
++++ b/python/sglang/srt/layers/quantization/gptq.py
+@@ -129,6 +129,8 @@ def __init__(
+         lm_head_quantized: bool,
+         dynamic: Dict[str, Dict[str, Union[int, bool]]],
+         checkpoint_format: str = "",
++        true_sequential: bool = False,
++        static_groups: bool = False,
+     ) -> None:
+         # GPTQModel use `dynamic` config property to allow per module
+         # quantization config so each module can be individually optimized.
+@@ -165,6 +167,8 @@ def __init__(
+         # Currently GPTQModel stores v1 format checkpoints by default,
+         # but provides the option to set `format="gptq_v2"` in `QuantizeConfig`.
+         self.checkpoint_format = checkpoint_format
++        self.true_sequential = true_sequential
++        self.static_groups = static_groups
+         if self.weight_bits not in [2, 3, 4, 8]:
+             raise ValueError(
+                 "Currently, only 2/3/4/8-bit weight quantization is "
+@@ -222,6 +226,10 @@ def from_config(cls, config: Dict[str, Any]) -> GPTQConfig:
+         checkpoint_format = cls.get_from_keys_or(
+             config, ["checkpoint_format"], default=""
+         )
++        true_sequential = cls.get_from_keys_or(
++            config, ["true_sequential"], default=False
++        )
++        static_groups = cls.get_from_keys_or(config, ["static_groups"], default=False)
+         return cls(
+             weight_bits,
+             group_size,
+@@ -229,6 +237,8 @@ def from_config(cls, config: Dict[str, Any]) -> GPTQConfig:
+             lm_head_quantized,
+             dynamic,
+             checkpoint_format,
++            true_sequential,
++            static_groups,
+         )
+ 
+     def get_quant_method(
+@@ -477,7 +487,6 @@ def create_weights(
+             group_size = self.quant_config.group_size
+         else:
+             group_size = input_size
+-
+         self.use_shuffle = True
+         scale_and_zero_size = input_size // group_size
+         scale_and_zero_input_dim = None
+diff --git a/python/sglang/srt/layers/quantization/gptq_cpu.py b/python/sglang/srt/layers/quantization/gptq_cpu.py
+new file mode 100644
+index 000000000000..1bac4ce0e3f9
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/gptq_cpu.py
+@@ -0,0 +1,375 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, List, Optional
++
++import torch
++
++from sglang.srt.layers.moe import (
++    MoeRunnerConfig,
++)
++from sglang.srt.layers.parameter import (
++    ChannelQuantScaleParameter,
++    GroupQuantScaleParameter,
++    PackedColumnParameter,
++    PackedvLLMParameter,
++    RowvLLMParameter,
++)
++from sglang.srt.layers.quantization.base_config import (
++    FusedMoEMethodBase,
++    LinearMethodBase,
++)
++
++if TYPE_CHECKING:
++    from sglang.srt.layers.moe.token_dispatcher import (
++        StandardDispatchOutput,
++    )
++
++from sglang.srt.layers.amx_utils import (
++    CPUQuantMethod,
++    _amx_process_weight_after_loading,
++)
++
++from .gptq import GPTQConfig
++
++
++class CPUGPTQConfig(GPTQConfig):
++    """CPU Config class for AWQ, inherit from AWQConfig"""
++
++    @classmethod
++    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
++        return [torch.half, torch.bfloat16]
++
++    def get_quant_method(
++        self, layer: torch.nn.Module, prefix: str
++    ) -> Optional[LinearMethodBase]:
++        # Delay the import to avoid circular dependency
++        from sglang.srt.layers.linear import LinearBase
++        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
++
++        if isinstance(layer, FusedMoE):
++            return GPTQMoEIntelAMXMethod(self)
++
++        if isinstance(layer, LinearBase):
++            return GPTQLinearIntelAMXMethod(self)
++
++
++class GPTQLinearIntelAMXMethod(LinearMethodBase):
++    """Linear method for GPTQ on Intel CPU with AMX."""
++
++    def __init__(self, quant_config: GPTQConfig):
++        self.quant_config = quant_config
++        # GPTQ v1 and v2 format deals with zero points differently
++        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        del output_size  # Unused.
++        weight_loader = extra_weight_attrs.get("weight_loader")
++        if input_size_per_partition % self.quant_config.group_size != 0:
++            raise ValueError(
++                "The input size is not aligned with the quantized "
++                "weight shape. This can be caused by too large "
++                "tensor parallel size."
++            )
++        output_size_per_partition = sum(output_partition_sizes)
++        if output_size_per_partition % self.quant_config.pack_factor.numerator != 0:
++            raise ValueError(
++                "The output size is not aligned with the quantized "
++                "weight shape. This can be caused by too large "
++                "tensor parallel size."
++            )
++
++        if self.quant_config.desc_act and not (
++            self.quant_config.true_sequential and self.quant_config.static_groups
++        ):
++            raise ValueError(
++                "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
++            )
++        if self.quant_config.weight_bits != 4:
++            raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
++        if self.use_v2_format:
++            raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
++
++        if self.quant_config.group_size != -1:
++            group_size = self.quant_config.group_size
++        else:
++            group_size = input_size
++
++        scale_and_zero_size = input_size_per_partition // group_size
++        scale_and_zero_input_dim = 0
++
++        qweight = PackedvLLMParameter(
++            data=torch.empty(
++                input_size_per_partition // self.quant_config.pack_factor,
++                output_size_per_partition,
++                dtype=torch.int32,
++            ),
++            input_dim=0,
++            output_dim=1,
++            packed_dim=0,
++            packed_factor=self.quant_config.pack_factor,
++            weight_loader=weight_loader,
++        )
++
++        g_idx = RowvLLMParameter(
++            data=torch.tensor(
++                [
++                    i // self.quant_config.group_size
++                    for i in range(input_size_per_partition)
++                ],
++                dtype=torch.int32,
++            ),
++            input_dim=0,
++            weight_loader=weight_loader,
++        )
++        qzeros_args = {
++            "data": torch.empty(
++                scale_and_zero_size,
++                output_size_per_partition // self.quant_config.pack_factor,
++                dtype=torch.int32,
++            ),
++            "weight_loader": weight_loader,
++        }
++        weight_scale_args = {
++            "data": torch.empty(
++                scale_and_zero_size,
++                output_size_per_partition,
++                dtype=params_dtype,
++            ),
++            "weight_loader": weight_loader,
++        }
++        if scale_and_zero_input_dim is None:
++            scales = ChannelQuantScaleParameter(output_dim=1, **weight_scale_args)
++            qzeros = PackedColumnParameter(
++                output_dim=1,
++                packed_dim=1,
++                packed_factor=self.quant_config.pack_factor,
++                **qzeros_args,
++            )
++
++        else:
++            scales = GroupQuantScaleParameter(
++                output_dim=1, input_dim=0, **weight_scale_args
++            )
++            qzeros = PackedvLLMParameter(
++                input_dim=0,
++                output_dim=1,
++                packed_dim=1,
++                packed_factor=self.quant_config.pack_factor,
++                **qzeros_args,
++            )
++
++        layer.register_parameter("qweight", qweight)
++        layer.register_parameter("g_idx", g_idx)
++        layer.register_parameter("qzeros", qzeros)
++        layer.register_parameter("scales", scales)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        _amx_process_weight_after_loading(
++            layer, ["qweight", "qzeros", "scales"], None, "gptq"
++        )
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++        return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
++            x,
++            layer.qweight,
++            layer.qzeros,
++            layer.scales,
++            bias,
++        )
++
++
++class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
++    """MoE method for GPTQ on Intel CPU with AMX."""
++
++    def __init__(self, quant_config: GPTQConfig):
++        super().__init__()
++        self.quant_config = quant_config
++        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
++        self.moe_runner_config: Optional[MoeRunnerConfig] = None
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        num_experts: int,
++        hidden_size: int,
++        intermediate_size_per_partition: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        if self.quant_config.desc_act and not (
++            self.quant_config.true_sequential and self.quant_config.static_groups
++        ):
++            raise ValueError(
++                "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
++            )
++        if self.quant_config.weight_bits != 4:
++            raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
++        if self.use_v2_format:
++            raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
++        # Delay the import to avoid circular dependency
++        from sglang.srt.layers.linear import set_weight_attrs
++        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
++
++        if self.quant_config.group_size != -1:
++            scales_size13 = hidden_size // self.quant_config.group_size
++            w2_scales_size = intermediate_size_per_partition
++            scales_size2 = w2_scales_size // self.quant_config.group_size
++            strategy = FusedMoeWeightScaleSupported.GROUP.value
++        else:
++            scales_size13 = 1
++            scales_size2 = 1
++            strategy = FusedMoeWeightScaleSupported.CHANNEL.value
++
++        extra_weight_attrs.update({"quant_method": strategy, "is_transposed": True})
++        # Fused gate_up_proj (column parallel)
++        w13_qweight = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                hidden_size // self.quant_config.pack_factor,
++                2 * intermediate_size_per_partition,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_qweight", w13_qweight)
++        set_weight_attrs(w13_qweight, extra_weight_attrs)
++        # down_proj (row parallel)
++        w2_qweight = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                intermediate_size_per_partition // self.quant_config.pack_factor,
++                hidden_size,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_qweight", w2_qweight)
++        set_weight_attrs(w2_qweight, extra_weight_attrs)
++        # up_proj scales
++        w13_scales = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                scales_size13,
++                2 * intermediate_size_per_partition,
++                dtype=params_dtype,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_scales", w13_scales)
++        set_weight_attrs(w13_scales, extra_weight_attrs)
++        # down_proj scales
++        w2_scales = torch.nn.Parameter(
++            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_scales", w2_scales)
++        set_weight_attrs(w2_scales, extra_weight_attrs)
++        # dont shard the w2 scales when running act order
++        set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
++        # up_proj scales
++        w13_qzeros = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                scales_size13,
++                2 * intermediate_size_per_partition // self.quant_config.pack_factor,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_qzeros", w13_qzeros)
++        set_weight_attrs(w13_qzeros, extra_weight_attrs)
++        # down_proj scales
++        w2_qzeros = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                scales_size2,
++                hidden_size // self.quant_config.pack_factor,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_qzeros", w2_qzeros)
++        set_weight_attrs(w2_qzeros, extra_weight_attrs)
++        # dont shard the w2 scales when running act order
++        set_weight_attrs(w2_qzeros, {"load_full_w2": self.quant_config.desc_act})
++        w13_g_idx = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                hidden_size,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_g_idx", w13_g_idx)
++        set_weight_attrs(w13_g_idx, extra_weight_attrs)
++        w2_g_idx = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                intermediate_size_per_partition,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_g_idx", w2_g_idx)
++        set_weight_attrs(w2_g_idx, extra_weight_attrs)
++
++    def create_moe_runner(
++        self,
++        layer: torch.nn.Module,
++        moe_runner_config: MoeRunnerConfig,
++        **extra_weight_attrs,
++    ):
++        self.moe_runner_config = moe_runner_config
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        _amx_process_weight_after_loading(
++            layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "gptq"
++        )
++        _amx_process_weight_after_loading(
++            layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
++        )
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        dispatch_output: StandardDispatchOutput,
++    ) -> torch.Tensor:
++        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
++
++        assert (
++            self.moe_runner_config.activation == "silu"
++        ), "Only SiLU activation is supported."
++
++        x = dispatch_output.hidden_states
++        topk_output = dispatch_output.topk_output
++        topk_weights, topk_ids, _ = topk_output
++        output = torch.ops.sgl_kernel.fused_experts_cpu(
++            x,
++            layer.w13_qweight,
++            layer.w2_qweight,
++            topk_weights,
++            topk_ids,
++            False,  # inplace See [Note] inplace should be False in fused_experts.
++            CPUQuantMethod.INT4_W4A8,
++            layer.w13_scales,  # w1_scale
++            layer.w2_scales,  # w2_scale
++            layer.w13_qzeros,
++            layer.w2_qzeros,
++            None,  # block_size
++            True,  # is_vnni
++        )
++        return StandardCombineInput(hidden_states=output)
+diff --git a/sgl-kernel/csrc/cpu/gemm.h b/sgl-kernel/csrc/cpu/gemm.h
+index fc2b199bfea6..bbfdccf45242 100644
+--- a/sgl-kernel/csrc/cpu/gemm.h
++++ b/sgl-kernel/csrc/cpu/gemm.h
+@@ -77,6 +77,16 @@ constexpr bool operator==(int64_t a, CPUQuantMethod b) {
+   return a == static_cast<int64_t>(b);
+ }
+ 
++enum class CPUQuantAlgo : int64_t { AWQ = 0, GPTQ = 1 };
++
++constexpr bool operator==(CPUQuantAlgo a, int64_t b) {
++  return static_cast<int64_t>(a) == b;
++}
++
++constexpr bool operator==(int64_t a, CPUQuantAlgo b) {
++  return a == static_cast<int64_t>(b);
++}
++
+ inline int64_t get_4bit_block_k_size(int64_t group_size) {
+   return group_size > 128 ? 128 : group_size;
+ }
+diff --git a/sgl-kernel/csrc/cpu/gemm_int4.cpp b/sgl-kernel/csrc/cpu/gemm_int4.cpp
+index e2da063a0243..42d60c61018a 100644
+--- a/sgl-kernel/csrc/cpu/gemm_int4.cpp
++++ b/sgl-kernel/csrc/cpu/gemm_int4.cpp
+@@ -590,34 +590,114 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
+   return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros));
+ }
+ 
+-std::tuple<at::Tensor, at::Tensor> autoawq_to_int4pack(
+-    at::Tensor qweight,  // (*, K, N / 8), int32
+-    at::Tensor qzeros)   // (*, K / group_size, N / 8), int32
+-{
+-  // bitshifts: [0, 4, 1, 5, 2, 6, 3, 7] * 4
+-  auto bitshifts = at::tensor({0, 4, 1, 5, 2, 6, 3, 7}, at::kInt) * 4;
+-  // qweight: assumed shape [..., K, N/8] (int32)
+-  auto qweight_unsq = qweight.unsqueeze(-1);  // [..., K, N/8, 1]
+-  auto shape = qweight_unsq.sizes().vec();    // shape: [A, B, C, 1]
+-  shape[3] = 8;
+-  auto unpacked = at::bitwise_right_shift(qweight_unsq, bitshifts) & 0xF;
+-  auto qweight_final = unpacked.flatten(-2).transpose(-1, -2).to(at::kByte);
+-
+-  auto qzeros_unsq = qzeros.unsqueeze(-1);
+-  auto qzeros_unpacked = at::bitwise_right_shift(qzeros_unsq, bitshifts) & 0xF;
+-  auto qzeros_final = qzeros_unpacked.flatten(-2).to(at::kByte);
+-
+-  return std::make_tuple(qweight_final, qzeros_final);
++std::tuple<at::Tensor, at::Tensor> unpack_4bit_to_32bit_signed(const at::Tensor& qweight, const at::Tensor& qzeros) {
++  TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
++  TORCH_CHECK(qzeros.scalar_type() == at::kInt, "qzeros must be int32");
++  const auto W0 = qweight.size(0);
++  const auto W1 = qweight.size(1);
++  const auto Z0 = qzeros.size(0);
++  const auto Z1 = qzeros.size(1);
++
++  // unpacked_weights: (W0 * 8, W1), int8
++  auto unpacked_weights = at::zeros({W0 * 8, W1}, at::TensorOptions().dtype(at::kChar));
++  // unpacked_zeros: (Z0, Z1 * 8), int8
++  auto unpacked_zeros = at::zeros({Z0, Z1 * 8}, at::TensorOptions().dtype(at::kChar));
++
++  const int32_t* qw_ptr = qweight.data_ptr<int32_t>();
++  const int32_t* qz_ptr = qzeros.data_ptr<int32_t>();
++  int8_t* uw_ptr = unpacked_weights.data_ptr<int8_t>();
++  int8_t* uz_ptr = unpacked_zeros.data_ptr<int8_t>();
++
++  // ---- unpack qweight ----
++  for (int64_t row = 0; row < W0 * 8; ++row) {
++    const int i = row & 7;         // row % 8
++    const int src_row = row >> 3;  // row // 8
++    const int shift = 4 * i;
++    for (int64_t col = 0; col < W1; ++col) {
++      int32_t v = qw_ptr[src_row * W1 + col];
++      uw_ptr[row * W1 + col] = static_cast<int8_t>((v >> shift) & 0xF);
++    }
++  }
++  // ---- unpack qzeros ----
++  for (int64_t col = 0; col < Z1 * 8; ++col) {
++    const int i = col & 7;
++    const int src_col = col >> 3;
++    const int shift = 4 * i;
++
++    for (int64_t row = 0; row < Z0; ++row) {
++      int32_t v = qz_ptr[row * Z1 + src_col];
++      uz_ptr[row * (Z1 * 8) + col] = static_cast<int8_t>((v >> shift) & 0xF);
++    }
++  }
++
++  return std::make_tuple(unpacked_weights, unpacked_zeros + 1);
++}
++
++std::tuple<at::Tensor, at::Tensor>
++autogptq_to_int4pack(const at::Tensor& qweight_tensor, const at::Tensor& qzeros_tensor) {
++  TORCH_CHECK(qweight_tensor.scalar_type() == at::kInt, "qweight_tensor must be int32");
++  TORCH_CHECK(qzeros_tensor.scalar_type() == at::kInt, "qzeros_tensor must be int32");
++  TORCH_CHECK(qweight_tensor.is_cpu(), "CPU only implementation");
++  if (qweight_tensor.dim() == 3) {
++    const int64_t B = qweight_tensor.size(0);
++    std::vector<at::Tensor> qweight_list;
++    std::vector<at::Tensor> qzeros_list;
++    qweight_list.reserve(B);
++    qzeros_list.reserve(B);
++    for (int64_t i = 0; i < B; ++i) {
++      auto outputs = unpack_4bit_to_32bit_signed(qweight_tensor[i], qzeros_tensor[i]);
++      at::Tensor unpacked_qweight = std::get<0>(outputs);
++      at::Tensor unpacked_qzeros = std::get<1>(outputs);
++      qweight_list.push_back(unpacked_qweight.transpose(0, 1).contiguous().to(at::kByte));
++      qzeros_list.push_back(unpacked_qzeros.contiguous().to(at::kByte));
++    }
++    return std::make_tuple(at::stack(qweight_list).detach(), at::stack(qzeros_list).detach());
++  }
++  auto outputs = unpack_4bit_to_32bit_signed(qweight_tensor, qzeros_tensor);
++  at::Tensor unpacked_qweight = std::get<0>(outputs);
++  at::Tensor unpacked_qzeros = std::get<1>(outputs);
++  at::Tensor return_qweight = unpacked_qweight.transpose(0, 1).contiguous().to(at::kByte);
++  at::Tensor return_qzeros = unpacked_qzeros.contiguous().to(at::kByte);
++  return std::make_tuple(return_qweight, return_qzeros);
++}
++
++std::tuple<at::Tensor, at::Tensor> int4pack(at::Tensor qweight, at::Tensor qzeros, int64_t quant_method_4bit) {
++  if (quant_method_4bit == CPUQuantAlgo::AWQ) {
++    // autoawq unpacking
++    qweight = qweight.contiguous();
++    qzeros = qzeros.contiguous();
++    // bitshifts: [0, 4, 1, 5, 2, 6, 3, 7] * 4
++    auto bitshifts = at::tensor({0, 4, 1, 5, 2, 6, 3, 7}, at::kInt) * 4;
++    auto qweight_unsq = qweight.unsqueeze(-1);  // [..., K, N/8, 1]
++    auto unpacked = (at::bitwise_right_shift(qweight_unsq, bitshifts) & 0xF).contiguous();
++    auto qweight_final = unpacked.flatten(-2).transpose(-1, -2).to(at::kByte).clone();
++    auto qzeros_unsq = qzeros.unsqueeze(-1);
++    auto qzeros_unpacked = (at::bitwise_right_shift(qzeros_unsq, bitshifts) & 0xF).contiguous();
++    auto qzeros_final = qzeros_unpacked.flatten(-2).to(at::kByte).clone();
++    return std::make_tuple(qweight_final, qzeros_final);
++  } else if (quant_method_4bit == CPUQuantAlgo::GPTQ) {
++    // autogptq unpacking
++    auto outputs = autogptq_to_int4pack(qweight, qzeros);
++    at::Tensor unpacked_qweight = std::get<0>(outputs);
++    at::Tensor unpacked_qzeros = std::get<1>(outputs);
++    return std::make_tuple(unpacked_qweight, unpacked_qzeros);
++  } else {
++    TORCH_CHECK(false, "CPU int4 pack only support AWQ or GPTQ...");
++  }
+ }
+ 
+ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
+-    at::Tensor qweight,  // (*, K, N / 8), int32
+-    at::Tensor qzeros,   // (*, K / group_size, N / 8), int32
+-    at::Tensor scales    // (*, K / group_size, N), bfloat16
+-) {
+-  auto res = autoawq_to_int4pack(qweight, qzeros);
+-  auto _qweight = std::get<0>(res);
+-  auto _qzeros = std::get<1>(res);
++    at::Tensor qweight,  // awq: (*, K, N / 8)  ||  gptq: (*, K / 8, N) , int32
++    at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
++    at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
++    int64_t quant_method_4bit) {
++  at::Tensor _qweight;
++  at::Tensor _qzeros;
++
++  auto res = int4pack(qweight, qzeros, quant_method_4bit);
++  _qweight = std::get<0>(res);
++  _qzeros = std::get<1>(res);
++
+   auto _scales = scales;
+   _qzeros = _qzeros.transpose(-2, -1).contiguous();  // .T
+   _scales = _scales.transpose(-2, -1).contiguous();
+diff --git a/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp b/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
+index 197dcbd869aa..921e5b7d1760 100644
+--- a/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
++++ b/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
+@@ -200,8 +200,11 @@ at::Tensor int4_scaled_mm_cpu(
+     at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
+ 
+ // weight prepack for int4 weights
+-std::tuple<at::Tensor, at::Tensor, at::Tensor>
+-convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
++std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
++    at::Tensor qweight,  // awq: (*, K, N / 8)  ||  gptq: (*, K / 8, N) , int32
++    at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
++    at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
++    int64_t quant_method_4bit);
+ 
+ // bmm
+ void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
+@@ -520,8 +523,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+ 
+   // weight prepack for int4 weights
+   m.def(
+-      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales) -> (Tensor, Tensor, "
+-      "Tensor)");
++      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales, int quant_method_4bit) -> (Tensor, "
++      "Tensor, Tensor)");
+   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
+ 
+   // bmm
+diff --git a/test/srt/cpu/test_gemm.py b/test/srt/cpu/test_gemm.py
+index 1019a06f2396..cde23a3716ad 100644
+--- a/test/srt/cpu/test_gemm.py
++++ b/test/srt/cpu/test_gemm.py
+@@ -10,6 +10,7 @@
+     per_token_quant_int8,
+     precision,
+     unpack_and_dequant_awq,
++    unpack_and_dequant_gptq,
+ )
+ 
+ from sglang.test.test_utils import CustomTestCase
+@@ -44,6 +45,10 @@ class TestGemm(CustomTestCase):
+     N_awq = [4096]
+     K_awq = [4096]
+ 
++    M_gptq = [1, 32]
++    N_gptq = [4096]
++    K_gptq = [4096]
++
+     def _bf16_gemm(self, M, N, K, has_bias):
+ 
+         mat1 = torch.randn(M, K, dtype=torch.bfloat16)
+@@ -250,7 +255,7 @@ def _int4_awq_gemm(self, M, N, K, group_size, has_bias):
+ 
+         packed_weight, packed_zero, packed_scales = (
+             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+-                awq_weight, awq_zero, awq_scales
++                awq_weight, awq_zero, awq_scales, 0
+             )
+         )
+         target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+@@ -277,6 +282,51 @@ def test_int4_awq_gemm(self):
+             ):
+                 self._int4_awq_gemm(*params)
+ 
++    def _int4_gptq_gemm(self, M, N, K, group_size, has_bias):
++        torch.manual_seed(127)
++        gptq_weight = torch.randint(-128, 128, (K // 8, N)).to(torch.int)
++        gptq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
++        gptq_scales = torch.rand(int(K // group_size), N).to(torch.bfloat16) // 10
++
++        bf16_weight = unpack_and_dequant_gptq(gptq_weight, gptq_zero, gptq_scales)
++        if has_bias:
++            bias = torch.rand(bf16_weight.shape[0]).to(torch.float)
++        else:
++            bias = None
++        x = torch.rand(M, bf16_weight.size(-1)).to(torch.bfloat16)
++        ref_res = torch.nn.functional.linear(
++            x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
++        )
++
++        packed_weight, packed_zero, packed_scales = (
++            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
++                gptq_weight, gptq_zero, gptq_scales, 1
++            )
++        )
++        target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
++            x,
++            packed_weight,
++            packed_zero,
++            packed_scales,
++            bias,
++        )
++
++        atol = rtol = precision[ref_res.dtype]
++        torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
++
++    def test_int4_gptq_gemm(self):
++        for params in itertools.product(
++            self.M_gptq, self.N_gptq, self.K_gptq, [128], self.has_bias
++        ):
++            with self.subTest(
++                M=params[0],
++                N=params[1],
++                K=params[2],
++                group_size=params[3],
++                has_bias=params[4],
++            ):
++                self._int4_gptq_gemm(*params)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/srt/cpu/test_moe.py b/test/srt/cpu/test_moe.py
+index 10cc0fd9d312..8a0a89c60096 100644
+--- a/test/srt/cpu/test_moe.py
++++ b/test/srt/cpu/test_moe.py
+@@ -302,12 +302,12 @@ def _int4_moe(self, M, N, K, E, topk, group_size=128):
+         topk_weight, topk_ids = torch.topk(score, topk)
+         awq_w13_weight_pack, awq_w13_zero_pack, awq_w13_scales_pack = (
+             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+-                awq_w13_weight, awq_w13_zero, awq_w13_scales
++                awq_w13_weight, awq_w13_zero, awq_w13_scales, 0
+             )
+         )
+         awq_w2_weight_pack, awq_w2_zero_pack, awq_w2_scales_pack = (
+             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+-                awq_w2_weight, awq_w2_zero, awq_w2_scales
++                awq_w2_weight, awq_w2_zero, awq_w2_scales, 0
+             )
+         )
+ 
+diff --git a/test/srt/cpu/utils.py b/test/srt/cpu/utils.py
+index eccdccbb1f0a..57e7e74c103c 100644
+--- a/test/srt/cpu/utils.py
++++ b/test/srt/cpu/utils.py
+@@ -402,3 +402,39 @@ def unpack_and_dequant_awq(
+     fp16_weight = qdq_weight_T.T
+ 
+     return fp16_weight, zeros
++
++
++def unpack_4bit_to_32bit_signed(qweight, qzeros):
++    # Unpack 4-bit values and interpret them as signed integers
++    unpacked_weights = torch.zeros(
++        (qweight.shape[0] * 8, qweight.shape[1]),
++        dtype=torch.int8,
++        device=qweight.device,
++        requires_grad=False,
++    )
++    unpacked_zeros = torch.zeros(
++        (qzeros.shape[0], qzeros.shape[1] * 8),
++        dtype=torch.int8,
++        device=qzeros.device,
++        requires_grad=False,
++    )
++
++    for row in range(unpacked_weights.shape[0]):
++        i = row % 8
++        unpacked_weights[row, :] = (qweight[row // 8, :] >> (4 * i)) & 0xF
++
++    for col in range(unpacked_zeros.shape[1]):
++        i = col % 8
++        unpacked_zeros[:, col] = (qzeros[:, col // 8] >> (4 * i)) & 0xF
++
++    return unpacked_weights, unpacked_zeros + 1
++
++
++def unpack_and_dequant_gptq(qweight, qzeros, scales):
++    unpacked_qweight, unpacked_qzeros = unpack_4bit_to_32bit_signed(qweight, qzeros)
++    group_size = unpacked_qweight.shape[0] // scales.shape[0]
++    scales = scales.repeat_interleave(group_size, dim=0)
++    unpacked_qzeros = unpacked_qzeros.repeat_interleave(group_size, dim=0)
++    unpacked_qweight = (unpacked_qweight - unpacked_qzeros) * scales
++
++    return unpacked_qweight.T

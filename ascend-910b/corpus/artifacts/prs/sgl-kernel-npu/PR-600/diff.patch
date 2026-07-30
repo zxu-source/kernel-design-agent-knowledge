@@ -1,0 +1,766 @@
+diff --git a/csrc/deepep/deep_ep.cpp b/csrc/deepep/deep_ep.cpp
+index 59f11711c..5d8573923 100644
+--- a/csrc/deepep/deep_ep.cpp
++++ b/csrc/deepep/deep_ep.cpp
+@@ -14,6 +14,7 @@ constexpr int64_t NO_SCALES = 0;
+ constexpr int64_t DYNAMIC_SCALES = 2;
+ constexpr int64_t MXFP8_SCALES = 3;
+ constexpr int64_t MXFP4_SCALES = 4;
++constexpr int64_t PER_TOKEN_FP8_SCALES = 5;
+ constexpr uint32_t MX_BLOCK_SIZE = 32;
+ constexpr uint32_t MXFP4_HALF = 2;
+ constexpr int LOCAL_RANK_SIZE = 8;
+@@ -301,21 +302,31 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor>
+ 
+     int64_t trt = total_recv_token.item<int>();
+     int num_recv_tokens = (trt == 0) ? 1 : trt;
+-    is_mxfp8_quant = use_quant && (quant_type == "fp8_e4m3" || quant_type == "fp8_e5m2");
+-    bool is_mxfp4_quant = use_quant && (quant_type == "fp4_e2m1");
++    is_mxfp8_quant = use_quant && (quant_type == "mx_fp8_e4m3" || quant_type == "mx_fp8_e5m2");
++    bool is_mxfp4_quant = use_quant && (quant_type == "mx_fp4_e2m1");
++    bool is_pertoken_fp8_quant = use_quant && (quant_type == "pertoken_fp8_e4m3" || quant_type == "pertoken_fp8_e5m2");
+     int64_t quant_mode =
+-        use_quant ? (is_mxfp8_quant ? MXFP8_SCALES : (is_mxfp4_quant ? MXFP4_SCALES : DYNAMIC_SCALES)) : NO_SCALES;
++        use_quant
++            ? (is_mxfp8_quant
++                   ? MXFP8_SCALES
++                   : (is_mxfp4_quant ? MXFP4_SCALES : (is_pertoken_fp8_quant ? PER_TOKEN_FP8_SCALES : DYNAMIC_SCALES)))
++            : NO_SCALES;
+     at::Tensor expandx_out;
+     at::Tensor dynamic_scales_out;
+ #ifdef __DAV_C310__
+     if (quant_mode == MXFP8_SCALES) {
+-        if (quant_type == "fp8_e5m2") {
++        if (quant_type == "mx_fp8_e5m2") {
+             expandx_out = torch::empty({num_recv_tokens, hidden}, at::dtype(at::kFloat8_e5m2).device(x.device()));
+         } else {
+             expandx_out = torch::empty({num_recv_tokens, hidden}, at::dtype(at::kFloat8_e4m3fn).device(x.device()));
+         }
+         dynamic_scales_out =
+             torch::empty({num_recv_tokens * hidden / MX_BLOCK_SIZE}, at::dtype(at::kFloat8_e8m0fnu).device(x.device()));
++    } else if (quant_mode == PER_TOKEN_FP8_SCALES) {
++        EP_HOST_ASSERT_S(quant_type != "pertoken_fp8_e5m2",
++                         "pertoken_fp8_e5m2 is not supported yet, please use pertoken_fp8_e4m3 instead");
++        expandx_out = torch::empty({num_recv_tokens, hidden}, at::dtype(at::kFloat8_e4m3fn).device(x.device()));
++        dynamic_scales_out = torch::empty({num_recv_tokens}, at::dtype(at::kFloat).device(x.device()));
+     } else if (quant_mode == MXFP4_SCALES) {
+         expandx_out =
+             torch::empty({num_recv_tokens, hidden / MXFP4_HALF}, at::dtype(at::kFloat4_e2m1fn_x2).device(x.device()));
+diff --git a/csrc/deepep/ops/op_host/cam_moe_dispatch_normal_tiling.cc b/csrc/deepep/ops/op_host/cam_moe_dispatch_normal_tiling.cc
+index 52a2ab0c8..a35f04e86 100644
+--- a/csrc/deepep/ops/op_host/cam_moe_dispatch_normal_tiling.cc
++++ b/csrc/deepep/ops/op_host/cam_moe_dispatch_normal_tiling.cc
+@@ -68,6 +68,7 @@ constexpr uint32_t NO_SCALES = 0;
+ constexpr uint32_t DYNAMIC_SCALES = 2;
+ constexpr uint32_t MXFP8_SCALES = 3;
+ constexpr uint32_t MXFP4_SCALES = 4;
++constexpr uint32_t PER_TOKEN_FP8_SCALES = 5;
+ constexpr uint32_t OP_TYPE_ALL_GATHER = 6;
+ 
+ constexpr size_t MAX_GROUP_NAME_LENGTH = 128UL;
+@@ -161,7 +162,7 @@ static bool CheckTensorDim(gert::TilingContext *context, const char *nodeName, c
+     OP_LOGD(nodeName, "expandX dim0 = %ld", expandXStorageShape->GetStorageShape().GetDim(0));
+     OP_LOGD(nodeName, "expandX dim1 = %ld", expandXStorageShape->GetStorageShape().GetDim(1));
+ 
+-    if (quantMode == DYNAMIC_SCALES) {
++    if (quantMode == DYNAMIC_SCALES || quantMode == PER_TOKEN_FP8_SCALES) {
+         const gert::StorageShape *dynamicScalesStorageShape = context->GetOutputShape(OUTPUT_DYNAMIC_SCALES_INDEX);
+         OP_TILING_CHECK(dynamicScalesStorageShape == nullptr, OP_LOGE(nodeName, "dynamicScalesShape is null."),
+                         return false);
+@@ -224,6 +225,14 @@ static bool CheckTensorDataType(gert::TilingContext *context, const char *nodeNa
+                     "expandX dataType is invalid for MXFP8 quant, dataType should be fp8e4m3 or fp8e5m2, but is %s",
+                     geDataTypeMap.at(expandXDesc->GetDataType()).c_str()),
+             return false);
++    } else if (quantMode == PER_TOKEN_FP8_SCALES) {
++        OP_TILING_CHECK(
++            expandXDesc->GetDataType() != ge::DT_FLOAT8_E4M3FN && expandXDesc->GetDataType() != ge::DT_FLOAT8_E5M2,
++            OP_LOGE(
++                nodeName,
++                "expandX dataType is invalid for scalar FP8 quant, dataType should be fp8e4m3 or fp8e5m2, but is %s",
++                geDataTypeMap.at(expandXDesc->GetDataType()).c_str()),
++            return false);
+     } else if (quantMode == MXFP4_SCALES) {
+         OP_TILING_CHECK(
+             expandXDesc->GetDataType() != ge::DT_FLOAT4_E2M1 && expandXDesc->GetDataType() != ge::DT_FLOAT4_E1M2,
+@@ -239,12 +248,12 @@ static bool CheckTensorDataType(gert::TilingContext *context, const char *nodeNa
+             return false);
+     }
+ 
+-    if (quantMode == DYNAMIC_SCALES) {
++    if (quantMode == DYNAMIC_SCALES || quantMode == PER_TOKEN_FP8_SCALES) {
+         auto dynamicScalesDesc = context->GetOutputDesc(OUTPUT_DYNAMIC_SCALES_INDEX);
+         OP_TILING_CHECK(dynamicScalesDesc == nullptr, OP_LOGE(nodeName, "dynamicScalesDesc is null."), return false);
+         OP_TILING_CHECK(
+             dynamicScalesDesc->GetDataType() != ge::DT_FLOAT,
+-            OP_LOGE(nodeName, "dynamicScales dataType is invalid for INT8 quant, dataType should be float, but is %s",
++            OP_LOGE(nodeName, "dynamicScales dataType is invalid for quant, dataType should be float, but is %s",
+                     geDataTypeMap.at(dynamicScalesDesc->GetDataType()).c_str()),
+             return false);
+     } else if (quantMode == MXFP8_SCALES || quantMode == MXFP4_SCALES) {
+@@ -300,7 +309,8 @@ static bool CheckTensorFormat(gert::TilingContext *context, const char *nodeName
+         static_cast<ge::Format>(ge::GetPrimaryFormat(expandXDesc->GetStorageFormat())) == ge::FORMAT_FRACTAL_NZ,
+         OP_LOGE(nodeName, "expandX format is invalid."), return false);
+ 
+-    if (quantMode == DYNAMIC_SCALES || quantMode == MXFP8_SCALES || quantMode == MXFP4_SCALES) {
++    if (quantMode == DYNAMIC_SCALES || quantMode == MXFP8_SCALES || quantMode == MXFP4_SCALES ||
++        quantMode == PER_TOKEN_FP8_SCALES) {
+         auto dynamicScalesDesc = context->GetOutputDesc(OUTPUT_DYNAMIC_SCALES_INDEX);
+         OP_TILING_CHECK(dynamicScalesDesc == nullptr, OP_LOGE(nodeName, "dynamicScalesDesc is null."), return false);
+         OP_TILING_CHECK(static_cast<ge::Format>(ge::GetPrimaryFormat(dynamicScalesDesc->GetStorageFormat())) ==
+@@ -387,11 +397,11 @@ static ge::graphStatus GetAttrAndSetTilingData(gert::TilingContext *context, con
+                     OP_LOGE(nodeName, "moeExpertNum is invalid, only support (0, %ld], but got moeExpertNum=%ld.",
+                             MOE_EXPERT_MAX_NUM, moeExpertNum),
+                     return ge::GRAPH_FAILED);
+-    OP_TILING_CHECK(
+-        (*quantModePtr < static_cast<int64_t>(NO_SCALES)) || (*quantModePtr > static_cast<int64_t>(MXFP4_SCALES)),
+-        OP_LOGE(nodeName, "quantMode is invalid, only support [0, %u], but got quantMode=%ld.", MXFP4_SCALES,
+-                *quantModePtr),
+-        return ge::GRAPH_FAILED);
++    OP_TILING_CHECK((*quantModePtr < static_cast<int64_t>(NO_SCALES)) ||
++                        (*quantModePtr > static_cast<int64_t>(PER_TOKEN_FP8_SCALES)),
++                    OP_LOGE(nodeName, "quantMode is invalid, only support [0, %u], but got quantMode=%ld.",
++                            PER_TOKEN_FP8_SCALES, *quantModePtr),
++                    return ge::GRAPH_FAILED);
+ 
+     int64_t moePerRankNum = moeExpertNum / epWorldSize;
+     int64_t curDispatchStatusNum = moePerRankNum * epWorldSize;
+diff --git a/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal.cpp b/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal.cpp
+index 0d49edf43..1e8a5bed3 100644
+--- a/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal.cpp
++++ b/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal.cpp
+@@ -13,6 +13,7 @@ using namespace CamMoeDispatchNormalA5Impl;
+ #define TILINGKEY_A5_QUANT 15002
+ #define TILINGKEY_A5_MXFP8_QUANT 15003
+ #define TILINGKEY_A5_MXFP4_QUANT 15004
++#define TILINGKEY_A5_PER_TOKEN_FP8_QUANT 15005
+ 
+ extern "C" __global__ __aicore__ void cam_moe_dispatch_normal(
+     GM_ADDR x, GM_ADDR expertIds, GM_ADDR send_offset, GM_ADDR send_token_idx, GM_ADDR recv_offset, GM_ADDR recv_count,
+@@ -71,6 +72,15 @@ extern "C" __global__ __aicore__ void cam_moe_dispatch_normal(
+         op.Process();
+         return;
+     }
++    if (TILING_KEY_IS(TILINGKEY_A5_PER_TOKEN_FP8_QUANT)) {
++        GET_TILING_DATA_WITH_STRUCT(CamMoeDispatchNormalTilingData, tilingData, tilingGM);
++        CamMoeDispatchNormalA5<DTYPE_X, DTYPE_RECV_X, DTYPE_X_SCALES, true, false, false, false> op;
++        op.Init(x, expertIds, send_offset, send_token_idx, recv_offset, recv_count, expert_global_offset,
++                srcrank_in_expert_offset, r_in_srcrank_offset, expandXOut, dynamicScalesOut, assist_info_for_combine,
++                waitRecvCostStatsOut, workspaceGM, &pipe, &tilingData);
++        op.Process();
++        return;
++    }
+ #endif
+ #if (ORIG_DTYPE_RECV_X == DT_FLOAT4_E2M1 || ORIG_DTYPE_RECV_X == DT_FLOAT4_E1M2)
+     if (TILING_KEY_IS(TILINGKEY_A5_MXFP4_QUANT)) {
+diff --git a/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal_a5.h b/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal_a5.h
+index 2af9e470e..2156b94f0 100644
+--- a/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal_a5.h
++++ b/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal_a5.h
+@@ -29,8 +29,8 @@ constexpr uint64_t ROUND_STATE_OFFSET = Moe::BASE_ROUND_STATE_OFFSET;
+ constexpr uint32_t FLOAT_NUM_PER_ALIGN = 8U;
+ 
+ // related to FP8 and INT8 quantization
+-constexpr float FP8_E5M2_MAX_VALUE = 448.0f;
+-constexpr float FP8_E4M3_MAX_VALUE = 57344.0f;
++constexpr float FP8_E5M2_MAX_VALUE = 57344.0f;
++constexpr float FP8_E4M3_MAX_VALUE = 448.0f;
+ constexpr float HIFP8_MAX_VALUE = 32768.0f;
+ constexpr float INT8_MAX_VALUE = 127.0f;
+ constexpr uint32_t FP4_ELEMS_PER_BYTE = 2;
+diff --git a/csrc/deepep/ops/op_kernel/moe_distribute_combine_v2_a5.h b/csrc/deepep/ops/op_kernel/moe_distribute_combine_v2_a5.h
+index 550e55eba..516c01e52 100644
+--- a/csrc/deepep/ops/op_kernel/moe_distribute_combine_v2_a5.h
++++ b/csrc/deepep/ops/op_kernel/moe_distribute_combine_v2_a5.h
+@@ -39,8 +39,8 @@ constexpr size_t MASK_CALC_NEED_WORKSPACE = 10UL * 1024UL;
+ constexpr uint32_t BLOCK_NUM = ALIGNED_LEN / UB_ALIGN;  // blockReduceMax中，最多支持连续256字节数据参与计算
+ 
+ // related to FP8 and INT8 quantization
+-constexpr float FP8_E5M2_MAX_VALUE = 448.0f;
+-constexpr float FP8_E4M3_MAX_VALUE = 57344.0f;
++constexpr float FP8_E5M2_MAX_VALUE = 57344.0f;
++constexpr float FP8_E4M3_MAX_VALUE = 448.0f;
+ constexpr float HIFP8_MAX_VALUE = 32768.0f;
+ constexpr float INT8_MAX_VALUE = 127.0f;
+ 
+diff --git a/csrc/deepep/ops/op_kernel/moe_distribute_dispatch_v2_a5.h b/csrc/deepep/ops/op_kernel/moe_distribute_dispatch_v2_a5.h
+index 5eb1a7365..2a8d6705c 100644
+--- a/csrc/deepep/ops/op_kernel/moe_distribute_dispatch_v2_a5.h
++++ b/csrc/deepep/ops/op_kernel/moe_distribute_dispatch_v2_a5.h
+@@ -43,9 +43,9 @@ constexpr uint8_t MOE_NUM_IDX = 3;
+ constexpr int32_t BITS_PER_BYTE = 8;
+ constexpr uint32_t MAX_UB_SIZE = 170U * 1024U;
+ 
+-// related to FP8/4 and INT8 quantization
+-constexpr float FP8_E5M2_MAX_VALUE = 448.0f;
+-constexpr float FP8_E4M3_MAX_VALUE = 57344.0f;
++// related to FP8 and INT8 quantization
++constexpr float FP8_E5M2_MAX_VALUE = 57344.0f;
++constexpr float FP8_E4M3_MAX_VALUE = 448.0f;
+ constexpr float HIFP8_MAX_VALUE = 32768.0f;
+ constexpr float INT8_MAX_VALUE = 127.0f;
+ constexpr uint32_t FP4_ELEMS_PER_BYTE = 2;
+diff --git a/python/deep_ep/README.md b/python/deep_ep/README.md
+index b6f08c686..852201d5f 100644
+--- a/python/deep_ep/README.md
++++ b/python/deep_ep/README.md
+@@ -138,6 +138,35 @@ High-throughput dispatch and combine for training and prefill phases:
+ - **A3**: Pure HCCS intranode communication, full-mesh HCCS internode communication. No hierarchical implementation needed.
+ - **A2 Intranode**: Pure HCCS communication, supports up to `bs=8000` for normal dispatch/combine.
+ - **A2 Internode**: Hierarchical (HCCS intranode + RDMA internode) or non-hierarchical (pure RDMA) implementation. Supports up to `bs=4096`.
++- **A5 (C310)**: Supports scalar FP8 per-token quantization and MXFP8 per-block quantization (A5/C310 only).
++
++#### Quantization Modes in Normal Dispatch
++
++| Mode | `quant_mode` | Data Format | Scale Format | Granularity | Platform |
++|------|-------------|-------------|--------------|-------------|----------|
++| BF16 (no quant) | `"bf16"` (default) | `bfloat16` | — | — | All |
++| INT8 dynamic | `"int8"` | `int8` | `float32` | per-token | All |
++| MXFP8 per-block | `"mx_fp8_e4m3"` / `"mx_fp8_e5m2"` | `float8_e4m3fn` / `float8_e5m2` | `float8_e8m0fnu` | per 32 elements | A5/C310 |
++| Scalar FP8 | `"pertoken_fp8_e4m3"` / `"pertoken_fp8_e5m2"` | `float8_e4m3fn` / `float8_e5m2` | `float32` | per-token | A5/C310 |
++| MXFP4 | `"mx_fp4_e2m1"` | `float4_e2m1fn_x2` | `float8_e8m0fnu` | per 32 elements | A5/C310 |
++
++Usage:
++```python
++# BF16 (no quantization)
++buffer.dispatch(x=data, ...)
++
++# INT8 per-token quantization
++buffer.dispatch(x=data, quant_mode="int8", ...)
++
++# Scalar FP8 per-token quantization (A5 only)
++buffer.dispatch(x=data, quant_mode="pertoken_fp8_e4m3", ...)
++
++# MXFP8 per-block quantization (A5 only)
++buffer.dispatch(x=data, quant_mode="mx_fp8_e4m3", ...)
++
++# MXFP4 quantization (A5 only)
++buffer.dispatch(x=data, quant_mode="mx_fp4_e2m1", ...)
++```
+ 
+ ### Low-Latency Mode (Decode)
+ 
+@@ -172,7 +201,7 @@ See [Fused Deep MoE API](doc/FUSED_DEEP_MOE_EN.md) for details.
+ | Variable | Default | Description |
+ |----------|---------|-------------|
+ | `DEEP_USE_MODE` | `default` | Normal mode strategy and Low-latency mode strategy: `default`, `ops`, or `alltoall`. |
+-| `DEEP_NORMAL_MODE_USE_INT8_QUANT` | `0` | **Deprecated.** Enable INT8 quantization in normal dispatch. A2 internode does NOT support quantization in normal mode. MXFP8 per-block quantization (A5/C310 only) is triggered by passing a tuple `(float8_e4m3fn_tensor, float8_e8m0fnu_tensor)` as `x`. |
++| `DEEP_NORMAL_MODE_USE_INT8_QUANT` | `0` | **Removed.** INT8 quantization is now specified via `quant_mode="int8"` parameter in `dispatch()`. |
+ | `SGLANG_DEEPEP_BF16_DISPATCH` | `0` | Disable quantization in low_latency_dispatch (BF16 dispatch). Set to `1` to disable; only effective in decode phase. |
+ | `MOE_EXPERT_TOKEN_NUMS_TYPE` | `1` | Dispatch return type for `num_recv_tokens_per_expert_list`: `1` = per-expert token count, `0` = prefix sum. |
+ | `MOE_SHARED_EXPERT_RANK_NUM` | `0` | Number of shared expert ranks (used by ops strategy). |
+@@ -198,7 +227,7 @@ For detailed A2 usage, see [A2_DEEPEP_CN.md](A2_DEEPEP_CN.md).
+ ### A2 Dual Node
+ 
+ - Applicable when P/D node ranks > 8 (cross-node communication).
+-- **Normal mode does NOT support quantization** (`DEEP_NORMAL_MODE_USE_INT8_QUANT=0`).
++- **Normal mode does NOT support quantization** (use BF16 `quant_mode` for A2 internode).
+ - **Must set** `HCCL_INTRA_PCIE_ENABLE=1` and `HCCL_INTRA_ROCE_ENABLE=0` for hierarchical communication.
+ - **Performance limits**: normal up to `bs=4096`, low_latency up to `bs=512`.
+ 
+@@ -211,6 +240,7 @@ For detailed A2 usage, see [A2_DEEPEP_CN.md](A2_DEEPEP_CN.md).
+ 
+ - Only supports CANN 9.0.
+ - Build with: `bash build.sh -a deepep Ascend950`.
++- Supports scalar FP8 per-token quantization (`quant_mode="pertoken_fp8_e4m3"`) and MXFP8 per-block quantization in normal dispatch.
+ 
+ 
+ ## Test
+diff --git a/python/deep_ep/README_CN.md b/python/deep_ep/README_CN.md
+index e9994f02d..5c5a73cd0 100644
+--- a/python/deep_ep/README_CN.md
++++ b/python/deep_ep/README_CN.md
+@@ -139,6 +139,35 @@ DeepEP-Ascend 采用**策略式架构**，通信实现被抽象为可互换的
+ - **A3**：纯 HCCS 节点内通信，全互联 HCCS 节点间通信。无需分层实现。
+ - **A2 单机**：纯 HCCS 通信，normal dispatch/combine 最大支持 `bs=8000`。
+ - **A2 双机**：分层（节点内 HCCS + 节点间 RDMA）或不分层（纯 RDMA）实现。最大支持 `bs=4096`。
++- **A5（C310）**：支持标量 FP8 逐 token 量化和 MXFP8 逐 block 量化（仅 A5/C310）。
++
++#### Normal Dispatch 量化模式
++
++| 模式 | `quant_mode` | 数据格式 | 缩放因子格式 | 粒度 | 平台 |
++|------|-------------|---------|-------------|------|------|
++| BF16（不量化） | `"bf16"`（默认） | `bfloat16` | — | — | 全部 |
++| INT8 动态量化 | `"int8"` | `int8` | `float32` | 逐 token | 全部 |
++| MXFP8 逐 block | `"mx_fp8_e4m3"` / `"mx_fp8_e5m2"` | `float8_e4m3fn` / `float8_e5m2` | `float8_e8m0fnu` | 每 32 元素 | A5/C310 |
++| 标量 FP8 | `"pertoken_fp8_e4m3"` / `"pertoken_fp8_e5m2"` | `float8_e4m3fn` / `float8_e5m2` | `float32` | 逐 token | A5/C310 |
++| MXFP4 | `"mx_fp4_e2m1"` | `float4_e2m1fn_x2` | `float8_e8m0fnu` | 每 32 元素 | A5/C310 |
++
++用法：
++```python
++# BF16（不量化）
++buffer.dispatch(x=data, ...)
++
++# INT8 逐 token 量化
++buffer.dispatch(x=data, quant_mode="int8", ...)
++
++# 标量 FP8 逐 token 量化（仅 A5）
++buffer.dispatch(x=data, quant_mode="pertoken_fp8_e4m3", ...)
++
++# MXFP8 逐 block 量化（仅 A5）
++buffer.dispatch(x=data, quant_mode="mx_fp8_e4m3", ...)
++
++# MXFP4 量化（仅 A5）
++buffer.dispatch(x=data, quant_mode="mx_fp4_e2m1", ...)
++```
+ 
+ ### Low-Latency 模式（Decode）
+ 
+@@ -173,7 +202,7 @@ low_latency_dispatch 量化模式：
+ | 变量 | 默认值 | 说明 |
+ |------|--------|------|
+ | `DEEP_USE_MODE` | `default` | Normal 模式策略 and Low-latency 模式策略：`default`、`ops` 或 `alltoall`。 |
+-| `DEEP_NORMAL_MODE_USE_INT8_QUANT` | `0` | **已弃用。** 在 Normal dispatch 中启用 INT8 量化。A2 双机 Normal 模式**不支持**量化。MXFP8 per-block 量化（仅 A5/C310）通过传入 tuple `(float8_e4m3fn_tensor, float8_e8m0fnu_tensor)` 作为 `x` 参数触发。 |
++| `DEEP_NORMAL_MODE_USE_INT8_QUANT` | `0` | **已移除。** INT8 量化现通过 `dispatch()` 的 `quant_mode="int8"` 参数指定。 |
+ | `SGLANG_DEEPEP_BF16_DISPATCH` | `0` | 在 low_latency_dispatch 中关闭量化（BF16 dispatch）。设为 `1` 关闭量化；仅在 Decode 阶段生效。 |
+ | `MOE_EXPERT_TOKEN_NUMS_TYPE` | `1` | dispatch 返回的 `num_recv_tokens_per_expert_list` 类型：`1` = 各专家 token 数，`0` = 前缀和。 |
+ | `MOE_SHARED_EXPERT_RANK_NUM` | `0` | 共享专家 rank 数（ops 策略使用）。 |
+@@ -199,7 +228,7 @@ low_latency_dispatch 量化模式：
+ ### A2 双机
+ 
+ - 适用条件：P/D 节点 ranks > 8（跨节点通信）。
+-- **Normal 模式不支持量化**（`DEEP_NORMAL_MODE_USE_INT8_QUANT=0`）。
++- **Normal 模式不支持量化**（A2 双机使用 BF16 `quant_mode`）。
+ - **必须设置** `HCCL_INTRA_PCIE_ENABLE=1` 和 `HCCL_INTRA_ROCE_ENABLE=0` 启用分层通信。
+ - **性能上限**：normal 最大 `bs=4096`，low_latency 最大 `bs=512`。
+ 
+@@ -212,6 +241,7 @@ low_latency_dispatch 量化模式：
+ 
+ - 仅支持 CANN 9.0。
+ - 构建命令：`bash build.sh -a deepep Ascend950`。
++- Normal dispatch 支持标量 FP8 逐 token 量化（`quant_mode="pertoken_fp8_e4m3"`）和 MXFP8 逐 block 量化。
+ 
+ 
+ ## 测试
+diff --git a/python/deep_ep/deep_ep/buffer.py b/python/deep_ep/deep_ep/buffer.py
+index bc082b4ed..de17e33c0 100644
+--- a/python/deep_ep/deep_ep/buffer.py
++++ b/python/deep_ep/deep_ep/buffer.py
+@@ -298,6 +298,7 @@ def dispatch(
+         async_finish: bool = False,
+         allocate_on_comm_stream: bool = False,
+         dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
++        quant_mode: Optional[str] = None,
+     ) -> Tuple[
+         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+         Optional[torch.Tensor],
+@@ -375,6 +376,7 @@ def dispatch(
+             async_finish=async_finish,
+             allocate_on_comm_stream=allocate_on_comm_stream,
+             dispatch_wait_recv_cost_stats=dispatch_wait_recv_cost_stats,
++            quant_mode=quant_mode,
+         )
+ 
+     @log_parameters(["topk_idx"])
+@@ -409,8 +411,6 @@ def notify_verify(
+         # Default config
+         config = self.get_dispatch_config(self.group_size) if config is None else config
+         # Launch the kernel with cached or non-cached mode
+-        if isinstance(x, tuple):
+-            raise NotImplementedError("Not support fp8")
+         x_scales = None
+         use_quant = os.getenv("DEEP_NORMAL_MODE_USE_INT8_QUANT") == "1"
+ 
+@@ -545,8 +545,8 @@ def internode_dispatch(
+         Internode dispatch implementation, for more details, please refer to the `dispatch` docs.
+         Normally, you should not directly call this function.
+         """
+-        x, x_scales = x if isinstance(x, tuple) else (x, None)
+-        use_quant = os.getenv("DEEP_NORMAL_MODE_USE_INT8_QUANT") == "1"
++        x_scales = None
++        use_quant = False
+         if handle is not None:
+             raise NotImplementedError(
+                 "Optional communication handle is not supported yet."
+diff --git a/python/deep_ep/deep_ep/strategies/normal_strategy.py b/python/deep_ep/deep_ep/strategies/normal_strategy.py
+index 243fd8cb7..a51407ade 100644
+--- a/python/deep_ep/deep_ep/strategies/normal_strategy.py
++++ b/python/deep_ep/deep_ep/strategies/normal_strategy.py
+@@ -86,6 +86,7 @@ def dispatch(
+         async_finish: bool = False,
+         allocate_on_comm_stream: bool = False,
+         dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
++        quant_mode: Optional[str] = None,
+     ) -> Tuple[
+         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+         Optional[torch.Tensor],
+@@ -127,6 +128,7 @@ def dispatch(
+             async_finish,
+             allocate_on_comm_stream,
+             dispatch_wait_recv_cost_stats,
++            quant_mode,
+         )
+ 
+     def _intranode_dispatch(
+@@ -145,6 +147,7 @@ def _intranode_dispatch(
+         async_finish: bool,
+         allocate_on_comm_stream: bool,
+         dispatch_wait_recv_cost_stats: Optional[torch.Tensor],
++        quant_mode: Optional[str] = None,
+     ) -> Tuple[
+         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+         Optional[torch.Tensor],
+@@ -153,39 +156,26 @@ def _intranode_dispatch(
+         Tuple,
+         EventOverlap,
+     ]:
+-        # Determine quant type
+-        if isinstance(x, torch.Tensor):
+-            # BF16 no quant
+-            data = x
+-            x_scales = None
+-            quant_type = "bf16"
+-            use_quant = False
+-        elif isinstance(x, tuple) and len(x) == 2:
+-            data, quant_type_tensor = x
+-            if quant_type_tensor.dtype == torch.float8_e4m3fn:
+-                quant_type = "fp8_e4m3"
+-                use_quant = True
+-            elif quant_type_tensor.dtype == torch.float8_e5m2:
+-                quant_type = "fp8_e5m2"
+-                use_quant = True
+-            elif quant_type_tensor.dtype == torch.int8:
+-                quant_type = "int8"
+-                use_quant = True
+-            elif quant_type_tensor.dtype == torch.float4_e2m1fn_x2:
+-                quant_type = "fp4_e2m1"
+-                use_quant = True
+-            else:
+-                raise TypeError(
+-                    f"Unsupported quantized dtype: {quant_type_tensor.dtype}"
+-                )
+-            x_scales = None
+-        else:
+-            raise TypeError(f"Unsupported x type: {type(x)}")
+-
+-        if not use_quant:
+-            use_quant = os.getenv("DEEP_NORMAL_MODE_USE_INT8_QUANT") == "1"
+-            if use_quant:
+-                quant_type = "int8"
++        # Determine quant type from quant_mode
++        VALID_QUANT_MODES = {
++            "bf16",
++            "int8",
++            "mx_fp8_e4m3",
++            "mx_fp8_e5m2",
++            "pertoken_fp8_e4m3",
++            "pertoken_fp8_e5m2",
++            "mx_fp4_e2m1",
++        }
++        if quant_mode is None:
++            quant_mode = "bf16"
++        if quant_mode not in VALID_QUANT_MODES:
++            raise ValueError(
++                f"Invalid quant_mode: {quant_mode}. Valid options: {VALID_QUANT_MODES}"
++            )
++        data = x
++        x_scales = None
++        quant_type = quant_mode
++        use_quant = quant_mode != "bf16"
+ 
+         if handle is not None:
+             raise NotImplementedError(
+@@ -275,8 +265,8 @@ def _internode_dispatch(
+         Tuple,
+         EventOverlap,
+     ]:
+-        x, x_scales = x if isinstance(x, tuple) else (x, None)
+-        use_quant = os.getenv("DEEP_NORMAL_MODE_USE_INT8_QUANT") == "1"
++        x_scales = None
++        use_quant = False
+ 
+         if handle is not None:
+             raise NotImplementedError(
+diff --git a/tests/python/deepep/test_internode.py b/tests/python/deepep/test_internode.py
+index 2edfb730a..fcf947dbb 100644
+--- a/tests/python/deepep/test_internode.py
++++ b/tests/python/deepep/test_internode.py
+@@ -436,7 +436,7 @@ def test_correctness():
+         for current_x in filter(lambda elem: elem is not None, (x_pure_rand, x)):
+             if local_rank == 0:
+                 print(
+-                    f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, with top-k {num_topk} ...',
++                    f"[testing] Running with BF16, with top-k {num_topk} ...",
+                     flush=True,
+                 )
+             # Test dispatch
+@@ -529,16 +529,8 @@ def test_tuning():
+ 
+         # Tune dispatch performance
+         for current_x in filter(lambda elem: elem is not None, (x,)):
+-            recv_bytes = (
+-                (dispatch_bf16_recv_bytes * fp8_factor)
+-                if isinstance(current_x, tuple)
+-                else dispatch_bf16_recv_bytes
+-            )
+-            rdma_send_bytes = (
+-                (dispatch_bf16_rdma_send_bytes * fp8_factor)
+-                if isinstance(current_x, tuple)
+-                else dispatch_bf16_rdma_send_bytes
+-            )
++            recv_bytes = dispatch_bf16_recv_bytes
++            rdma_send_bytes = dispatch_bf16_rdma_send_bytes
+ 
+             tune_args = {
+                 "x": current_x,
+@@ -556,7 +548,7 @@ def test_tuning():
+             )
+             if local_rank == 0:
+                 print(
+-                    f'[tuning] Dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}) {recv_bytes / 1e9 / t:.2f} GB/s (HCCS), '
++                    f"[tuning] Dispatch (BF16) {recv_bytes / 1e9 / t:.2f} GB/s (HCCS), "
+                     f"{rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), avg_t: {t * 1e6:.2f} us, notify_t: {notify_t  * 1e6:.2f} us",
+                     flush=True,
+                 )
+diff --git a/tests/python/deepep/test_internode_a2.py b/tests/python/deepep/test_internode_a2.py
+index e93c1d8d4..b348ca528 100644
+--- a/tests/python/deepep/test_internode_a2.py
++++ b/tests/python/deepep/test_internode_a2.py
+@@ -438,7 +438,7 @@ def test_correctness():
+         for current_x in filter(lambda elem: elem is not None, (x_pure_rand, x)):
+             if local_rank == 0:
+                 print(
+-                    f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, with top-k {num_topk} ...',
++                    f"[testing] Running with BF16, with top-k {num_topk} ...",
+                     flush=True,
+                 )
+             # Test dispatch
+@@ -531,16 +531,8 @@ def test_tuning():
+ 
+         # Tune dispatch performance
+         for current_x in filter(lambda elem: elem is not None, (x,)):
+-            recv_bytes = (
+-                (dispatch_bf16_recv_bytes * fp8_factor)
+-                if isinstance(current_x, tuple)
+-                else dispatch_bf16_recv_bytes
+-            )
+-            rdma_send_bytes = (
+-                (dispatch_bf16_rdma_send_bytes * fp8_factor)
+-                if isinstance(current_x, tuple)
+-                else dispatch_bf16_rdma_send_bytes
+-            )
++            recv_bytes = dispatch_bf16_recv_bytes
++            rdma_send_bytes = dispatch_bf16_rdma_send_bytes
+ 
+             tune_args = {
+                 "x": current_x,
+@@ -558,7 +550,7 @@ def test_tuning():
+             )
+             if local_rank == 0:
+                 print(
+-                    f'[tuning] Dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}) {recv_bytes / 1e9 / t:.2f} GB/s (HCCS), '
++                    f"[tuning] Dispatch (BF16) {recv_bytes / 1e9 / t:.2f} GB/s (HCCS), "
+                     f"{rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), avg_t: {t * 1e6:.2f} us, notify_t: {notify_t  * 1e6:.2f} us",
+                     flush=True,
+                 )
+diff --git a/tests/python/deepep/test_intranode.py b/tests/python/deepep/test_intranode.py
+index dbee024c9..f1206dc1a 100644
+--- a/tests/python/deepep/test_intranode.py
++++ b/tests/python/deepep/test_intranode.py
+@@ -35,15 +35,8 @@ def test_main(
+     num_topk, num_experts = args.num_topk, args.num_experts
+     enable_diagnose = args.enable_diagnose
+     enable_dynamic_tokens = args.enable_dynamic_tokens
+-    quant_type = args.quant_type  # no, int8, fp8, fp4
+-    if quant_type == "no":
+-        quant_type_tensor = None
+-    elif quant_type == "int8":
+-        quant_type_tensor = torch.tensor([], dtype=torch.int8, device="npu")
+-    elif quant_type == "fp8":
+-        quant_type_tensor = torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
+-    elif quant_type == "fp4":
+-        quant_type_tensor = torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
++    quant_type = args.quant_type
++    dispatch_quant_mode = quant_type
+     num_servers = num_ranks // num_local_ranks
+     expert_token_nums_type = int(os.getenv("MOE_EXPERT_TOKEN_NUMS_TYPE", 1))
+ 
+@@ -261,6 +254,10 @@ def test_main(
+     # Random data
+     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="npu") * rank
+     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="npu")
++    print(
++        f"[seed check] rank {rank} x_pure_rand hash: {x_pure_rand.view(torch.int8).sum().item()}",
++        flush=True,
++    )
+     topk_weights = (
+         torch.ones((num_tokens, num_topk), dtype=torch.float32, device="npu") * rank
+     )
+@@ -288,11 +285,7 @@ def test_diagnose(
+     ):
+         for current_x in filter(lambda elem: elem is not None, (x_pure_rand,)):
+             dispatch_args = {
+-                "x": (
+-                    current_x
+-                    if quant_type_tensor is None
+-                    else (current_x, quant_type_tensor)
+-                ),
++                "x": current_x,
+                 "num_tokens_per_rank": ref_num_tokens_per_rank,
+                 "is_token_in_rank": ref_is_token_in_rank,
+                 "num_tokens_per_expert": ref_num_tokens_per_expert,
+@@ -300,6 +293,7 @@ def test_diagnose(
+                 "topk_idx": topk_idx,
+                 "topk_weights": topk_weights_pure_rand,
+                 "dispatch_wait_recv_cost_stats": dispatch_wait_recv_cost_stats,
++                "quant_mode": dispatch_quant_mode,
+             }
+             if dispatch_wait_recv_cost_stats is not None:
+                 bench(lambda: buffer.dispatch(**dispatch_args), num_warmups=0)
+@@ -352,17 +346,17 @@ def test_diagnose(
+                 )
+ 
+     for current_x in filter(lambda elem: elem is not None, (x_pure_rand, x)):
++        use_fp8 = (
++            dispatch_quant_mode not in ("bf16", "int8", None)
++            and current_x is x_pure_rand
++        )
+         if local_rank == 0:
+             print(
+-                f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, with top-k {num_topk} ...',
++                f'[testing] Running with {"FP8" if use_fp8 else "BF16"}, with top-k {num_topk} ...',
+                 flush=True,
+             )
+         dispatch_args = {
+-            "x": (
+-                current_x
+-                if quant_type_tensor is None
+-                else (current_x, quant_type_tensor)
+-            ),
++            "x": current_x,
+             "num_tokens_per_rank": ref_num_tokens_per_rank,
+             "is_token_in_rank": ref_is_token_in_rank,
+             "num_tokens_per_expert": ref_num_tokens_per_expert,
+@@ -371,6 +365,7 @@ def test_diagnose(
+             "topk_weights": (
+                 topk_weights_pure_rand if current_x is x_pure_rand else topk_weights
+             ),
++            "quant_mode": dispatch_quant_mode if current_x is x_pure_rand else "bf16",
+         }
+ 
+         (
+@@ -436,8 +431,14 @@ def test_diagnose(
+         golden_nozero = torch.where(golden == 0, eps, golden)
+         max_diff = torch.max(torch.abs(check_x - golden) / golden_nozero).item()
+         avg_diff = torch.mean(torch.abs(check_x - golden) / golden_nozero).item()
+-        print(f"{rank=}, {avg_diff=:.5f}, {max_diff=:.5f}, cosine_diff={diff:.5f}")
+-        assert diff < 5e-5
++        print(f"{rank=}, {avg_diff=:.8f}, {max_diff=:.8f}, cosine_diff={diff:.8f}")
++        if "_fp4_" in quant_type:
++            diff_threshold = 4e-2
++        elif "_fp8_" in quant_type:
++            diff_threshold = 2e-3
++        else:
++            diff_threshold = 5e-5
++        assert diff < diff_threshold
+ 
+         # For later tuning
+         dispatch_bf16_recv_bytes = recv_x.numel() * 2
+@@ -449,45 +450,68 @@ def test_diagnose(
+         print("", flush=True)
+ 
+     # Tune dispatch performance
+-    fp8_factor = (1 + 4 / 128) / 2
+     config = deep_ep.Config(24, 8, buffer_size)
+-    for current_x in filter(lambda elem: elem is not None, (x,)):
+-        recv_bytes = (
+-            (dispatch_bf16_recv_bytes * fp8_factor)
+-            if isinstance(current_x, tuple)
+-            else dispatch_bf16_recv_bytes
++
++    # BF16 dispatch tuning
++    tune_args_bf16 = {
++        "x": x,
++        "config": config,
++        "num_tokens_per_rank": ref_num_tokens_per_rank,
++        "is_token_in_rank": ref_is_token_in_rank,
++        "num_tokens_per_expert": ref_num_tokens_per_expert,
++        "topk_idx": topk_idx,
++        "topk_weights": topk_weights,
++    }
++    t = bench(lambda: buffer.dispatch(**tune_args_bf16))[0]
++    if local_rank == 0:
++        print(
++            f"[tuning] Dispatch (BF16) {dispatch_bf16_recv_bytes / 1e9 / t:.2f} GB/s (HCCS), avg_t: {t * 1e6:.2f} us",
++            flush=True,
+         )
+ 
+-        tune_args = {
+-            "x": (
+-                current_x
+-                if quant_type_tensor is None
+-                else (current_x, quant_type_tensor)
+-            ),
++    # FP8 dispatch tuning (if quantized)
++    if dispatch_quant_mode not in ("bf16", "int8", None):
++        num_recv_tokens = dispatch_bf16_recv_bytes // (hidden * 2)
++        if dispatch_quant_mode.startswith("pertoken_fp8"):
++            quant_data_bytes = num_recv_tokens * hidden
++            quant_scale_bytes = num_recv_tokens * 4
++        elif dispatch_quant_mode.startswith("mx_fp8"):
++            quant_data_bytes = num_recv_tokens * hidden
++            quant_scale_bytes = num_recv_tokens * hidden // 32
++        elif dispatch_quant_mode.startswith("mx_fp4"):
++            quant_data_bytes = num_recv_tokens * hidden // 2
++            quant_scale_bytes = num_recv_tokens * hidden // 32
++        else:
++            quant_data_bytes = num_recv_tokens * hidden
++            quant_scale_bytes = 0
++        fp8_recv_bytes = quant_data_bytes + quant_scale_bytes
++        tune_args_fp8 = {
++            "x": x,
+             "config": config,
+             "num_tokens_per_rank": ref_num_tokens_per_rank,
+             "is_token_in_rank": ref_is_token_in_rank,
+             "num_tokens_per_expert": ref_num_tokens_per_expert,
+             "topk_idx": topk_idx,
+             "topk_weights": topk_weights,
++            "quant_mode": dispatch_quant_mode,
+         }
+-
+-        t = bench(lambda: buffer.dispatch(**tune_args))[0]
++        t = bench(lambda: buffer.dispatch(**tune_args_fp8))[0]
+         if local_rank == 0:
+             print(
+-                f'[tuning] Dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}) {recv_bytes / 1e9 / t:.2f} GB/s (HCCS), avg_t: {t * 1e6:.2f} us',
++                f"[tuning] Dispatch ({dispatch_quant_mode}, raw_bytes={fp8_recv_bytes/1e9:.3f}GB) "
++                f"{dispatch_bf16_recv_bytes / 1e9 / t:.2f} GB/s (HCCS), avg_t: {t * 1e6:.2f} us",
+                 flush=True,
+             )
+-            print("", flush=True)
+ 
+     dispatch_args = {
+-        "x": x if quant_type_tensor is None else (x, quant_type_tensor),
++        "x": x,
+         "num_tokens_per_rank": ref_num_tokens_per_rank,
+         "is_token_in_rank": ref_is_token_in_rank,
+         "num_tokens_per_expert": ref_num_tokens_per_expert,
+         "config": config,
+         "topk_idx": topk_idx,
+         "topk_weights": topk_weights,
++        "quant_mode": dispatch_quant_mode,
+     }
+     recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+     recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
+@@ -530,7 +554,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+         group, int(2e9), 0, low_latency_mode=False, num_qps_per_rank=1
+     )
+     print(f"[Rank {rank}] Buffer created OK.", flush=True)
+-    torch.manual_seed(rank)
++    seed = int.from_bytes(os.urandom(4), "little")
++    print(f"[seed] rank {rank} seed={seed}", flush=True)
++    torch.manual_seed(seed)
++    torch.npu.manual_seed(seed)
+ 
+     test_main(args, num_local_ranks, local_rank, num_ranks, rank, buffer, group)
+     if local_rank == 0:
+@@ -595,8 +622,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+         "--quant-type",
+         dest="quant_type",
+         type=str,
+-        default="no",
+-        help="quant type: no, int8, fp8, fp4",
++        default="bf16",
++        help="quant type: bf16, int8, mx_fp8_e4m3, mx_fp8_e5m2, pertoken_fp8_e4m3, pertoken_fp8_e5m2, mx_fp4_e2m1",
+     )
+     args = parser.parse_args()
+ 

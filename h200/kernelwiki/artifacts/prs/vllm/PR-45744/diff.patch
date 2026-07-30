@@ -1,0 +1,710 @@
+diff --git a/cmake/external_projects/fmha_sm100.cmake b/cmake/external_projects/fmha_sm100.cmake
+index 15610552f236..4a2414f5b83c 100644
+--- a/cmake/external_projects/fmha_sm100.cmake
++++ b/cmake/external_projects/fmha_sm100.cmake
+@@ -32,19 +32,17 @@ message(STATUS "fmha_sm100 is available at ${fmha_sm100_SOURCE_DIR}")
+ 
+ add_custom_target(fmha_sm100)
+ 
++set(FMHA_SM100_PY_ROOT "${fmha_sm100_SOURCE_DIR}/python/fmha_sm100")
++
+ install(FILES
+-  "${fmha_sm100_SOURCE_DIR}/python/fmha_sm100/__init__.py"
+-  "${fmha_sm100_SOURCE_DIR}/python/fmha_sm100/sparse.py"
++  "${FMHA_SM100_PY_ROOT}/__init__.py"
++  "${FMHA_SM100_PY_ROOT}/sparse.py"
+   DESTINATION vllm/third_party/fmha_sm100
+   COMPONENT fmha_sm100)
+ 
+-install(DIRECTORY "${fmha_sm100_SOURCE_DIR}/python/fmha_sm100/cute/"
++install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cute/"
+   DESTINATION vllm/third_party/fmha_sm100/cute
+   COMPONENT fmha_sm100
+-  FILES_MATCHING
+-    REGEX "/__pycache__(/.*)?$" EXCLUDE
+-    REGEX ".*\\.pyc$" EXCLUDE
+-    PATTERN "example.py" EXCLUDE
+-    PATTERN "test_*.py" EXCLUDE
+-    PATTERN "*.py"
+-    PATTERN "build_k2q_csr.cu")
++  PATTERN "__pycache__" EXCLUDE
++  PATTERN "*.pyc" EXCLUDE
++  PATTERN ".git*" EXCLUDE)
+diff --git a/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu b/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
+index 5dd610f28788..06c8048cd900 100644
+--- a/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
++++ b/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
+@@ -58,8 +58,15 @@
+ 
+ #include "../cuda_compat.h"
+ #include "../type_convert.cuh"
++#include "../attention/dtype_fp8.cuh"
+ #include "dispatch_utils.h"
+ 
++#ifdef USE_ROCM
++  #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
++#else
++  #include "../quantization/w8a8/fp8/nvidia/quant_utils.cuh"
++#endif
++
+ #ifndef FINAL_MASK
+   #ifdef USE_ROCM
+     #define FINAL_MASK 0xffffffffffffffffULL
+@@ -186,6 +193,21 @@ __device__ __forceinline__ void storeElems(
+   *reinterpret_cast<uint2*>(dst) = v;
+ }
+ 
++template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
++__device__ __forceinline__ void storeCacheElems(
++    cache_t* __restrict__ dst, float const (&elems)[kElemsPerLane]) {
++  if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
++    // kAuto means unquantized KV cache here: cache_t == scalar_t, so store the
++    // model dtype directly. FP8 cache dtypes use the conversion path below.
++    storeElems<scalar_t>(reinterpret_cast<scalar_t*>(dst), elems);
++  } else {
++#pragma unroll
++    for (int i = 0; i < kElemsPerLane; i++) {
++      dst[i] = fp8::scaled_convert<cache_t, float, kv_dt>(elems[i], 1.0f);
++    }
++  }
++}
++
+ // ────────────────────────────────────────────────────────────────────────────
+ // Kernel
+ // ────────────────────────────────────────────────────────────────────────────
+@@ -202,7 +224,8 @@ __device__ __forceinline__ void storeElems(
+ //     V : nkv  only if kInsertKV        (V-cache insert; no warps in dense)
+ //     IQ: niq  only if kIsSparse        (norm+RoPE)
+ //     IK: 1    only if kIsSparse        (norm+RoPE; +index-cache insert)
+-template <typename scalar_t, bool kIsSparse, bool kInsertKV>
++template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
++          bool kIsSparse, bool kInsertKV>
+ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     scalar_t* __restrict__ qkv,  // [N, qkv_row] in/out (packs index if sparse)
+     scalar_t* __restrict__ q_out,        // [N, nq*128] contiguous, or nullptr
+@@ -215,7 +238,7 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+     int64_t const* __restrict__ positions,       // [N] i64
+     int64_t const* __restrict__ slot_mapping,    // main K/V slots or nullptr
+     int64_t const* __restrict__ index_slot_mapping,  // index K slots/nullptr
+-    scalar_t* __restrict__ kv_cache,     // [nb,2,bs,nkv,128] or nullptr
++    cache_t* __restrict__ kv_cache,      // [nb,2,bs,nkv,128] or nullptr
+     scalar_t* __restrict__ index_cache,  // [nb*bs, 128] or nullptr
+     float const eps, int const rotary_dim, int const num_tokens, int const nq,
+     int const nkv, int const niq, int const block_size,
+@@ -355,7 +378,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+           int const kv = isK ? 0 : 1;
+           int64_t const off =
+               b * kv_s_block + kv * kv_s_kv + t * kv_s_token + head * kv_s_head;
+-          storeElems<scalar_t>(kv_cache + off + dim_base, elems);
++          storeCacheElems<scalar_t, cache_t, kv_dt>(kv_cache + off + dim_base,
++                                                    elems);
+         }
+       }
+     }
+@@ -373,13 +397,13 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+ // ────────────────────────────────────────────────────────────────────────────
+ // Launch wrapper
+ // ────────────────────────────────────────────────────────────────────────────
+-template <typename scalar_t>
++template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+ void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+                           scalar_t const* q_norm_w, scalar_t const* k_norm_w,
+                           scalar_t const* iq_norm_w, scalar_t const* ik_norm_w,
+                           scalar_t const* cos_sin_cache,
+                           int64_t const* positions, int64_t const* slot_mapping,
+-                          int64_t const* index_slot_mapping, scalar_t* kv_cache,
++                          int64_t const* index_slot_mapping, cache_t* kv_cache,
+                           scalar_t* index_cache, float const eps,
+                           int const rotary_dim, int const num_tokens,
+                           int const nq, int const nkv, int const niq,
+@@ -419,7 +443,8 @@ void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+   #define LAUNCH(IS_SPARSE, INSERT)                                           \
+     cudaLaunchKernelEx(                                                       \
+         &config,                                                              \
+-        fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, IS_SPARSE, INSERT>,   \
++        fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt,       \
++                                              IS_SPARSE, INSERT>,             \
+         qkv, q_out, index_q_out, q_norm_w, k_norm_w, iq_norm_w, ik_norm_w,    \
+         cos_sin_cache, positions, slot_mapping, index_slot_mapping, kv_cache, \
+         index_cache, eps, rotary_dim, num_tokens, nq, nkv, niq, block_size,   \
+@@ -428,7 +453,8 @@ void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+   // ROCm: standard kernel launch syntax (no PDL/stream serialization).
+   // clang-format off
+   #define LAUNCH(IS_SPARSE, INSERT)                                          \
+-    fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, IS_SPARSE, INSERT>       \
++    fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt,          \
++                                          IS_SPARSE, INSERT>                 \
+         <<<grid, kBlockSize, 0, stream>>>(                                   \
+             qkv, q_out, index_q_out, q_norm_w, k_norm_w, iq_norm_w,          \
+             ik_norm_w, cos_sin_cache, positions, slot_mapping,               \
+@@ -455,6 +481,33 @@ void launchFusedMiniMaxM3(scalar_t* qkv, scalar_t* q_out, scalar_t* index_q_out,
+ }  // namespace minimax_m3_fused_ops
+ }  // namespace vllm
+ 
++#define CALL_FUSED_MINIMAX_M3(_RAW_T, CACHE_T, KV_DTYPE)                       \
++  vllm::minimax_m3_fused_ops::launchFusedMiniMaxM3<st, CACHE_T, KV_DTYPE>(     \
++      reinterpret_cast<st*>(qkv.data_ptr()),                                   \
++      q_out.has_value() ? reinterpret_cast<st*>(q_out->data_ptr()) : nullptr,  \
++      index_q_out.has_value() ? reinterpret_cast<st*>(index_q_out->data_ptr()) \
++                              : nullptr,                                       \
++      reinterpret_cast<st const*>(q_norm_weight.data_ptr()),                   \
++      reinterpret_cast<st const*>(k_norm_weight.data_ptr()),                   \
++      has_index ? reinterpret_cast<st const*>(index_q_norm_weight->data_ptr()) \
++                : nullptr,                                                     \
++      has_index ? reinterpret_cast<st const*>(index_k_norm_weight->data_ptr()) \
++                : nullptr,                                                     \
++      reinterpret_cast<st const*>(cos_sin_cache.data_ptr()),                   \
++      reinterpret_cast<int64_t const*>(positions.data_ptr()),                  \
++      insert_kv ? reinterpret_cast<int64_t const*>(slot_mapping->data_ptr())   \
++                : nullptr,                                                     \
++      insert_kv ? reinterpret_cast<int64_t const*>(                            \
++                      effective_index_slot_mapping->data_ptr())                \
++                : nullptr,                                                     \
++      insert_kv ? reinterpret_cast<CACHE_T*>(kv_cache->data_ptr()) : nullptr,  \
++      (insert_kv && has_index)                                                 \
++          ? reinterpret_cast<st*>(index_cache->data_ptr())                     \
++          : nullptr,                                                           \
++      static_cast<float>(eps), static_cast<int>(rotary_dim), num_tokens, nq,   \
++      nkv, niq, static_cast<int>(block_size), kv_s_block, kv_s_kv, kv_s_token, \
++      kv_s_head, has_index, insert_kv, stream)
++
+ // ────────────────────────────────────────────────────────────────────────────
+ // Torch op wrapper
+ // ────────────────────────────────────────────────────────────────────────────
+@@ -475,9 +528,14 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+     int64_t block_size,
+     std::optional<torch::stable::Tensor> q_out,  // [N, nq*128] contiguous
+     std::optional<torch::stable::Tensor>
+-        index_q_out) {  // [N, niq*128] contiguous
++        index_q_out,  // [N, niq*128] contiguous
++    const std::string& kv_cache_dtype) {
+   STD_TORCH_CHECK(qkv.is_cuda() && qkv.is_contiguous(),
+                   "qkv must be contiguous CUDA");
++  STD_TORCH_CHECK(
++      qkv.scalar_type() == torch::headeronly::ScalarType::Half ||
++          qkv.scalar_type() == torch::headeronly::ScalarType::BFloat16,
++      "qkv must be float16 or bfloat16");
+   STD_TORCH_CHECK(
+       positions.is_cuda() &&
+           positions.scalar_type() == torch::headeronly::ScalarType::Long,
+@@ -510,6 +568,8 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+   // (1 head)]) right after [q|k|v] in the same row; the dense layer does not.
+   bool const has_index = niq > 0;
+   bool const insert_kv = kv_cache.has_value();
++  vllm::Fp8KVCacheDataType const kv_dt =
++      vllm::get_fp8_kv_cache_data_type(kv_cache_dtype);
+   int const kHeadDim = vllm::minimax_m3_fused_ops::kHeadDim;
+   int const expected_row =
+       (nq + 2 * nkv + (has_index ? niq + 1 : 0)) * kHeadDim;
+@@ -552,8 +612,14 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+                  torch::headeronly::ScalarType::Long &&
+              index_slot_mapping->numel() == slot_mapping->numel()),
+         "index_slot_mapping must be int64 CUDA with slot_mapping length");
+-    STD_TORCH_CHECK(kv_cache->scalar_type() == qkv.scalar_type(),
+-                    "kv_cache dtype must match qkv (bf16 cache only)");
++    if (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
++      STD_TORCH_CHECK(kv_cache->scalar_type() == qkv.scalar_type(),
++                      "auto kv_cache dtype must match qkv");
++    } else {
++      STD_TORCH_CHECK(
++          kv_cache->scalar_type() == torch::headeronly::ScalarType::Byte,
++          "fp8 kv_cache must use uint8 storage");
++    }
+     STD_TORCH_CHECK(index_cache.has_value() &&
+                         index_cache->scalar_type() == qkv.scalar_type(),
+                     "insert mode requires matching index_cache");
+@@ -601,35 +667,9 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+   VLLM_STABLE_DISPATCH_HALF_TYPES(
+       qkv.scalar_type(), "fused_minimax_m3_qknorm_rope_kv_insert", [&] {
+         using st = scalar_t;
+-        vllm::minimax_m3_fused_ops::launchFusedMiniMaxM3<st>(
+-            reinterpret_cast<st*>(qkv.data_ptr()),
+-            q_out.has_value() ? reinterpret_cast<st*>(q_out->data_ptr())
+-                              : nullptr,
+-            index_q_out.has_value()
+-                ? reinterpret_cast<st*>(index_q_out->data_ptr())
+-                : nullptr,
+-            reinterpret_cast<st const*>(q_norm_weight.data_ptr()),
+-            reinterpret_cast<st const*>(k_norm_weight.data_ptr()),
+-            has_index
+-                ? reinterpret_cast<st const*>(index_q_norm_weight->data_ptr())
+-                : nullptr,
+-            has_index
+-                ? reinterpret_cast<st const*>(index_k_norm_weight->data_ptr())
+-                : nullptr,
+-            reinterpret_cast<st const*>(cos_sin_cache.data_ptr()),
+-            reinterpret_cast<int64_t const*>(positions.data_ptr()),
+-            insert_kv
+-                ? reinterpret_cast<int64_t const*>(slot_mapping->data_ptr())
+-                : nullptr,
+-            insert_kv ? reinterpret_cast<int64_t const*>(
+-                            effective_index_slot_mapping->data_ptr())
+-                      : nullptr,
+-            insert_kv ? reinterpret_cast<st*>(kv_cache->data_ptr()) : nullptr,
+-            (insert_kv && has_index)
+-                ? reinterpret_cast<st*>(index_cache->data_ptr())
+-                : nullptr,
+-            static_cast<float>(eps), static_cast<int>(rotary_dim), num_tokens,
+-            nq, nkv, niq, static_cast<int>(block_size), kv_s_block, kv_s_kv,
+-            kv_s_token, kv_s_head, has_index, insert_kv, stream);
++        DISPATCH_BY_KV_CACHE_DTYPE(qkv.scalar_type(), kv_cache_dtype,
++                                   CALL_FUSED_MINIMAX_M3);
+       });
+ }
++
++#undef CALL_FUSED_MINIMAX_M3
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index d5144d76818a..49ce17440061 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -3,6 +3,9 @@
+ #include <torch/csrc/stable/library.h>
+ #include <torch/csrc/stable/tensor.h>
+ 
++#include <optional>
++#include <string>
++
+ void per_token_group_quant_fp8(const torch::stable::Tensor& input,
+                                torch::stable::Tensor& output_q,
+                                torch::stable::Tensor& output_s,
+@@ -297,7 +300,8 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
+     std::optional<torch::stable::Tensor> kv_cache,
+     std::optional<torch::stable::Tensor> index_cache, int64_t block_size,
+     std::optional<torch::stable::Tensor> q_out,
+-    std::optional<torch::stable::Tensor> index_q_out);
++    std::optional<torch::stable::Tensor> index_q_out,
++    const std::string& kv_cache_dtype);
+ 
+ // Sampler kernels (shared CUDA/ROCm)
+ void apply_repetition_penalties_(
+diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
+index 7d9a39a7a4b7..f360c83b8af2 100644
+--- a/csrc/libtorch_stable/torch_bindings.cpp
++++ b/csrc/libtorch_stable/torch_bindings.cpp
+@@ -471,7 +471,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+       "int num_index_heads, "
+       "Tensor? slot_mapping, Tensor? index_slot_mapping, "
+       "Tensor!? kv_cache, Tensor!? index_cache, "
+-      "int block_size, Tensor!? q_out, Tensor!? index_q_out) -> ()");
++      "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
++      "str kv_cache_dtype) -> ()");
+ 
+   // Apply repetition penalties to logits in-place.
+   ops.def(
+diff --git a/setup.py b/setup.py
+index a0af43e23313..2aaa7dfc49c8 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1168,7 +1168,7 @@ def _read_requirements(filename: str) -> list[str]:
+         "third_party/deep_gemm/include/**/*.h",
+         "third_party/deep_gemm/include/**/*.hpp",
+         # fmha_sm100 sparse CuTe-DSL helper kernels (vendored via cmake)
+-        "third_party/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu",
++        "third_party/fmha_sm100/cute/**/*.cu",
+     ]
+ }
+ 
+diff --git a/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py b/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
+index 3268d125bb2c..96729614f822 100644
+--- a/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
++++ b/tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py
+@@ -106,7 +106,16 @@ def test_dense_norm_rope(num_tokens, num_heads, num_kv_heads):
+     qkv_orig = qkv.clone()
+ 
+     ops.fused_minimax_m3_qknorm_rope_kv_insert(
+-        qkv, q_w, k_w, cos_sin, positions, num_heads, num_kv_heads, ROTARY_DIM, eps
++        qkv,
++        q_w,
++        k_w,
++        cos_sin,
++        positions,
++        num_heads,
++        num_kv_heads,
++        ROTARY_DIM,
++        eps,
++        kv_cache_dtype="auto",
+     )
+     q_out, k_out, v_out = qkv.split([qsz, kvsz, kvsz], dim=-1)
+ 
+@@ -133,7 +142,8 @@ def test_dense_norm_rope(num_tokens, num_heads, num_kv_heads):
+ 
+ @pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
+ @pytest.mark.parametrize("block_size", [16, 64])
+-def test_sparse_full(num_tokens, block_size):
++@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
++def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
+     torch.manual_seed(1)
+     device, dtype, eps = "cuda", torch.bfloat16, 1e-6
+     base, max_pos = 5_000_000.0, 4096
+@@ -158,8 +168,15 @@ def test_sparse_full(num_tokens, block_size):
+     splits = [qsz, kvsz, kvsz, iqsz, iksz]
+ 
+     num_blocks = (num_tokens + block_size - 1) // block_size + 1
++    kv_cache_storage_dtype = torch.uint8 if kv_cache_dtype == "fp8" else dtype
+     kv_cache = torch.zeros(
+-        num_blocks, 2, block_size, num_kv_heads, HEAD_DIM, dtype=dtype, device=device
++        num_blocks,
++        2,
++        block_size,
++        num_kv_heads,
++        HEAD_DIM,
++        dtype=kv_cache_storage_dtype,
++        device=device,
+     )
+     index_cache = torch.zeros(
+         num_blocks, block_size, HEAD_DIM, dtype=dtype, device=device
+@@ -195,11 +212,12 @@ def test_sparse_full(num_tokens, block_size):
+         block_size,
+         q_out,
+         index_q,
++        kv_cache_dtype,
+     )
+ 
+     # ── norm+rope parity. q/index_q land in their gather buffers; k/index_k are
+     # rewritten in place inside qkv. ──
+-    _, k_out, _, _, index_k = qkv.split(splits, dim=-1)
++    _, k_out, v_out, _, index_k = qkv.split(splits, dim=-1)
+     q_in, k_in, v_in, iq_orig, ik_orig = qkv_orig.split(splits, dim=-1)
+     q_ref = norm_rope_ref(
+         q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps
+@@ -230,15 +248,33 @@ def test_sparse_full(num_tokens, block_size):
+     # ── Cache inserts. ──
+     # Main cache layout is [num_blocks, 2, block_size, num_kv_heads, head_dim]
+     # (the K/V axis sits *before* block_size); index cache is [nb, bs, head_dim].
+-    idx_flat = index_cache.view(num_blocks * block_size, HEAD_DIM)
+     k_ref_h = k_ref.view(num_tokens, num_kv_heads, HEAD_DIM)
+     v_ref_h = v_in.view(num_tokens, num_kv_heads, HEAD_DIM)  # v is raw (no norm/rope)
+-    for t in range(num_tokens):
+-        s = slot_mapping[t].item()
+-        b, pos = s // block_size, s % block_size
+-        torch.testing.assert_close(
+-            kv_cache[b, 0, pos], k_ref_h[t], rtol=1e-2, atol=1e-2
++    if kv_cache_dtype == "fp8":
++        expected_kv_cache = torch.zeros_like(kv_cache)
++        scale = torch.ones((), device=device)
++        ops.reshape_and_cache_flash(
++            k_out.view(num_tokens, num_kv_heads, HEAD_DIM),
++            v_out.view(num_tokens, num_kv_heads, HEAD_DIM),
++            expected_kv_cache[:, 0],
++            expected_kv_cache[:, 1],
++            slot_mapping,
++            kv_cache_dtype,
++            scale,
++            scale,
+         )
+-        torch.testing.assert_close(kv_cache[b, 1, pos], v_ref_h[t], rtol=0, atol=0)
+-        index_s = index_slot_mapping[t].item()
+-        torch.testing.assert_close(idx_flat[index_s], ik_ref[t], rtol=1e-2, atol=1e-2)
++        torch.testing.assert_close(kv_cache, expected_kv_cache, rtol=0, atol=0)
++    else:
++        for t in range(num_tokens):
++            s = slot_mapping[t].item()
++            b, pos = s // block_size, s % block_size
++            torch.testing.assert_close(
++                kv_cache[b, 0, pos], k_ref_h[t], rtol=1e-2, atol=1e-2
++            )
++            torch.testing.assert_close(kv_cache[b, 1, pos], v_ref_h[t], rtol=0, atol=0)
++
++    expected_index_cache = torch.zeros_like(index_cache).view(-1, HEAD_DIM)
++    expected_index_cache[index_slot_mapping] = index_k
++    torch.testing.assert_close(
++        index_cache.view(-1, HEAD_DIM), expected_index_cache, rtol=0, atol=0
++    )
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 6f72a8a51563..5f52bc50eb21 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2634,6 +2634,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
+     block_size: int = 0,
+     q_out: torch.Tensor | None = None,
+     index_q_out: torch.Tensor | None = None,
++    kv_cache_dtype: str = "auto",
+ ) -> None:
+     """Fused MiniMax-M3 attention pre-processing (in-place).
+ 
+@@ -2645,8 +2646,9 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
+       index_k]`` — the index branch is read straight out of ``qkv``.
+ 
+     When ``kv_cache`` is given (sparse serving), also scatter-inserts the
+-    normed/roped k & v into the paged bf16 KV cache by ``slot_mapping`` and the
+-    index key into ``index_cache`` by ``index_slot_mapping``. If
++    normed/roped k & v into the paged KV cache by ``slot_mapping`` and the
++    index key into ``index_cache`` by ``index_slot_mapping``. ``kv_cache_dtype``
++    selects the cache storage/conversion path. If
+     ``index_slot_mapping`` is omitted, ``slot_mapping`` is used for both caches.
+ 
+     If ``q_out`` / ``index_q_out`` (contiguous ``[N, nq*128]`` / ``[N,
+@@ -2675,6 +2677,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
+         block_size,
+         q_out,
+         index_q_out,
++        kv_cache_dtype,
+     )
+ 
+ 
+diff --git a/vllm/models/minimax_m3/amd/model.py b/vllm/models/minimax_m3/amd/model.py
+index b80d3b8b3b8c..4bd924447287 100644
+--- a/vllm/models/minimax_m3/amd/model.py
++++ b/vllm/models/minimax_m3/amd/model.py
+@@ -426,6 +426,7 @@ def forward(
+             self.num_kv_heads,
+             self.rotary_emb.rotary_dim,
+             self.q_norm.variance_epsilon,
++            kv_cache_dtype="auto",
+         )
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         attn_output = self.attn(q, k, v)
+@@ -533,11 +534,6 @@ def __init__(
+         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+             self.kv_cache_dtype, vllm_config.model_config
+         )
+-        # fp8 main-K/V cache: the fused qknorm+rope+kv-insert op is bf16-cache-only
+-        # (asserts kv_cache dtype == qkv), so on the fp8 path we run it in
+-        # norm+rope-only mode and write the cache via the fp8-capable
+-        # reshape_and_cache_flash in _insert_kv. (index cache stays bf16.)
+-        self._fp8_kv = "fp8" in self.kv_cache_dtype
+ 
+         self.attn_backend = MiniMaxM3SparseBackend
+         # Indexer and main attention are separate impls. On ROCm the SM100 gate
+@@ -592,37 +588,6 @@ def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+         )
+ 
+-    def _insert_kv(
+-        self,
+-        key: torch.Tensor,
+-        value: torch.Tensor,
+-        index_key: torch.Tensor,
+-        main_slot_mapping: torch.Tensor,
+-        index_slot_mapping: torch.Tensor,
+-    ) -> None:
+-        """Write main K/V (fp8-quantizing) and index-K into their paged caches.
+-
+-        Used only on the fp8-KV path: the fused #20 op is bf16-cache-only, so it
+-        runs in norm+rope-only mode and the (already normed/roped) k/v/index_k are
+-        written here via ``reshape_and_cache_flash`` (which honors kv_cache_dtype,
+-        unit scale -- matching the fp8 read path added in #33). Mirrors the
+-        pre-#20 unfused insert. The index cache stays bf16 (no quant).
+-        """
+-        key_cache, value_cache = self.kv_cache.unbind(1)
+-        scale = torch.ones((), device=key.device)
+-        ops.reshape_and_cache_flash(
+-            key.view(-1, self.num_kv_heads, self.head_dim),
+-            value.view(-1, self.num_kv_heads, self.head_dim),
+-            key_cache,
+-            value_cache,
+-            main_slot_mapping,
+-            self.kv_cache_dtype,
+-            scale,
+-            scale,
+-        )
+-        idx_cache = self.indexer.index_cache.kv_cache.view(-1, self.idx_head_dim)
+-        idx_cache[index_slot_mapping] = index_key.to(idx_cache.dtype)
+-
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -636,11 +601,9 @@ def forward(
+         # of the single fused ``qkv`` tensor. Once the paged caches are bound the
+         # kernel also inserts k/v and the index key into them (each with its own
+         # slot_mapping); the memory-profiling run (caches unbound, no slot_mapping)
+-        # short-circuits to zeros below. Replaces the
+-        # q_norm/k_norm/rotary_emb/index_*_norm/index_rotary_emb/_insert_kv chain.
+-        # (#20 fused_minimax_m3_qknorm_rope_kv_insert; HIP/CDNA path. The main and
+-        # index slot mappings are read from the forward context's slot_mapping
+-        # dict, matching the breakable-cudagraph path -- see nvidia/model.py.)
++        # short-circuits to zeros below. The main and index slot mappings are read
++        # from the forward context's slot_mapping dict, matching the
++        # breakable-cudagraph path -- see nvidia/model.py.
+         cos_sin_cache = self.rotary_emb.cos_sin_cache
+         rotary_dim = self.rotary_emb.rotary_dim
+         eps = self.q_norm.variance_epsilon
+@@ -658,12 +621,6 @@ def forward(
+         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+         q = qkv.new_empty((num_tokens, self.q_size))
+         index_q = qkv.new_empty((num_tokens, self.index_q_size))
+-        # On the fp8-KV path the fused op cannot write the (fp8) cache, so pass
+-        # kv_cache/index_cache = None -> insert_kv=False (norm+rope only): it still
+-        # de-interleaves q/index_q and rewrites the normed/roped k & index_k in
+-        # place in qkv, leaving v raw (correct -- v is never normed/roped). We then
+-        # write the cache via _insert_kv below.
+-        insert_via_fused = not self._fp8_kv
+         ops.fused_minimax_m3_qknorm_rope_kv_insert(
+             qkv,
+             self.q_norm.weight,
+@@ -679,26 +636,13 @@ def forward(
+             self.num_idx_heads,
+             main_slot_mapping,
+             index_slot_mapping,
+-            self.kv_cache if insert_via_fused else None,
+-            self.indexer.index_cache.kv_cache if insert_via_fused else None,
++            self.kv_cache,
++            self.indexer.index_cache.kv_cache,
+             self.kv_cache.size(2),  # paged-cache block size
+             q,
+             index_q,
++            self.kv_cache_dtype,
+         )
+-        if not insert_via_fused:
+-            # Extract the normed/roped k, raw v, normed/roped index_k from qkv
+-            # ([q | k | v | index_q | index_k], all head_dim=128) and fp8-insert.
+-            kv = self.num_kv_heads * self.head_dim
+-            # These are strided views into qkv (row stride = full qkv width), but
+-            # their last dim is contiguous, so `_insert_kv`'s `.view(-1, nkv,
+-            # head_dim)` works on them and `reshape_and_cache_flash` honors the
+-            # input stride -- no `.contiguous()` needed (verified bit-identical;
+-            # avoids a [N, kv] copy per step on the fp8-KV path).
+-            k = qkv[:, self.q_size : self.q_size + kv]
+-            v = qkv[:, self.q_size + kv : self.q_size + 2 * kv]
+-            ik0 = self.q_size + 2 * kv + self.index_q_size
+-            index_k = qkv[:, ik0 : ik0 + self.num_idx_heads * self.idx_head_dim]
+-            self._insert_kv(k, v, index_k, main_slot_mapping, index_slot_mapping)
+ 
+         output = torch.empty_like(q)
+         attn_output = self._run_attention(q, index_q, output)
+diff --git a/vllm/models/minimax_m3/common/sparse_attention.py b/vllm/models/minimax_m3/common/sparse_attention.py
+index ab8f24186e6b..b8d60e09e4b8 100644
+--- a/vllm/models/minimax_m3/common/sparse_attention.py
++++ b/vllm/models/minimax_m3/common/sparse_attention.py
+@@ -22,6 +22,7 @@
+ from vllm.config import VllmConfig
+ from vllm.config.cache import CacheDType
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.models.minimax_m3.common.ops.sparse_attn import (
+     SPARSE_BLOCK_SIZE,
+     minimax_m3_sparse_attn,
+@@ -44,6 +45,8 @@
+ )
+ from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
+ 
++logger = init_logger(__name__)
++
+ 
+ class MiniMaxM3SparseBackend(AttentionBackend):
+     """Block-sparse GQA backend for MiniMax M3 sparse attention layers."""
+@@ -385,16 +388,25 @@ def select_main_impl_cls(
+ ) -> type[MiniMaxM3SparseImpl]:
+     """Pick the main attend impl off the main KV-cache dtype.
+ 
+-    bf16 on Blackwell (SM100) uses the MSA attend; fp8 or non-Blackwell falls
++    Blackwell (SM100) uses the MSA attend for supported top-k block counts
++    when the KV cache is BF16 or FP8 E4M3; non-Blackwell and FP8 E5M2 fall
+     back to Triton. The MSA module is imported lazily so AMD/non-SM100 never
+     import fmha_sm100.
+     """
+-    if (
++    use_msa = (
+         current_platform.is_cuda()
+         and current_platform.is_device_capability_family(100)
+         and topk_blocks in (4, 8, 16, 32)
+-        and not is_quantized_kv_cache(kv_cache_dtype)
+-    ):
++        and kv_cache_dtype != "fp8_e5m2"
++    )
++    selected = "MSA" if use_msa else "Triton"
++    logger.info_once(
++        "MiniMax M3 sparse attention selected %s (kv_cache_dtype=%s, topk_blocks=%s)",
++        selected,
++        kv_cache_dtype,
++        topk_blocks,
++    )
++    if use_msa:
+         from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
+             MiniMaxM3SparseMSAImpl,
+         )
+diff --git a/vllm/models/minimax_m3/nvidia/model.py b/vllm/models/minimax_m3/nvidia/model.py
+index e2cd62704fda..aaced78ed7cd 100644
+--- a/vllm/models/minimax_m3/nvidia/model.py
++++ b/vllm/models/minimax_m3/nvidia/model.py
+@@ -66,10 +66,7 @@
+     maybe_prefix,
+ )
+ from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
+-from vllm.models.minimax_m3.common.indexer import (
+-    MiniMaxM3Indexer,
+-    MiniMaxM3IndexerMetadata,
+-)
++from vllm.models.minimax_m3.common.indexer import MiniMaxM3Indexer
+ from vllm.models.minimax_m3.common.mm_preprocess import (
+     MiniMaxM3VLDummyInputsBuilder,
+     MiniMaxM3VLMultiModalProcessor,
+@@ -78,7 +75,6 @@
+ from vllm.models.minimax_m3.common.sparse_attention import (
+     MiniMaxM3SparseBackend,
+     MiniMaxM3SparseImpl,
+-    MiniMaxM3SparseMetadata,
+     select_main_impl_cls,
+ )
+ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
+@@ -375,6 +371,7 @@ def forward(
+             self.num_kv_heads,
+             self.rotary_emb.rotary_dim,
+             self.q_norm.variance_epsilon,
++            kv_cache_dtype="auto",
+         )
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         attn_output = self.attn(q, k, v)
+@@ -545,40 +542,6 @@ def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+         )
+ 
+-    def _insert_kv(
+-        self, key: torch.Tensor, value: torch.Tensor, index_key: torch.Tensor
+-    ) -> None:
+-        """Write main K/V and index-K into their paged caches.
+-
+-        No-op during the profiling run, where caches are not yet bound and
+-        ``attn_metadata`` is None.
+-        """
+-        attn_metadata = get_forward_context().attn_metadata
+-        if not isinstance(attn_metadata, dict):
+-            return
+-        main_meta = attn_metadata[self.layer_name]
+-        index_meta = attn_metadata[self.indexer.index_cache.prefix]
+-        assert isinstance(main_meta, MiniMaxM3SparseMetadata)
+-        assert isinstance(index_meta, MiniMaxM3IndexerMetadata)
+-
+-        # Identity scale: unused for the bf16 cache, required arg of the op.
+-        key_cache, value_cache = self.kv_cache.unbind(1)
+-        scale = torch.ones((), device=key.device)
+-        ops.reshape_and_cache_flash(
+-            key.view(-1, self.num_kv_heads, self.head_dim),
+-            value.view(-1, self.num_kv_heads, self.head_dim),
+-            key_cache,
+-            value_cache,
+-            main_meta.slot_mapping,
+-            self.kv_cache_dtype,
+-            scale,
+-            scale,
+-        )
+-
+-        # Index-key cache: single vector per token, scatter by slot.
+-        idx_cache = self.indexer.index_cache.kv_cache.view(-1, self.idx_head_dim)
+-        idx_cache[index_meta.slot_mapping] = index_key.to(idx_cache.dtype)
+-
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -592,10 +555,9 @@ def forward(
+         # of the single fused ``qkv`` tensor (the "5 results").  Once the paged
+         # caches are bound the kernel also inserts k/v and the index key into
+         # them; the initial memory-profiling run (caches unbound, no slot_mapping)
+-        # short-circuits to zeros below.  Replaces the
+-        # q_norm/k_norm/rotary_emb/index_*_norm/index_rotary_emb/_insert_kv
+-        # sequence.  k/v and index_k are rewritten in place inside qkv (and
+-        # scatter-inserted into the caches); q and index_q are de-interleaved
++        # short-circuits to zeros below. k/v and index_k are rewritten in place
++        # inside qkv (and scatter-inserted into the caches); q and index_q are
++        # de-interleaved
+         # straight into the dedicated contiguous ``q``/``index_q`` buffers below.
+ 
+         cos_sin_cache = self.rotary_emb.cos_sin_cache
+@@ -635,6 +597,7 @@ def forward(
+             self.kv_cache.size(2),  # paged-cache block size
+             q,
+             index_q,
++            self.kv_cache_dtype,
+         )
+ 
+         output = torch.empty_like(q)

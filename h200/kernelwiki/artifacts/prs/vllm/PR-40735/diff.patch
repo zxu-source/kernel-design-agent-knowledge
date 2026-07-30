@@ -1,0 +1,2982 @@
+diff --git a/tests/kernels/moe/test_zero_expert_moe.py b/tests/kernels/moe/test_zero_expert_moe.py
+index d8f900256ec3..f10459aa5192 100644
+--- a/tests/kernels/moe/test_zero_expert_moe.py
++++ b/tests/kernels/moe/test_zero_expert_moe.py
+@@ -183,6 +183,7 @@ def test_zero_expert_moe_output_decomposition(zero_expert_moe, num_tokens):
+             x=hidden_states,
+             topk_weights=topk_weights,
+             topk_ids=topk_ids,
++            shared_experts=None,
+             shared_experts_input=None,
+         )
+ 
+diff --git a/vllm/lora/layers/fused_moe.py b/vllm/lora/layers/fused_moe.py
+index abc2f84debb2..1ceb34b71496 100644
+--- a/vllm/lora/layers/fused_moe.py
++++ b/vllm/lora/layers/fused_moe.py
+@@ -40,9 +40,6 @@ def __init__(self, base_layer: FusedMoE) -> None:
+         self.base_layer.ensure_moe_quant_config_init()
+         if getattr(self.base_layer.quant_method, "supports_internal_mk", False):
+             moe_kernel = self.base_layer.quant_method.moe_kernel
+-            # Don't let the kernel own shared experts so the runner can
+-            # overlap them with routed experts via a separate CUDA stream.
+-            moe_kernel.shared_experts = None
+         else:
+             prepare_finalize = MoEPrepareAndFinalizeNoDPEPModular()
+             moe_kernel = FusedMoEKernel(
+diff --git a/vllm/model_executor/layers/fused_moe/__init__.py b/vllm/model_executor/layers/fused_moe/__init__.py
+index 9938dc0dd53d..7a48ae0d9bc5 100644
+--- a/vllm/model_executor/layers/fused_moe/__init__.py
++++ b/vllm/model_executor/layers/fused_moe/__init__.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from contextlib import contextmanager
+-from typing import Any
++from typing import Any, TypeAlias
+ 
+ from vllm.model_executor.layers.fused_moe.activation import (
+     MoEActivation,
+@@ -11,6 +11,8 @@
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
++    FusedMoEParallelConfig,
++    FusedMoEQuantConfig,
+     RoutingMethodType,
+ )
+ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+@@ -30,6 +32,9 @@
+     FusedMoERouter,
+ )
+ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
++from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
++    SharedExperts,
++)
+ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+     UnquantizedFusedMoEMethod,
+ )
+@@ -38,6 +43,10 @@
+ _config: dict[str, Any] | None = None
+ 
+ 
++# Temporary alias for FusedMoE, eventually we be its own class.
++RoutedExperts: TypeAlias = FusedMoE
++
++
+ @contextmanager
+ def override_config(config):
+     global _config
+@@ -55,6 +64,8 @@ def get_config() -> dict[str, Any] | None:
+     "FusedMoE",
+     "FusedMoERouter",
+     "FusedMoEConfig",
++    "FusedMoEQuantConfig",
++    "FusedMoEParallelConfig",
+     "FusedMoEMethodBase",
+     "MoEActivation",
+     "UnquantizedFusedMoEMethod",
+@@ -64,6 +75,8 @@ def get_config() -> dict[str, Any] | None:
+     "FusedMoEPrepareAndFinalizeModular",
+     "GateLinear",
+     "RoutingMethodType",
++    "RoutedExperts",
++    "SharedExperts",
+     "activation_without_mul",
+     "apply_moe_activation",
+     "fused_moe_make_expert_params_mapping",
+diff --git a/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py b/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py
+index fdd802e7da3a..c1274a3c14d5 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py
+@@ -1489,7 +1489,6 @@ def cutlass_moe_w4a8_fp8(
+             quant_config=quant_config,
+             group_size=group_size,
+         ),
+-        shared_experts=None,
+         inplace=False,
+     )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py b/vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py
+index 5876f1c87ed6..99a9f323c0f8 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py
+@@ -4,7 +4,7 @@
+ 
+ import json
+ import math
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ import torch
+ from humming import dtypes
+@@ -38,6 +38,10 @@
+ from vllm.platforms import current_platform
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
++if TYPE_CHECKING:
++    from vllm.model_executor.layers.fused_moe import RoutedExperts
++
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -58,7 +62,7 @@ def get_humming_moe_gemm_type() -> str:
+ class HummingExpertsBase(mk.FusedMoEExpertsModular):
+     def __init__(
+         self,
+-        layer: torch.nn.Module,
++        layer: "RoutedExperts",
+         moe_config: FusedMoEConfig,
+         quant_config: FusedMoEQuantConfig,
+         max_num_tokens: int | None = None,
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+index 7d54e2b717d6..601d64b792e6 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from abc import abstractmethod
++from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+@@ -20,6 +21,9 @@
+     QuantizeMethodBase,
+ )
+ 
++if TYPE_CHECKING:
++    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -37,10 +41,12 @@ def supports_internal_mk(self) -> bool:
+         return self.moe_kernel is not None
+ 
+     @property
+-    def mk_owns_shared_expert(self) -> bool:
++    def mk_can_overlap_shared_experts(self) -> bool:
+         # NOTE(rob): temporary attribute to indicate support for
+         # completed migration to the new internal MK interface.
+-        return self.moe_kernel is not None and self.moe_kernel.owns_shared_experts
++        return (
++            self.moe_kernel is not None and self.moe_kernel.can_overlap_shared_experts
++        )
+ 
+     @abstractmethod
+     def create_weights(
+@@ -156,17 +162,18 @@ def is_monolithic(self) -> bool:
+ 
+     def apply(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: "RoutedExperts",  # type: ignore[name-defined] # noqa: F821
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: "SharedExperts | None",
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         raise NotImplementedError
+ 
+     def apply_monolithic(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: "RoutedExperts",  # type: ignore[name-defined] # noqa: F821
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
+index 142e180786c6..e8300b5f6af2 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
+@@ -47,7 +47,6 @@ def make(
+         moe_layer: torch.nn.Module,
+         old_quant_method: FusedMoEMethodBase,
+         prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+-        shared_experts: SharedExperts | None,
+         inplace: bool = False,
+     ) -> "FusedMoEModularMethod":
+         return FusedMoEModularMethod(
+@@ -55,7 +54,6 @@ def make(
+             FusedMoEKernel(
+                 prepare_finalize,
+                 old_quant_method.select_gemm_impl(prepare_finalize, moe_layer),
+-                shared_experts=shared_experts,
+                 inplace=inplace,
+             ),
+         )
+@@ -86,10 +84,11 @@ def get_fused_moe_quant_config(
+ 
+     def apply(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: "RoutedExperts",  # type: ignore[name-defined] # noqa: F821
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert self.moe_kernel is not None
+@@ -103,5 +102,6 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+             expert_map=None if self.disable_expert_map else layer.expert_map,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index ca18e8588798..453968b0208c 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -480,7 +480,6 @@ def maybe_init_modular_kernel(self) -> None:
+                     self,
+                     self.base_quant_method,
+                     prepare_finalize,
+-                    self.shared_experts,
+                     inplace=not self.moe_config.disable_inplace,
+                 )
+             )
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 135a677ffde2..c222220e31c6 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -1018,17 +1018,10 @@ def __init__(
+         self,
+         prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+         fused_experts: FusedMoEExpertsModular,
+-        shared_experts: SharedExperts | None,
+         inplace: bool = False,
+     ):
+         self.prepare_finalize = prepare_finalize
+         self.fused_experts = fused_experts
+-        # Only accept shared experts if they can be run w/async.
+-        # The MoERunner/SharedExperts class will coordinate with the MK to ensure
+-        # that the SharedExperts are executed only once.
+-        self.shared_experts = (
+-            shared_experts if prepare_finalize.supports_async() else None
+-        )
+         self.inplace = inplace
+         moe_parallel_config = fused_experts.moe_config.moe_parallel_config
+         self.moe_parallel_config = moe_parallel_config
+@@ -1103,11 +1096,12 @@ def _allocate_buffers(
+ 
+     def _maybe_apply_shared_experts(
+         self,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ):
+-        if self.shared_experts is not None:
++        if shared_experts is not None:
+             assert shared_experts_input is not None
+-            self.shared_experts.apply(
++            shared_experts.apply(
+                 shared_experts_input,
+                 SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+             )
+@@ -1289,6 +1283,7 @@ def _finalize(
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
+         apply_router_weight_on_input: bool,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         """
+@@ -1296,6 +1291,7 @@ def _finalize(
+         that handles DBO, async and shared expert overlap.
+ 
+         Args:
++            shared_experts: SharedExperts | None. The shared experts if any.
+             shared_experts_input: Optional separate input for shared experts.
+                 When latent MoE is used, hidden_states is the latent-projected
+                 tensor (smaller dimension) used by routed experts, while
+@@ -1322,7 +1318,7 @@ def _finalize(
+                 apply_router_weight_on_input,
+                 self.fused_experts.finalize_weight_and_reduce_impl(),
+             )
+-            self._maybe_apply_shared_experts(shared_experts_input)
++            self._maybe_apply_shared_experts(shared_experts, shared_experts_input)
+ 
+             # TODO(lucas): refactor this in the alternative schedules followup
+             # currently unpack if we have hook + receiver pair or just
+@@ -1358,6 +1354,7 @@ def apply(
+         global_num_experts: int = -1,
+         expert_map: torch.Tensor | None = None,
+         apply_router_weight_on_input: bool = False,
++        shared_experts: SharedExperts | None = None,
+         shared_experts_input: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """
+@@ -1380,6 +1377,7 @@ def apply(
+         - apply_router_weight_on_input (bool): When true, the topk weights are
+           applied directly on the inputs. This is only applicable when topk is
+           1.
++        - shared_experts: SharedExperts | None. The shared experts if any.
+         - shared_experts_input (Optional[torch.Tensor]): Optional separate
+           input for shared experts. For latent MoE, this is the original
+           hidden_states before latent projection.
+@@ -1388,7 +1386,7 @@ def apply(
+         - torch.Tensor: The output tensor after applying the MoE layer.
+         """
+         if self.inplace:
+-            assert self.shared_experts is None
++            assert shared_experts is None
+             assert not disable_inplace()
+             output = hidden_states
+         else:
+@@ -1431,6 +1429,7 @@ def apply(
+             topk_weights,
+             topk_ids,
+             apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+@@ -1503,7 +1502,6 @@ def __init__(
+         self,
+         prepare_finalize: FusedMoEPrepareAndFinalize,
+         fused_experts: FusedMoEExperts,
+-        shared_experts: SharedExperts | None = None,
+         inplace: bool = False,
+     ):
+         super().__init__()
+@@ -1516,7 +1514,6 @@ def __init__(
+             self.impl = FusedMoEKernelModularImpl(
+                 prepare_finalize,
+                 fused_experts,
+-                shared_experts,
+                 inplace,
+             )
+ 
+@@ -1539,9 +1536,9 @@ def __init__(
+         self._post_init_setup()
+ 
+     @property
+-    def owns_shared_experts(self) -> bool:
++    def can_overlap_shared_experts(self) -> bool:
+         if isinstance(self.impl, FusedMoEKernelModularImpl):
+-            return self.impl.shared_experts is not None
++            return self.impl.prepare_finalize.supports_async()
+         else:
+             return False
+ 
+@@ -1627,6 +1624,7 @@ def apply(
+         global_num_experts: int,
+         expert_map: torch.Tensor | None,
+         apply_router_weight_on_input: bool,
++        shared_experts: SharedExperts | None = None,
+         shared_experts_input: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         assert isinstance(self.impl, FusedMoEKernelModularImpl)
+@@ -1640,5 +1638,6 @@ def apply(
+             global_num_experts=global_num_experts,
+             expert_map=expert_map,
+             apply_router_weight_on_input=apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+index 0fa706d8daaf..66cd088e4cb4 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+@@ -18,9 +18,6 @@
+     fp8_w8a8_moe_quant_config,
+     fp8_w8a16_moe_quant_config,
+ )
+-from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+-    SharedExperts,
+-)
+ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+     FlashinferMoeBackend,
+     get_flashinfer_moe_backend,
+@@ -590,7 +587,6 @@ def make_fp8_moe_kernel(
+     experts_cls: type[mk.FusedMoEExperts],
+     fp8_backend: Fp8MoeBackend,
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+-    shared_experts: SharedExperts | None = None,
+ ) -> mk.FusedMoEKernel:
+     # Create Prepare/Finalize.
+     prepare_finalize = maybe_make_prepare_finalize(
+@@ -620,13 +616,9 @@ def make_fp8_moe_kernel(
+             quant_config=moe_quant_config,
+         )
+ 
+-    # NOTE(rob): we only want the mk to control the shared_expert
+-    # if using all2all (for SBO). bnell is making this explicit in
+-    # the new MoE runner class.
+     kernel = mk.FusedMoEKernel(
+         prepare_finalize,
+         experts,
+-        shared_experts=shared_experts,
+         inplace=(
+             not moe_config.disable_inplace
+             and fp8_backend != Fp8MoeBackend.FLASHINFER_CUTLASS
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int8.py b/vllm/model_executor/layers/fused_moe/oracle/int8.py
+index 0c1d641a8e62..f5fceef727d1 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int8.py
+@@ -17,9 +17,6 @@
+     int8_w8a8_moe_quant_config,
+     int8_w8a16_moe_quant_config,
+ )
+-from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+-    SharedExperts,
+-)
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
+     kInt8DynamicTokenSym,
+@@ -178,7 +175,6 @@ def make_int8_moe_kernel(
+     moe_config: FusedMoEConfig,
+     experts_cls: type[mk.FusedMoEExperts],
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+-    shared_experts: SharedExperts | None = None,
+ ) -> mk.FusedMoEKernel:
+     # Create Prepare/Finalize.
+     prepare_finalize = maybe_make_prepare_finalize(
+@@ -211,7 +207,6 @@ def make_int8_moe_kernel(
+     kernel = mk.FusedMoEKernel(
+         prepare_finalize,
+         experts,
+-        shared_experts=shared_experts,
+         inplace=not moe_config.disable_inplace,
+     )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+index a0dde3cb7f77..9d25500ad078 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+@@ -154,7 +154,6 @@ def make_wna16_moe_kernel(
+     w13_g_idx_sort_indices: torch.Tensor | None,
+     w2_g_idx_sort_indices: torch.Tensor | None,
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+-    shared_experts: torch.nn.Module | None = None,
+ ) -> mk.FusedMoEKernel:
+     # Currently, we only support MarlinExperts and BatchedMarlinExperts
+     assert experts_cls in (MarlinExperts, BatchedMarlinExperts)
+@@ -202,7 +201,6 @@ def make_wna16_moe_kernel(
+     return mk.FusedMoEKernel(
+         prepare_finalize,
+         experts,
+-        shared_experts=shared_experts,
+         inplace=not moe_config.disable_inplace,
+     )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+index 1820e3463621..3b374c39a9d0 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from enum import Enum
+-from typing import Union
++from typing import TYPE_CHECKING, Union
+ 
+ import torch
+ 
+@@ -37,6 +37,10 @@
+ from vllm.utils.import_utils import has_triton_kernels
+ from vllm.utils.math_utils import round_up
+ 
++if TYPE_CHECKING:
++    from vllm.model_executor.layers.fused_moe import RoutedExperts
++
++
+ logger = init_logger(__name__)
+ 
+ if has_triton_kernels():
+@@ -1479,8 +1483,7 @@ def make_mxfp4_moe_kernel(
+     experts_cls: type[mk.FusedMoEExperts],
+     mxfp4_backend: Mxfp4MoeBackend,
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+-    shared_experts: torch.nn.Module | None = None,
+-    layer: torch.nn.Module | None = None,
++    layer: "RoutedExperts | None" = None,
+ ) -> mk.FusedMoEKernel:
+     """Create a FusedMoEKernel for the given MXFP4 backend."""
+     is_monolithic = issubclass(experts_cls, mk.FusedMoEExpertsMonolithic)
+@@ -1522,11 +1525,6 @@ def make_mxfp4_moe_kernel(
+     kernel = mk.FusedMoEKernel(
+         prepare_finalize,
+         experts,
+-        shared_experts=(
+-            shared_experts
+-            if moe_config.moe_parallel_config.use_batched_activation_format
+-            else None
+-        ),
+         inplace=(
+             not moe_config.disable_inplace and mxfp4_backend not in TRTLLM_BACKENDS
+         ),
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+index d22fe95f1e51..902d788da3c8 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+@@ -17,9 +17,6 @@
+     nvfp4_moe_quant_config,
+     nvfp4_w4a16_moe_quant_config,
+ )
+-from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+-    SharedExperts,
+-)
+ from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
+     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
+@@ -476,7 +473,6 @@ def make_nvfp4_moe_kernel(
+     moe_config: FusedMoEConfig,
+     experts_cls: type[mk.FusedMoEExperts],
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+-    shared_experts: SharedExperts | None = None,
+ ) -> mk.FusedMoEKernel:
+     # Create Prepare/Finalize.
+     prepare_finalize = maybe_make_prepare_finalize(
+@@ -506,13 +502,9 @@ def make_nvfp4_moe_kernel(
+             quant_config=moe_quant_config,
+         )
+ 
+-    # NOTE(rob): we only want the mk to control the shared_expert
+-    # if using all2all (for SBO). bnell is making this explicit in
+-    # the new MoE runner class.
+     kernel = mk.FusedMoEKernel(
+         prepare_finalize,
+         experts,
+-        shared_experts=shared_experts,
+         inplace=False,
+     )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
+index 9215c960a8c9..9c0df9d153bf 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
+@@ -18,9 +18,6 @@
+     FusedMoEConfig,
+     FusedMoEQuantConfig,
+ )
+-from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+-    SharedExperts,
+-)
+ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+     FlashinferMoeBackend,
+     convert_moe_weights_to_flashinfer_trtllm_block_layout,
+@@ -329,7 +326,6 @@ def make_unquantized_moe_kernel(
+     backend: UnquantizedMoeBackend,
+     experts_cls: type[mk.FusedMoEExperts],
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+-    shared_experts: SharedExperts | None = None,
+ ) -> mk.FusedMoEKernel:
+     # Create Prepare/Finalize
+     is_monolithic = issubclass(experts_cls, mk.FusedMoEExpertsMonolithic)
+@@ -363,7 +359,6 @@ def make_unquantized_moe_kernel(
+     kernel = mk.FusedMoEKernel(
+         prepare_finalize,
+         experts,
+-        shared_experts=shared_experts,
+         inplace=(not moe_config.disable_inplace and not is_monolithic),
+     )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 37b15ed40637..d0f4681daec6 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -540,6 +540,7 @@ def _apply_quant_method(
+                 x=hidden_states,
+                 topk_weights=topk_weights,
+                 topk_ids=topk_ids,
++                shared_experts=self._shared_experts,
+                 shared_experts_input=shared_experts_input,
+             )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index 227014e23973..e6492cef61c6 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -96,7 +96,7 @@ def _determine_shared_experts_order(
+         if self._disable_shared_experts_overlap:
+             return SharedExpertsOrder.NO_OVERLAP
+ 
+-        if self._quant_method.mk_owns_shared_expert:
++        if self._quant_method.mk_can_overlap_shared_experts:
+             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+ 
+         should_run_shared_in_aux_stream = (
+diff --git a/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py b/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
+index 074f216e908e..0261b8f603a3 100644
+--- a/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
++++ b/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from collections.abc import Callable
++from typing import TYPE_CHECKING
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -29,10 +30,16 @@
+     make_unquantized_moe_kernel,
+     select_unquantized_moe_backend,
+ )
++from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
++    SharedExperts,
++)
+ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+ from vllm.platforms import current_platform
+ from vllm.platforms.interface import CpuArchEnum
+ 
++if TYPE_CHECKING:
++    from vllm.model_executor.layers.fused_moe import RoutedExperts
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -192,7 +199,6 @@ def _setup_kernel(
+                 backend=self.unquantized_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+             )
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+@@ -277,10 +283,11 @@ def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantCon
+ 
+     def apply(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: "RoutedExperts",
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         return self.forward(
+@@ -288,15 +295,17 @@ def apply(
+             x=x,
+             topk_weights=topk_weights,
+             topk_ids=topk_ids,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+     def forward_native(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: "RoutedExperts",
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert self.moe_kernel is not None
+@@ -310,15 +319,17 @@ def forward_native(
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+     def forward_cuda(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: "RoutedExperts",
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         return self.forward_native(
+@@ -326,12 +337,13 @@ def forward_cuda(
+             x,
+             topk_weights,
+             topk_ids,
++            shared_experts,
+             shared_experts_input,
+         )
+ 
+     def apply_monolithic(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: "RoutedExperts",
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+diff --git a/vllm/model_executor/layers/quantization/awq.py b/vllm/model_executor/layers/quantization/awq.py
+index 37cffcb3da26..edacfc76334b 100644
+--- a/vllm/model_executor/layers/quantization/awq.py
++++ b/vllm/model_executor/layers/quantization/awq.py
+@@ -10,7 +10,7 @@
+ from vllm import _custom_ops as ops
+ from vllm import envs
+ from vllm.logger import init_logger
+-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
++from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.linear import (
+     LinearBase,
+     LinearMethodBase,
+@@ -106,7 +106,7 @@ def get_quant_method(
+             ):
+                 return UnquantizedLinearMethod()
+             return AWQLinearMethod(self)
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             # Lazy import to avoid circular import.
+             from .awq_marlin import AWQMarlinConfig
+             from .moe_wna16 import MoeWNA16Config
+diff --git a/vllm/model_executor/layers/quantization/awq_marlin.py b/vllm/model_executor/layers/quantization/awq_marlin.py
+index 8f455220fe3b..fdffdaceafeb 100644
+--- a/vllm/model_executor/layers/quantization/awq_marlin.py
++++ b/vllm/model_executor/layers/quantization/awq_marlin.py
+@@ -16,17 +16,18 @@
+     MPLinearLayerConfig,
+     choose_mp_linear_kernel,
+ )
++from vllm.model_executor.layers.fused_moe import (
++    FusedMoEMethodBase,
++    FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
++    UnquantizedFusedMoEMethod,
++)
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+     FusedMoEQuantConfig,
+ )
+ from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
+-from vllm.model_executor.layers.fused_moe.layer import (
+-    FusedMoE,
+-    FusedMoEMethodBase,
+-    FusedMoeWeightScaleSupported,
+-    UnquantizedFusedMoEMethod,
+-)
+ from vllm.model_executor.layers.linear import (
+     LinearBase,
+     LinearMethodBase,
+@@ -286,7 +287,7 @@ def get_quant_method(
+             quant_method = AWQMarlinLinearMethod(self)
+             quant_method.input_dtype = get_marlin_input_dtype(prefix)
+             return quant_method
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+ 
+             if is_layer_skipped(
+@@ -507,7 +508,7 @@ def __init__(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -606,7 +607,7 @@ def create_weights(
+         device = layer.w13_qweight.device
+         layer.workspace = marlin_make_workspace_new(device, 4)
+ 
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         num_experts = layer.w13_qweight.shape[0]
+         device = layer.w13_qweight.device
+         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
+@@ -723,7 +724,7 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+             layer.w2_bias.data = marlin_permute_bias(layer.w2_bias)
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self, layer: RoutedExperts
+     ) -> FusedMoEQuantConfig | None:
+         from vllm.model_executor.layers.fused_moe.config import (
+             awq_marlin_moe_quant_config,
+@@ -747,7 +748,7 @@ def get_fused_moe_quant_config(
+     def select_gemm_impl(
+         self,
+         prepare_finalize,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+     ):
+         """
+         Select the GEMM implementation for AWQ-Marlin MoE.
+@@ -812,10 +813,11 @@ def select_gemm_impl(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         return fused_marlin_moe(
+diff --git a/vllm/model_executor/layers/quantization/bitsandbytes.py b/vllm/model_executor/layers/quantization/bitsandbytes.py
+index 729924663646..a32ed3196c1a 100644
+--- a/vllm/model_executor/layers/quantization/bitsandbytes.py
++++ b/vllm/model_executor/layers/quantization/bitsandbytes.py
+@@ -6,13 +6,12 @@
+ import torch
+ from packaging import version
+ 
+-from vllm.model_executor.layers.fused_moe.config import (
++from vllm.model_executor.layers.fused_moe import (
+     FusedMoEConfig,
+-    FusedMoEQuantConfig,
+-)
+-from vllm.model_executor.layers.fused_moe.layer import (
+-    FusedMoE,
+     FusedMoEMethodBase,
++    FusedMoEQuantConfig,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.linear import (
+     LinearBase,
+@@ -164,7 +163,7 @@ def get_quant_method(
+             if is_layer_skipped_bnb(prefix, self.llm_int8_skip_modules):
+                 return UnquantizedLinearMethod()
+             return BitsAndBytesLinearMethod(self)
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             return BitsAndBytesMoEMethod(self, layer.moe_config)
+         return None
+ 
+@@ -451,7 +450,7 @@ def __init__(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -472,16 +471,17 @@ def create_weights(
+         )
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self, layer: RoutedExperts
+     ) -> FusedMoEQuantConfig | None:
+         return None
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         from vllm.model_executor.layers.fused_moe import fused_experts
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
+index 6a7e71884ccd..85f12a464fe1 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
+@@ -23,7 +23,7 @@
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+-from vllm.model_executor.layers.fused_moe import FusedMoE
++from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.linear import (
+     LinearBase,
+     LinearMethodBase,
+@@ -191,7 +191,7 @@ def get_quant_method(
+ 
+         if isinstance(layer, Attention):
+             return CompressedTensorsKVCacheMethod(self)
+-        if isinstance(layer, FusedMoE):
++        if isinstance(layer, RoutedExperts):
+             return CompressedTensorsMoEMethod.get_moe_method(
+                 self, layer, layer_name=prefix
+             )
+@@ -202,7 +202,7 @@ def _add_fused_moe_to_target_scheme_map(self):
+         Helper function to update target_scheme_map
+         since linear layers get fused into FusedMoE
+         targeting 'Linear' needs to also match
+-        FusedMoE modules.
++        RoutedExperts modules.
+         """
+         if (
+             "Linear" not in self.target_scheme_map
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
+index f25b8af1d6b3..a2e941621927 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
+@@ -32,7 +32,7 @@ def get_moe_method(
+         layer: torch.nn.Module,
+         layer_name: str,
+     ) -> FusedMoEMethodBase:
+-        # FusedMoE was made by combining multiple Linears so need to
++        # RoutedExperts was made by combining multiple Linears so need to
+         # make sure quantization config for Linear can target it
+         quant_config._add_fused_moe_to_target_scheme_map()
+         unfused_names = [
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py
+index f26225e94d14..af42222e0c53 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py
+@@ -7,8 +7,9 @@
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEQuantConfig,
+@@ -136,7 +137,7 @@ def get_fused_moe_quant_config(
+                 w2_scale=layer.w2_weight_scale,
+             )
+ 
+-    def process_weights_after_loading(self, layer: FusedMoE) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         layer.w13_weight = torch.nn.Parameter(
+             layer.w13_weight_packed.data, requires_grad=False
+         )
+@@ -194,16 +195,16 @@ def process_weights_after_loading(self, layer: FusedMoE) -> None:
+                 moe_config=self.moe,
+                 experts_cls=self.experts_cls,
+                 mxfp4_backend=self.mxfp4_backend,
+-                shared_experts=layer.shared_experts,
+                 routing_tables=layer._expert_routing_tables(),
+             )
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert self.moe_kernel is not None
+@@ -217,5 +218,6 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_nvfp4.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_nvfp4.py
+index 46b7db1f0475..e1df4484f17e 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_nvfp4.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_nvfp4.py
+@@ -7,8 +7,9 @@
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -167,7 +168,7 @@ def create_weights(
+         )
+         set_weight_attrs(w2_input_scale, extra_weight_attrs)
+ 
+-    def process_weights_after_loading(self, layer: FusedMoE) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         """
+         Convert NVFP4 MoE weights into kernel format and setup the kernel.
+         """
+@@ -235,7 +236,6 @@ def process_weights_after_loading(self, layer: FusedMoE) -> None:
+             moe_quant_config=self.moe_quant_config,
+             moe_config=self.moe,
+             experts_cls=self.experts_cls,
+-            shared_experts=layer.shared_experts,
+             routing_tables=layer._expert_routing_tables(),
+         )
+         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+@@ -262,7 +262,7 @@ def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantCon
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+@@ -286,10 +286,11 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert self.moe_kernel is not None
+@@ -303,5 +304,6 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_fp8.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_fp8.py
+index b14571fe5013..f772807b6534 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_fp8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_fp8.py
+@@ -11,10 +11,11 @@
+ from vllm import _custom_ops as ops
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoEActivationFormat,
+     FusedMoEExpertsModular,
+     FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -136,7 +137,7 @@ def create_weights(
+             requires_grad=False,
+         )
+         layer.register_parameter("w2_weight_scale", w2_weight_scale)
+-        # Add PER-GROUP quantization for FusedMoE.weight_loader.
++        # Add PER-GROUP quantization for RoutedExperts.weight_loader.
+         extra_weight_attrs.update(
+             {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
+         )
+@@ -303,10 +304,11 @@ def select_gemm_impl(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         if layer.enable_eplb:
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_int8.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_int8.py
+index 88cdbadd3f83..400dffeb6dee 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_int8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a8_int8.py
+@@ -10,7 +10,7 @@
+ 
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
++    RoutedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.fused_moe.config import (
+@@ -302,7 +302,7 @@ def is_monolithic(self) -> bool:
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_fp8.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_fp8.py
+index 433f7a5c76a7..1e59f357f52e 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_fp8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_fp8.py
+@@ -12,8 +12,9 @@
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -191,7 +192,7 @@ def create_weights(
+                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+             )
+             layer.register_parameter("w2_weight_scale", w2_weight_scale)
+-            # Add PER-TENSOR quantization for FusedMoE.weight_loader.
++            # Add PER-TENSOR quantization for RoutedExperts.weight_loader.
+             extra_weight_attrs.update(
+                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+             )
+@@ -214,7 +215,7 @@ def create_weights(
+                 requires_grad=False,
+             )
+             layer.register_parameter("w2_weight_scale", w2_weight_scale)
+-            # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
++            # Add PER-CHANNEL quantization for RoutedExperts.weight_loader.
+             extra_weight_attrs.update(
+                 {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+             )
+@@ -243,7 +244,7 @@ def create_weights(
+                 requires_grad=False,
+             )
+             layer.register_parameter("w2_weight_scale", w2_weight_scale)
+-            # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
++            # Add PER-CHANNEL quantization for RoutedExperts.weight_loader.
+             extra_weight_attrs.update(
+                 {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+             )
+@@ -267,7 +268,7 @@ def create_weights(
+             layer.w13_input_scale = None
+             layer.w2_input_scale = None
+ 
+-    def process_weights_after_loading(self, layer: FusedMoE) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         # Allow for accessing weights and scales in standard way.
+         w13 = layer.w13_weight
+         w2 = layer.w2_weight
+@@ -337,7 +338,6 @@ def process_weights_after_loading(self, layer: FusedMoE) -> None:
+                 fp8_backend=self.fp8_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+             )
+ 
+     def maybe_make_prepare_finalize(
+@@ -364,7 +364,7 @@ def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantCon
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+@@ -387,10 +387,11 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -407,6 +408,7 @@ def apply(
+             # https://github.com/vllm-project/vllm/commit/84166fee9770e6fba71a96978b3e7d149392fb28 # noqa: E501
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py
+index d39dbee747c0..74bf8a3546e0 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_int8.py
+@@ -11,8 +11,9 @@
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -128,7 +129,7 @@ def create_weights(
+             requires_grad=False,
+         )
+         layer.register_parameter("w2_weight_scale", w2_weight_scale)
+-        # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
++        # Add PER-CHANNEL quantization for RoutedExperts.weight_loader.
+         extra_weight_attrs.update(
+             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+         )
+@@ -140,7 +141,7 @@ def create_weights(
+         layer.w13_input_scale = None
+         layer.w2_input_scale = None
+ 
+-    def process_weights_after_loading(self, layer: FusedMoE) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+         assert self.experts_cls is not None
+         self.moe_kernel = make_int8_moe_kernel(
+@@ -148,7 +149,6 @@ def process_weights_after_loading(self, layer: FusedMoE) -> None:
+             moe_config=self.moe,
+             experts_cls=self.experts_cls,
+             routing_tables=layer._expert_routing_tables(),
+-            shared_experts=layer.shared_experts,
+         )
+ 
+     def maybe_make_prepare_finalize(
+@@ -171,10 +171,11 @@ def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantCon
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -189,5 +190,6 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_mxfp8.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_mxfp8.py
+index 219a0526c481..97e1e92c2c93 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_mxfp8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w8a8_mxfp8.py
+@@ -5,8 +5,9 @@
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -111,7 +112,7 @@ def create_weights(
+         layer.w13_input_scale = None
+         layer.w2_input_scale = None
+ 
+-    def process_weights_after_loading(self, layer: FusedMoE) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         layer.weight_block_size = self.weight_block_size
+ 
+         w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
+@@ -139,7 +140,6 @@ def process_weights_after_loading(self, layer: FusedMoE) -> None:
+                 fp8_backend=self.fp8_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+             )
+ 
+     def get_fused_moe_quant_config(
+@@ -165,7 +165,7 @@ def maybe_make_prepare_finalize(
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+@@ -188,10 +188,11 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -206,5 +207,6 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
+index f530a1a1df2b..f6418194fd70 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
+@@ -10,7 +10,8 @@
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -240,10 +241,11 @@ def select_gemm_impl(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         from vllm.model_executor.layers.fused_moe import fused_experts
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
+index 10a7302dc1d0..c60691df5835 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
+@@ -13,7 +13,8 @@
+ from vllm import _custom_ops as ops
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -514,7 +515,7 @@ def is_monolithic(self) -> bool:
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+@@ -540,10 +541,11 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert self.kernel_backend == "Marlin"
+diff --git a/vllm/model_executor/layers/quantization/experts_int8.py b/vllm/model_executor/layers/quantization/experts_int8.py
+index 007c3c214eed..3db2916055ca 100644
+--- a/vllm/model_executor/layers/quantization/experts_int8.py
++++ b/vllm/model_executor/layers/quantization/experts_int8.py
+@@ -5,7 +5,9 @@
+ 
+ import torch
+ 
+-from vllm.model_executor.layers.fused_moe import FusedMoE
++from vllm.model_executor.layers.fused_moe import (
++    RoutedExperts,
++)
+ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+ from vllm.model_executor.layers.quantization import QuantizationMethods
+ from vllm.model_executor.layers.quantization.base_config import (
+@@ -53,6 +55,6 @@ def get_quant_method(
+     ) -> "QuantizeMethodBase | None":
+         if isinstance(layer, LinearBase):
+             return UnquantizedLinearMethod()
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             return Int8OnlineMoEMethod(layer=layer)
+         return None
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+index d3d4a15a3b5e..fe8522a4f4b2 100644
+--- a/vllm/model_executor/layers/quantization/fp8.py
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -4,7 +4,6 @@
+ from typing import TYPE_CHECKING, Any
+ 
+ import torch
+-from torch.nn import Module
+ from torch.utils._python_dispatch import TorchDispatchMode
+ 
+ import vllm.envs as envs
+@@ -22,14 +21,15 @@
+ )
+ from vllm.model_executor.layers.attention import Attention
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoEMethodBase,
+     FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
++    UnquantizedFusedMoEMethod,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEQuantConfig,
+ )
+-from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
+ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+     Fp8MoeBackend,
+     convert_to_fp8_moe_kernel_format,
+@@ -191,7 +191,7 @@ def get_quant_method(
+                 offline_method = Fp8LinearMethod(self)
+                 offline_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
+                 return offline_method
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             if is_layer_skipped(
+                 prefix=prefix,
+                 ignored_layers=self.ignored_layers,
+@@ -315,7 +315,7 @@ def __init__(self, quant_config: Fp8Config):
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         input_size_per_partition: int,
+         output_partition_sizes: list[int],
+         input_size: int,
+@@ -389,7 +389,7 @@ def create_weights(
+ 
+         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+ 
+-    def process_weights_after_loading(self, layer: Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         if self.use_marlin:
+             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
+             # AttributeError if backend selection changes.
+@@ -534,7 +534,7 @@ def create_weights(
+         )
+         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+ 
+-    def process_weights_after_loading(self, layer: Module) -> None:
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+ 
+@@ -575,7 +575,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+         quant_config: The quantization config.
+     """
+ 
+-    def __init__(self, quant_config: Fp8Config, layer: torch.nn.Module):
++    def __init__(self, quant_config: Fp8Config, layer: RoutedExperts):
+         super().__init__(layer.moe_config)
+         self.quant_config = quant_config
+         self.weight_block_size = self.quant_config.weight_block_size
+@@ -606,7 +606,7 @@ def __init__(self, quant_config: Fp8Config, layer: torch.nn.Module):
+ 
+     def create_weights(
+         self,
+-        layer: Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -746,7 +746,7 @@ def create_weights(
+ 
+     def _setup_kernel(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         w13: torch.Tensor,
+         w2: torch.Tensor,
+         w13_scale: torch.Tensor,
+@@ -787,10 +787,9 @@ def _setup_kernel(
+                 fp8_backend=self.fp8_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+             )
+ 
+-    def process_weights_after_loading(self, layer: Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         # Allow for accessing weights and scales in standard way.
+         w13 = layer.w13_weight
+         w2 = layer.w2_weight
+@@ -844,7 +843,7 @@ def maybe_make_prepare_finalize(
+             "logic. This function should not be called."
+         )
+ 
+-    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
++    def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+         w1_scale = getattr(layer, f"w13_{self.weight_scale_name}")
+         w2_scale = getattr(layer, f"w2_{self.weight_scale_name}")
+         a1_scale = layer.w13_input_scale
+@@ -877,7 +876,7 @@ def supports_eplb(self) -> bool:
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+@@ -901,10 +900,11 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -919,6 +919,7 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+@@ -937,7 +938,7 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
+ 
+     uses_meta_device: bool = True
+ 
+-    def __init__(self, quant_config: Fp8Config, layer: torch.nn.Module):
++    def __init__(self, quant_config: Fp8Config, layer: RoutedExperts):
+         super().__init__(quant_config, layer)
+         assert not quant_config.is_checkpoint_fp8_serialized
+         assert quant_config.activation_scheme == "dynamic"
+@@ -945,7 +946,7 @@ def __init__(self, quant_config: Fp8Config, layer: torch.nn.Module):
+ 
+     def create_weights(
+         self,
+-        layer: Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -1011,7 +1012,7 @@ def create_weights(
+ 
+         initialize_online_processing(layer)
+ 
+-    def process_weights_after_loading(self, layer: Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         # TODO(@ksayers): inplace fp8 quant kernel, initialize scales with ones
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+diff --git a/vllm/model_executor/layers/quantization/gguf.py b/vllm/model_executor/layers/quantization/gguf.py
+index 61eb6c912a11..dca49d7ed976 100644
+--- a/vllm/model_executor/layers/quantization/gguf.py
++++ b/vllm/model_executor/layers/quantization/gguf.py
+@@ -15,17 +15,14 @@
+ 
+ from vllm import _custom_ops as ops
+ from vllm.logger import init_logger
+-from vllm.model_executor.layers.fused_moe.activation import (
+-    MoEActivation,
+-    apply_moe_activation,
+-)
+-from vllm.model_executor.layers.fused_moe.config import (
++from vllm.model_executor.layers.fused_moe import (
+     FusedMoEConfig,
+-    FusedMoEQuantConfig,
+-)
+-from vllm.model_executor.layers.fused_moe.layer import (
+-    FusedMoE,
+     FusedMoEMethodBase,
++    FusedMoEQuantConfig,
++    MoEActivation,
++    RoutedExperts,
++    SharedExperts,
++    apply_moe_activation,
+ )
+ from vllm.model_executor.layers.linear import (
+     LinearBase,
+@@ -107,7 +104,7 @@ def get_quant_method(
+             ):
+                 return UnquantizedEmbeddingMethod()
+             return GGUFEmbeddingMethod(self)
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             # TODO: Select UnquantizedFusedMoEMethod on unquantized layers.
+             return GGUFMoEMethod(self, layer.moe_config)
+         return None
+@@ -578,7 +575,7 @@ def __init__(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -639,16 +636,17 @@ def create_weights(
+         layer.register_parameter("w2_qweight_type", w2_qweight_type)
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self, layer: RoutedExperts
+     ) -> FusedMoEQuantConfig | None:
+         return None
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         if layer.apply_router_weight_on_input:
+diff --git a/vllm/model_executor/layers/quantization/gptq.py b/vllm/model_executor/layers/quantization/gptq.py
+index 458741478538..db2db086815d 100644
+--- a/vllm/model_executor/layers/quantization/gptq.py
++++ b/vllm/model_executor/layers/quantization/gptq.py
+@@ -13,7 +13,7 @@
+ 
+ from vllm import _custom_ops as ops
+ from vllm.logger import init_logger
+-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
++from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.linear import LinearMethodBase
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+@@ -172,7 +172,7 @@ def from_config(cls, config: dict[str, Any]) -> "GPTQConfig":
+     def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> Union["GPTQLinearMethod", "QuantizeMethodBase"] | None:
+-        if isinstance(layer, FusedMoE):
++        if isinstance(layer, RoutedExperts):
+             # GPTQ MoE support: fall back to MoeWNA16 for broad compatibility
+             from .moe_wna16 import MoeWNA16Config
+ 
+diff --git a/vllm/model_executor/layers/quantization/gptq_marlin.py b/vllm/model_executor/layers/quantization/gptq_marlin.py
+index 0156744fcc42..26a41ef89e95 100644
+--- a/vllm/model_executor/layers/quantization/gptq_marlin.py
++++ b/vllm/model_executor/layers/quantization/gptq_marlin.py
+@@ -14,14 +14,13 @@
+     MPLinearLayerConfig,
+     choose_mp_linear_kernel,
+ )
+-from vllm.model_executor.layers.fused_moe.config import (
++from vllm.model_executor.layers.fused_moe import (
+     FusedMoEConfig,
+-    FusedMoEQuantConfig,
+-)
+-from vllm.model_executor.layers.fused_moe.layer import (
+-    FusedMoE,
+     FusedMoEMethodBase,
++    FusedMoEQuantConfig,
+     FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
+     UnquantizedFusedMoEMethod,
+ )
+ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+@@ -71,29 +70,28 @@
+ 
+ def get_moe_quant_method(
+     config: "GPTQMarlinConfig",
+-    layer: torch.nn.Module,
++    layer: RoutedExperts,
+     prefix: str,
+     moe_method_cls: type,
+ ):
+     cloned_config = deepcopy(config)
+ 
+-    if isinstance(layer, FusedMoE):
+-        # False = skip module, None = no override, else = Positive match
+-        if (
+-            get_dynamic_override(  # noqa: E712
+-                cloned_config,  # noqa: E712
+-                layer_name=prefix,
+-            )
+-            == False
+-        ):  # noqa: E712
+-            return UnquantizedFusedMoEMethod(layer.moe_config)
++    assert isinstance(layer, RoutedExperts)
++    # False = skip module, None = no override, else = Positive match
++    if (
++        get_dynamic_override(  # noqa: E712
++            cloned_config,  # noqa: E712
++            layer_name=prefix,
++        )
++        == False
++    ):  # noqa: E712
++        return UnquantizedFusedMoEMethod(layer.moe_config)
+ 
+-        if prefix:
+-            # Dynamic per module/layer rules may override base config
+-            override_config(cloned_config, prefix=prefix)
++    if prefix:
++        # Dynamic per module/layer rules may override base config
++        override_config(cloned_config, prefix=prefix)
+ 
+-        return moe_method_cls(cloned_config, layer.moe_config)
+-    return None
++    return moe_method_cls(cloned_config, layer.moe_config)
+ 
+ 
+ class GPTQMarlinConfig(QuantizationConfig):
+@@ -247,7 +245,7 @@ def override_quantization_method(
+     def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> "QuantizeMethodBase | None":
+-        if isinstance(layer, FusedMoE):
++        if isinstance(layer, RoutedExperts):
+             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+ 
+             if not check_moe_marlin_supports_layer(layer, self.group_size):
+@@ -522,7 +520,7 @@ def __init__(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -676,7 +674,7 @@ def create_weights(
+         device = layer.w13_qweight.device
+         layer.workspace = marlin_make_workspace_new(device, 4)
+ 
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
+ 
+         if is_a_8bit:
+@@ -755,7 +753,7 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+ 
+         self._setup_kernel(layer)
+ 
+-    def _setup_kernel(self, layer: FusedMoE) -> None:
++    def _setup_kernel(self, layer: RoutedExperts) -> None:
+         """Build the FusedMoEKernel for this layer."""
+ 
+         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+@@ -770,10 +768,9 @@ def _setup_kernel(self, layer: FusedMoE) -> None:
+             w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
+             w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
+             routing_tables=layer._expert_routing_tables(),
+-            shared_experts=layer.shared_experts,
+         )
+ 
+-    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
++    def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+         from vllm.model_executor.layers.fused_moe.config import (
+             gptq_marlin_moe_quant_config,
+         )
+@@ -796,7 +793,7 @@ def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantCon
+     def select_gemm_impl(
+         self,
+         prepare_finalize,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+     ):
+         raise ValueError(
+             f"{self.__class__.__name__} uses the new modular kernel "
+@@ -805,10 +802,11 @@ def select_gemm_impl(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -823,5 +821,6 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+             expert_map=layer.expert_map,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/quantization/humming.py b/vllm/model_executor/layers/quantization/humming.py
+index 063f91203267..8139b2441b70 100644
+--- a/vllm/model_executor/layers/quantization/humming.py
++++ b/vllm/model_executor/layers/quantization/humming.py
+@@ -9,14 +9,15 @@
+ import torch
+ 
+ from vllm import envs
++from vllm.model_executor.layers.fused_moe import (
++    FusedMoEMethodBase,
++    RoutedExperts,
++    SharedExperts,
++)
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+     FusedMoEQuantConfig,
+ )
+-from vllm.model_executor.layers.fused_moe.layer import (
+-    FusedMoE,
+-    FusedMoEMethodBase,
+-)
+ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+     UnquantizedFusedMoEMethod,
+ )
+@@ -334,20 +335,20 @@ def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> "QuantizeMethodBase | None":
+         layer_type = "other"
+-        if isinstance(layer, FusedMoE):
++        if isinstance(layer, RoutedExperts):
+             layer_type = "moe"
+         elif isinstance(layer, LinearBase):
+             layer_type = "linear"
+ 
+         quant_config = self.get_quant_config_for_layer(prefix, layer_type)
+         if quant_config is None:
+-            if isinstance(layer, FusedMoE):
++            if isinstance(layer, RoutedExperts):
+                 return UnquantizedFusedMoEMethod(layer.moe_config)
+             elif isinstance(layer, LinearBase):
+                 return UnquantizedLinearMethod()
+         elif isinstance(layer, LinearBase):
+             return HummingLinearMethod(quant_config)
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             return HummingMoEMethod(quant_config, layer.moe_config)
+         return None
+ 
+@@ -764,7 +765,7 @@ def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantCon
+ 
+         return get_humming_moe_quant_config(layer)
+ 
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         if getattr(self, "processed", False):
+             return
+         self.processed = True
+@@ -898,10 +899,11 @@ def select_gemm_impl(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         workspace1, workspace2, output = self.experts.make_workspaces(
+diff --git a/vllm/model_executor/layers/quantization/inc.py b/vllm/model_executor/layers/quantization/inc.py
+index 4457555c0764..1db74ad21376 100644
+--- a/vllm/model_executor/layers/quantization/inc.py
++++ b/vllm/model_executor/layers/quantization/inc.py
+@@ -9,6 +9,7 @@
+ from torch.nn.parameter import Parameter
+ 
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.linear import (
+     LinearBase,
+     LinearMethodBase,
+@@ -234,7 +235,6 @@ def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
+             self.extra_config = hf_to_vllm_mapper.apply_dict(self.extra_config)
+ 
+     def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+-        from vllm.model_executor.layers.fused_moe import FusedMoE
+         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+             check_marlin_supported,
+             check_moe_marlin_supports_layer,
+@@ -264,7 +264,7 @@ def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+                 AWQ_TYPE_MAP[weight_bits], group_size, not sym
+             )
+ 
+-            if isinstance(layer, FusedMoE):
++            if isinstance(layer, RoutedExperts):
+                 use_marlin = use_marlin and check_moe_marlin_supports_layer(
+                     layer, group_size
+                 )
+@@ -298,7 +298,7 @@ def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+                 zero_point=not sym,
+             )
+ 
+-        if isinstance(layer, FusedMoE):
++        if isinstance(layer, RoutedExperts):
+             if use_marlin:
+                 return AWQMarlinMoEMethod(quant_args_marlin, layer.moe_config)
+             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+@@ -320,7 +320,6 @@ def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+         return None
+ 
+     def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+-        from vllm.model_executor.layers.fused_moe import FusedMoE
+         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+             check_marlin_supported,
+             check_moe_marlin_supports_layer,
+@@ -349,7 +348,7 @@ def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+             use_marlin = (weight_bits, sym) in GPTQ_TYPE_MAP and check_marlin_supported(
+                 GPTQ_TYPE_MAP[(weight_bits, sym)], group_size, has_zp=not sym
+             )
+-            if isinstance(layer, FusedMoE):
++            if isinstance(layer, RoutedExperts):
+                 use_marlin = use_marlin and check_moe_marlin_supports_layer(
+                     layer, group_size
+                 )
+@@ -385,7 +384,7 @@ def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+                 dynamic={},
+             )
+ 
+-        if isinstance(layer, FusedMoE):
++        if isinstance(layer, RoutedExperts):
+             if use_marlin:
+                 return GPTQMarlinMoEMethod(quant_args_marlin, layer.moe_config)
+             else:
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index 13cbbabd7c3d..b7e8c81565f0 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -18,18 +18,15 @@
+     init_nvfp4_linear_kernel,
+ )
+ from vllm.model_executor.layers.attention import Attention, MLAAttention
+-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+-from vllm.model_executor.layers.fused_moe.config import (
++from vllm.model_executor.layers.fused_moe import (
+     FusedMoEConfig,
+-    FusedMoEQuantConfig,
+-    RoutingMethodType,
+-)
+-from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+     FusedMoEMethodBase,
+-)
+-from vllm.model_executor.layers.fused_moe.layer import (
+-    FusedMoE,
++    FusedMoEQuantConfig,
+     FusedMoeWeightScaleSupported,
++    MoEActivation,
++    RoutedExperts,
++    RoutingMethodType,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+     Fp8MoeBackend,
+@@ -208,7 +205,7 @@ def get_quant_method(
+             if getattr(quant_method, "backend", "") == "marlin":
+                 quant_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
+             return quant_method
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             quant_method = self.FusedMoEMethodCls(
+                 quant_config=self, moe_config=layer.moe_config
+             )
+@@ -779,7 +776,7 @@ def maybe_make_prepare_finalize(
+     def select_gemm_impl(
+         self,
+         prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+     ) -> mk.FusedMoEExpertsModular:
+         raise ValueError(
+             f"{self.__class__.__name__} uses the new modular kernel initialization "
+@@ -788,7 +785,7 @@ def select_gemm_impl(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -867,7 +864,7 @@ def create_weights(
+ 
+     def _setup_kernel(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         w13: torch.Tensor,
+         w2: torch.Tensor,
+         w13_scale: torch.Tensor,
+@@ -902,10 +899,9 @@ def _setup_kernel(
+             fp8_backend=self.fp8_backend,
+             experts_cls=self.experts_cls,
+             routing_tables=layer._expert_routing_tables(),
+-            shared_experts=layer.shared_experts,
+         )
+ 
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         w13 = layer.w13_weight
+         w2 = layer.w2_weight
+         w13_scale = layer.w13_weight_scale
+@@ -936,7 +932,7 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+             layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
+         )
+ 
+-    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
++    def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+         w1_scale = layer.w13_weight_scale
+         w2_scale = layer.w2_weight_scale
+         a1_scale = layer.w13_input_scale
+@@ -952,7 +948,7 @@ def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantCon
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+@@ -976,10 +972,11 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -994,6 +991,7 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+@@ -1421,7 +1419,7 @@ def uses_weight_scale_2_pattern(self) -> bool:
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -1535,7 +1533,7 @@ def create_weights(
+         )
+         layer.register_parameter("w2_input_scale", w2_input_scale)
+ 
+-    def process_weights_after_loading(self, layer: FusedMoE) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         """
+         Convert NVFP4 MoE weights into kernel format and setup the kernel.
+         """
+@@ -1589,12 +1587,11 @@ def process_weights_after_loading(self, layer: FusedMoE) -> None:
+             moe_quant_config=self.moe_quant_config,
+             moe_config=self.moe,
+             experts_cls=self.experts_cls,
+-            shared_experts=layer.shared_experts,
+             routing_tables=layer._expert_routing_tables(),
+         )
+         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+ 
+-    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
++    def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+         return make_nvfp4_moe_quant_config(
+             backend=self.nvfp4_backend,
+             w13_scale=layer.w13_weight_scale,
+@@ -1611,7 +1608,7 @@ def supports_eplb(self) -> bool:
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+@@ -1635,10 +1632,11 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -1653,6 +1651,7 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+@@ -1860,15 +1859,15 @@ def __init__(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+         params_dtype: torch.dtype,
+         **extra_weight_attrs,
+     ):
+-        layer.intermediate_size_per_partition = intermediate_size_per_partition
+-        layer.hidden_size = hidden_size
++        assert layer.intermediate_size_per_partition == intermediate_size_per_partition
++        assert layer.hidden_size == hidden_size
+         layer.orig_dtype = params_dtype
+ 
+         if hidden_size % MXFP8_BLOCK_SIZE != 0:
+@@ -2051,7 +2050,7 @@ def _shuffle_weights_for_trtllm(self, layer: torch.nn.Module) -> None:
+             torch.stack(w2_scale_shuffled).contiguous(),
+         )
+ 
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+ 
+@@ -2071,7 +2070,7 @@ def maybe_make_prepare_finalize(
+     def select_gemm_impl(
+         self,
+         prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+     ) -> mk.FusedMoEExpertsModular:
+         raise ValueError(
+             f"{self.__class__.__name__} uses the new modular kernel initialization "
+@@ -2079,7 +2078,7 @@ def select_gemm_impl(
+         )
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self, layer: RoutedExperts
+     ) -> FusedMoEQuantConfig | None:
+         # TRTLLM MXFP8 path is monolithic and does not use modular kernel config.
+         return None
+@@ -2090,11 +2089,11 @@ def is_monolithic(self) -> bool:
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++    ) -> torch.Tensor:
+         from flashinfer.fused_moe.core import (
+             ActivationType,
+             Fp8QuantizationType,
+@@ -2174,12 +2173,13 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++    ) -> torch.Tensor:
+         assert not self.is_monolithic
+         raise NotImplementedError(
+             "Non-monolithic MXFP8 MoE path is not yet implemented."
+@@ -2295,7 +2295,7 @@ def _resolve_quant_algo(self, prefix: str) -> str | None:
+         Tries three strategies in order:
+         1. Direct lookup in ``quantized_layers``.
+         2. Packed/fused-layer lookup (unfuse via ``packed_modules_mapping``).
+-        3. Prefix-based lookup for FusedMoE (any child key starts with
++        3. Prefix-based lookup for RoutedExperts (any child key starts with
+            ``prefix + "."``).
+ 
+         Returns the upper-cased quant_algo string, or *None* if the prefix
+@@ -2322,7 +2322,7 @@ def _resolve_quant_algo(self, prefix: str) -> str | None:
+                     f"{algos}. All shards must use the same quantization."
+                 )
+ 
+-        # 3. Prefix-based lookup (for FusedMoE / parent modules)
++        # 3. Prefix-based lookup (for RoutedExperts / parent modules)
+         prefix_dot = prefix + "."
+         for key, info in self.quantized_layers.items():
+             if key.startswith(prefix_dot):
+@@ -2356,7 +2356,7 @@ def get_quant_method(
+             # Layer not in quantized_layers — leave unquantized
+             return UnquantizedLinearMethod()
+ 
+-        if isinstance(layer, FusedMoE):
++        if isinstance(layer, RoutedExperts):
+             if quant_algo == "FP8":
+                 return ModelOptFp8MoEMethod(
+                     quant_config=self.fp8_config,
+diff --git a/vllm/model_executor/layers/quantization/moe_wna16.py b/vllm/model_executor/layers/quantization/moe_wna16.py
+index e5ef3f4c3168..436502e39447 100644
+--- a/vllm/model_executor/layers/quantization/moe_wna16.py
++++ b/vllm/model_executor/layers/quantization/moe_wna16.py
+@@ -6,18 +6,19 @@
+ import torch
+ 
+ from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
++from vllm.model_executor.layers.fused_moe import (
++    FusedMoEConfig,
++    FusedMoEMethodBase,
++    FusedMoeWeightScaleSupported,
++    RoutedExperts,
++    SharedExperts,
++)
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEQuantConfig,
+     int4_w4a16_moe_quant_config,
+     int8_w8a16_moe_quant_config,
+ )
+-from vllm.model_executor.layers.fused_moe.layer import (
+-    FusedMoE,
+-    FusedMoEConfig,
+-    FusedMoEMethodBase,
+-    FusedMoeWeightScaleSupported,
+-)
+ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+     UnquantizedFusedMoEMethod,
+ )
+@@ -166,7 +167,7 @@ def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> "QuantizeMethodBase | None":
+         if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
+-            if isinstance(layer, FusedMoE):
++            if isinstance(layer, RoutedExperts):
+                 return UnquantizedFusedMoEMethod(layer.moe_config)
+             return UnquantizedLinearMethod()
+         elif isinstance(layer, LinearBase):
+@@ -202,7 +203,7 @@ def get_quant_method(
+                     )
+             else:
+                 raise ValueError("moe_wna16 only support gptq and awq.")
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             return MoeWNA16Method(self, layer.moe_config)
+         return None
+ 
+@@ -224,7 +225,7 @@ def __init__(self, quant_config: MoeWNA16Config, moe: "FusedMoEConfig") -> None:
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -343,7 +344,7 @@ def create_weights(
+                 set_weight_attrs(param, extra_weight_attrs)
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self, layer: RoutedExperts
+     ) -> FusedMoEQuantConfig | None:
+         weight_bits = self.quant_config.weight_bits
+         has_zp = self.quant_config.has_zp
+@@ -364,10 +365,11 @@ def get_fused_moe_quant_config(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         from vllm.model_executor.layers.fused_moe import fused_experts
+diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
+index ba7be3483ebf..2c69fc74530d 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4.py
++++ b/vllm/model_executor/layers/quantization/mxfp4.py
+@@ -7,15 +7,14 @@
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoEConfig,
+     FusedMoEMethodBase,
+-)
+-from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+-from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEParallelConfig,
+     FusedMoEQuantConfig,
++    RoutedExperts,
++    SharedExperts,
+ )
++from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+     TRITON_BACKENDS,
+     Mxfp4MoeBackend,
+@@ -87,7 +86,7 @@ def get_quant_method(
+                 "UnquantizedLinearMethod.",
+             )
+             return UnquantizedLinearMethod()
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             return GptOssMxfp4MoEMethod(layer.moe_config)
+         elif isinstance(layer, Attention):
+             logger.debug_once(
+@@ -178,7 +177,7 @@ def maybe_roundup_sizes(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -272,7 +271,7 @@ def create_weights(
+ 
+     def _setup_kernel(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         w13: torch.Tensor,
+         w2: torch.Tensor,
+         w13_scale: torch.Tensor,
+@@ -370,11 +369,10 @@ def _setup_kernel(
+                 mxfp4_backend=self.mxfp4_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+                 layer=layer,
+             )
+ 
+-    def process_weights_after_loading(self, layer):
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         w13 = layer.w13_weight
+         w2 = layer.w2_weight
+         w13_scale = layer.w13_weight_scale
+@@ -388,7 +386,7 @@ def process_weights_after_loading(self, layer):
+         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self, layer: RoutedExperts
+     ) -> FusedMoEQuantConfig | None:
+         w1_scale = layer.w13_weight_scale
+         w2_scale = layer.w2_weight_scale
+@@ -416,7 +414,7 @@ def get_fused_moe_quant_config(
+     def select_gemm_impl(
+         self,
+         prepare_finalize: mk.FusedMoEPrepareAndFinalize,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+     ) -> mk.FusedMoEExpertsModular:
+         raise ValueError(
+             f"{self.__class__.__name__} uses the new modular kernel "
+@@ -425,10 +423,11 @@ def select_gemm_impl(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -443,12 +442,13 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+             expert_map=layer.expert_map,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+@@ -511,7 +511,7 @@ def maybe_roundup_sizes(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -605,7 +605,7 @@ def create_weights(
+ 
+     def _setup_kernel(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         w13: torch.Tensor,
+         w2: torch.Tensor,
+         w13_scale: torch.Tensor,
+@@ -703,7 +703,6 @@ def _setup_kernel(
+                 mxfp4_backend=self.mxfp4_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+                 layer=layer,
+             )
+ 
+@@ -721,7 +720,8 @@ def process_weights_after_loading(self, layer):
+         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self,
++        layer: RoutedExperts,
+     ) -> FusedMoEQuantConfig | None:
+         w1_scale = layer.w13_weight_scale
+         w2_scale = layer.w2_weight_scale
+@@ -748,7 +748,7 @@ def get_fused_moe_quant_config(
+     def select_gemm_impl(
+         self,
+         prepare_finalize: mk.FusedMoEPrepareAndFinalize,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+     ) -> mk.FusedMoEExpertsModular:
+         raise ValueError(
+             f"{self.__class__.__name__} uses the new modular kernel "
+@@ -757,10 +757,11 @@ def select_gemm_impl(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert not self.is_monolithic
+@@ -775,12 +776,13 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+             expert_map=layer.expert_map,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+diff --git a/vllm/model_executor/layers/quantization/online/base.py b/vllm/model_executor/layers/quantization/online/base.py
+index 315dcfacffcd..21230177aae2 100644
+--- a/vllm/model_executor/layers/quantization/online/base.py
++++ b/vllm/model_executor/layers/quantization/online/base.py
+@@ -11,7 +11,7 @@
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
++    RoutedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+     UnquantizedFusedMoEMethod,
+@@ -118,7 +118,7 @@ def get_quant_method(
+                 return Mxfp8OnlineLinearMethod()
+             else:
+                 return Fp8PerTensorOnlineLinearMethod()
+-        elif isinstance(layer, FusedMoE):
++        elif isinstance(layer, RoutedExperts):
+             if should_ignore_layer(
+                 prefix,
+                 ignore=self.ignored_layers,
+diff --git a/vllm/model_executor/layers/quantization/online/fp8.py b/vllm/model_executor/layers/quantization/online/fp8.py
+index 3e81b791ef88..7f8bd11cb7a3 100644
+--- a/vllm/model_executor/layers/quantization/online/fp8.py
++++ b/vllm/model_executor/layers/quantization/online/fp8.py
+@@ -8,7 +8,6 @@
+ 
+ if TYPE_CHECKING:
+     import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+-    from vllm.model_executor.layers.fused_moe import FusedMoE
+     from vllm.model_executor.layers.fused_moe.config import (
+         FusedMoEQuantConfig,
+     )
+@@ -21,6 +20,7 @@
+ from vllm.model_executor.kernels.linear.scaled_mm import (
+     CutlassFP8ScaledMMLinearKernel,
+ )
++from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+     select_fp8_moe_backend,
+ )
+@@ -314,7 +314,7 @@ def __init__(
+ 
+     def _setup_kernel(
+         self,
+-        layer: "FusedMoE",
++        layer: RoutedExperts,
+         w13: torch.Tensor,
+         w2: torch.Tensor,
+         w13_scale: torch.Tensor,
+@@ -355,7 +355,6 @@ def _setup_kernel(
+                 fp8_backend=self.fp8_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+             )
+ 
+     def get_fused_moe_quant_config(
+diff --git a/vllm/model_executor/layers/quantization/online/int8.py b/vllm/model_executor/layers/quantization/online/int8.py
+index f4d2f9a2a371..fc9c18e66c75 100644
+--- a/vllm/model_executor/layers/quantization/online/int8.py
++++ b/vllm/model_executor/layers/quantization/online/int8.py
+@@ -7,11 +7,11 @@
+ from torch.nn import Module
+ 
+ if TYPE_CHECKING:
+-    from vllm.model_executor.layers.fused_moe import FusedMoE
+     from vllm.model_executor.layers.fused_moe.config import (
+         FusedMoEQuantConfig,
+     )
+ 
++from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.fused_moe.oracle.int8 import (
+     make_int8_moe_kernel,
+     make_int8_moe_quant_config,
+@@ -91,7 +91,7 @@ def _quantize_weights(self, layer: Module) -> None:
+         replace_parameter(layer, "w13_scale", w13_scale)
+         replace_parameter(layer, "w2_scale", w2_scale)
+ 
+-    def _setup_kernel(self, layer: "FusedMoE") -> None:
++    def _setup_kernel(self, layer: RoutedExperts) -> None:
+         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+         assert self.moe_quant_config is not None
+         assert self.experts_cls is not None
+@@ -100,7 +100,6 @@ def _setup_kernel(self, layer: "FusedMoE") -> None:
+             moe_config=self.moe,
+             experts_cls=self.experts_cls,
+             routing_tables=layer._expert_routing_tables(),
+-            shared_experts=layer.shared_experts,
+         )
+ 
+     def get_fused_moe_quant_config(
+diff --git a/vllm/model_executor/layers/quantization/online/moe_base.py b/vllm/model_executor/layers/quantization/online/moe_base.py
+index 417ce1770f9e..32eb81601bea 100644
+--- a/vllm/model_executor/layers/quantization/online/moe_base.py
++++ b/vllm/model_executor/layers/quantization/online/moe_base.py
+@@ -6,8 +6,12 @@
+ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+-from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
+-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
++from vllm.model_executor.layers.fused_moe import (
++    FusedMoEMethodBase,
++    FusedMoEQuantConfig,
++    RoutedExperts,
++    SharedExperts,
++)
+ from vllm.model_executor.model_loader.reload.layerwise import (
+     initialize_online_processing,
+ )
+@@ -127,11 +131,11 @@ def supports_eplb(self) -> bool:
+ 
+     def apply_monolithic(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++    ) -> torch.Tensor:
+         assert self.is_monolithic
+         assert self.moe_kernel is not None
+         return self.moe_kernel.apply_monolithic(
+@@ -151,12 +155,13 @@ def apply_monolithic(
+ 
+     def apply(
+         self,
+-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++    ) -> torch.Tensor:
+         assert not self.is_monolithic
+         assert self.moe_kernel is not None
+         return self.moe_kernel.apply(
+@@ -169,5 +174,6 @@ def apply(
+             global_num_experts=layer.global_num_experts,
+             expert_map=layer.expert_map,
+             apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
+diff --git a/vllm/model_executor/layers/quantization/online/mxfp8.py b/vllm/model_executor/layers/quantization/online/mxfp8.py
+index 312da8a12158..f2ff5b043b9a 100644
+--- a/vllm/model_executor/layers/quantization/online/mxfp8.py
++++ b/vllm/model_executor/layers/quantization/online/mxfp8.py
+@@ -10,9 +10,9 @@
+ 
+ if TYPE_CHECKING:
+     import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+-    from vllm.model_executor.layers.fused_moe import FusedMoE
+-    from vllm.model_executor.layers.fused_moe.config import (
++    from vllm.model_executor.layers.fused_moe import (
+         FusedMoEQuantConfig,
++        RoutedExperts,
+     )
+     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+ 
+@@ -161,7 +161,7 @@ def _quantize_mxfp8_moe_weight(
+ 
+     def _setup_kernel(
+         self,
+-        layer: "FusedMoE",
++        layer: "RoutedExperts",
+         w13: torch.Tensor,
+         w2: torch.Tensor,
+         w13_scale: torch.Tensor,
+@@ -200,7 +200,6 @@ def _setup_kernel(
+                 fp8_backend=self.fp8_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+             )
+ 
+     def get_fused_moe_quant_config(
+diff --git a/vllm/model_executor/layers/quantization/quark/quark.py b/vllm/model_executor/layers/quantization/quark/quark.py
+index dd7f33e2619c..c117c71df0ac 100644
+--- a/vllm/model_executor/layers/quantization/quark/quark.py
++++ b/vllm/model_executor/layers/quantization/quark/quark.py
+@@ -8,7 +8,7 @@
+ 
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+-from vllm.model_executor.layers.fused_moe import FusedMoE
++from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.linear import (
+     LinearBase,
+     LinearMethodBase,
+@@ -135,7 +135,7 @@ def get_quant_method(
+         if isinstance(layer, Attention):
+             return QuarkKVCacheMethod(self)
+ 
+-        if isinstance(layer, FusedMoE):
++        if isinstance(layer, RoutedExperts):
+             return QuarkMoEMethod.get_moe_method(self, module=layer, layer_name=prefix)
+         return None
+ 
+diff --git a/vllm/model_executor/layers/quantization/quark/quark_moe.py b/vllm/model_executor/layers/quantization/quark/quark_moe.py
+index 3caced3d3dbc..100192de837d 100644
+--- a/vllm/model_executor/layers/quantization/quark/quark_moe.py
++++ b/vllm/model_executor/layers/quantization/quark/quark_moe.py
+@@ -12,11 +12,12 @@
+ from vllm.config import get_current_vllm_config
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import (
+-    FusedMoE,
+     FusedMoEConfig,
+     FusedMoEMethodBase,
+     FusedMoeWeightScaleSupported,
+     MoEActivation,
++    RoutedExperts,
++    SharedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEParallelConfig,
+@@ -73,7 +74,7 @@ def __init__(self, moe: FusedMoEConfig):
+     @staticmethod
+     def get_moe_method(
+         quant_config: "QuarkConfig",  # type: ignore # noqa E501 # noqa F821
+-        module: torch.nn.Module,
++        module: RoutedExperts,
+         layer_name: str,
+     ) -> "QuarkMoEMethod":
+         layer_quant_config = quant_config._find_matched_config(layer_name, module)
+@@ -164,7 +165,7 @@ def __init__(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -220,7 +221,7 @@ def create_weights(
+                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+             )
+             layer.register_parameter("w2_weight_scale", w2_weight_scale)
+-            # Add PER-TENSOR quantization for FusedMoE.weight_loader.
++            # Add PER-TENSOR quantization for RoutedExperts.weight_loader.
+             extra_weight_attrs.update(
+                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+             )
+@@ -242,7 +243,7 @@ def create_weights(
+                 requires_grad=False,
+             )
+             layer.register_parameter("w2_weight_scale", w2_weight_scale)
+-            # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
++            # Add PER-CHANNEL quantization for RoutedExperts.weight_loader.
+             extra_weight_attrs.update(
+                 {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+             )
+@@ -287,7 +288,7 @@ def create_weights(
+         else:
+             layer.w13_bias, layer.w2_bias = None, None
+ 
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         # Fp8 moe kernels require a single activation scale.
+         # We take the max of all the scales in case they differ.
+         if self.static_input_scales:
+@@ -422,7 +423,7 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+             )
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self, layer: RoutedExperts
+     ) -> FusedMoEQuantConfig | None:
+         return fp8_w8a8_moe_quant_config(
+             w1_scale=layer.w13_weight_scale,
+@@ -437,10 +438,11 @@ def get_fused_moe_quant_config(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         if self.rocm_aiter_moe_enabled:
+@@ -751,12 +753,13 @@ def get_fused_moe_quant_config(
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++    ) -> torch.Tensor:
+         from vllm.model_executor.layers.fused_moe import fused_experts
+ 
+         return fused_experts(
+@@ -791,7 +794,7 @@ def __init__(
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -858,7 +861,7 @@ def create_weights(
+         set_weight_attrs(w13_weight_scale_2, extra_weight_attrs)
+         set_weight_attrs(w2_weight_scale_2, extra_weight_attrs)
+ 
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
+             layer.w13_weight.data, layer.w2_weight.data
+         )
+@@ -903,10 +906,11 @@ def get_fused_moe_quant_config(self, layer):
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+@@ -1093,7 +1097,7 @@ def get_packed_dim(self, dim: int, quant_dtype: str):
+ 
+     def create_weights(
+         self,
+-        layer: torch.nn.Module,
++        layer: RoutedExperts,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
+@@ -1198,7 +1202,7 @@ def create_weights(
+             layer.w13_input_scale = None
+             layer.w2_input_scale = None
+ 
+-    def process_weights_after_loading(self, layer):
++    def process_weights_after_loading(self, layer: RoutedExperts):
+         # For MXFP4 schemes with native backend, use oracle
+         if self.mxfp4_backend != Mxfp4MoeBackend.NONE:
+             self._setup_kernel(layer)
+@@ -1290,7 +1294,7 @@ def process_weights_after_loading(self, layer):
+         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+         torch.accelerator.empty_cache()
+ 
+-    def _setup_kernel(self, layer: FusedMoE):
++    def _setup_kernel(self, layer: RoutedExperts):
+         """Setup kernel using oracle functions for MXFP4 schemes (W4A16, W4A8)."""
+         w13_bias = getattr(layer, "w13_bias", None)
+         w2_bias = getattr(layer, "w2_bias", None)
+@@ -1341,11 +1345,10 @@ def _setup_kernel(self, layer: FusedMoE):
+                 mxfp4_backend=self.mxfp4_backend,
+                 experts_cls=self.experts_cls,
+                 routing_tables=layer._expert_routing_tables(),
+-                shared_experts=layer.shared_experts,
+             )
+ 
+     def get_fused_moe_quant_config(
+-        self, layer: torch.nn.Module
++        self, layer: RoutedExperts
+     ) -> FusedMoEQuantConfig | None:
+         # For oracle-based backends (W4A16, W4A8), use make_mxfp4_moe_quant_config
+         if self.mxfp4_backend not in (Mxfp4MoeBackend.NONE, Mxfp4MoeBackend.EMULATION):
+@@ -1413,10 +1416,11 @@ def is_monolithic(self) -> bool:
+ 
+     def apply(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         # For oracle-based kernels (W4A16, W4A8) or emulation kernel
+@@ -1431,6 +1435,7 @@ def apply(
+                 global_num_experts=layer.global_num_experts,
+                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                 expert_map=layer.expert_map,
++                shared_experts=shared_experts,
+                 shared_experts_input=shared_experts_input,
+             )
+ 
+@@ -1454,7 +1459,7 @@ def apply(
+ 
+     def apply_monolithic(
+         self,
+-        layer: FusedMoE,
++        layer: RoutedExperts,
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+diff --git a/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py b/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
+index ef0bf2bf7aca..5bd08de9a610 100644
+--- a/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
++++ b/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
+@@ -21,7 +21,7 @@
+ )
+ 
+ if TYPE_CHECKING:
+-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
++    from vllm.model_executor.layers.fused_moe import RoutedExperts
+     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+         NvFp4MoeBackend,
+     )
+@@ -80,7 +80,7 @@ def interleave_linear_and_gate(
+ 
+ 
+ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
+-    layer: "FusedMoE",
++    layer: "RoutedExperts",
+     w13: torch.Tensor,
+     w13_scale: torch.Tensor,
+     w13_scale_2: torch.Tensor,
+@@ -286,7 +286,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
+ 
+ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+     backend: "NvFp4MoeBackend",
+-    layer: "FusedMoE",
++    layer: "RoutedExperts",
+     w13: torch.Tensor,
+     w13_scale: torch.Tensor,
+     w13_scale_2: torch.Tensor,
+diff --git a/vllm/model_executor/layers/quantization/utils/humming_utils.py b/vllm/model_executor/layers/quantization/utils/humming_utils.py
+index f8c10bdcae16..2cfc0fc87305 100644
+--- a/vllm/model_executor/layers/quantization/utils/humming_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/humming_utils.py
+@@ -12,7 +12,7 @@
+     FusedMoEQuantConfig,
+     FusedMoEQuantDesc,
+ )
+-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
++from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+ from vllm.model_executor.layers.linear import LinearBase
+ from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+ 
+@@ -82,7 +82,7 @@ def prepare_humming_layer(layer: LinearBase, quant_config: dict):
+     HummingMethod.transform_humming_layer(layer)
+ 
+ 
+-def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
++def prepare_humming_moe_layer(layer: RoutedExperts, quant_config: dict):
+     weight_schema = BaseWeightSchema.from_config(quant_config)
+     input_quant_config = envs.VLLM_HUMMING_INPUT_QUANT_CONFIG or {}
+     if humming_is_layer_skipped(input_quant_config, layer.layer_name):
+@@ -164,7 +164,7 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
+         layer.register_buffer("locks", locks)
+ 
+ 
+-def get_humming_moe_quant_config(layer: FusedMoE):
++def get_humming_moe_quant_config(layer: RoutedExperts):
+     input_schema = layer.input_schemas["w13"]
+     weight_schema = layer.weight_schemas["w13"]
+ 
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils.py b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+index d659effd70ff..4600cb36918b 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+@@ -8,6 +8,7 @@
+ import vllm.envs as envs
+ from vllm import _custom_ops as ops
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.linear import LinearBase
+ from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+ from vllm.model_executor.layers.quantization.utils.int8_utils import (
+@@ -226,7 +227,7 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+     )[0]
+ 
+ 
+-def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
++def check_moe_marlin_supports_layer(layer: RoutedExperts, group_size: int) -> bool:
+     if current_platform.is_rocm():
+         return False
+     hidden_size = layer.hidden_size
+diff --git a/vllm/model_executor/models/laguna.py b/vllm/model_executor/models/laguna.py
+index 5bf5b7cb021e..f79f6097c611 100644
+--- a/vllm/model_executor/models/laguna.py
++++ b/vllm/model_executor/models/laguna.py
+@@ -20,7 +20,10 @@
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+-from vllm.model_executor.layers.fused_moe import FusedMoE
++from vllm.model_executor.layers.fused_moe import (
++    FusedMoE,
++    fused_moe_make_expert_params_mapping,
++)
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
+@@ -666,7 +669,7 @@ def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         Returns mapping tuples of (param_name, weight_name, expert_id, shard_id)
+         that handle both weights and quantization scales.
+         """
+-        return FusedMoE.make_expert_params_mapping(
++        return fused_moe_make_expert_params_mapping(
+             self,
+             ckpt_gate_proj_name="gate_proj",
+             ckpt_down_proj_name="down_proj",

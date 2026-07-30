@@ -1,0 +1,337 @@
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 336ffc6ef13d..526bb5d1c319 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -995,17 +995,24 @@ def forward_extend(
+                     else forward_batch.encoder_out_cache_loc
+                 )
+                 if self.use_mla:
+-                    # MLA: under CP, k and k_rope arrive full-sequence
+-                    # (rebuild_cp_kv_cache ran upstream in
+-                    # forward_absorb_prepare); rank-local otherwise.
+-                    # out_cache_loc is never zigzag-split, so the write
+-                    # lands in the right slots on every rank in either case.
+-                    self.token_to_kv_pool.set_mla_kv_buffer(
+-                        layer,
+-                        cache_loc,
+-                        k,
+-                        k_rope,
+-                    )
++                    if is_cp_v2_active(forward_batch):
++                        # CP-v2: k/k_rope are rank-local; the strategy gathers
++                        # the latent to full sequence and writes it.
++                        cp_strategy = get_cp_strategy()
++                        assert cp_strategy is not None
++                        cp_strategy.materialize_full_mla_kv(
++                            forward_batch, layer, k, k_rope
++                        )
++                    else:
++                        # CP-v1: k/k_rope arrive full-sequence (rebuild_cp_kv_cache
++                        # ran upstream); rank-local when CP is off. out_cache_loc is
++                        # never zigzag-split, so the write lands in the right slots.
++                        self.token_to_kv_pool.set_mla_kv_buffer(
++                            layer,
++                            cache_loc,
++                            k,
++                            k_rope,
++                        )
+                 elif is_cp_mode:
+                     # Dense-MHA CP: k, v are still rank-local; backend
+                     # all-gathers and writes to the per-rank pool.
+@@ -1438,9 +1445,20 @@ def _mla_cp_attn(
+                             ver=self.fa_impl_ver,
+                         )
+ 
+-                    o = cp_attn_forward_extend(
+-                        forward_batch, q_fused, self.device, _mla_cp_attn
+-                    )
++                    if is_cp_v2_active(forward_batch):
++                        cp_strategy = get_cp_strategy()
++                        assert cp_strategy is not None
++                        o = cp_strategy.run_attention(
++                            q_fused,
++                            forward_batch,
++                            self.device,
++                            _mla_cp_attn,
++                            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
++                        )
++                    else:
++                        o = cp_attn_forward_extend(
++                            forward_batch, q_fused, self.device, _mla_cp_attn
++                        )
+                 else:
+                     result = flash_attn_with_kvcache(
+                         q=q_rope,
+diff --git a/python/sglang/srt/layers/cp/utils.py b/python/sglang/srt/layers/cp/utils.py
+index fbadc0c745e0..1ba7545cac81 100644
+--- a/python/sglang/srt/layers/cp/utils.py
++++ b/python/sglang/srt/layers/cp/utils.py
+@@ -40,6 +40,7 @@
+ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
+     {
+         "Qwen3MoeForCausalLM",
++        "DeepseekV3ForCausalLM",
+     }
+ )
+ 
+diff --git a/python/sglang/srt/layers/cp/zigzag.py b/python/sglang/srt/layers/cp/zigzag.py
+index b53236994767..d353f0d7965c 100644
+--- a/python/sglang/srt/layers/cp/zigzag.py
++++ b/python/sglang/srt/layers/cp/zigzag.py
+@@ -354,6 +354,21 @@ def materialize_full_kv(
+             layer.v_scale,
+         )
+ 
++    def materialize_full_mla_kv(
++        self, forward_batch, layer: Any, k_nope: Any, k_rope: Any
++    ) -> None:
++        kv_lora_rank = k_nope.shape[-1]
++        latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
++        latent_full = self.gather_kv_cache(
++            latent, forward_batch, torch.cuda.current_stream()
++        )
++        get_token_to_kv_pool().set_mla_kv_buffer(
++            layer,
++            forward_batch.out_cache_loc,
++            latent_full[..., :kv_lora_rank],
++            latent_full[..., kv_lora_rank:],
++        )
++
+     def _all_gather_reorganized(self, x: torch.Tensor, forward_batch, stream):
+         meta = forward_batch.attn_cp_metadata
+         max_len = meta.max_rank_len[0]
+diff --git a/python/sglang/srt/model_executor/runner/eager_runner.py b/python/sglang/srt/model_executor/runner/eager_runner.py
+index f6f4afd2615e..a7a76c2ed8de 100644
+--- a/python/sglang/srt/model_executor/runner/eager_runner.py
++++ b/python/sglang/srt/model_executor/runner/eager_runner.py
+@@ -285,21 +285,7 @@ def _execute_extend(
+             model_runner.attn_backend.init_forward_metadata(forward_batch)
+ 
+         cp_v2_active = is_cp_v2_active(forward_batch)
+-        forward_positions = forward_batch.positions
+-        if cp_v2_active:
+-            prepare_cp_forward(forward_batch)
+-            complete_hidden_states = kwargs.get("input_embeds")
+-            if complete_hidden_states is None:
+-                embed_layer = model_runner.model.get_input_embeddings()
+-                complete_hidden_states = embed_layer(forward_batch.input_ids)
+-            sharded_hidden_states, sharded_positions = cp_split_before_forward(
+-                complete_hidden_states,
+-                forward_batch.positions,
+-                forward_batch,
+-            )
+-            kwargs["input_embeds"] = sharded_hidden_states
+-            forward_positions = sharded_positions
+-        else:
++        if not cp_v2_active:
+             forward_batch.attn_cp_metadata = None
+ 
+         category = (
+@@ -335,51 +321,67 @@ def _execute_extend(
+                 ):
+                     ret = model_runner.model.forward(
+                         forward_batch.input_ids,
+-                        forward_positions,
++                        forward_batch.positions,
+                         forward_batch,
+                         **kwargs,
+                     )
+             elif cp_v2_active:
+-                # CP-V2: drive .model directly to gather across CP ranks before logits.
+-                hidden_states = model_runner.model.model(
+-                    forward_batch.input_ids,
+-                    forward_positions,
+-                    forward_batch,
+-                    input_embeds=kwargs.get("input_embeds"),
+-                    pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
+-                )
+-                aux_hidden_states = None
+-                capture_aux_hidden_states = getattr(
+-                    model_runner.model, "capture_aux_hidden_states", False
+-                )
+-                if capture_aux_hidden_states:
+-                    hidden_states, aux_hidden_states = hidden_states
+-                if model_runner.model.pp_group.is_last_rank:
+-                    hidden_states = cp_gather_after_forward(
+-                        hidden_states,
+-                        forward_batch,
+-                        torch.cuda.current_stream(),
+-                    )
+-                    ret = model_runner.model.logits_processor(
+-                        forward_batch.input_ids,
+-                        hidden_states,
+-                        model_runner.model.lm_head,
+-                        forward_batch,
+-                        aux_hidden_states,
+-                    )
+-                elif capture_aux_hidden_states:
+-                    ret = hidden_states, aux_hidden_states
+-                else:
+-                    ret = hidden_states
++                ret = self._execute_extend_cp_v2(forward_batch, kwargs)
+             else:
+                 ret = model_runner.model.forward(
+                     forward_batch.input_ids,
+-                    forward_positions,
++                    forward_batch.positions,
+                     forward_batch,
+                     **kwargs,
+                 )
+         return ret
+ 
++    def _execute_extend_cp_v2(
++        self, forward_batch: ForwardBatch, kwargs: dict
++    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
++        """CP-v2 extend: shard inputs at the model boundary, run the body on the
++        rank-local slice, then gather hidden states before the logits step.
++        """
++        model = self.model_runner.model
++
++        prepare_cp_forward(forward_batch)
++        input_embeds = kwargs.get("input_embeds")
++        if input_embeds is None:
++            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
++        input_embeds, positions = cp_split_before_forward(
++            input_embeds, forward_batch.positions, forward_batch
++        )
++
++        hidden_states = model.model(
++            forward_batch.input_ids,
++            positions,
++            forward_batch,
++            input_embeds=input_embeds,
++            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
++        )
++        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
++        aux_hidden_states = None
++        if capture_aux_hidden_states:
++            hidden_states, aux_hidden_states = hidden_states
++
++        if not model.pp_group.is_last_rank:
++            return (
++                (hidden_states, aux_hidden_states)
++                if capture_aux_hidden_states
++                else hidden_states
++            )
++
++        hidden_states = cp_gather_after_forward(
++            hidden_states, forward_batch, torch.cuda.current_stream()
++        )
++        return model.logits_processor(
++            forward_batch.input_ids,
++            hidden_states,
++            model.lm_head,
++            forward_batch,
++            aux_hidden_states,
++        )
++
+     def _execute_idle(
+         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
+     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+index c3ed4674258e..c399cf39f985 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+@@ -19,6 +19,7 @@
+     is_graph_dsa_split_op_surface,
+ )
+ from sglang.srt.layers.communicator import get_attn_tp_context
++from sglang.srt.layers.cp.utils import is_cp_v2_active
+ from sglang.srt.layers.dcp import (
+     all_gather_kv_cache_for_mla_extend,
+     all_gather_q_for_mla_decode,
+@@ -565,8 +566,13 @@ def forward_absorb_prepare(
+             dsa_prefill_cp=dsa_prefill_cp,
+             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
+         )
+-        if (dsa_prefill_cp or mla_prefill_cp) and not defer_kv_gather_until_after_rope:
+-            # support allgather+rerrange
++        if (
++            (dsa_prefill_cp or mla_prefill_cp)
++            and not defer_kv_gather_until_after_rope
++            and not is_cp_v2_active(forward_batch)
++        ):
++            # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
++            # backend via the strategy (materialize_full_mla_kv).
+             k_nope, k_pe = self.rebuild_cp_kv_cache(
+                 latent_cache, forward_batch, k_nope, k_pe
+             )
+diff --git a/python/sglang/srt/models/deepseek_nextn.py b/python/sglang/srt/models/deepseek_nextn.py
+index 35fcedeea2e3..222effb03b07 100644
+--- a/python/sglang/srt/models/deepseek_nextn.py
++++ b/python/sglang/srt/models/deepseek_nextn.py
+@@ -35,6 +35,7 @@
+     is_dsa_enable_prefill_cp,
+     is_dsa_prefill_cp_round_robin_split,
+ )
++from sglang.srt.layers.cp.utils import is_cp_v2_active
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import ReplicatedLinear
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+@@ -251,10 +252,12 @@ def forward(
+                 else:
+                     hidden_states = self.eh_proj(eh_input)
+ 
+-            use_cp = dsa_use_prefill_cp(
+-                forward_batch, self.dsa_enable_prefill_cp
+-            ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+-            if use_cp:
++            # CP-v2 shards/gathers at the eager-runner boundary instead.
++            use_cp_v1 = (
++                dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
++                or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
++            ) and not is_cp_v2_active(forward_batch)
++            if use_cp_v1:
+                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+                 positions = cp_split_and_rebuild_position(forward_batch, positions)
+             residual = None
+@@ -285,7 +288,7 @@ def forward(
+                 else:
+                     hidden_states = self.shared_head.norm(hidden_states)
+ 
+-                if use_cp:
++                if use_cp_v1:
+                     local_num_tokens = hidden_states.shape[0]
+                     hidden_states = cp_all_gather_rerange_output(
+                         hidden_states,
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 7428ce1833c7..d121f9e83b68 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -77,6 +77,7 @@
+     DSACPLayerCommunicator,
+     maybe_prefetch_next_full_attention_kv,
+ )
++from sglang.srt.layers.cp.utils import is_cp_v2_active
+ from sglang.srt.layers.dcp.planner import (
+     prepare_decode_context_parallel_metadata,
+ )
+@@ -2546,9 +2547,13 @@ def forward(
+             else None
+         )
+ 
+-        if dsa_use_prefill_cp(
+-            forward_batch, self.dsa_enable_prefill_cp
+-        ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
++        # CP-v2 shards/gathers at the eager-runner boundary instead.
++        use_cp_v1 = (
++            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
++            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
++        ) and not is_cp_v2_active(forward_batch)
++
++        if use_cp_v1:
+             if self.pp_group.is_first_rank:
+                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+             positions = cp_split_and_rebuild_position(forward_batch, positions)
+@@ -2651,10 +2656,7 @@ def forward(
+                 else:
+                     hidden_states, _ = self.norm(hidden_states, residual)
+ 
+-        if self.pp_group.is_last_rank and (
+-            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+-            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+-        ):
++        if self.pp_group.is_last_rank and use_cp_v1:
+             # allgather + rerrange
+             hidden_states = cp_all_gather_rerange_output(
+                 hidden_states,

@@ -1,0 +1,467 @@
+diff --git a/tests/v1/attention/test_mla_backends.py b/tests/v1/attention/test_mla_backends.py
+index aca09c3db3d6..7de61b32a7d9 100644
+--- a/tests/v1/attention/test_mla_backends.py
++++ b/tests/v1/attention/test_mla_backends.py
+@@ -119,6 +119,7 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
+     layer.kv_b_proj.quant_method = None
+     layer.is_aiter_triton_fp4_bmm_enabled = False
+     layer.is_aiter_triton_fp8_bmm_enabled = False
++    layer.dcp_q_replicate = False
+     layer.quant_config = None
+     layer.layer_name = "test"
+ 
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 67d8fa5a2c65..ff6b78b8a412 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -186,6 +186,7 @@
+     VLLM_MOE_USE_DEEP_GEMM: bool = True
+     VLLM_USE_DEEP_GEMM_E8M0: bool = True
+     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
++    VLLM_DCP_Q_REPLICATE: bool = False
+     VLLM_DEEP_GEMM_WARMUP: Literal[
+         "skip",
+         "full",
+@@ -1490,6 +1491,8 @@ def _resolve_rust_frontend_path() -> str | None:
+     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
+         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+     ),
++    # Opt-in MLA DCP query replication: skip the decode query all-gather.
++    "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
+     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
+     # JIT all the required kernels before model execution so there is no
+     # JIT'ing in the hot-path. However, this warmup increases the engine
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index a450ada185be..14662e9fc03d 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -366,6 +366,7 @@ def __init__(
+         q_lora_rank: int | None,
+         kv_lora_rank: int,
+         kv_b_proj: ColumnParallelLinear,
++        dcp_q_replicate: bool = False,
+         cache_config: CacheConfig | None = None,
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+@@ -384,10 +385,11 @@ def __init__(
+         self.q_lora_rank = q_lora_rank
+         self.kv_lora_rank = kv_lora_rank
+         self.kv_b_proj = kv_b_proj
++        self.dcp_q_replicate = dcp_q_replicate
++        self.W_UK_T_dcp_qrep: torch.Tensor | None = None
+         self.head_size = kv_lora_rank + qk_rope_head_dim
+         self.layer_name = prefix
+         self.indexer = indexer
+-
+         self.num_kv_heads = 1
+         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+ 
+@@ -591,6 +593,7 @@ def forward(
+         kv_c_normed: torch.Tensor,
+         k_pe: torch.Tensor,
+         output_shape: torch.Size | None = None,
++        q_dcp_replicated: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         if self.calculate_kv_scales:
+             torch.ops.vllm.maybe_calc_kv_scales(
+@@ -646,6 +649,7 @@ def forward(
+                 self_kv_cache,
+                 attn_metadata,
+                 output=output,
++                q_dcp_replicated=q_dcp_replicated,
+             )
+             return output
+         else:
+@@ -665,6 +669,7 @@ def forward(
+                 output,
+                 encoded,
+                 kv_cache_dummy_dep=kv_cache_dummy_dep,
++                q_dcp_replicated=q_dcp_replicated,
+             )
+             return output
+ 
+@@ -682,6 +687,7 @@ def forward_impl(
+         quant_scale_ue8m0: bool | None = None,
+         quant_col_major: bool | None = None,
+         quant_tma_aligned: bool | None = None,
++        q_dcp_replicated: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         assert output is not None, "Output tensor must be provided."
+ 
+@@ -738,6 +744,8 @@ def forward_impl(
+         output_padded = output
+         output = output[:num_actual_toks, ...]
+         q = q[:num_actual_toks, ...]
++        if q_dcp_replicated is not None:
++            q_dcp_replicated = q_dcp_replicated[:num_actual_toks, ...]
+         k_c_normed = k_c_normed[:num_actual_toks, ...]
+         k_pe = k_pe[:num_actual_toks, ...]
+ 
+@@ -793,7 +801,12 @@ def forward_impl(
+             )
+ 
+         if num_mqa_tokens > 0:
+-            mqa_q = q[:num_mqa_tokens]
++            if q_dcp_replicated is not None:
++                mqa_q = q_dcp_replicated[:num_mqa_tokens]
++                qrep_decode = True
++            else:
++                mqa_q = q[:num_mqa_tokens]
++                qrep_decode = False
+             mqa_output_slice = output[:num_mqa_tokens]
+ 
+             mqa_q_nope, mqa_q_pe = mqa_q.split(
+@@ -833,7 +846,9 @@ def forward_impl(
+             else:
+                 # Pads the head_dim if necessary (for the underlying kernel)
+                 N, B, P = mqa_q_nope.shape
+-                _, _, L = self.W_UK_T.shape
++                W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
++                assert W_UK_T is not None
++                _, _, L = W_UK_T.shape
+ 
+                 if self.q_pad_num_heads is not None:
+                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
+@@ -842,7 +857,7 @@ def forward_impl(
+                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
+ 
+                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+-                torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
++                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+ 
+                 # Convert from (N, B, L) to (B, N, L)
+                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+@@ -855,6 +870,7 @@ def forward_impl(
+                 )
+             else:
+                 mqa_q = (mqa_ql_nope, mqa_q_pe)
++            # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
+             if self.impl.dcp_world_size > 1:
+                 if self.use_pcp:
+                     if self.impl.dcp_world_size > self.impl.pcp_world_size:
+@@ -863,8 +879,11 @@ def forward_impl(
+                         mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
+                 else:
+                     if isinstance(mqa_q, tuple):
++                        # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                         mqa_q = torch.cat(mqa_q, dim=-1)
+-                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
++                    if not qrep_decode:
++                        # mqa_q do allgather in head dim.
++                        mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+ 
+             # call decode attn
+             if not self.impl.is_sparse:
+@@ -952,6 +971,21 @@ def process_weights_after_loading(self, act_dtype: torch.dtype):
+             self.kv_b_proj, out_dtype=act_dtype
+         ).T
+ 
++        if self.dcp_q_replicate:
++            # qrep wired here: validate unsupported decode backends once.
++            assert self.q_pad_num_heads in (None, self.num_heads), (
++                "DCP query replication is unsupported on head-padding MLA "
++                "backends (q_pad_num_heads)."
++            )
++            if (
++                self.is_aiter_triton_fp4_bmm_enabled
++                or self.is_aiter_triton_fp8_bmm_enabled
++            ):
++                raise NotImplementedError(
++                    "DCP query replication is not implemented for the aiter "
++                    "FP4/FP8 MLA BMM paths."
++                )
++
+         assert kv_b_proj_weight.shape == (
+             self.kv_lora_rank,
+             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+@@ -1032,6 +1066,10 @@ def process_weights_after_loading(self, act_dtype: torch.dtype):
+             replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+             # Convert from (L, N, P) to (N, P, L)
+             replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
++            if self.dcp_q_replicate:
++                self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
++                    self.W_UK_T.contiguous(), dim=0
++                )
+ 
+         # If we should not load quant weights, we initialize the scales to 1.0
+         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
+@@ -1176,6 +1214,7 @@ def unified_mla_attention_with_output(
+     quant_scale_ue8m0: bool | None = None,
+     quant_col_major: bool | None = None,
+     quant_tma_aligned: bool | None = None,
++    q_dcp_replicated: torch.Tensor | None = None,
+ ) -> None:
+     # kv_cache_dummy_dep is not used but accepting it creates a data dependency
+     # that ensures torch.compile preserves ordering between KV cache update and
+@@ -1196,6 +1235,7 @@ def unified_mla_attention_with_output(
+         quant_scale_ue8m0=quant_scale_ue8m0,
+         quant_col_major=quant_col_major,
+         quant_tma_aligned=quant_tma_aligned,
++        q_dcp_replicated=q_dcp_replicated,
+     )
+ 
+ 
+@@ -1212,6 +1252,7 @@ def unified_mla_attention_with_output_fake(
+     quant_scale_ue8m0: bool | None = None,
+     quant_col_major: bool | None = None,
+     quant_tma_aligned: bool | None = None,
++    q_dcp_replicated: torch.Tensor | None = None,
+ ) -> None:
+     return
+ 
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index c0dbc776acb1..df105f066349 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -11,6 +11,7 @@
+ from typing_extensions import TypeIs
+ 
+ import vllm.envs as envs
++from vllm.config import get_current_vllm_config
+ from vllm.distributed import (
+     divide,
+     get_tensor_model_parallel_rank,
+@@ -254,6 +255,8 @@ def __init__(
+         *,
+         return_bias: bool = True,
+         disable_tp: bool = False,
++        tp_rank: int | None = None,
++        tp_size: int | None = None,
+     ):
+         super().__init__()
+ 
+@@ -277,8 +280,17 @@ def __init__(
+             raise ValueError("All linear layers should support quant method.")
+         self.return_bias = return_bias
+         self.disable_tp = disable_tp
+-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
++        if disable_tp:
++            self.tp_rank, self.tp_size = 0, 1
++        else:
++            self.tp_rank = (
++                tp_rank if tp_rank is not None else get_tensor_model_parallel_rank()
++            )
++            self.tp_size = (
++                tp_size
++                if tp_size is not None
++                else get_tensor_model_parallel_world_size()
++            )
+ 
+     def update_param_tp_status(self):
+         # Single source of truth for a parameter's TP state. BasevLLMParameter
+@@ -425,6 +437,11 @@ class ColumnParallelLinear(LinearBase):
+                         (e.g. model.layers.0.qkv_proj)
+         return_bias: If true, return bias together with outputs in forward pass.
+         disable_tp: If true, weights matrix won't be sharded through tp rank.
++        tp_rank: Override the tensor-parallel rank used for sharding. Defaults to
++            the global TP rank. Used to shard at a coarser granularity than one
++            shard per rank (see ``DCPGroupColumnParallelLinear``).
++        tp_size: Override the tensor-parallel world size used for sharding.
++            Defaults to the global TP world size.
+     """
+ 
+     # --8<-- [end:column_parallel_linear]
+@@ -442,10 +459,21 @@ def __init__(
+         *,
+         return_bias: bool = True,
+         disable_tp: bool = False,
++        tp_rank: int | None = None,
++        tp_size: int | None = None,
+     ):
+         # Divide the weight matrix along the last dimension.
+-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
++        if disable_tp:
++            self.tp_rank, self.tp_size = 0, 1
++        else:
++            self.tp_rank = (
++                tp_rank if tp_rank is not None else get_tensor_model_parallel_rank()
++            )
++            self.tp_size = (
++                tp_size
++                if tp_size is not None
++                else get_tensor_model_parallel_world_size()
++            )
+         self.input_size_per_partition = input_size
+         self.output_size_per_partition = divide(output_size, self.tp_size)
+         self.output_partition_sizes = [self.output_size_per_partition]
+@@ -465,6 +493,8 @@ def __init__(
+             prefix,
+             return_bias=return_bias,
+             disable_tp=disable_tp,
++            tp_rank=self.tp_rank,
++            tp_size=self.tp_size,
+         )
+ 
+         self._maybe_allow_fp8_block_shape_mismatch()
+@@ -586,6 +616,47 @@ def extra_repr(self) -> str:
+         return s
+ 
+ 
++class DCPGroupColumnParallelLinear(ColumnParallelLinear):
++    """Column-parallel linear whose weight is sharded across DCP groups.
++
++    With Decode Context Parallelism (DCP) the KV cache is sharded across a DCP
++    group, so MLA decode must attend the group's full head set. This layer shards
++    its output across DCP *groups* (effective tp size ``tp_size //
++    dcp_world_size``) rather than across every rank, so each rank in a group
++    holds the whole group's heads, letting decode skip the query all-gather.
++
++    :meth:`forward` returns the group's full head set. :meth:`_local_view`
++    extracts this rank's TP shard for prefill.
++    """
++
++    def __init__(self, *args, **kwargs):
++        dcp_world_size = (
++            get_current_vllm_config().parallel_config.decode_context_parallel_size
++        )
++        rank = get_tensor_model_parallel_rank()
++        world_size = get_tensor_model_parallel_world_size()
++        self.group_size = max(dcp_world_size, 1)
++        self.qrep_active = self.group_size > 1
++        self.rank_in_group = rank % self.group_size
++        super().__init__(
++            *args,
++            **kwargs,
++            tp_rank=rank // self.group_size,
++            tp_size=world_size // self.group_size,
++        )
++
++    def _local_view(self, out: torch.Tensor) -> torch.Tensor:
++        """Slice this rank's tp head shard from a group-heads output.
++
++        ``out`` is head-shaped, i.e. ``(..., group_heads, head_dim)``.
++        """
++        if self.group_size == 1:
++            return out
++        n = out.shape[-2] // self.group_size
++        start = self.rank_in_group * n
++        return out[..., start : start + n, :].contiguous()
++
++
+ class MergedColumnParallelLinear(ColumnParallelLinear):
+     """Packed linear layers with column parallelism.
+ 
+diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+index 66a95b43c71f..ca4a20874a09 100644
+--- a/vllm/model_executor/layers/mla.py
++++ b/vllm/model_executor/layers/mla.py
+@@ -93,6 +93,10 @@ def __init__(
+         # the topk_tokens buffer written by a previous layer in the same pass.
+         # Refer: https://arxiv.org/abs/2603.12201 for more details.
+         self.skip_topk = skip_topk
++        # qrep is active when the query projection is a DCP-group-sharded layer
++        # that materializes the full group head set locally.
++        q_proj_layer = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
++        self.dcp_q_replicate = getattr(q_proj_layer, "qrep_active", False)
+         if self.indexer is not None:
+             assert hasattr(self.indexer, "topk_tokens")
+             self.topk_tokens = self.indexer.topk_tokens
+@@ -110,6 +114,7 @@ def __init__(
+             quant_config=quant_config,
+             prefix=f"{prefix}.attn",
+             kv_b_proj=self.kv_b_proj,
++            dcp_q_replicate=self.dcp_q_replicate,
+             use_sparse=self.is_sparse,
+             indexer=self.indexer,
+             topk_indices_buffer=mla_modules.topk_indices_buffer,
+@@ -143,7 +148,8 @@ def forward(
+                 dim=-1,
+             )
+             q_c = self.q_a_layernorm(q_c)
+-            q = self.q_b_proj(q_c)[0]
++            q_proj_layer = self.q_b_proj
++            q_proj_input = q_c
+         else:
+             assert self.kv_a_proj_with_mqa is not None, (
+                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
+@@ -152,15 +158,20 @@ def forward(
+                 "q_proj is required when q_lora_rank is None"
+             )
+             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+-            q = self.q_proj(hidden_states)[0]
++            q_proj_layer = self.q_proj
++            q_proj_input = hidden_states
+ 
+         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+         kv_c_normed = self.kv_a_layernorm(kv_c)
+-
+-        q = q.view(-1, self.num_heads, self.qk_head_dim)
+         # Add head dim of 1 to k_pe
+         k_pe = k_pe.unsqueeze(1)
+ 
++        q = q_proj_layer(q_proj_input)[0]
++        heads = self.num_heads
++        if self.dcp_q_replicate:
++            heads *= q_proj_layer.group_size
++        q = q.view(-1, heads, self.qk_head_dim)
++
+         if self.rotary_emb is not None:
+             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                 positions, q[..., self.qk_nope_head_dim :], k_pe
+@@ -172,11 +183,16 @@ def forward(
+         if llama_4_scaling is not None:
+             q *= llama_4_scaling
+ 
++        q_dcp_replicated = None
++        if self.dcp_q_replicate:
++            q_dcp_replicated, q = q, q_proj_layer._local_view(q)
++
+         attn_out = self.mla_attn(
+             q,
+             kv_c_normed,
+             k_pe,
+             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
++            q_dcp_replicated=q_dcp_replicated,
+         )
+ 
+         return self.o_proj(attn_out)[0]
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index daf4ea3de9f3..2e30fd4aa2f2 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -33,6 +33,7 @@
+ from transformers import DeepseekV2Config, DeepseekV3Config
+ 
+ import vllm._custom_ops as ops
++import vllm.envs as envs
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
+@@ -56,6 +57,7 @@
+ from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
++    DCPGroupColumnParallelLinear,
+     MergedColumnParallelLinear,
+     QKVParallelLinear,
+     ReplicatedLinear,
+@@ -1015,9 +1017,17 @@ def __init__(
+                 prefix=f"{prefix}.kv_a_proj_with_mqa",
+             )
+ 
++        qrep_enabled = (
++            envs.VLLM_DCP_Q_REPLICATE
++            and vllm_config.parallel_config.decode_context_parallel_size > 1
++            and vllm_config.parallel_config.prefill_context_parallel_size <= 1
++        )
++        q_proj_cls = (
++            DCPGroupColumnParallelLinear if qrep_enabled else ColumnParallelLinear
++        )
+         if self.q_lora_rank is not None:
+             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+-            self.q_b_proj = ColumnParallelLinear(
++            self.q_b_proj = q_proj_cls(
+                 self.q_lora_rank,
+                 self.num_heads * self.qk_head_dim,
+                 bias=False,
+@@ -1025,7 +1035,7 @@ def __init__(
+                 prefix=f"{prefix}.q_b_proj",
+             )
+         else:
+-            self.q_proj = ColumnParallelLinear(
++            self.q_proj = q_proj_cls(
+                 proj_input_size,
+                 self.num_heads * self.qk_head_dim,
+                 bias=False,

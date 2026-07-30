@@ -1,0 +1,292 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index a707790f0b31..88fba9ac60cc 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -1006,6 +1006,59 @@ def grouped_topk_cpu(
+     )
+ 
+ 
++def grouped_topk_xpu(
++    hidden_states: torch.Tensor,
++    gating_output: torch.Tensor,
++    topk: int,
++    renormalize: bool,
++    num_expert_group: Optional[int] = None,
++    topk_group: Optional[int] = None,
++    num_fused_shared_experts: int = 0,
++    routed_scaling_factor: Optional[float] = None,
++    apply_routed_scaling_factor_on_output: Optional[bool] = False,
++    scoring_func: str = "softmax",
++):
++    num_experts = gating_output.shape[1]
++    experts_per_group = (
++        num_experts // num_expert_group if num_expert_group else num_experts
++    )
++
++    # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now.
++    if experts_per_group <= 32 and is_power_of_two(num_experts):
++        from sgl_kernel import moe_fused_gate
++
++        return moe_fused_gate(
++            gating_output.to(torch.float32),
++            None,  # without bias
++            num_expert_group,
++            topk_group,
++            topk,
++            renormalize=renormalize,
++            scoring_func=scoring_func,
++            num_fused_shared_experts=num_fused_shared_experts,
++            routed_scaling_factor=(
++                routed_scaling_factor if routed_scaling_factor is not None else 1.0
++            ),
++            apply_routed_scaling_factor_on_output=bool(
++                apply_routed_scaling_factor_on_output
++            ),
++        )
++
++    # use default implementation
++    return grouped_topk_gpu(
++        hidden_states,
++        gating_output,
++        topk,
++        renormalize,
++        num_expert_group,
++        topk_group,
++        num_fused_shared_experts,
++        routed_scaling_factor,
++        apply_routed_scaling_factor_on_output,
++        scoring_func,
++    )
++
++
+ @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+ def kimi_k2_biased_topk_impl(
+     hidden_states: torch.Tensor,
+@@ -1539,8 +1592,15 @@ def biased_grouped_topk_gpu(
+             and num_experts <= 256
+             and topk <= 8
+         ):
+-            if not apply_routed_scaling_factor_on_output:
+-                scaling = 1.0
++
++            scale = (
++                routed_scaling_factor
++                if (
++                    apply_routed_scaling_factor_on_output
++                    and routed_scaling_factor is not None
++                )
++                else 1.0
++            )
+ 
+             num_tokens = gating_output.shape[0]
+ 
+@@ -1560,8 +1620,34 @@ def biased_grouped_topk_gpu(
+                 gating_output,
+                 renormalize,
+                 correction_bias,
++                scale,
++            )
++
++            return topk_values, topk_indices
++        elif (
++            _is_xpu
++            # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now.
++            and experts_per_group <= 32
++            and is_power_of_two(num_experts)
++        ):
++            from sgl_kernel import moe_fused_gate
++
++            return moe_fused_gate(
++                gating_output.to(torch.float32),
++                correction_bias.to(torch.float32),
++                num_expert_group,
++                topk_group,
++                topk,
++                renormalize=renormalize,
++                scoring_func="sigmoid",
++                num_fused_shared_experts=num_fused_shared_experts,
++                routed_scaling_factor=(
++                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
++                ),
++                apply_routed_scaling_factor_on_output=bool(
++                    apply_routed_scaling_factor_on_output
++                ),
+             )
+-            return topk_values * scaling, topk_indices
+ 
+         else:
+             return biased_grouped_topk_impl(
+@@ -1613,7 +1699,7 @@ def biased_grouped_topk_cpu(
+     fused_topk = fused_topk_cpu
+ else:
+     biased_grouped_topk = biased_grouped_topk_gpu
+-    grouped_topk = grouped_topk_gpu
++    grouped_topk = grouped_topk_xpu if _is_xpu else grouped_topk_gpu
+     fused_topk_native = fused_topk_torch_native
+ 
+ 
+diff --git a/test/registered/xpu/test_topk.py b/test/registered/xpu/test_topk.py
+index 2ddc0be5933f..c10e54cc3718 100644
+--- a/test/registered/xpu/test_topk.py
++++ b/test/registered/xpu/test_topk.py
+@@ -8,12 +8,31 @@
+ from sglang.srt.layers.moe.topk import (
+     biased_grouped_topk_impl as native_biased_grouped_topk,
+ )
++from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
++from sglang.srt.layers.moe.topk import (
++    grouped_topk_xpu,
++)
+ from sglang.test.ci.ci_register import register_xpu_ci
+ from sglang.test.test_utils import CustomTestCase
+ 
+ register_xpu_ci(est_time=5, suite="stage-b-test-1-gpu-xpu")
+ 
+ 
++def _scatter_by_expert(
++    weights: torch.Tensor, indices: torch.Tensor, num_columns: int
++) -> torch.Tensor:
++    """Scatter (weight, id) pairs into a dense ``[M, num_columns]`` tensor.
++
++    Makes the comparison independent of the per-row slot order, so the test does
++    not depend on how ties between equal scores are broken.
++    """
++    dense = torch.zeros(
++        (weights.shape[0], num_columns), dtype=torch.float32, device=weights.device
++    )
++    dense.scatter_(1, indices.long(), weights.float())
++    return dense
++
++
+ # Nemotron-3 uses biased_grouped_topk
+ class TestBiasedGroupedTopK(CustomTestCase):
+     def _run_single_test(
+@@ -96,6 +115,128 @@ def test_fast_biased_grouped_topk(self):
+                 routed_scaling_factor,
+             )
+ 
++    def test_biased_grouped_topk(self):
++        # DeepSeek-V3 style grouped routing shape
++        E_num = 256
++        num_expert_group = 8
++        topk_value = 8
++        topk_group = 4
++        gating_dtype = torch.bfloat16
++        bias_dtype = torch.float32
++        renormalize = True
++        routed_scaling_factor = 2.5
++
++        torch.manual_seed(1024)
++        device = torch.device("xpu")
++
++        bs = [1, 2, 4, 8]
++        seq_len = 1024
++        num_tokens = [b * seq_len for b in bs]
++        num_fused_shared_experts_list = [0, 1]
++
++        for M in num_tokens:
++            for num_fused_shared_experts in num_fused_shared_experts_list:
++
++                topk_routed = topk_value - num_fused_shared_experts
++                hidden_states = torch.randn(M, 100, dtype=torch.bfloat16, device=device)
++                gating_output = torch.randn(M, E_num, dtype=gating_dtype, device=device)
++                correction_bias = torch.randn(E_num, dtype=bias_dtype, device=device)
++
++                ref_topk_weights, ref_topk_ids = native_biased_grouped_topk(
++                    hidden_states.float(),
++                    gating_output.float(),
++                    correction_bias,
++                    topk_value,
++                    renormalize,
++                    num_expert_group,
++                    topk_group,
++                    num_fused_shared_experts,
++                    routed_scaling_factor=routed_scaling_factor,
++                )
++
++                # fused version
++                topk_weights, topk_ids = biased_grouped_topk_gpu(
++                    hidden_states,
++                    gating_output,
++                    correction_bias,
++                    topk_value,
++                    renormalize,
++                    num_expert_group,
++                    topk_group,
++                    num_fused_shared_experts,
++                    routed_scaling_factor,
++                )
++
++                torch.testing.assert_close(
++                    _scatter_by_expert(
++                        topk_weights[:, :topk_routed], topk_ids[:, :topk_routed], E_num
++                    ),
++                    _scatter_by_expert(
++                        ref_topk_weights[:, :topk_routed],
++                        ref_topk_ids[:, :topk_routed],
++                        E_num,
++                    ),
++                )
++
++    def test_grouped_topk(self):
++        # DeepSeek-V3 style grouped routing shape
++        E_num = 256
++        num_expert_group = 8
++        topk_value = 8
++        topk_group = 4
++        gating_dtype = torch.bfloat16
++        renormalize = True
++        routed_scaling_factor = 2.5
++
++        torch.manual_seed(1024)
++        device = torch.device("xpu")
++
++        bs = [1]
++        seq_len = 1024
++        num_tokens = [b * seq_len for b in bs]
++        num_fused_shared_experts_list = [0, 1]
++
++        for M in num_tokens:
++            for num_fused_shared_experts in num_fused_shared_experts_list:
++
++                topk_routed = topk_value - num_fused_shared_experts
++                hidden_states = torch.randn(M, 100, dtype=torch.bfloat16, device=device)
++                gating_output = torch.randn(M, E_num, dtype=gating_dtype, device=device)
++
++                ref_topk_weights, ref_topk_ids = native_grouped_topk(
++                    hidden_states.float(),
++                    gating_output.float(),
++                    topk_value,
++                    renormalize,
++                    num_expert_group,
++                    topk_group,
++                    num_fused_shared_experts,
++                    routed_scaling_factor=routed_scaling_factor,
++                )
++
++                # fused version
++                topk_weights, topk_ids = grouped_topk_xpu(
++                    hidden_states,
++                    gating_output,
++                    topk_value,
++                    renormalize,
++                    num_expert_group,
++                    topk_group,
++                    num_fused_shared_experts,
++                    routed_scaling_factor,
++                )
++
++                torch.testing.assert_close(
++                    _scatter_by_expert(
++                        topk_weights[:, :topk_routed], topk_ids[:, :topk_routed], E_num
++                    ),
++                    _scatter_by_expert(
++                        ref_topk_weights[:, :topk_routed],
++                        ref_topk_ids[:, :topk_routed],
++                        E_num,
++                    ),
++                )
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,1787 @@
+diff --git a/docs_new/docs/advanced_features/quantization.mdx b/docs_new/docs/advanced_features/quantization.mdx
+index d763d70aea47..0fdbfc99b74d 100644
+--- a/docs_new/docs/advanced_features/quantization.mdx
++++ b/docs_new/docs/advanced_features/quantization.mdx
+@@ -883,7 +883,7 @@ Other layers (e.g. projections in the attention layers) have their weights quant
+ 
+ SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
+ 
+-Example:
++Example (BF16 to MXFP4 requantization):
+ 
+ ```bash
+ sglang serve --model-path Qwen/Qwen3-30B-A3B \
+@@ -891,6 +891,22 @@ sglang serve --model-path Qwen/Qwen3-30B-A3B \
+     --quantization quark_mxfp4
+ ```
+ 
++The option `--quantization quark_mxfp4` also supports converting FP8 dense and MOE models to MXFP4, following this logic:
++
++1. Load an FP8 weight tensor,
++2. Dequantize it to BF16,
++3. Requantize it to MXFP4
++
++progressively during weight loading.
++
++Example (FP8 to MXFP4 requantization):
++
++```bash
++sglang serve --model-path Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
++    --tensor-parallel-size 1 \
++    --quantization quark_mxfp4
++```
++
+ ### Intel® Neural Compressor online quantization method
+ 
+ SGLang supports quantization methods based on the advanced algorithm [auto-round](https://github.com/intel/auto-round) in [Intel® Neural Compressor](https://github.com/intel/neural-compressor). You can simply specify `--quantization auto-round-int8` to use this feature. It will quantize the model on the fly to target format. More online quantization methods are on the way.
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index 020995054c2e..2bcc2fd45b6f 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -211,6 +211,9 @@ def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
+     return config.index_n_heads
+ 
+ 
++REQUANTIZATION_METHODS = ["quark_mxfp4"]
++
++
+ def get_num_indexer_layers(config) -> int:
+     """Layer count for the global indexer-topk capturer's host buffer.
+ 
+@@ -1242,7 +1245,7 @@ def get_quantization_config_log_str(self) -> Optional[str]:
+             log_str = f"quant={quant_method}"
+ 
+             # Append interesting fields if they exist
+-            for field in ["bits", "quant_algo", "fmt"]:
++            for field in ["bits", "quant_algo", "fmt", "requantization_method"]:
+                 if field in quant_cfg:
+                     log_str += f", {field}={quant_cfg[field]}"
+ 
+@@ -1441,6 +1444,10 @@ def _verify_quantization(self) -> None:
+                         f"Using draft model's detected quantization: {quant_method}"
+                     )
+                     self.quantization = quant_method
++                elif self.quantization in REQUANTIZATION_METHODS:
++                    logger.info_once(
++                        f"Requantizing from quant_method='{quant_method}' to the requested online quantization='{self.quantization}'. Beware that requantization may incur a loss in accuracy, the requantized model should be re-validated/re-evaluated. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
++                    )
+                 else:
+                     raise ValueError(
+                         "Quantization method specified in the model config "
+diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
+index 086b64badac0..57aae27ba712 100644
+--- a/python/sglang/srt/layers/linear.py
++++ b/python/sglang/srt/layers/linear.py
+@@ -76,6 +76,7 @@
+     "PetitNvFp4LinearMethod",
+     "QuarkInt4Fp8LinearMethod",
+     "HummingLinearMethod",
++    "QuarkLinearMethod",
+ ]
+ 
+ _is_cpu = is_cpu()
+diff --git a/python/sglang/srt/layers/quantization/dequantization.py b/python/sglang/srt/layers/quantization/dequantization.py
+new file mode 100644
+index 000000000000..c2de905a44c4
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/dequantization.py
+@@ -0,0 +1,44 @@
++"""
++Utilities to manage the dequantization of weights.
++"""
++
++import torch
++
++from sglang.srt.layers.quantization.fp8_utils import (
++    block_quant_dequant,
++    inverse_transform_scale_ue8m0,
++)
++from sglang.srt.utils import set_weight_attrs
++
++
++def copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
++    """Copies any attrs present in `old` but not in `new` to `new`"""
++    new_attrs = set(dir(new))
++    attrs_to_set = {}
++    for attr in dir(old):
++        if attr not in new_attrs:
++            attrs_to_set[attr] = getattr(old, attr)
++    set_weight_attrs(new, attrs_to_set)
++
++
++def dequantize_fp8(
++    w_q: torch.Tensor,
++    w_s: torch.Tensor,
++    block_size: list[int],
++    format_ue8m0: bool = False,
++) -> torch.Tensor:
++    """
++    Dequantizes `w_q` to bfloat16.
++    """
++    if format_ue8m0:
++        # TODO this is only needed for Blackwell
++        w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
++
++    w_dequant = block_quant_dequant(
++        w_q,
++        w_s,
++        block_size=block_size,
++        dtype=torch.bfloat16,
++    )
++
++    return w_dequant
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index 33c2f16f9308..27c3ef7db252 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -461,8 +461,9 @@ def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
+         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
+         self.use_per_token_if_dynamic = False
+ 
++    @staticmethod
+     def validate_block_quant_shapes(
+-        self,
++        quant_config,
+         input_size: int,
+         input_size_per_partition: int,
+         output_size: int,
+@@ -472,8 +473,8 @@ def validate_block_quant_shapes(
+     ):
+         tp_size = get_parallel().tp_size
+         block_n, block_k = (
+-            self.quant_config.weight_block_size[0],
+-            self.quant_config.weight_block_size[1],
++            quant_config.weight_block_size[0],
++            quant_config.weight_block_size[1],
+         )
+ 
+         if skip_block_quant_check:
+@@ -501,28 +502,36 @@ def validate_block_quant_shapes(
+                             f"weight quantization block_n = {block_n}."
+                         )
+ 
+-    def create_weights(
+-        self,
++    @staticmethod
++    def create_fp8_weight_(
+         layer: torch.nn.Module,
++        block_quant: bool,
++        quant_config,
++        use_mxfp8: bool,
++        output_size_per_partition: int,
+         input_size_per_partition: int,
+         output_partition_sizes: List[int],
+         input_size: int,
+         output_size: int,
+         params_dtype: torch.dtype,
++        weight_loader,
++        is_checkpoint_fp8_serialized: bool,
+         skip_block_quant_check: bool = False,
+         **extra_weight_attrs,
+     ):
++        """
++        Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
++        """
+         # Copy the layer attributes
+-        output_size_per_partition = sum(output_partition_sizes)
+         layer.logical_widths = output_partition_sizes
+         layer.input_size_per_partition = input_size_per_partition
+         layer.output_size_per_partition = output_size_per_partition
+         layer.orig_dtype = params_dtype
+-        weight_loader = extra_weight_attrs.get("weight_loader")
+ 
+-        if self.block_quant:
+-            block_n, block_k = self.quant_config.weight_block_size
+-            self.validate_block_quant_shapes(
++        if block_quant:
++            block_n, block_k = quant_config.weight_block_size
++            Fp8LinearMethod.validate_block_quant_shapes(
++                quant_config,
+                 input_size,
+                 input_size_per_partition,
+                 output_size,
+@@ -530,10 +539,12 @@ def create_weights(
+                 output_partition_sizes,
+                 skip_block_quant_check,
+             )
++        else:
++            block_n, block_k = None, None
+ 
+         # Create the weight
+         weight_dtype = (
+-            torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
++            torch.float8_e4m3fn if is_checkpoint_fp8_serialized else params_dtype
+         )
+         weight = ModelWeightParameter(
+             data=torch.empty(
+@@ -545,20 +556,14 @@ def create_weights(
+         )
+         layer.register_parameter("weight", weight)
+ 
+-        # If checkpoint is serialized fp8, load them.
+-        # Otherwise, wait until process_weights_after_loading.
+-        if self.is_checkpoint_fp8_serialized:
+-            # WEIGHT SCALE
+-            if self.block_quant:
+-                if hasattr(self.quant_config, "activation_scheme"):
+-                    assert self.quant_config.activation_scheme == "dynamic"
+-                elif hasattr(self.quant_config, "linear_activation_scheme"):
+-                    assert self.quant_config.linear_activation_scheme == "dynamic"
+-                if self.use_mxfp8 and not self.is_checkpoint_fp8_serialized:
+-                    raise ValueError(
+-                        "MXFP8 requires fp8-serialized checkpoint for linear layers."
+-                    )
+-                scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
++        if is_checkpoint_fp8_serialized:
++            if block_quant:
++                if hasattr(quant_config, "activation_scheme"):
++                    assert quant_config.activation_scheme == "dynamic"
++                elif hasattr(quant_config, "linear_activation_scheme"):
++                    assert quant_config.linear_activation_scheme == "dynamic"
++
++                scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
+                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
+                 scale = BlockQuantScaleParameter(
+                     data=scale_init(
+@@ -570,7 +575,7 @@ def create_weights(
+                     output_dim=0,
+                     weight_loader=weight_loader,
+                 )
+-                scale.format_ue8m0 = self.use_mxfp8
++                scale.format_ue8m0 = use_mxfp8
+                 if scale_dtype != torch.uint8:
+                     scale[:] = torch.finfo(torch.float32).min
+                 layer.register_parameter("weight_scale_inv", scale)
+@@ -584,11 +589,11 @@ def create_weights(
+ 
+             # INPUT ACTIVATION SCALE
+             if (
+-                hasattr(self.quant_config, "activation_scheme")
+-                and self.quant_config.activation_scheme == "static"
++                hasattr(quant_config, "activation_scheme")
++                and quant_config.activation_scheme == "static"
+             ) or (
+-                hasattr(self.quant_config, "linear_activation_scheme")
+-                and self.quant_config.linear_activation_scheme == "static"
++                hasattr(quant_config, "linear_activation_scheme")
++                and quant_config.linear_activation_scheme == "static"
+             ):
+                 scale = PerTensorScaleParameter(
+                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+@@ -599,6 +604,37 @@ def create_weights(
+                 layer.register_parameter("input_scale", scale)
+             else:
+                 layer.register_parameter("input_scale", None)
++        elif use_mxfp8:
++            raise ValueError(
++                "MXFP8 requires fp8-serialized checkpoint for linear layers."
++            )
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: List[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        skip_block_quant_check: bool = False,
++        **extra_weight_attrs,
++    ):
++        Fp8LinearMethod.create_fp8_weight_(
++            layer,
++            block_quant=self.block_quant,
++            quant_config=self.quant_config,
++            use_mxfp8=self.use_mxfp8,
++            output_size_per_partition=sum(output_partition_sizes),
++            input_size_per_partition=input_size_per_partition,
++            output_partition_sizes=output_partition_sizes,
++            weight_loader=extra_weight_attrs.get("weight_loader"),
++            skip_block_quant_check=skip_block_quant_check,
++            input_size=input_size,
++            output_size=output_size,
++            is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
++            params_dtype=params_dtype,
++        )
+ 
+     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+         if self.convert_mxfp8_to_block:
+@@ -1044,22 +1080,30 @@ def is_deepgemm_moe_runner_backend_enabled() -> bool:
+             )
+         return False
+ 
+-    def create_weights(
+-        self,
++    @staticmethod
++    def create_fp8_moe_weight_(
+         layer: Module,
+         num_experts: int,
+         hidden_size: int,
+         intermediate_size_per_partition: int,
++        block_quant: bool,
++        quant_config,
++        use_mxfp8: bool,
++        is_checkpoint_fp8_serialized: bool,
++        is_fp4_expert: bool,
+         params_dtype: torch.dtype,
+         with_bias: bool = False,
+         fp4_scale_dtype: Optional[torch.dtype] = None,
+         **extra_weight_attrs,
+     ):
+-        self.with_bias = with_bias
++        """
++        Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
++        """
+         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+ 
+-        if self.quant_config.is_checkpoint_fp8_serialized:
++        if is_checkpoint_fp8_serialized:
+             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
++
+         tp_size = get_parallel().tp_size
+ 
+         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
+@@ -1069,10 +1113,10 @@ def create_weights(
+             is_packed=False,
+         )
+ 
+-        if self.block_quant:
++        if block_quant:
+             block_n, block_k = (
+-                self.quant_config.weight_block_size[0],
+-                self.quant_config.weight_block_size[1],
++                quant_config.weight_block_size[0],
++                quant_config.weight_block_size[1],
+             )
+ 
+             padding_size = get_moe_padding_size(_use_aiter)
+@@ -1095,7 +1139,7 @@ def create_weights(
+                         )
+ 
+         # WEIGHTS
+-        if self.is_fp4_expert:
++        if is_fp4_expert:
+             w13_weight = torch.nn.Parameter(
+                 torch.empty(
+                     num_experts,
+@@ -1165,7 +1209,7 @@ def create_weights(
+         set_weight_attrs(w2_weight, extra_weight_attrs)
+ 
+         # BIAS (optional, e.g. GPT-OSS)
+-        if self.with_bias:
++        if with_bias:
+             w13_up_dim = (
+                 2 * intermediate_size_per_partition
+                 if layer.moe_runner_config.is_gated
+@@ -1186,7 +1230,7 @@ def create_weights(
+             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+ 
+         # WEIGHT_SCALES
+-        if self.is_fp4_expert:
++        if is_fp4_expert:
+             fp4_block_k = 32
+             if fp4_scale_dtype is None:
+                 fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+@@ -1210,8 +1254,8 @@ def create_weights(
+             )
+             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+-        elif self.block_quant:
+-            scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
++        elif block_quant:
++            scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
+             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
+             w13_weight_scale = torch.nn.Parameter(
+                 scale_init(
+@@ -1232,13 +1276,12 @@ def create_weights(
+                 requires_grad=False,
+             )
+             # w13_weight and w2_weight are always requanted together
+-            w13_weight_scale.format_ue8m0 = self.use_mxfp8
+-            w2_weight_scale.format_ue8m0 = self.use_mxfp8
++            w13_weight_scale.format_ue8m0 = use_mxfp8
++            w2_weight_scale.format_ue8m0 = use_mxfp8
+             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+-            assert self.quant_config.activation_scheme == "dynamic"
+-            if get_moe_runner_backend().is_cutlass():
+-                self._ensure_cutlass_buffers_initialized(layer)
++
++            assert quant_config.activation_scheme == "dynamic"
+ 
+         else:
+             # Allocate 2 scales for w1 and w3 respectively.
+@@ -1273,13 +1316,14 @@ def create_weights(
+         # to ensure the weight scales are loaded in properly
+         extra_weight_attrs.update(
+             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+-            if self.block_quant
++            if block_quant
+             else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+         )
++
+         # If loading fp8 checkpoint, pass the weight loaders.
+         # If loading an fp16 checkpoint, do not (we will quantize in
+         #   process_weights_after_loading()
+-        if self.quant_config.is_checkpoint_fp8_serialized:
++        if quant_config.is_checkpoint_fp8_serialized:
+             set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+             set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+ 
+@@ -1291,8 +1335,8 @@ def create_weights(
+                 set_weight_attrs(w2_weight_scale1, extra_weight_attrs)
+ 
+         # INPUT_SCALES
+-        if self.quant_config.activation_scheme == "static":
+-            if not self.quant_config.is_checkpoint_fp8_serialized:
++        if quant_config.activation_scheme == "static":
++            if not quant_config.is_checkpoint_fp8_serialized:
+                 raise ValueError(
+                     "Found static activation scheme for checkpoint that "
+                     "was not serialized fp8."
+@@ -1314,6 +1358,38 @@ def create_weights(
+             layer.w13_input_scale = None
+             layer.w2_input_scale = None
+ 
++    def create_weights(
++        self,
++        layer: Module,
++        num_experts: int,
++        hidden_size: int,
++        intermediate_size_per_partition: int,
++        params_dtype: torch.dtype,
++        with_bias: bool = False,
++        **extra_weight_attrs,
++    ):
++        Fp8MoEMethod.create_fp8_moe_weight_(
++            layer=layer,
++            num_experts=num_experts,
++            hidden_size=hidden_size,
++            intermediate_size_per_partition=intermediate_size_per_partition,
++            block_quant=self.block_quant,
++            quant_config=self.quant_config,
++            use_mxfp8=self.use_mxfp8,
++            is_checkpoint_fp8_serialized=self.quant_config.is_checkpoint_fp8_serialized,
++            is_fp4_expert=self.is_fp4_expert,
++            params_dtype=params_dtype,
++            with_bias=with_bias,
++            **extra_weight_attrs,
++        )
++
++        if (
++            not self.is_fp4_expert
++            and self.block_quant
++            and get_moe_runner_backend().is_cutlass()
++        ):
++            self._ensure_cutlass_buffers_initialized(layer)
++
+     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+         # AMD FP4 experts: use aiter's native MXFP4 MoE path
+         if _use_aiter and self.is_fp4_expert:
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 7281e1a6ab1b..f6c6b2fbbb56 100755
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -1378,6 +1378,8 @@ def block_quant_dequant(
+     block_n, block_k = block_size[0], block_size[1]
+     *_, n, k = x_q_block.shape
+ 
++    # NOTE: This is very memory inefficient, results in *16384 memory requirement for scales
++    # with block_size = [128, 128].
+     # ... n_scale k_scale -> ... (n_scale block_n) (k_scale block_k)
+     x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(
+         block_k, dim=-1
+diff --git a/python/sglang/srt/layers/quantization/online_quantization.py b/python/sglang/srt/layers/quantization/online_quantization.py
+new file mode 100644
+index 000000000000..b5c067c8fa2b
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/online_quantization.py
+@@ -0,0 +1,23 @@
++# Adapted from https://github.com/vllm-project/vllm/pull/31914
++import torch
++from torch.utils._python_dispatch import TorchDispatchMode
++
++
++class CopyNumelCounter(TorchDispatchMode):
++    """
++    Tracks total number of elements modified with `copy_`. Useful for keeping
++    track of weight loading where underlying weights can be arbitrarily
++    transformed (such as with `narrow`) before calling copy.
++    """
++
++    def __init__(self):
++        super().__init__()
++        self.copied_numel = 0
++
++    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
++        if kwargs is None:
++            kwargs = {}
++        out = func(*args, **kwargs)
++        if func == torch.ops.aten.copy_.default:
++            self.copied_numel += args[0].numel()
++        return out
+diff --git a/python/sglang/srt/layers/quantization/quark/quark.py b/python/sglang/srt/layers/quantization/quark/quark.py
+index aaa26214c478..69a7177f0dd4 100644
+--- a/python/sglang/srt/layers/quantization/quark/quark.py
++++ b/python/sglang/srt/layers/quantization/quark/quark.py
+@@ -14,6 +14,7 @@
+     QuantizationConfig,
+     QuantizeMethodBase,
+ )
++from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+ from sglang.srt.layers.quantization.quark.schemes import (
+     QuarkLinearScheme,
+@@ -55,13 +56,14 @@ class QuarkConfig(QuantizationConfig):
+ 
+     def __init__(
+         self,
+-        quant_config: Optional[dict[str, Any]] = None,
++        quant_config: dict[str, Any] | None = None,
+         hf_config: "PretrainedConfig | None" = None,
+         kv_cache_group: Optional[list[str]] = None,
+         kv_cache_config: Optional[dict[str, Any]] = None,
+         pack_method: str = "reorder",
+         is_prequantized: bool = False,
+         online_scheme: Optional[str] = None,
++        dequantization_config: Optional[QuantizationConfig] = None,
+     ):
+         super().__init__()
+         if kv_cache_group is None:
+@@ -79,23 +81,39 @@ def __init__(
+         if quant_config is None:
+             raise ValueError("Either quant_config or online_scheme must be provided")
+ 
++        self.online_scheme = online_scheme
+         self.quant_config = quant_config
+         self.kv_cache_group = kv_cache_group
+         self.kv_cache_config = kv_cache_config
+         self.pack_method = pack_method
+         self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
+         self.is_prequantized = is_prequantized
+-
++        self.dequantization_config = dequantization_config
+         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
+-        self._quantized_layers = set()
++        self._online_quantized_layers = set()
++
++        if isinstance(self.dequantization_config, Fp8Config):
++            self.weight_block_size = self.dequantization_config.weight_block_size
+ 
+-    @property
+-    def quantized_layers(self) -> tuple[list[str], int]:
+-        # Extract unique layer types (last part after ".")
+-        layer_types = sorted(
+-            set(name.split(".")[-1] for name in self._quantized_layers)
++    def log_online_quantization(self) -> None:
++        """
++        Log which layers are using online quantization, as well as a count for each layer type.
++        """
++        # Count layers per type (last two parts after ".")
++        type_counts: dict[str, int] = {}
++        for name in self._online_quantized_layers:
++            parts = name.split(".")
++            layer_type = ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
++            type_counts[layer_type] = type_counts.get(layer_type, 0) + 1
++
++        type_counts = dict(sorted(type_counts.items()))
++        count = len(self._online_quantized_layers)
++
++        type_summary = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
++        logger.info_once(
++            f"Online {self.online_scheme} quantization: "
++            f"quantized {count} layers in total ({type_summary})."
+         )
+-        return layer_types, len(self._quantized_layers)
+ 
+     def get_linear_method(self) -> "QuarkLinearMethod":
+         return QuarkLinearMethod(self)
+@@ -124,14 +142,18 @@ def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> Optional["QuantizeMethodBase"]:
+         # Check if the layer is skipped for quantization.
+-
+         if should_ignore_layer(
+             prefix,
+             ignore=self.exclude_layers,
+             fused_mapping=self.packed_modules_mapping,
+         ):
+             if isinstance(layer, LinearBase):
+-                return UnquantizedLinearMethod()
++                if self.dequantization_config is not None:
++                    # In case of online requantization, "exclude" means keeping the original precision.
++                    # NOTE: Only FP8 supported for now.
++                    return Fp8LinearMethod(quant_config=self.dequantization_config)
++                else:
++                    return UnquantizedLinearMethod()
+             elif isinstance(layer, RadixAttention):
+                 return QuarkKVCacheMethod(self)
+             return None
+@@ -139,17 +161,17 @@ def get_quant_method(
+         if isinstance(layer, LinearBase):
+             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+             layer.scheme = scheme
+-            self._quantized_layers.add(prefix)
++            self._online_quantized_layers.add(prefix)
+             return QuarkLinearMethod(self)
+ 
+         if isinstance(layer, RadixAttention):
+-            self._quantized_layers.add(prefix)
++            self._online_quantized_layers.add(prefix)
+             return QuarkKVCacheMethod(self)
+ 
+         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+ 
+         if isinstance(layer, FusedMoE):
+-            self._quantized_layers.add(prefix)
++            self._online_quantized_layers.add(prefix)
+             layer.scheme = self.get_moe_scheme(layer, prefix)
+             return QuarkFusedMoEMethod(self)
+ 
+@@ -157,6 +179,33 @@ def get_quant_method(
+ 
+     @classmethod
+     def from_config(cls, config: dict[str, Any]) -> "QuarkConfig":
++        if config["quant_method"] != "quark":
++            assert "requantization_method" in config
++
++            if (
++                config["quant_method"] == "fp8"
++                and config["requantization_method"] == "quark_mxfp4"
++                and config["activation_scheme"] == "dynamic"
++            ):
++                hf_config = config["hf_config"]
++                quant_config = QuarkConfig._create_online_mxfp4_config(
++                    model_type=hf_config.model_type
++                )
++                dequantization_config = Fp8Config.from_config(config)
++                quark_config = cls(
++                    quant_config=quant_config,
++                    hf_config=hf_config,
++                    is_prequantized=False,
++                    dequantization_config=dequantization_config,
++                    online_scheme=config["requantization_method"],
++                )
++            else:
++                raise NotImplementedError(
++                    f"Requantization into {config['requantization_method']} is not supported, from the original quant_method={config['quant_method']} and activation_scheme={config['activation_scheme']}. "
++                )
++
++            return quark_config
++
+         export_config = config.get("export")
+         if export_config is None:
+             raise ValueError(
+@@ -241,7 +290,17 @@ def _create_online_mxfp4_config(model_type: str) -> dict[str, Any]:
+             "re:.*embed_tokens",
+         ]
+ 
+-        if model_type == "qwen3_5_moe":
++        # Exclusion for accuracy adapted from
++        # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
++        if model_type in ["deepseek_v3", "deepseek_v32"]:
++            exclude.extend(
++                [
++                    "re:.*model.layers.61.*",
++                    "re:.*self_attn.*",
++                    "re:.*mlp.gate$",
++                ]
++            )
++        elif model_type == "qwen3_5_moe":
+             # Exclusion for accuracy adapted from
+             # https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4/blob/main/config.json
+             exclude.extend(
+@@ -470,6 +529,7 @@ def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme"
+                 weight_config,
+                 input_config,
+                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
++                dequantization_config=self.dequantization_config,
+             )
+         if self._is_fp8_w8a8(weight_config, input_config):
+             is_fp8_w8a8_supported = self._check_scheme_supported(
+@@ -520,6 +580,7 @@ def get_moe_scheme(
+                 weight_config,
+                 input_config,
+                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
++                dequantization_config=self.dequantization_config,
+             )
+         elif self._is_mx_w4a8(weight_config, input_config):
+             logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
+@@ -569,10 +630,14 @@ class QuarkLinearMethod(LinearMethodBase):
+ 
+     def __init__(self, quantization_config: QuarkConfig):
+         self.quantization_config = quantization_config
++        self.quant_config = quantization_config
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         layer.scheme.process_weights_after_loading(layer)
+ 
++        if self.quantization_config.online_scheme is not None:
++            self.quantization_config.log_online_quantization()
++
+     def create_weights(
+         self,
+         layer: torch.nn.Module,
+@@ -625,6 +690,9 @@ def __init__(self, quantization_config: QuarkConfig):
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         layer.scheme.process_weights_after_loading(layer)
+ 
++        if self.quantization_config.online_scheme is not None:
++            self.quantization_config.log_online_quantization()
++
+     def create_weights(
+         self,
+         layer: torch.nn.Module,
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
+index 65c2f4a9a1d3..1b7146584cca 100644
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
+@@ -1,11 +1,19 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import logging
++import threading
+ from typing import Any, Callable, Optional
+ 
+ import torch
+ 
+ from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
++from sglang.srt.layers.quantization import QuantizationConfig
++from sglang.srt.layers.quantization.dequantization import (
++    copy_missing_attrs,
++    dequantize_fp8,
++)
++from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
++from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
+ from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
+ from sglang.srt.utils import is_hip
+ from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
+@@ -162,12 +170,14 @@ def __init__(
+         weight_quant_spec: dict[str, Any],
+         input_quant_spec: dict[str, Any],
+         is_checkpoint_mxfp4_serialized: bool = True,
++        dequantization_config: QuantizationConfig | None = None,
+     ):
+         self.out_dtype = torch.get_default_dtype()
+         self.qscheme = "per_group"
+         self.weight_quant_spec = weight_quant_spec
+         self.input_quant_spec = input_quant_spec
+         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
++        self.dequantization_config = dequantization_config
+ 
+         if not self.is_checkpoint_mxfp4_serialized:
+             if not mxfp_supported():
+@@ -176,7 +186,7 @@ def __init__(
+                     "FP4 hardware support (gfx95x, e.g. MI355x)."
+                 )
+             logger.info_once(
+-                "Using online MXFP4 quantization from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
++                "Using online MXFP4 quantization in dense linear layers from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+             )
+ 
+     @classmethod
+@@ -204,38 +214,96 @@ def create_weights(
+ 
+         layer.logical_widths = output_partition_sizes
+ 
+-        original_weight_loader = weight_loader
+-        if not self.is_checkpoint_mxfp4_serialized:
+-            weight_loader = self.get_online_mxfp4_weight_loader(layer, weight_loader)
+-
+-        # WEIGHT
+-        # Both serialized and online quantization use packed uint8 format
+-        weight = PackedvLLMParameter(
+-            data=torch.empty(
+-                output_size_per_partition,
+-                input_size_per_partition // 2,
+-                dtype=torch.uint8,
+-            ),
+-            input_dim=1,
+-            output_dim=0,
+-            packed_dim=1,
+-            packed_factor=2,
+-            weight_loader=weight_loader,
+-        )
+-        layer.register_parameter("weight", weight)
+-
+-        # WEIGHT SCALE
+-        weight_scale = GroupQuantScaleParameter(
+-            data=torch.empty(
+-                output_size_per_partition,
+-                input_size_per_partition // OCP_MX_BLOCK_SIZE,
+-                dtype=torch.uint8,
+-            ),
+-            input_dim=1,
+-            output_dim=0,
+-            weight_loader=original_weight_loader,
+-        )
+-        layer.register_parameter("weight_scale", weight_scale)
++        # If dequantization_config is provided, we need to create FP8 weights first
++        # for dequantization from FP8 checkpoint to MXFP4
++        if self.dequantization_config is not None:
++            if not isinstance(self.dequantization_config, Fp8Config):
++                raise NotImplementedError(
++                    f"Requantization in QuarkW4A4MXFP4 from {self.dequantization_config.__class__.__name__} is not supported, only Fp8Config is supported."
++                )
++            # Create FP8 weights for re-quantization from FP8 checkpoint
++            # Extract necessary parameters from dequantization_config
++            self.weight_block_size = self.dequantization_config.weight_block_size
++
++            if self.dequantization_config.use_mxfp8:
++                raise NotImplementedError(
++                    "use_mxfp8=True is not supported in Quark MXFP4 requantization."
++                )
++
++            block_quant = self.weight_block_size is not None
++
++            if not block_quant:
++                raise NotImplementedError(
++                    "Only block_quant=True is supported in Quark MXFP4 requantization, got block_quant=False."
++                )
++
++            layer._fp8_weight_loaded_numel = 0
++            layer._load_device = torch.get_default_device()
++            layer._fp8_weight_loading_lock = threading.Lock()
++            layer._fp8_weight_materialized = False
++
++            # Wrap the weight loader to handle FP8->MXFP4 conversion
++            fp8_to_mxfp4_weight_loader = self.get_online_fp8_to_mxfp4_weight_loader(
++                layer, weight_loader
++            )
++
++            # Create FP8 MoE weight parameters on meta device to avoid device memory overhead during weight loading, as the resulting model uses MXFP4 using less device memory.
++            # The weight loader handles progressive FP8 weight materialization on device.
++            with torch.device("meta"):
++                Fp8LinearMethod.create_fp8_weight_(
++                    layer=layer,
++                    block_quant=block_quant,
++                    quant_config=self.dequantization_config,
++                    use_mxfp8=False,
++                    output_size_per_partition=output_size_per_partition,
++                    input_size_per_partition=input_size_per_partition,
++                    output_partition_sizes=output_partition_sizes,
++                    weight_loader=fp8_to_mxfp4_weight_loader,
++                    is_checkpoint_fp8_serialized=True,
++                    params_dtype=params_dtype,
++                    skip_block_quant_check=False,
++                    input_size=kwargs.get("input_size", input_size_per_partition),
++                    output_size=kwargs.get("output_size", output_size_per_partition),
++                )
++
++            # NOTE: ideally, weight_loader should be refactored to be aware of `param_name`.
++            layer.weight._param_name = "weight"
++            layer.weight_scale_inv._param_name = "weight_scale_inv"
++        else:
++            original_weight_loader = weight_loader
++            if not self.is_checkpoint_mxfp4_serialized:
++                weight_loader = self.get_online_mxfp4_weight_loader(
++                    layer, weight_loader
++                )
++
++            # WEIGHT
++            # Both serialized and online quantization use packed uint8 format
++            weight = PackedvLLMParameter(
++                data=torch.empty(
++                    output_size_per_partition,
++                    input_size_per_partition // 2,
++                    dtype=torch.uint8,
++                ),
++                input_dim=1,
++                output_dim=0,
++                packed_dim=1,
++                packed_factor=2,
++                weight_loader=weight_loader,
++            )
++            layer.register_parameter("weight", weight)
++
++            # WEIGHT SCALE
++            weight_scale = GroupQuantScaleParameter(
++                data=torch.empty(
++                    output_size_per_partition,
++                    input_size_per_partition // OCP_MX_BLOCK_SIZE,
++                    dtype=torch.uint8,
++                ),
++                input_dim=1,
++                output_dim=0,
++                weight_loader=original_weight_loader,
++            )
++            layer.register_parameter("weight_scale", weight_scale)
+ 
+     def get_online_mxfp4_weight_loader(
+         self,
+@@ -270,6 +338,119 @@ def online_mxfp4_weight_loader(
+ 
+         return online_mxfp4_weight_loader
+ 
++    def get_online_fp8_to_mxfp4_weight_loader(
++        self,
++        layer,
++        original_weight_loader: Callable,
++    ) -> Callable:
++        """
++        Wrap the original weight loader to perform FP8 to MXFP4 requantization.
++
++        This loader handles:
++        1. Loading FP8 weights and weight_scale_inv parameters
++        2. Waiting for all shards (e.g., q_proj, k_proj, v_proj) to be loaded
++        3. Dequantizing FP8 -> BF16
++        4. Requantizing BF16 -> MXFP4
++        """
++
++        def online_fp8_to_mxfp4_weight_loader(
++            param: torch.nn.Parameter,
++            loaded_weight: torch.Tensor,
++            shard_id: int | str | None = None,
++        ):
++            param_name = getattr(param, "_param_name", None)
++
++            is_weight_or_weight_scale = "weight" in param_name
++            is_weight = param_name == "weight"
++            is_weight_scale_inv = param_name == "weight_scale_inv"
++
++            # Sanity multi-threaded load check.
++            assert torch.cuda.current_device() == layer._load_device.index
++
++            with layer._fp8_weight_loading_lock:
++                # Materialize FP8 parameters on first load on device (there may be several shards for a single layer parameter, e.g. q_proj, k_proj, v_proj).
++
++                if is_weight_or_weight_scale and not layer._fp8_weight_materialized:
++
++                    # Sanity check.
++                    assert layer.weight.device.type == "meta"
++
++                    materialized_tensor = layer.weight.__class__(
++                        data=torch.empty_like(
++                            layer.weight.data, device=layer._load_device
++                        ),
++                        input_dim=1,
++                        output_dim=0,
++                        weight_loader=layer.weight._weight_loader,
++                    )
++                    copy_missing_attrs(layer.weight, materialized_tensor)
++                    layer.weight = materialized_tensor
++
++                    # Sanity check.
++                    assert layer.weight_scale_inv.device.type == "meta"  # Sanity check.
++
++                    materialized_tensor = layer.weight_scale_inv.__class__(
++                        data=torch.empty_like(
++                            layer.weight_scale_inv.data, device=layer._load_device
++                        ),
++                        input_dim=1,
++                        output_dim=0,
++                        weight_loader=layer.weight_scale_inv._weight_loader,
++                    )
++                    copy_missing_attrs(layer.weight_scale_inv, materialized_tensor)
++                    layer.weight_scale_inv = materialized_tensor
++
++                    # Mark as materialized to prevent other threads from doing it again.
++                    layer._fp8_weight_materialized = True
++
++                if is_weight:
++                    param = layer.weight
++                elif is_weight_scale_inv:
++                    param = layer.weight_scale_inv
++
++            kwargs = {}
++            if shard_id is not None:
++                kwargs["loaded_shard_id"] = shard_id
++
++            # Track how much data we are actually loading (`narrow` used in weight loader)
++            copy_numel_counter = CopyNumelCounter()
++            with copy_numel_counter:
++                original_weight_loader(param, loaded_weight, **kwargs)
++
++            with layer._fp8_weight_loading_lock:
++                if is_weight_or_weight_scale:
++                    layer._fp8_weight_loaded_numel += copy_numel_counter.copied_numel
++
++                target_numel = layer.weight.numel() + layer.weight_scale_inv.numel()
++
++                # Perform requantization outside the lock (but only if we're the chosen thread)
++                if layer._fp8_weight_loaded_numel == target_numel and hasattr(
++                    layer, "weight_scale_inv"
++                ):
++                    assert layer.weight.device.type != "meta"
++
++                    # FP8 -> BF16 dequantization.
++                    weight_bf16 = dequantize_fp8(
++                        layer.weight,
++                        layer.weight_scale_inv,
++                        block_size=self.weight_block_size,
++                    )
++
++                    # BF16 -> MXFP4 requantization.
++                    weight_mxfp4, weight_mxfp4_scale = dynamic_mxfp4_quant(weight_bf16)
++
++                    layer.weight = torch.nn.Parameter(weight_mxfp4, requires_grad=False)
++                    layer.weight_scale = torch.nn.Parameter(
++                        weight_mxfp4_scale, requires_grad=False
++                    )
++
++                    # Clean up FP8 parameters and tracking attributes
++                    del layer.weight_scale_inv
++                    del layer._load_device
++                    del weight_bf16
++
++        return online_fp8_to_mxfp4_weight_loader
++
+     def apply_weights(
+         self,
+         layer: torch.nn.Module,
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+index c6890dfd5014..df97eeec3f93 100644
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+@@ -3,12 +3,20 @@
+ from __future__ import annotations
+ 
+ import logging
++import threading
+ from typing import TYPE_CHECKING, Any
+ 
+ import torch
+ 
+ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+ from sglang.srt.layers.moe.utils import get_moe_weight_sizes
++from sglang.srt.layers.quantization.base_config import QuantizationConfig
++from sglang.srt.layers.quantization.dequantization import (
++    copy_missing_attrs,
++    dequantize_fp8,
++)
++from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
++from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
+ from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
+ from sglang.srt.utils import (
+     get_bool_env_var,
+@@ -51,10 +59,12 @@ def __init__(
+         weight_config: dict[str, Any],
+         input_config: dict[str, Any],
+         is_checkpoint_mxfp4_serialized: bool = True,
++        dequantization_config: QuantizationConfig | None = None,
+     ):
+         self.weight_quant = weight_config
+         self.input_quant = input_config
+         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
++        self.dequantization_config = dequantization_config
+ 
+         weight_qscheme = self.weight_quant.get("qscheme")
+         input_qscheme = self.input_quant.get("qscheme")
+@@ -96,6 +106,61 @@ def create_weights(
+ 
+         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+ 
++        original_weight_loader = extra_weight_attrs.get("weight_loader")
++        with_bias = extra_weight_attrs.pop("with_bias", False)
++        self.with_bias = with_bias
++
++        # Handle FP8 to MXFP4 requantization
++        if self.dequantization_config is not None:
++            if not isinstance(self.dequantization_config, Fp8Config):
++                raise NotImplementedError(
++                    f"Requantization in QuarkW4A4MXFp4MoEMethod from {self.dequantization_config.__class__.__name__} is not supported, only Fp8Config is supported."
++                )
++
++            if self.dequantization_config.use_mxfp8:
++                raise NotImplementedError(
++                    "use_mxfp8=True is not supported in Quark MXFP4 requantization."
++                )
++
++            block_quant = self.dequantization_config.weight_block_size is not None
++
++            if not block_quant:
++                raise NotImplementedError(
++                    "Only block_quant=True is supported in Quark MXFP4 requantization, got block_quant=False."
++                )
++
++            # `_fp8_loaded_numel` is used to trigger FP8 -> MXFP4 requantization once all weights are loaded.
++            # `_fp8_materialized` is used to ensure only one thread materializes weights from meta device.
++            layer._fp8_loaded_numel = 0
++            layer._fp8_materialized = False
++            layer._load_device = torch.get_default_device()
++            layer._fp8_loading_lock = threading.Lock()
++
++            # Custom weight loader handling FP8->MXFP4 conversion.
++            fp8_to_mxfp4_weight_loader = self.get_online_fp8_to_mxfp4_weight_loader(
++                layer, original_weight_loader
++            )
++
++            extra_weight_attrs["weight_loader"] = fp8_to_mxfp4_weight_loader
++            # Create FP8 MoE weight parameters on meta device to avoid device memory overhead during weight loading, as the resulting model uses MXFP4 using less device memory.
++            # The weight loader handles progressive FP8 weight materialization on device.
++            with torch.device("meta"):
++                Fp8MoEMethod.create_fp8_moe_weight_(
++                    layer=layer,
++                    num_experts=num_experts,
++                    hidden_size=hidden_size,
++                    intermediate_size_per_partition=intermediate_size_per_partition,
++                    block_quant=block_quant,
++                    quant_config=self.dequantization_config,
++                    use_mxfp8=False,
++                    is_checkpoint_fp8_serialized=True,
++                    is_fp4_expert=False,
++                    params_dtype=params_dtype,
++                    with_bias=with_bias,
++                    **extra_weight_attrs,
++                )
++            return
++
+         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
+             intermediate_size_per_partition,
+             is_aiter_moe=_use_aiter,
+@@ -112,40 +177,61 @@ def create_weights(
+             },
+         )
+ 
+-        params_dtype = torch.uint8
+-
+-        original_weight_loader = extra_weight_attrs.get("weight_loader")
+-
+         if self.is_checkpoint_mxfp4_serialized:
+             weight_loader = original_weight_loader
++            weight_device = torch.get_default_device()
++            weight_dtype = torch.uint8
+         else:
++            # Online quantization: use original dtype and meta device
+             weight_loader = self.get_online_weight_loader(layer, original_weight_loader)
++            weight_device = torch.device("meta")
++            weight_dtype = params_dtype
++
++        params_dtype = torch.uint8
++
++        layer._load_device = torch.get_default_device()
++        layer._w13_loaded_numel = 0
++        layer._w2_loaded_numel = 0
+ 
+         extra_weight_attrs["weight_loader"] = weight_loader
+ 
+-        # WEIGHTS — always uint8 (packed mxfp4), always on device
++        # WEIGHTS
++        w13_shape = (
++            num_experts,
++            2 * intermediate_size_per_partition,
++            hidden_size // 2 if self.is_checkpoint_mxfp4_serialized else hidden_size,
++        )
+         w13_weight = torch.nn.Parameter(
+             torch.empty(
+-                num_experts,
+-                w13_up_dim,
+-                hidden_size // 2,
+-                dtype=params_dtype,
++                w13_shape,
++                dtype=weight_dtype,
++                device=weight_device,
+             ),
+             requires_grad=False,
+         )
+         layer.register_parameter("w13_weight", w13_weight)
++
+         set_weight_attrs(w13_weight, extra_weight_attrs)
+ 
++        w2_shape = (
++            num_experts,
++            hidden_size,
++            (
++                intermediate_size_per_partition // 2
++                if self.is_checkpoint_mxfp4_serialized
++                else intermediate_size_per_partition
++            ),
++        )
+         w2_weight = torch.nn.Parameter(
+             torch.empty(
+-                num_experts,
+-                hidden_size,
+-                w2_down_dim,
+-                dtype=params_dtype,
++                w2_shape,
++                dtype=weight_dtype,
++                device=weight_device,
+             ),
+             requires_grad=False,
+         )
+         layer.register_parameter("w2_weight", w2_weight)
++
+         set_weight_attrs(w2_weight, extra_weight_attrs)
+ 
+         # WEIGHT_SCALES
+@@ -180,7 +266,7 @@ def create_weights(
+ 
+     def get_online_weight_loader(self, layer, original_weight_loader):
+         """
+-        Wrap the original weight loader to perform online MXFP4 quantization.
++        Wrap the original weight loader to perform online MXFP4 quantization for MoE layers.
+         """
+ 
+         def online_mxfp4_moe_weight_loader(
+@@ -195,29 +281,290 @@ def online_mxfp4_moe_weight_loader(
+                     "Online MXFP4 quantization for MoE is only supported on AMD GPUs."
+                 )
+ 
+-            # Materialize on device the loaded weight.
+-            loaded_weight = loaded_weight.to(param.device)
++            # Determine which weight parameter we're loading (w13 or w2)
++            is_w13 = "w13" in weight_name
++            is_w2 = "w2" in weight_name
+ 
+-            # Quantize the high-precision shard loaded_weight to MXFP4.
+-            qweight, weight_scale = dynamic_mxfp4_quant(loaded_weight)
++            # Initialize weight on device if first load
++            if is_w13 and layer._w13_loaded_numel == 0:
++                layer.w13_weight = torch.nn.Parameter(
++                    torch.empty_like(param.data, device=layer._load_device),
++                    requires_grad=False,
++                )
++                param = layer.w13_weight
++            elif is_w2 and layer._w2_loaded_numel == 0:
++                layer.w2_weight = torch.nn.Parameter(
++                    torch.empty_like(param.data, device=layer._load_device),
++                    requires_grad=False,
++                )
++                param = layer.w2_weight
+ 
+-            original_weight_loader(param, qweight, weight_name, shard_id, expert_id)
++            # Move to device for faster quantization
++            loaded_weight = loaded_weight.to(layer._load_device)
+ 
+-            if "w13" in weight_name:
+-                scale_param = layer.w13_weight_scale
+-                scale_weight_name = "w13_weight_scale"
++            if is_w13:
++                param = layer.w13_weight
++            elif is_w2:
++                param = layer.w2_weight
++
++            # In case TP>1, the weight loader logic uses narrow so we cannot directly rely on `param.shape` or `loaded_weight.shape`.
++            copy_numel_counter = CopyNumelCounter()
++            with copy_numel_counter:
++                original_weight_loader(
++                    param, loaded_weight, weight_name, shard_id, expert_id
++                )
++
++            if is_w13:
++                layer._w13_loaded_numel += copy_numel_counter.copied_numel
++                target_loaded_numel = layer.w13_weight.numel()
++                current_loaded = layer._w13_loaded_numel
++            elif is_w2:
++                layer._w2_loaded_numel += copy_numel_counter.copied_numel
++                target_loaded_numel = layer.w2_weight.numel()
++                current_loaded = layer._w2_loaded_numel
+             else:
+-                # w2.
+-                scale_param = layer.w2_weight_scale
+-                scale_weight_name = "w2_weight_scale"
++                raise ValueError("Expected w13 or w2.")
+ 
+-            scale_param.weight_loader(
+-                scale_param, weight_scale, scale_weight_name, shard_id, expert_id
+-            )
++            assert (
++                current_loaded <= target_loaded_numel
++            ), f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
++
++            # Delay online quantization until all tensor shards (e.g. w1 and w3) are loaded, to avoid having to re-quantize later on.
++            if is_w13 and layer._w13_loaded_numel == target_loaded_numel:
++                self._quantize_w13_online(layer, dynamic_mxfp4_quant)
++            elif is_w2 and layer._w2_loaded_numel == target_loaded_numel:
++                self._quantize_w2_online(layer, dynamic_mxfp4_quant)
+ 
+         return online_mxfp4_moe_weight_loader
+ 
++    def get_online_fp8_to_mxfp4_weight_loader(self, layer, original_weight_loader):
++        """
++        Wrap the original weight loader to perform FP8 to MXFP4 requantization for MoE layers.
++
++        This loader handles:
++        1. Loading FP8 weights (w13_weight, w2_weight) and weight_scale_inv parameters
++        2. Waiting for all experts to be loaded
++        3. Dequantizing FP8 -> BF16 using weight_scale_inv
++        4. Requantizing BF16 -> MXFP4
++        """
++
++        def online_fp8_to_mxfp4_moe_weight_loader(
++            param: torch.nn.Parameter,
++            loaded_weight: torch.Tensor,
++            weight_name: str,
++            shard_id: str,
++            expert_id: int,
++        ):
++            is_w13_weight = "w13_weight" in weight_name and "scale" not in weight_name
++            is_w2_weight = "w2_weight" in weight_name and "scale" not in weight_name
++            is_w13_scale = "w13_weight_scale_inv" in weight_name
++            is_w2_scale = "w2_weight_scale_inv" in weight_name
++
++            # Sanity multi-threaded load check.
++            assert torch.cuda.current_device() == layer._load_device.index
++
++            # Materialize FP8 parameters on first load from meta device. Adds a small but manageable overhead compared to materializing one by one - but weights are loaded in order layer by layer so it is fine.
++            with layer._fp8_loading_lock:
++
++                if not layer._fp8_materialized:
++                    # w13_weight
++                    assert layer.w13_weight.device.type == "meta"
++                    materialized = torch.nn.Parameter(
++                        torch.empty_like(
++                            layer.w13_weight.data, device=layer._load_device
++                        ),
++                        requires_grad=False,
++                    )
++                    copy_missing_attrs(layer.w13_weight, materialized)
++                    layer.w13_weight = materialized
++
++                    # w13_weight_scale_inv
++                    materialized = torch.nn.Parameter(
++                        torch.empty_like(
++                            layer.w13_weight_scale_inv.data, device=layer._load_device
++                        ),
++                        requires_grad=False,
++                    )
++                    copy_missing_attrs(layer.w13_weight_scale_inv, materialized)
++                    layer.w13_weight_scale_inv = materialized
++
++                    # w2_weight
++                    assert layer.w2_weight.device.type == "meta"
++                    materialized = torch.nn.Parameter(
++                        torch.empty_like(
++                            layer.w2_weight.data, device=layer._load_device
++                        ),
++                        requires_grad=False,
++                    )
++                    copy_missing_attrs(layer.w2_weight, materialized)
++                    layer.w2_weight = materialized
++
++                    # w2_weight_scale_inv
++                    assert layer.w2_weight_scale_inv.device.type == "meta"
++                    materialized = torch.nn.Parameter(
++                        torch.empty_like(
++                            layer.w2_weight_scale_inv.data, device=layer._load_device
++                        ),
++                        requires_grad=False,
++                    )
++                    copy_missing_attrs(layer.w2_weight_scale_inv, materialized)
++                    layer.w2_weight_scale_inv = materialized
++
++                    # Mark as materialized to prevent other threads from doing it again.
++                    layer._fp8_materialized = True
++
++                if is_w13_weight:
++                    param = layer.w13_weight
++                elif is_w2_weight:
++                    param = layer.w2_weight
++                elif is_w13_scale:
++                    param = layer.w13_weight_scale_inv
++                elif is_w2_scale:
++                    param = layer.w2_weight_scale_inv
++
++            # Track how much data we are actually loading (`narrow` used in weight loader)
++            copy_numel_counter = CopyNumelCounter()
++            with copy_numel_counter:
++                original_weight_loader(
++                    param, loaded_weight, weight_name, shard_id, expert_id
++                )
++
++            with layer._fp8_loading_lock:
++                layer._fp8_loaded_numel += copy_numel_counter.copied_numel
++
++                total_target_numel = (
++                    layer.w13_weight.numel()
++                    + layer.w2_weight.numel()
++                    + layer.w13_weight_scale_inv.numel()
++                    + layer.w2_weight_scale_inv.numel()
++                )
++
++                # Sanity check
++                assert layer._fp8_loaded_numel <= total_target_numel
++
++                # Perform dequantization and requantization only when all data is loaded AND no other threads are still loading.
++                if layer._fp8_loaded_numel == total_target_numel:
++                    if dynamic_mxfp4_quant is None:
++                        raise NotImplementedError(
++                            "MXFP4 quantization for MoE is only supported on AMD GPUs."
++                        )
++
++                    assert layer.w13_weight.device.type == "cuda"
++                    assert layer.w13_weight_scale_inv.device.type == "cuda"
++                    assert layer.w13_weight.dtype != torch.uint8
++
++                    # Dequantize and requantize w13
++                    w13_bf16 = dequantize_fp8(
++                        layer.w13_weight,
++                        layer.w13_weight_scale_inv,
++                        block_size=self.dequantization_config.weight_block_size,
++                    )
++
++                    qw13_weight_list = []
++                    w13_weight_scale_list = []
++                    for expert_idx in range(w13_bf16.shape[0]):
++                        # NOTE: dynamic_mxfp4_quant does not accept 3D inputs.
++                        qweight, weight_scale = dynamic_mxfp4_quant(
++                            w13_bf16[expert_idx]
++                        )
++                        qw13_weight_list.append(qweight)
++                        w13_weight_scale_list.append(weight_scale)
++
++                    qw13_weight = torch.stack(qw13_weight_list)
++                    w13_weight_scale = torch.stack(w13_weight_scale_list)
++
++                    # Dequantize and requantize w2
++                    w2_bf16 = dequantize_fp8(
++                        layer.w2_weight,
++                        layer.w2_weight_scale_inv,
++                        block_size=self.dequantization_config.weight_block_size,
++                    )
++
++                    qw2_weight_list = []
++                    w2_weight_scale_list = []
++                    for expert_idx in range(w2_bf16.shape[0]):
++                        # NOTE: dynamic_mxfp4_quant does not accept 3D inputs.
++                        qweight, weight_scale = dynamic_mxfp4_quant(w2_bf16[expert_idx])
++                        qw2_weight_list.append(qweight)
++                        w2_weight_scale_list.append(weight_scale)
++
++                    qw2_weight = torch.stack(qw2_weight_list)
++                    w2_weight_scale = torch.stack(w2_weight_scale_list)
++
++                    # Replace FP8 parameters with MXFP4 parameters
++                    layer.w13_weight = torch.nn.Parameter(
++                        qw13_weight, requires_grad=False
++                    )
++                    layer.w13_weight_scale = torch.nn.Parameter(
++                        w13_weight_scale, requires_grad=False
++                    )
++                    layer.w2_weight = torch.nn.Parameter(
++                        qw2_weight, requires_grad=False
++                    )
++                    layer.w2_weight_scale = torch.nn.Parameter(
++                        w2_weight_scale, requires_grad=False
++                    )
++
++                    # Clean up FP8 parameters and tracking attributes
++                    del layer.w13_weight_scale_inv
++                    del layer.w2_weight_scale_inv
++                    del layer._fp8_materialized
++                    del layer._load_device
++                    del layer._fp8_loading_lock
++
++        return online_fp8_to_mxfp4_moe_weight_loader
++
++    def _quantize_w13_online(self, layer, dynamic_mxfp4_quant):
++        qw13_weight = torch.empty(
++            layer.w13_weight.shape[0],
++            layer.w13_weight.shape[1],
++            layer.w13_weight.shape[2] // 2,
++            dtype=torch.uint8,
++            device=layer._load_device,
++        )
++
++        for expert in range(layer.w13_weight.shape[0]):
++            qweight, weight_scale = dynamic_mxfp4_quant(layer.w13_weight.data[expert])
++            assert qw13_weight[expert].shape == qweight.shape
++            assert qw13_weight[expert].dtype == qweight.dtype
++            qw13_weight[expert] = qweight
++
++            assert layer.w13_weight_scale[expert].shape == weight_scale.shape
++            assert layer.w13_weight_scale[expert].dtype == weight_scale.dtype
++            layer.w13_weight_scale[expert] = weight_scale
++
++        layer.w13_weight = torch.nn.Parameter(qw13_weight, requires_grad=False)
++
++    def _quantize_w2_online(self, layer, dynamic_mxfp4_quant):
++        qw2_weight = torch.empty(
++            layer.w2_weight.shape[0],
++            layer.w2_weight.shape[1],
++            layer.w2_weight.shape[2] // 2,
++            dtype=torch.uint8,
++            device=layer._load_device,
++        )
++
++        for expert in range(layer.w2_weight.shape[0]):
++            qweight, weight_scale = dynamic_mxfp4_quant(layer.w2_weight.data[expert])
++            qw2_weight[expert] = qweight
++            layer.w2_weight_scale[expert] = weight_scale
++
++        layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
++
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if (
++            not self.is_checkpoint_mxfp4_serialized
++            or self.dequantization_config is not None
++        ):
++            # Quantization already happened during weight loading.
++            # This covers both:
++            # - Online quantization from BF16/FP16 -> MXFP4
++            # - Requantization from FP8 -> MXFP4
++            assert layer.w13_weight.dtype == torch.uint8
++            assert layer.w2_weight.dtype == torch.uint8
++            assert layer.w13_weight_scale.dtype == torch.uint8
++            assert layer.w2_weight_scale.dtype == torch.uint8
++
+         # Pre-shuffle weight scales
+         s0, s1, _ = layer.w13_weight_scale.shape
+         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+diff --git a/python/sglang/srt/layers/quantization/quark/utils.py b/python/sglang/srt/layers/quantization/quark/utils.py
+index 4c2d162f0839..948a79dbb16d 100644
+--- a/python/sglang/srt/layers/quantization/quark/utils.py
++++ b/python/sglang/srt/layers/quantization/quark/utils.py
+@@ -206,5 +206,9 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
+             w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
+             w_s_kc = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
+             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
++        else:
++            raise ValueError(
++                f"Unexpected w.dtype: {w.dtype} (should be bfloat16 or uint8)"
++            )
+ 
+         return w_kc, w_s_kc, w_vc, w_s_vc
+diff --git a/python/sglang/srt/model_loader/utils.py b/python/sglang/srt/model_loader/utils.py
+index 533983a55b0a..8006fd6a9b8b 100644
+--- a/python/sglang/srt/model_loader/utils.py
++++ b/python/sglang/srt/model_loader/utils.py
+@@ -309,7 +309,21 @@ def maybe_executor_submit(
+     if func_kwargs is None:
+         func_kwargs = {}
+     if use_async:
+-        futures.append(executor.submit(func, *func_args, **func_kwargs))
++        # CRITICAL: Capture current CUDA device and restore it in worker thread.
++        # torch.cuda.current_device() is thread-local and is NOT correctly passed to threads.
++        # This may result in errors in case the `func` relies on torch current device to be already correctly specified.
++        # See details in https://github.com/pytorch/pytorch/issues/56588.
++        current_device = (
++            torch.cuda.current_device() if torch.cuda.is_available() else None
++        )
++
++        def device_aware_wrapper(*args, **kwargs):
++            # Set CUDA device in worker thread to match parent thread
++            if current_device is not None:
++                torch.cuda.set_device(current_device)
++            return func(*args, **kwargs)
++
++        futures.append(executor.submit(device_aware_wrapper, *func_args, **func_kwargs))
+     else:
+         func(*func_args, **func_kwargs)
+ 
+diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
+index 11b8a1c9837c..67156b16d0ca 100644
+--- a/python/sglang/srt/model_loader/weight_utils.py
++++ b/python/sglang/srt/model_loader/weight_utils.py
+@@ -40,7 +40,7 @@
+ from tqdm.auto import tqdm
+ 
+ from sglang.srt.configs.load_config import LoadConfig
+-from sglang.srt.configs.model_config import ModelConfig
++from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
+ from sglang.srt.distributed import (
+     get_world_group,
+ )
+@@ -276,6 +276,12 @@ def get_quant_config(
+         )
+         if not modelopt_mixed_config_incomplete:
+             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
++            hf_quant_config["hf_config"] = model_config.hf_config
++
++            # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
++            if model_config.quantization in REQUANTIZATION_METHODS:
++                hf_quant_config["requantization_method"] = model_config.quantization
++
+             return quant_cls.from_config(hf_quant_config)
+ 
+     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
+diff --git a/test/registered/quant/test_quark_mxfp4.py b/test/registered/quant/test_quark_mxfp4.py
+index 637a3a423256..f249bd9c89ca 100644
+--- a/test/registered/quant/test_quark_mxfp4.py
++++ b/test/registered/quant/test_quark_mxfp4.py
+@@ -1,4 +1,5 @@
+ import io
++import os
+ import re
+ import unittest
+ 
+@@ -10,6 +11,7 @@
+ from types import SimpleNamespace
+ 
+ import requests
++import torch
+ 
+ from sglang.srt.utils import kill_process_tree
+ from sglang.srt.utils.common import is_cuda_alike, mxfp_supported
+@@ -18,15 +20,22 @@
+     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+     DEFAULT_URL_FOR_TEST,
+     CustomTestCase,
++    is_in_ci,
+     popen_launch_server,
+ )
+ 
+ 
+ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
+     runner_args = []
++    environment = {}
+ 
+     @classmethod
+     def setUpClass(cls):
++        if torch.cuda.device_count() < cls.tp:
++            raise unittest.SkipTest(
++                f"test requires {cls.tp} devices, only {torch.cuda.device_count()} are available."
++            )
++
+         if not mxfp_supported():
+             raise unittest.SkipTest(
+                 "online MXFP4 quantization requires an AMD ROCm device with "
+@@ -55,6 +64,14 @@ def setUpClass(cls):
+             return_stdout_stderr=(cls.stdout, cls.stderr),
+         )
+ 
++        cls.original_envs = {}
++        for env_name, env_value in cls.environment.items():
++            original_env = os.environ.get(env_name, None)
++            if original_env is not None:
++                cls.original_envs[env_name] = os.environ.get(env_name, None)
++
++            os.environ[env_name] = env_value
++
+         url = cls.base_url + "/health"
+         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+         start_time = time.perf_counter()
+@@ -108,6 +125,9 @@ def _extract_memory_increase_load_weights(cls, log_output):
+ 
+     @classmethod
+     def tearDownClass(cls):
++        for env_name, env_value in cls.original_envs.items():
++            os.environ[env_name] = env_value
++
+         kill_process_tree(cls.process.pid)
+         cls.stdout.close()
+         cls.stderr.close()
+@@ -153,6 +173,7 @@ def _test_gsm8k(self, accuracy_threshold):
+ 
+ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
+     model = "Qwen/Qwen3-8B"
++    tp = 1
+ 
+     def test_peak_memory(self):
+         # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
+@@ -171,6 +192,7 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
+     # - ibm-granite/granite-3.0-3b-a800m-base: dtype issue with fp16 in AITER MOE MLP activation
+     # so using a large model here.
+     model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
++    tp = 1
+     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
+ 
+     def test_peak_memory(self):
+@@ -184,5 +206,117 @@ def test_gsm8k(self):
+         self._test_gsm8k(accuracy_threshold=0.89)
+ 
+ 
++class TestFP8ToMXFP4DenseTP1(TestOnlineQuantizationMemoryLoad):
++    tp = 1
++    model = "Qwen/Qwen3-8B-FP8"
++
++    def test_peak_memory(self):
++        # Original Qwen/Qwen3-8B-FP8 model: 8.801 GiB (TP=1, peak_memory_before_load)
++        self._test_peak_memory(
++            threshold=6.5, test_start=False, add_peak_memory_before_load=True
++        )
++
++    def test_gsm8k(self):
++        # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
++        self._test_gsm8k(accuracy_threshold=0.868)
++
++
++class TestFP8ToMXFP4DenseTP2(TestOnlineQuantizationMemoryLoad):
++    tp = 2
++    model = "Qwen/Qwen3-8B-FP8"
++
++    def test_peak_memory(self):
++        # Original Qwen/Qwen3-8B-FP8 model: 4.663 GiB (TP=2, peak_memory_before_load)
++        self._test_peak_memory(
++            threshold=4.2, test_start=False, add_peak_memory_before_load=True
++        )
++
++    def test_gsm8k(self):
++        # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
++        self._test_gsm8k(accuracy_threshold=0.868)
++
++
++class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
++    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"  # FP8 model
++    tp = 1
++
++    def test_peak_memory(self):
++        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: 29.103 GiB (TP=1, peak_memory_before_load)
++        self._test_peak_memory(
++            threshold=18.5, test_start=False, add_peak_memory_before_load=True
++        )
++
++    def test_gsm8k(self):
++        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948
++        self._test_gsm8k(accuracy_threshold=0.92)
++
++
++@unittest.skipIf(is_in_ci(), "local test only")
++class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
++    # Loading should take ~51.65 seconds on TP=8 on MI355X.
++    # model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
++    model = "deepseek-ai/DeepSeek-V3.2"
++    tp = 8
++
++    def test_peak_memory(self):
++        # Original deepseek-ai/DeepSeek-V3.2 model: 80.366 GiB (TP=8, peak_memory_before_load)
++        self._test_peak_memory(
++            threshold=70, test_start=True, add_peak_memory_before_load=False
++        )  # TP=8
++
++    def test_gsm8k(self):
++        # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: ~0.948
++        self._test_gsm8k(accuracy_threshold=0.94)
++
++
++@unittest.skipIf(is_in_ci(), "local test only")
++class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
++    model = "moonshotai/Kimi-K2-Instruct-0905"  # FP8 model
++    tp = 8
++
++    # Same as in test/registered/amd/test_kimi_k2_instruct.py
++    runner_args = [
++        "--decode-attention-backend",
++        "triton",
++        "--prefill-attention-backend",
++        "aiter",
++        "--trust-remote-code",
++    ]
++
++    # Same as in test/registered/amd/test_kimi_k2_instruct.py, getting an error otherwise.
++    environment = {"SGLANG_ROCM_FUSED_DECODE_MLA": "0"}
++
++    def test_peak_memory(self):
++        # Original moonshotai/Kimi-K2-Instruct-0905 model: 121.020 GiB (TP=8, peak_memory_before_load)
++        self._test_peak_memory(
++            threshold=82, test_start=True, add_peak_memory_before_load=False
++        )  # TP=8
++
++    def test_gsm8k(self):
++        # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: ~0.962
++        self._test_gsm8k(accuracy_threshold=0.96)
++
++
++@unittest.skipIf(is_in_ci(), "local test only")
++class TestMiniMaxFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
++    model = "MiniMaxAI/MiniMax-M2.1"  # FP8 model
++
++    tp = 2
++    # NOTE: this test is failing in FP16 (default dtype of the original MiniMax-M2.1 model).
++    # Hence the usage of `--dtype bfloat16`
++    # NOTE: this test requires the following fix for TP>1: https://github.com/sgl-project/sglang/pull/18310
++    runner_args = ["--trust-remote-code", "--dtype", "bfloat16"]
++
++    def test_peak_memory(self):
++        # Original MiniMaxAI/MiniMax-M2.1 model: 107.375 GiB (TP=2, peak_memory_before_load)
++        self._test_peak_memory(
++            threshold=72, test_start=True, add_peak_memory_before_load=False
++        )  # TP=2
++
++    def test_gsm8k(self):
++        # Original MiniMaxAI/MiniMax-M2.1 reference accuracy: 0.954
++        self._test_gsm8k(accuracy_threshold=0.92)
++
++
+ if __name__ == "__main__":
+     unittest.main()

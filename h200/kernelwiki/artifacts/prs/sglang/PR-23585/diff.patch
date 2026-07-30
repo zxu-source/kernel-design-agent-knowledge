@@ -1,0 +1,148 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 4fd67aef9c6f..9128b4ed688b 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -213,8 +213,6 @@ def __init__(
+         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
+         self._has_fused_shared = num_fused_shared_experts > 0
+ 
+-        self.expert_mask_gpu = None
+-
+         assert intermediate_size % self.moe_tp_size == 0
+         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+         self.reduce_results = reduce_results
+@@ -1010,16 +1008,6 @@ def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+             hidden_states=hidden_states, topk_output=topk_output
+         )
+ 
+-        if _use_aiter and self.dispatcher.local_expert_mapping is not None:
+-            self.expert_mask_gpu = (
+-                (
+-                    (self.dispatcher.local_expert_mapping >= 0)
+-                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
+-                )
+-                .to(torch.int32)
+-                .to(device="cuda")
+-            )
+-
+         combine_input = self.run_moe_core(
+             dispatch_output=dispatch_output,
+         )
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/standard.py b/python/sglang/srt/layers/moe/token_dispatcher/standard.py
+index 65d0fbc4401b..721cbe629296 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/standard.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/standard.py
+@@ -99,12 +99,14 @@ def __init__(self, moe_runner_config: MoeRunnerConfig):
+             get_moe_runner_backend().is_flashinfer_trtllm_routed()
+         )
+         self.num_experts = moe_runner_config.num_experts
++        self.num_local_experts = moe_runner_config.num_local_experts
+         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
+         self.num_local_routed_experts = (
+-            moe_runner_config.num_local_experts - self.num_local_shared_experts
++            self.num_local_experts - self.num_local_shared_experts
+         )
+         self.moe_ep_rank = get_moe_expert_parallel_rank()
+         self.local_expert_mapping = None
++        self.expert_mask_gpu = None
+ 
+     def dispatch(
+         self, hidden_states: torch.Tensor, topk_output: TopKOutput
+@@ -187,13 +189,23 @@ def dispatch(
+                         )
+                     )
+ 
+-        if self.local_expert_mapping is not None and not _use_aiter:
+-            if TopKOutputChecker.format_is_standard(topk_output):
+-                topk_output = topk_output._replace(
+-                    topk_ids=self.local_expert_mapping[topk_output.topk_ids]
++        if self.local_expert_mapping is not None:
++            if _use_aiter:
++                self.expert_mask_gpu = (
++                    (
++                        (self.local_expert_mapping >= 0)
++                        & (self.local_expert_mapping < self.num_local_experts)
++                    )
++                    .to(torch.int32)
++                    .to(device="cuda")
+                 )
+-            elif TopKOutputChecker.format_is_triton_kernels(topk_output):
+-                raise NotImplementedError()
++            else:
++                if TopKOutputChecker.format_is_standard(topk_output):
++                    topk_output = topk_output._replace(
++                        topk_ids=self.local_expert_mapping[topk_output.topk_ids]
++                    )
++                elif TopKOutputChecker.format_is_triton_kernels(topk_output):
++                    raise NotImplementedError()
+ 
+         return StandardDispatchOutput(
+             hidden_states=hidden_states,
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index db8c0210b5c9..cafc7a6a69ce 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -1821,7 +1821,7 @@ def maybe_apply_hip_fused_experts(
+                         if activation == "silu"
+                         else ActivationType.Gelu
+                     ),
+-                    expert_mask=layer.expert_mask_gpu,
++                    expert_mask=layer.dispatcher.expert_mask_gpu,
+                 )
+             else:
+                 return fused_moe(
+@@ -1838,7 +1838,7 @@ def maybe_apply_hip_fused_experts(
+                         if activation == "silu"
+                         else ActivationType.Gelu
+                     ),
+-                    expert_mask=layer.expert_mask_gpu,
++                    expert_mask=layer.dispatcher.expert_mask_gpu,
+                 )
+         return None
+ 
+diff --git a/python/sglang/srt/layers/quantization/mxfp4.py b/python/sglang/srt/layers/quantization/mxfp4.py
+index 3c4b3ac12756..d6435da3aecb 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4.py
++++ b/python/sglang/srt/layers/quantization/mxfp4.py
+@@ -856,7 +856,7 @@ def apply(
+                 w2_weight,
+                 topk_weights,
+                 topk_ids,
+-                expert_mask=layer.expert_mask_gpu,
++                expert_mask=layer.dispatcher.expert_mask_gpu,
+                 activation=ActivationType.Swiglu,
+                 quant_type=QuantType.per_1x32,
+                 w1_scale=layer.w13_weight_scale,
+@@ -1045,6 +1045,6 @@ def apply(
+                 else ActivationType.Gelu
+             ),
+             doweight_stage1=False,
+-            expert_mask=layer.expert_mask_gpu,
++            expert_mask=layer.dispatcher.expert_mask_gpu,
+         )
+         return StandardCombineInput(hidden_states=output)
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+index 68386e3b9de9..715d782a5bce 100644
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+@@ -227,6 +227,6 @@ def apply_weights(
+                 else ActivationType.Gelu
+             ),
+             doweight_stage1=False,
+-            expert_mask=layer.expert_mask_gpu,
++            expert_mask=layer.dispatcher.expert_mask_gpu,
+         )
+         return StandardCombineInput(hidden_states=output)
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 3cc28e2aef14..2dcdd49b7acb 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -484,7 +484,7 @@ def forward_cuda(
+                             if moe_runner_config.activation == "silu"
+                             else ActivationType.Gelu
+                         ),
+-                        expert_mask=layer.expert_mask_gpu,
++                        expert_mask=layer.dispatcher.expert_mask_gpu,
+                     )
+                     return StandardCombineInput(hidden_states=output)
+                 except RuntimeError as e:

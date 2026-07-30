@@ -1,0 +1,491 @@
+diff --git a/tests/kernels/test_fused_deepseek_v32_norm_rope.py b/tests/kernels/test_fused_deepseek_v32_norm_rope.py
+index a6f6d71b482c..a27e67b62459 100644
+--- a/tests/kernels/test_fused_deepseek_v32_norm_rope.py
++++ b/tests/kernels/test_fused_deepseek_v32_norm_rope.py
+@@ -292,6 +292,76 @@ def test_fused_norm_rope_no_indexer(num_tokens: int):
+     assert (topk == 7).all(), "topk buffer should be untouched on shared layer"
+ 
+ 
++@pytest.mark.parametrize("num_tokens", [1, 4, 17, 512])
++def test_fused_norm_rope_ds_mla(num_tokens: int):
++    """fp8_ds_mla MLA cache layout (FlashMLA sparse, bf16-query path; SM90/SM100).
++
++    Per-token 656-byte entry: 512 fp8 NoPE (4 per-128 tiles, dynamic float32
++    scale) | 4 float32 scales | 64 bf16 (unquantized) RoPE.
++    """
++    torch.manual_seed(5)
++    dev = "cuda"
++    max_pos = 8192
++    pos = torch.arange(num_tokens, device=dev, dtype=torch.int64) % max_pos
++
++    q_c = torch.randn(num_tokens, Q_LORA, device=dev, dtype=torch.bfloat16)
++    kv_c = torch.randn(num_tokens, KV_LORA, device=dev, dtype=torch.bfloat16)
++    k_pe = torch.randn(num_tokens, ROPE_DIM, device=dev, dtype=torch.bfloat16)
++    qw = torch.randn(Q_LORA, device=dev, dtype=torch.bfloat16)
++    kvw = torch.randn(KV_LORA, device=dev, dtype=torch.bfloat16)
++    mla_cos_sin = make_cos_sin(max_pos, ROPE_DIM, dev)
++
++    bs = max_pos
++    mla_cache = torch.zeros(1, bs, 656, device=dev, dtype=torch.uint8)
++    slot = torch.arange(num_tokens, device=dev, dtype=torch.int64)
++    topk = torch.full((num_tokens, 2048), 7, device=dev, dtype=torch.int32)
++
++    q_out = K.fused_norm_rope(
++        pos,
++        q_c,
++        qw,
++        EPS,
++        kv_c,
++        kvw,
++        EPS,
++        k_pe,
++        mla_cos_sin,
++        None,
++        None,
++        None,
++        EPS,
++        None,
++        topk,
++        slot_mapping=slot,
++        indexer_k_cache=None,
++        mla_kv_cache=mla_cache,
++        mla_kv_cache_dtype="fp8_ds_mla",
++        mla_k_scale=None,
++        has_indexer=False,
++        index_rope_interleave=False,
++    )
++
++    assert_bf16(q_out, rms_norm(q_c, qw), "q_c rmsnorm (ds_mla)")
++
++    kv_ref = rms_norm(kv_c, kvw)  # [N, 512] fp32
++    kpe_ref = rope(k_pe.float(), pos, mla_cos_sin, interleave=True)  # [N, 64]
++    tiles = kv_ref.view(num_tokens, 4, 128)
++    ref_scale = torch.clamp(tiles.abs().amax(dim=-1) / FP8_MAX, min=1.1754944e-38)
++    ref_nope = (tiles / ref_scale[..., None]).reshape(num_tokens, KV_LORA).to(FP8)
++
++    cache = mla_cache[0, :num_tokens]  # [N, 656] uint8
++    nope = cache[:, :KV_LORA].view(FP8)
++    scales = cache.view(torch.float32)[:, KV_LORA // 4 : KV_LORA // 4 + 4]
++    rope_off = KV_LORA // 2 + 8
++    rope_vals = cache.view(torch.bfloat16)[:, rope_off : rope_off + ROPE_DIM]
++
++    torch.testing.assert_close(scales, ref_scale, rtol=1e-2, atol=1e-6)
++    assert_fp8(nope, ref_nope, "ds_mla NoPE fp8")
++    assert_bf16(rope_vals, kpe_ref, "ds_mla RoPE bf16")
++    # No indexer on this call: top-k buffer must be untouched.
++    assert (topk == 7).all(), "topk buffer should be untouched (no indexer)"
++
++
+ # ── fused_q ──────────────────────────────────────────────────────────────────
+ 
+ 
+@@ -400,6 +470,75 @@ def test_fused_q_no_indexer(num_tokens: int):
+     assert_fp8(mqa[:, :, KV_LORA:], (qpe_ref / s).to(FP8), "mqa q_pe")
+ 
+ 
++@pytest.mark.parametrize("num_tokens", [1, 17, 512])
++@pytest.mark.parametrize("has_indexer", [True, False])
++def test_fused_q_bf16_query(num_tokens: int, has_indexer: bool):
++    """bf16-query path (FlashMLA sparse, SM90/SM100): only the RoPE'd q_pe is
++    produced (bf16, unquantized); ql_nope is consumed directly by the caller."""
++    torch.manual_seed(6)
++    dev = "cuda"
++    max_pos = 8192
++    pos = torch.arange(num_tokens, device=dev, dtype=torch.int64) % max_pos
++
++    q_pe = torch.randn(
++        num_tokens, NUM_HEADS, ROPE_DIM, device=dev, dtype=torch.bfloat16
++    )
++    ql_nope = torch.randn(
++        num_tokens, NUM_HEADS, KV_LORA, device=dev, dtype=torch.bfloat16
++    )
++    q_scale = torch.tensor([0.37], device=dev, dtype=torch.float32)
++    q_cos_sin = make_cos_sin(max_pos, ROPE_DIM, dev)
++
++    index_q = index_w = idx_cos_sin = None
++    if has_indexer:
++        index_q = torch.randn(
++            num_tokens, INDEX_HEADS, INDEX_HEAD_DIM, device=dev, dtype=torch.bfloat16
++        )
++        index_w = torch.randn(num_tokens, INDEX_HEADS, device=dev, dtype=torch.float32)
++        idx_cos_sin = make_cos_sin(max_pos, ROPE_DIM, dev)
++
++    iq_fp8, iw_out, q_pe_out = K.fused_q(
++        pos,
++        q_pe,
++        q_cos_sin,
++        index_q,
++        idx_cos_sin,
++        ql_nope,
++        q_scale,
++        index_w,
++        INDEX_HEAD_DIM**-0.5,
++        INDEX_HEADS**-0.5,
++        has_indexer=has_indexer,
++        index_rope_interleave=False,
++        quantize_mqa=False,
++    )
++
++    # MQA query: only the RoPE'd q_pe, bf16, unquantized.
++    assert q_pe_out.dtype == torch.bfloat16
++    assert q_pe_out.shape == (num_tokens, NUM_HEADS, ROPE_DIM)
++    qpe_ref = rope(
++        q_pe.float(),
++        pos.unsqueeze(-1).expand(num_tokens, NUM_HEADS),
++        q_cos_sin,
++        interleave=True,
++    )
++    assert_bf16(q_pe_out, qpe_ref, "bf16 q_pe RoPE")
++
++    # Indexer-Q is unchanged on this path (still UE8M0 fp8 + folded weights).
++    if has_indexer:
++        assert index_q is not None
++        iq_ref = rope(
++            index_q.float(),
++            pos.unsqueeze(-1).expand(num_tokens, INDEX_HEADS),
++            idx_cos_sin,
++            interleave=False,
++        )
++        q_ref, scale_ref = ue8m0_quant(iq_ref)
++        assert_fp8(iq_fp8, q_ref, "indexer-Q fp8 (bf16-query path)")
++        iw_ref = index_w * scale_ref * (INDEX_HEAD_DIM**-0.5) * (INDEX_HEADS**-0.5)
++        torch.testing.assert_close(iw_out, iw_ref, rtol=1e-3, atol=1e-3)
++
++
+ # ── fused_eh_norm (MTP) ──────────────────────────────────────────────────────
+ 
+ 
+diff --git a/vllm/models/deepseek_v32/nvidia/attention.py b/vllm/models/deepseek_v32/nvidia/attention.py
+index 771a3d4f9544..3c9f48e3b7d0 100644
+--- a/vllm/models/deepseek_v32/nvidia/attention.py
++++ b/vllm/models/deepseek_v32/nvidia/attention.py
+@@ -269,20 +269,30 @@ def __init__(
+         # Runtime toggle for index_share_for_mtp_iteration: MTP draft step 0
+         # computes the top-k, steps 1+ set this True to reuse it.
+         self.skip_topk = False
+-        # Single fused fp8 path: Triton fused norm/rope/cache + fused-q write a
+-        # single fp8 MQA query and the contiguous [kv_c; k_pe] MLA cache layout.
+-        # This requires an fp8 KV cache and a sparse MLA backend that accepts a
+-        # quantized query (FlashInfer sparse on SM100).
+-        assert (
+-            is_quantized_kv_cache(self.kv_cache_dtype)
+-            and self.impl.supports_quant_query_input
+-        ), (
+-            "deepseek_v32 (nvidia) requires an fp8 KV cache served by the "
+-            "FlashInfer sparse MLA backend (which accepts a quantized query). "
+-            "Launch with --kv-cache-dtype fp8."
++        # Fused fp8 paths: Triton fused norm/rope/cache + fused-q. Two layouts,
++        # picked by the sparse MLA backend's query support:
++        #   * supports_quant_query_input (FlashInfer sparse, SM100): per-tensor
++        #     fp8 cache + a single packed fp8 MQA query.
++        #   * not supported (FlashMLA sparse, SM90/SM100): fp8_ds_mla cache
++        #     (per-128 block-scaled fp8 NoPE + unquantized bf16 RoPE) + a bf16
++        #     (ql_nope, q_pe) query tuple. FA3 cannot mix a bf16 query with an
++        #     fp8 KV cache, so FlashMLA (which dequantizes internally) is used.
++        #     FlashMLA sparse runs on both Hopper and Blackwell, so this is the
++        #     only DSA path on SM90 and an opt-in alternative on SM100.
++        assert is_quantized_kv_cache(self.kv_cache_dtype), (
++            "deepseek_v32 (nvidia) requires an fp8 KV cache served by a sparse "
++            "MLA backend. Launch with --kv-cache-dtype fp8 (FlashInfer sparse) "
++            "or --kv-cache-dtype fp8_ds_mla (FlashMLA sparse)."
+         )
++        self._fp8_query = self.impl.supports_quant_query_input
++        if not self._fp8_query:
++            assert self.kv_cache_dtype == "fp8_ds_mla", (
++                "deepseek_v32 (nvidia) on a bf16-query sparse MLA backend "
++                "(FlashMLA sparse) requires the fp8_ds_mla KV cache layout. "
++                "Launch with --kv-cache-dtype fp8_ds_mla."
++            )
+         # The paged KV cache is stored as uint8 and viewed as fp8 for the decode
+-        # (per-tensor fp8; never the fp8_ds_mla layout on this path).
++        # (per-tensor fp8). The fp8_ds_mla layout is consumed as raw bytes.
+         self._fp8_kv_needs_view = self.kv_cache_dtype != "fp8_ds_mla"
+         # GLM-5.2 uses interleaved indexer RoPE; DeepSeek-V3.2 uses NeoX.
+         self._index_rope_interleave = getattr(config, "indexer_rope_interleave", False)
+@@ -465,6 +475,7 @@ def _fused_attention(
+             indexer_n_head_scale,
+             has_indexer=has_indexer,
+             index_rope_interleave=self._index_rope_interleave,
++            quantize_mqa=self._fp8_query,
+         )
+ 
+         if attn_metadata is None:
+@@ -496,8 +507,17 @@ def _fused_attention(
+         kv_cache = self.kv_cache
+         if self._fp8_kv_needs_view:
+             kv_cache = kv_cache.view(torch.float8_e4m3fn)
++        if self._fp8_query:
++            # FlashInfer sparse: single packed fp8 query.
++            mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = mqa_q[
++                :num_actual
++            ]
++        else:
++            # FlashMLA sparse: bf16 (ql_nope, q_pe) tuple. mqa_q is the RoPE'd
++            # q_pe; ql_nope is consumed directly.
++            mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
+         attn_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
+-            mqa_q[:num_actual], kv_cache, attn_metadata, self
++            mqa_q_arg, kv_cache, attn_metadata, self
+         )
+         x = attn_out.view(
+             num_actual, self.num_local_heads, self.kv_lora_rank
+diff --git a/vllm/models/deepseek_v32/nvidia/kernels.py b/vllm/models/deepseek_v32/nvidia/kernels.py
+index 86419b5060d2..ef7b14ef1c54 100644
+--- a/vllm/models/deepseek_v32/nvidia/kernels.py
++++ b/vllm/models/deepseek_v32/nvidia/kernels.py
+@@ -132,6 +132,14 @@ def _fused_norm_rope_kernel(
+     mla_cache_entry_stride,
+     MLA_CACHE_FP8: tl.constexpr,
+     mla_cache_scale_ptr,
++    # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).
++    # mla_cache_ptr is the fp8 (1-byte) view, so the block/entry strides above
++    # are byte offsets; these two share the same buffer as fp32 / bf16 views.
++    mla_cache_ds_scale_ptr,
++    mla_cache_ds_rope_ptr,
++    MLA_CACHE_DS_MLA: tl.constexpr,
++    MLA_NUM_TILES: tl.constexpr,
++    MLA_TILE_DIM: tl.constexpr,
+     # Top k indices
+     topk_indices_ptr,
+     topk_indices_stride,
+@@ -209,6 +217,37 @@ def _fused_norm_rope_kernel(
+         mla_block_size = mla_cache_block_stride // mla_cache_entry_stride
+         mla_block_idx = slot_idx // mla_block_size
+         mla_block_off = slot_idx % mla_block_size
++
++        if MLA_CACHE_DS_MLA:
++            # fp8_ds_mla layout (DeepSeek-V3.2, KV_DIM == 512): per-128-element
++            # tile of the NoPE is dynamically quantized to fp8 with its own
++            # float32 scale; the RoPE tail is stored unquantized in bf16.
++            #   bytes [0, KV_DIM)            : KV_DIM fp8 NoPE values
++            #   bytes [KV_DIM, KV_DIM + 16)  : MLA_NUM_TILES float32 scales
++            #   bytes [KV_DIM + 16, ...)     : 2 * KPE_HALF_ROT_DIM bf16 RoPE
++            # mla_cache_block_stride / mla_cache_entry_stride are byte strides
++            # (mla_cache_ptr is the 1-byte fp8 view of the uint8 cache).
++            byte_base = (
++                mla_block_idx * mla_cache_block_stride
++                + mla_block_off * mla_cache_entry_stride
++            )
++            kv_2d = tl.reshape(kv_c, (MLA_NUM_TILES, MLA_TILE_DIM))
++            tile_amax = tl.max(tl.abs(kv_2d), axis=1, keep_dims=True)
++            # scale = amax / 448 (fp8 e4m3 max), matching the reference
++            # concat_and_cache_ds_mla kernel; floored to FLT_MIN.
++            tile_scale = tl.maximum(tile_amax * (1.0 / 448.0), 1.1754944e-38)
++            kv_c_fp8 = tl.reshape((kv_2d / tile_scale).to(tl.float8e4nv), (KV_DIM,))
++            tl.store(mla_cache_ptr + byte_base + kv_block, kv_c_fp8)
++            tile_off = tl.arange(0, MLA_NUM_TILES)
++            tl.store(
++                mla_cache_ds_scale_ptr + byte_base // 4 + KV_DIM // 4 + tile_off,
++                tl.reshape(tile_scale, (MLA_NUM_TILES,)),
++            )
++            rope_dst = mla_cache_ds_rope_ptr + byte_base // 2 + (KV_DIM // 2 + 8)
++            tl.store(rope_dst + dim_off * 2, r1.to(tl.bfloat16))
++            tl.store(rope_dst + dim_off * 2 + 1, r2.to(tl.bfloat16))
++            return
++
+         dst = (
+             mla_cache_ptr
+             + mla_block_idx * mla_cache_block_stride
+@@ -397,12 +436,29 @@ def fused_norm_rope(
+             )
+ 
+     # --- MLA KV cache setup ---
+-    mla_cache_fp8 = mla_kv_cache_dtype != "auto"
++    mla_cache_ds_mla = mla_kv_cache_dtype == "fp8_ds_mla"
++    mla_cache_fp8 = mla_kv_cache_dtype not in ("auto", "fp8_ds_mla")
++    mla_num_tiles = 1
++    mla_ds_scale_view = torch.empty(0, dtype=torch.float32, device=device)
++    mla_ds_rope_view = torch.empty(0, dtype=torch.bfloat16, device=device)
+     if mla_kv_cache is not None:
+-        mla_block_stride = mla_kv_cache.stride(0)
+-        mla_entry_stride = mla_kv_cache.stride(1)
+-        if mla_cache_fp8 and mla_kv_cache.dtype == torch.uint8:
+-            mla_kv_cache = mla_kv_cache.view(torch.float8_e4m3fn)
++        if mla_cache_ds_mla:
++            # 656-byte custom layout addressed in bytes; mla_cache_ptr is the
++            # 1-byte fp8 view, so block/entry strides are byte offsets and the
++            # fp32/bf16 views share the same buffer.
++            assert kv_dim == 512, "fp8_ds_mla requires kv_lora_rank == 512"
++            mla_num_tiles = kv_dim // 128
++            u8_cache = mla_kv_cache.view(torch.uint8)
++            mla_block_stride = u8_cache.stride(0)
++            mla_entry_stride = u8_cache.stride(1)
++            mla_ds_scale_view = u8_cache.view(torch.float32)
++            mla_ds_rope_view = u8_cache.view(torch.bfloat16)
++            mla_kv_cache = u8_cache.view(torch.float8_e4m3fn)
++        else:
++            mla_block_stride = mla_kv_cache.stride(0)
++            mla_entry_stride = mla_kv_cache.stride(1)
++            if mla_cache_fp8 and mla_kv_cache.dtype == torch.uint8:
++                mla_kv_cache = mla_kv_cache.view(torch.float8_e4m3fn)
+         if mla_k_scale is None:
+             mla_k_scale = torch.ones(1, dtype=torch.float32, device=device)
+     else:
+@@ -461,6 +517,11 @@ def fused_norm_rope(
+         mla_entry_stride,
+         mla_cache_fp8,
+         mla_k_scale,
++        mla_ds_scale_view,
++        mla_ds_rope_view,
++        mla_cache_ds_mla,
++        mla_num_tiles,
++        kv_dim // mla_num_tiles if mla_cache_ds_mla else 1,
+         # Top k indices buffer
+         topk_indices_buffer,
+         topk_indices_buffer.stride(0),
+@@ -506,6 +567,11 @@ def _fused_q_kernel(
+     q_scale_ptr,
+     QL_NOPE_DIM: tl.constexpr,
+     QL_NOPE_BLOCK: tl.constexpr,
++    # bf16 MQA query RoPE output (when QUANTIZE_MQA is False); the NoPE part is
++    # consumed directly from ql_nope, so only the RoPE'd q_pe is written here.
++    q_pe_out_ptr,
++    q_pe_out_stride0,
++    q_pe_out_stride1,
+     # Index weights
+     index_weights_ptr,
+     index_weights_stride,
+@@ -515,13 +581,17 @@ def _fused_q_kernel(
+     index_weights_out_stride,
+     HAS_INDEXER: tl.constexpr,
+     INDEX_ROPE_INTERLEAVE: tl.constexpr,
++    QUANTIZE_MQA: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
+     tok_idx = tl.program_id(1)
+     head_idx = tl.program_id(2)
+ 
+     if pid == 2:
+-        # ql_nope quantize + pack into the front of mqa_q_fp8.
++        # ql_nope quantize + pack into the front of mqa_q_fp8. On the bf16
++        # query path ql_nope is consumed as-is (no pack), so skip entirely.
++        if not QUANTIZE_MQA:
++            return
+         if 2 * head_idx >= NUM_Q_HEADS:
+             return
+ 
+@@ -581,23 +651,34 @@ def _fused_q_kernel(
+                 ).to(tl.float32)
+                 r1 = x1 * cos - x2 * sin
+                 r2 = x2 * cos + x1 * sin
+-                tl.store(
+-                    mqa_q_fp8_ptr
+-                    + tok_idx * mqa_q_fp8_stride0
+-                    + q_head_idx * mqa_q_fp8_stride1
+-                    + QL_NOPE_DIM
+-                    + rot_off * 2,
+-                    (r1 / scale).to(tl.float8e4nv),
+-                )
+-                tl.store(
+-                    mqa_q_fp8_ptr
+-                    + tok_idx * mqa_q_fp8_stride0
+-                    + q_head_idx * mqa_q_fp8_stride1
+-                    + QL_NOPE_DIM
+-                    + rot_off * 2
+-                    + 1,
+-                    (r2 / scale).to(tl.float8e4nv),
+-                )
++                if QUANTIZE_MQA:
++                    tl.store(
++                        mqa_q_fp8_ptr
++                        + tok_idx * mqa_q_fp8_stride0
++                        + q_head_idx * mqa_q_fp8_stride1
++                        + QL_NOPE_DIM
++                        + rot_off * 2,
++                        (r1 / scale).to(tl.float8e4nv),
++                    )
++                    tl.store(
++                        mqa_q_fp8_ptr
++                        + tok_idx * mqa_q_fp8_stride0
++                        + q_head_idx * mqa_q_fp8_stride1
++                        + QL_NOPE_DIM
++                        + rot_off * 2
++                        + 1,
++                        (r2 / scale).to(tl.float8e4nv),
++                    )
++                else:
++                    # bf16 query: write the RoPE'd q_pe unquantized.
++                    out_ty = q_pe_out_ptr.dtype.element_ty
++                    q_pe_dst = (
++                        q_pe_out_ptr
++                        + tok_idx * q_pe_out_stride0
++                        + q_head_idx * q_pe_out_stride1
++                    )
++                    tl.store(q_pe_dst + rot_off * 2, r1.to(out_ty))
++                    tl.store(q_pe_dst + rot_off * 2 + 1, r2.to(out_ty))
+         return
+     elif pid == 1:
+         # Index Q RoPE + fp8 quant, all in registers. The roped bf16 index_q is
+@@ -681,7 +762,16 @@ def fused_q(
+     index_weights_head_scale: float,
+     has_indexer: bool = True,
+     index_rope_interleave: bool = False,
++    quantize_mqa: bool = True,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Fuse the MQA-query and indexer-query RoPE/quantization.
++
++    Returns ``(index_q_fp8, index_weights_out, mqa_q)``. When ``quantize_mqa``
++    is True (FlashInfer sparse, fp8 query) ``mqa_q`` is a single fp8 tensor
++    packing ``[ql_nope; q_pe]``. When False (FlashMLA sparse, bf16 query) it is
++    the RoPE'd ``q_pe`` in bf16; the caller pairs it with ``ql_nope`` as the
++    ``(ql_nope, q_pe)`` tuple the backend expects.
++    """
+     assert positions.ndim == 1
+     assert q_pe.ndim == 3
+     assert q_pe_cos_sin_cache.ndim == 2
+@@ -705,13 +795,23 @@ def fused_q(
+     num_index_q_heads = index_q.shape[1]
+     index_q_head_dim = index_q.shape[2]
+     grid_heads = max(mqa_grid_heads, num_index_q_heads)
+-    mqa_q_fp8 = torch.empty(
+-        q_pe.shape[0],
+-        q_pe.shape[1],
+-        ql_nope.shape[2] + q_pe.shape[2],
+-        dtype=torch.float8_e4m3fn,
+-        device=q_pe.device,
+-    )
++    if quantize_mqa:
++        # fp8 path: pack [ql_nope; q_pe] into a single fp8 tensor.
++        mqa_q_fp8 = torch.empty(
++            q_pe.shape[0],
++            q_pe.shape[1],
++            ql_nope.shape[2] + q_pe.shape[2],
++            dtype=torch.float8_e4m3fn,
++            device=q_pe.device,
++        )
++        # Placeholder; pid 0 packs q_pe into mqa_q_fp8 instead.
++        q_pe_out = mqa_q_fp8
++        mqa_q = mqa_q_fp8
++    else:
++        # bf16 path: only the RoPE'd q_pe is produced; ql_nope used directly.
++        q_pe_out = torch.empty_like(q_pe)
++        mqa_q_fp8 = q_pe_out  # unused placeholder for the fp8 pack pointer
++        mqa_q = q_pe_out
+ 
+     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
+     index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+@@ -744,6 +844,9 @@ def fused_q(
+         q_scale,
+         ql_nope.shape[2],
+         triton.next_power_of_2(ql_nope.shape[2]),
++        q_pe_out,
++        q_pe_out.stride(0),
++        q_pe_out.stride(1),
+         index_weights,
+         index_weights.stride(0),
+         index_weights_softmax_scale,
+@@ -752,12 +855,13 @@ def fused_q(
+         index_weights_out.stride(0),
+         HAS_INDEXER=has_indexer,
+         INDEX_ROPE_INTERLEAVE=index_rope_interleave,
++        QUANTIZE_MQA=quantize_mqa,
+         # num_warps=1 is optimal here: each program is a single 128-element
+         # rope+quant, so the kernel is program-count/occupancy bound, not
+         # per-program compute bound (swept 1/2/4/8 — 1 wins or ties everywhere).
+         num_warps=1,
+     )
+-    return index_q_fp8, index_weights_out, mqa_q_fp8
++    return index_q_fp8, index_weights_out, mqa_q
+ 
+ 
+ @triton.jit

@@ -1,0 +1,353 @@
+diff --git a/docs/features/quantization/quantized_kvcache.md b/docs/features/quantization/quantized_kvcache.md
+index 2c5bfd643946..50b1c5c2df30 100644
+--- a/docs/features/quantization/quantized_kvcache.md
++++ b/docs/features/quantization/quantized_kvcache.md
+@@ -49,6 +49,32 @@ You can configure how the quantization scales are computed in vLLM using three d
+ - `kv_cache_dtype="fp8_e4m3"`: Supported on CUDA 11.8+ and ROCm (AMD GPUs)
+ - `kv_cache_dtype="fp8_e5m2"`: Supported on CUDA 11.8+
+ 
++### Skipping Specific Layers from KV-Cache Quantization
++
++Some attention layer types (e.g. sliding-window) are more sensitive to KV-cache quantization. The `--kv-cache-dtype-skip-layers` flag leaves the specified layers at the model's native dtype while keeping the rest of the layers under the chosen quantized dtype. The flag accepts either layer indices or layer-type names:
++
++```bash
++# Skip every sliding-window attention layer.
++vllm serve <model> \
++  --kv-cache-dtype fp8 \
++  --kv-cache-dtype-skip-layers sliding_window
++
++# Skip specific layer indices.
++vllm serve <model> \
++  --kv-cache-dtype fp8 \
++  --kv-cache-dtype-skip-layers 0 1 23
++```
++
++Programmatic usage:
++
++```python
++llm = LLM(
++    model="meta-llama/Llama-3.1-8B-Instruct",
++    kv_cache_dtype="fp8",
++    kv_cache_dtype_skip_layers=["sliding_window"],
++)
++```
++
+ ---
+ 
+ ## Examples
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 2fb3358d55c3..70a58004fc58 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -119,6 +119,11 @@ class CacheConfig:
+     mamba_page_size_padded: int | None = None
+     """ Optional override for mamba page size; used by hybrid mamba/attention
+     models to ensure exact alignment with attention page size."""
++    skip_page_size_padded: int | None = None
++    """Optional override for the page size of layers skipped from KV cache
++    quantization (``--kv-cache-dtype-skip-layers``); set during block-size
++    alignment so unquantized skip layers pad up to the quantized primary's
++    page."""
+     mamba_block_size: int | None = Field(default=None, gt=0)
+     """Size of a contiguous cache block in number of tokens for mamba cache.
+     Can be set only when prefix caching is enabled.
+@@ -207,6 +212,7 @@ def compute_hash(self) -> str:
+             # Prefix-caching implementation detail (doesn't affect compiled graph).
+             "hash_block_size",
+             "mamba_page_size_padded",
++            "skip_page_size_padded",
+             "user_specified_block_size",
+             "user_specified_mamba_block_size",
+             "_block_size_resolved",
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index 195d1af3be91..c2adf3499acd 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -92,6 +92,35 @@ def should_load_quant_weights(quant_method: QuantizeMethodBase | None) -> bool:
+     )
+ 
+ 
++def _largest_kernel_block_within(
++    attn_backend: "type[AttentionBackend]",
++    per_token_bytes: int,
++    page_budget: int | None,
++    fallback: int,
++) -> int:
++    """Largest supported kernel block size whose page fits in ``page_budget``.
++
++    A padded spec (e.g. skip-quant layer) that pads its page up to a large shared page
++    wastes ``page_budget - block*per_token`` bytes per block. Picking the largest kernel
++    block whose natural page still fits under ``page_budget`` minimizes that waste.
++    Falls back to the smallest supported block when ``page_budget`` is None (no padding
++    — the block is handled by ``unify``'s integer scaling instead) or nothing fits.
++    """
++    from vllm.v1.attention.backend import MultipleOf
++
++    sizes = attn_backend.get_supported_kernel_block_sizes()
++    candidates = [s for s in sizes if isinstance(s, int)]
++    if not candidates:
++        candidates = [s.base for s in sizes if isinstance(s, MultipleOf)]
++    if not candidates:
++        return fallback
++    smallest = min(candidates)
++    if not page_budget or per_token_bytes <= 0:
++        return smallest
++    fitting = [b for b in candidates if b * per_token_bytes <= page_budget]
++    return max(fitting) if fitting else smallest
++
++
+ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) -> None:
+     """Sets default quantization scales for the layer."""
+     if register_buffer:
+@@ -601,14 +630,35 @@ def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+             assert not vllm_config.model_config.use_mla, (
+                 "MLA is not supported for slidingwindow"
+             )
++            # SW chooses its own block_size, decoupled from the user's
++            # ``--block-size`` (which only constrains primary attention).
++            # When this SW layer is a padded spec (skip-quant: its page is
++            # padded up to ``skip_page_size_padded``), pick the largest kernel
++            # block that still fits the shared page so we waste fewer padding
++            # bytes per block. Otherwise (page_size_padded is None) the smallest
++            # block is fine — ``unify`` scales it up by an integer ratio.
++            shared_page = vllm_config.cache_config.skip_page_size_padded
++            sw_per_token = SlidingWindowSpec(
++                block_size=1,
++                num_kv_heads=self.num_kv_heads,
++                head_size=self.head_size,
++                head_size_v=self.head_size_v,
++                dtype=self.kv_cache_torch_dtype,
++                kv_quant_mode=quant_mode,
++                sliding_window=self.sliding_window,
++            ).real_page_size_bytes
++            sw_block_size = _largest_kernel_block_within(
++                self.attn_backend, sw_per_token, shared_page, block_size
++            )
+             return SlidingWindowSpec(
+-                block_size=block_size,
++                block_size=sw_block_size,
+                 num_kv_heads=self.num_kv_heads,
+                 head_size=self.head_size,
+                 head_size_v=self.head_size_v,
+                 dtype=self.kv_cache_torch_dtype,
+                 kv_quant_mode=quant_mode,
+                 sliding_window=self.sliding_window,
++                page_size_padded=shared_page,
+             )
+         elif self.kv_cache_dtype.startswith("turboquant_"):
+             from vllm.model_executor.layers.quantization.turboquant.config import (
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index a7a0dd52df7e..a81c34d7a50d 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -629,6 +629,123 @@ def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+         if model_config.is_hybrid:
+             cls._align_hybrid_block_size(vllm_config, backend_cls)
+ 
++        # Phase 3: Align block/page sizes when multiple KV dtypes share the
++        # block pool (e.g. nvfp4 primary + unquantized skip layers).
++        # May override the user's --block-size.
++        if cache_config.kv_cache_dtype_skip_layers:
++            cls._align_heterogeneous_kv_block_size(vllm_config, backend_cls)
++
++    @classmethod
++    def _align_heterogeneous_kv_block_size(
++        cls,
++        vllm_config: "VllmConfig",
++        backend_cls: "type[AttentionBackend]",
++    ) -> None:
++        """Align block size when several KV dtypes share one block pool.
++
++        A quantized primary (e.g. nvfp4) shares the block pool with one or more
++        higher-precision "padded specs" (skip layers today; the first/last-N
++        sibling in the future). A padded spec's per-token page is larger than
++        the primary's *and not an integer multiple of it*, so the trivial
++        ``unify_kv_cache_spec_page_size`` cannot reconcile them. We do it here
++        instead, before the specs are built:
++
++        1. Bump the primary ``block_size`` (kernel-aligned) until the primary
++           page is large enough to cover the largest padded-spec page.
++        2. Record that shared page in each padded spec's ``*_page_size_padded``
++           hint, so it pads up to the shared page.
++
++        ``unify`` then sees equal pages and stays trivial.
++
++        To add a padded-spec type: append its per-token page to ``padded_pages``
++        and set its ``*_page_size_padded`` hint below.
++        """
++        from vllm.config.vllm import set_current_vllm_config
++        from vllm.utils.math_utils import cdiv
++        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
++        from vllm.v1.attention.backend import MultipleOf
++        from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
++
++        cache_config = vllm_config.cache_config
++        model_config = vllm_config.model_config
++        parallel_config = vllm_config.parallel_config
++        if not model_config:
++            return
++
++        def per_token_page_bytes(dtype: "torch.dtype", cache_dtype: str) -> int:
++            """Bytes one token occupies in one layer, for the given dtype."""
++            return FullAttentionSpec(
++                block_size=1,
++                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
++                head_size=model_config.get_head_size(),
++                dtype=dtype,
++                kv_quant_mode=get_kv_quant_mode(cache_dtype),
++            ).page_size_bytes
++
++        primary_dtype = (
++            STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
++            if cache_config.cache_dtype != "auto"
++            else model_config.dtype
++        )
++        primary_page = per_token_page_bytes(primary_dtype, cache_config.cache_dtype)
++
++        # Per-token page of every higher-precision padded spec sharing the pool.
++        padded_pages: list[int] = []
++        if cache_config.kv_cache_dtype_skip_layers:
++            padded_pages.append(per_token_page_bytes(model_config.dtype, "auto"))
++        # To add the first/last-N sibling:
++        #   padded_pages.append(per_token_page_bytes(<sibling_dtype>, "auto"))
++        if not padded_pages:
++            return
++
++        largest_padded_page = max(padded_pages)
++        assert largest_padded_page >= primary_page, (
++            f"padded-spec per-token page ({largest_padded_page}B) < primary "
++            f"({primary_page}B); a higher-precision padded spec must not be "
++            "smaller than the quantized primary."
++        )
++        if largest_padded_page == primary_page:
++            # Pages already match per token; ``unify`` reconciles the differing
++            # block sizes by integer scaling, so no bump or padding is needed.
++            return
++
++        # Smallest block the kernel supports, and the granularity the primary
++        # block is rounded up to (never below the already-chosen block_size).
++        with set_current_vllm_config(vllm_config):
++            supported = backend_cls.get_supported_kernel_block_sizes()
++        smallest_kernel_block = min(
++            s.base if isinstance(s, MultipleOf) else s for s in supported
++        )
++        block_alignment = max(smallest_kernel_block, cache_config.block_size)
++
++        # Bytes one padded-spec page spans at its own smallest kernel block;
++        # also cover any mamba page a hybrid model already padded.
++        required_page = max(
++            largest_padded_page * smallest_kernel_block,
++            cache_config.mamba_page_size_padded or 0,
++        )
++
++        # Smallest kernel-aligned primary block whose page covers required_page.
++        primary_block_size = block_alignment * cdiv(
++            required_page, block_alignment * primary_page
++        )
++        if cache_config.block_size < primary_block_size:
++            cache_config.block_size = primary_block_size
++            logger.info(
++                "Setting attention block size to %d tokens so the quantized "
++                "primary KV page covers the higher-precision padded-spec page.",
++                primary_block_size,
++            )
++
++        # The shared page that every padded spec (and mamba) pads up to.
++        shared_page = cache_config.block_size * primary_page
++        if cache_config.kv_cache_dtype_skip_layers:
++            cache_config.skip_page_size_padded = shared_page
++        # To add the first/last-N sibling:
++        #   cache_config.sibling_page_size_padded = shared_page
++        if cache_config.mamba_page_size_padded is not None:
++            cache_config.mamba_page_size_padded = shared_page
++
+     @classmethod
+     def _align_hybrid_block_size(
+         cls,
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 758bd3bac7a6..3906717b5b78 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -23,6 +23,7 @@
+     AttentionSpec,
+     KVCacheConfig,
+     KVCacheSpec,
++    KVQuantMode,
+     MambaSpec,
+     UniformTypeKVCacheSpecs,
+ )
+@@ -300,12 +301,20 @@ def _reshape_kv_cache(
+                     kv_cache_spec.storage_block_size // kernel_block_size
+                 )
+                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
++                # Skipped layers (--kv-cache-dtype-skip-layers) keep the
++                # unquantized shape; only the quantized primary uses the
++                # quantized cache dtype's (possibly packed) layout.
++                layer_cache_dtype = (
++                    "auto"
++                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
++                    else cache_dtype
++                )
+                 kv_cache_shape = group.backend.get_kv_cache_shape(
+                     kernel_num_blocks,
+                     kernel_block_size,
+                     kv_cache_spec.num_kv_heads,
+                     kv_cache_spec.head_size,
+-                    cache_dtype_str=cache_dtype,
++                    cache_dtype_str=layer_cache_dtype,
+                 )
+ 
+                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
+@@ -377,11 +386,18 @@ def _update_hybrid_attention_layout(
+         kv_cache_spec = group.kv_cache_spec
+         if not isinstance(kv_cache_spec, AttentionSpec):
+             continue
++        # Mirror the per-layer dtype selection used when building the shape
++        # above. The block-dim index is dtype-independent for current backends
++        # (quantization only changes the last dim), so this is a no-op today,
++        # but it keeps both call sites consistent for skip layers.
++        layer_cache_dtype = (
++            "auto" if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE else cache_dtype
++        )
+         block_dim = group.backend.get_kv_cache_block_dim(
+             kernel_block_sizes[group.kv_cache_group_id],
+             kv_cache_spec.num_kv_heads,
+             kv_cache_spec.head_size,
+-            cache_dtype_str=cache_dtype,
++            cache_dtype_str=layer_cache_dtype,
+         )
+         # if the first dim of the kvcache's layout is already num_blocks, continue
+         if block_dim == 0:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 53795951cb26..7394d5de9f22 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -150,6 +150,7 @@
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
++    KVQuantMode,
+     MambaSpec,
+     SlidingWindowSpec,
+     UniformTypeKVCacheSpecs,
+@@ -7147,12 +7148,19 @@ def _reshape_kv_cache_tensors(
+                     else:
+                         shape_block_size = kernel_block_size
+ 
++                    # Skipped layers (--kv-cache-dtype-skip-layers) need
++                    # the unquantized shape.
++                    layer_cache_dtype_str = (
++                        "auto"
++                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
++                        else self.cache_config.cache_dtype
++                    )
+                     kv_cache_shape = attn_backend.get_kv_cache_shape(
+                         kernel_num_blocks,
+                         shape_block_size,
+                         kv_cache_spec.num_kv_heads,
+                         kv_cache_spec.head_size,
+-                        cache_dtype_str=self.cache_config.cache_dtype,
++                        cache_dtype_str=layer_cache_dtype_str,
+                     )
+                     try:
+                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()

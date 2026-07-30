@@ -1,0 +1,585 @@
+diff --git a/.buildkite/test_areas/quantization.yaml b/.buildkite/test_areas/quantization.yaml
+index 8a9a36da4481..a92ee24f4aac 100644
+--- a/.buildkite/test_areas/quantization.yaml
++++ b/.buildkite/test_areas/quantization.yaml
+@@ -21,6 +21,18 @@ steps:
+   - uv pip install --system conch-triton-kernels
+   - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py
+ 
++- label: Quantized Fusions
++  key: quantized-fusions
++  timeout_in_minutes: 30
++  source_file_dependencies:
++  - tests/fusion
++  - vllm/model_executor/layers/fusion
++  - vllm/model_executor/kernels/linear
++  - vllm/model_executor/layers/quantization/compressed_tensors
++  - vllm/model_executor/layers/quantization/modelopt.py
++  commands:
++    - pytest -v -s fusion/
++
+ - label: Quantized MoE Test (B200)
+   key: quantized-moe-test-b200
+   timeout_in_minutes: 60
+diff --git a/tests/fusion/__init__.py b/tests/fusion/__init__.py
+new file mode 100644
+index 000000000000..208f01a7cb5e
+--- /dev/null
++++ b/tests/fusion/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/tests/fusion/test_quant_activation_contract.py b/tests/fusion/test_quant_activation_contract.py
+new file mode 100644
+index 000000000000..48d492b8d2ee
+--- /dev/null
++++ b/tests/fusion/test_quant_activation_contract.py
+@@ -0,0 +1,131 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Contract tests for the QuantizedActivation linear-kernel integration."""
++
++import pytest
++import torch
++
++from vllm.model_executor.kernels.linear import (
++    _POSSIBLE_FP8_BLOCK_KERNELS,
++    _POSSIBLE_FP8_KERNELS,
++    _POSSIBLE_INT8_KERNELS,
++    _POSSIBLE_NVFP4_KERNELS,
++)
++from vllm.model_executor.kernels.linear.nvfp4.base import (
++    NvFp4LinearKernel,
++    NvFp4LinearLayerConfig,
++)
++from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
++    FlashInferCutlassNvFp4LinearKernel,
++    FlashInferTrtllmNvFp4LinearKernel,
++)
++from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
++    CutlassFP8ScaledMMLinearKernel,
++)
++from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
++    FlashInferFP8ScaledMMLinearKernel,
++)
++from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
++    FP8ScaledMMLinearLayerConfig,
++    Int8ScaledMMLinearKernel,
++    Int8ScaledMMLinearLayerConfig,
++)
++from vllm.model_executor.layers.fusion.quant_activation import (
++    QuantizedActivation,
++    as_quantized_activation,
++    expose_input_quant_key,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    kFp8StaticTensorSym,
++    kNvfp4Dynamic,
++)
++from vllm.platforms import current_platform
++
++# The only backends that consume a pre-quantized activation.
++SUPPORTING = {
++    CutlassFP8ScaledMMLinearKernel,
++    FlashInferFP8ScaledMMLinearKernel,
++    FlashInferCutlassNvFp4LinearKernel,
++}
++
++
++def _all_kernel_classes() -> list[type]:
++    seen: dict[type, None] = {}
++    for registry in (
++        _POSSIBLE_FP8_KERNELS,
++        _POSSIBLE_FP8_BLOCK_KERNELS,
++        _POSSIBLE_INT8_KERNELS,
++        _POSSIBLE_NVFP4_KERNELS,
++    ):
++        for kernels in registry.values():
++            for cls in kernels:
++                seen.setdefault(cls, None)
++    return list(seen)
++
++
++def _probe(cls: type):
++    """A bare kernel instance with a plausible config, so input_quant_key()
++    can be queried without the hardware-gated constructor."""
++    obj = cls.__new__(cls)  # type: ignore[call-overload]
++    if issubclass(cls, NvFp4LinearKernel):
++        obj.config = NvFp4LinearLayerConfig()
++    elif issubclass(cls, Int8ScaledMMLinearKernel):
++        obj.config = Int8ScaledMMLinearLayerConfig(
++            is_static_input_scheme=True, is_channelwise=False, input_symmetric=True
++        )
++    else:
++        obj.config = FP8ScaledMMLinearLayerConfig(
++            weight_quant_key=kFp8StaticTensorSym,
++            activation_quant_key=kFp8StaticTensorSym,
++            weight_shape=(16, 16),
++            input_dtype=torch.bfloat16,
++            out_dtype=torch.bfloat16,
++        )
++    return obj
++
++
++def _resolved_apply_weights(cls: type):
++    for base in cls.__mro__:
++        if "apply_weights" in base.__dict__:
++            return base.__dict__["apply_weights"]
++    raise AssertionError(f"{cls.__name__} has no apply_weights in its MRO")
++
++
++def test_only_known_backends_support_prequantized_input():
++    declarers = {c for c in _all_kernel_classes() if _probe(c).input_quant_key()}
++    assert declarers == SUPPORTING
++
++
++def test_supporting_backend_declares_consume_via_helper():
++    for cls in SUPPORTING:
++        fn = _resolved_apply_weights(cls)
++        assert "as_quantized_activation" in fn.__code__.co_names, cls.__name__
++
++
++def test_bridge_marks_supporting_and_skips_others():
++    supported = _probe(FlashInferCutlassNvFp4LinearKernel)
++    layer = torch.nn.Module()
++    expose_input_quant_key(layer, supported)
++    assert layer.input_quant_key == kNvfp4Dynamic
++
++    unsupported = _probe(FlashInferTrtllmNvFp4LinearKernel)
++    assert unsupported.input_quant_key() is None
++    layer = torch.nn.Module()
++    expose_input_quant_key(layer, unsupported)
++    assert not hasattr(layer, "input_quant_key")
++
++
++def test_as_quantized_activation_validates_key():
++    qa = QuantizedActivation(
++        data=torch.zeros(2, 4, dtype=current_platform.fp8_dtype()),
++        scale=torch.tensor(1.0),
++        orig_dtype=torch.bfloat16,
++        orig_shape=torch.Size([2, 4]),
++        quant_key=kFp8StaticTensorSym,
++    )
++    with pytest.raises(AssertionError):
++        as_quantized_activation(qa, kNvfp4Dynamic)
++    with pytest.raises(AssertionError):
++        as_quantized_activation(qa, None)
++    assert as_quantized_activation(torch.zeros(2, 4), kFp8StaticTensorSym) is None
++    assert as_quantized_activation(qa, kFp8StaticTensorSym) is qa
+diff --git a/vllm/model_executor/kernels/linear/base.py b/vllm/model_executor/kernels/linear/base.py
+index 4e9b89bb3ff1..416b6ea1c1b6 100644
+--- a/vllm/model_executor/kernels/linear/base.py
++++ b/vllm/model_executor/kernels/linear/base.py
+@@ -8,6 +8,8 @@
+ import torch
+ from typing_extensions import Self
+ 
++from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
++
+ 
+ @dataclass
+ class MMLinearLayerConfig: ...
+@@ -237,6 +239,12 @@ def __init__(self, config: _ConfigT) -> None:
+         """
+         self.config = config
+ 
++    def input_quant_key(self) -> QuantKey | None:
++        """Return the input quantization key supported by this kernel. If the kernel
++        does not support input quantization outside of the kernel, return None.
++        """
++        return None
++
+     @abstractmethod
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         """Process and transform weights after loading from checkpoint.
+diff --git a/vllm/model_executor/kernels/linear/nvfp4/base.py b/vllm/model_executor/kernels/linear/nvfp4/base.py
+index 24e0aa308928..b5236c490ceb 100644
+--- a/vllm/model_executor/kernels/linear/nvfp4/base.py
++++ b/vllm/model_executor/kernels/linear/nvfp4/base.py
+@@ -6,6 +6,8 @@
+ 
+ import torch
+ 
++from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
++
+ 
+ @dataclass
+ class NvFp4LinearLayerConfig:
+@@ -33,6 +35,12 @@ def __init__(self, config: NvFp4LinearLayerConfig) -> None:
+         assert self.is_supported()[0]
+         self.config = config
+ 
++    def input_quant_key(self) -> QuantKey | None:
++        """Return the input quantization key supported by this kernel. If the kernel
++        does not support input quantization outside of the kernel, return None.
++        """
++        return None
++
+     @classmethod
+     @abstractmethod
+     def is_supported(
+diff --git a/vllm/model_executor/kernels/linear/nvfp4/flashinfer.py b/vllm/model_executor/kernels/linear/nvfp4/flashinfer.py
+index bcd47fda96ec..84c695693f14 100644
+--- a/vllm/model_executor/kernels/linear/nvfp4/flashinfer.py
++++ b/vllm/model_executor/kernels/linear/nvfp4/flashinfer.py
+@@ -4,12 +4,20 @@
+ import torch
+ 
+ from vllm._custom_ops import scaled_fp4_quant
++from vllm.model_executor.layers.fusion.quant_activation import (
++    QuantizedActivation,
++    as_quantized_activation,
++)
+ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+     pad_nvfp4_activation_for_cutlass,
+     pad_nvfp4_weight_for_cutlass,
+     slice_nvfp4_output,
+     swizzle_blockscale,
+ )
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    QuantKey,
++    kNvfp4Dynamic,
++)
+ from vllm.platforms import current_platform
+ from vllm.utils.flashinfer import (
+     flashinfer_scaled_fp4_mm,
+@@ -23,6 +31,11 @@
+ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
+     """NVFP4 GEMM via FlashInfer's CUTLASS wrapper."""
+ 
++    def input_quant_key(self) -> QuantKey | None:
++        """This kernel supports dynamic quantization of the input. By
++        convention, pre-quantized blockscales must use the swizzled layout."""
++        return kNvfp4Dynamic
++
+     @classmethod
+     def is_supported(
+         cls, compute_capability: int | None = None
+@@ -56,21 +69,29 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+     def apply_weights(
+         self,
+         layer: torch.nn.Module,
+-        x: torch.Tensor,
++        x: torch.Tensor | QuantizedActivation,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         output_size = layer.output_size_per_partition
+-        output_dtype = x.dtype
+-        output_shape = [*x.shape[:-1], output_size]
+         weights_padding_bytes = getattr(layer, "weights_padding_cols", 0)
+ 
+-        x_fp4, x_blockscale = scaled_fp4_quant(
+-            x,
+-            layer.input_global_scale_inv,
+-            is_sf_swizzled_layout=True,
+-            backend="flashinfer-cutlass",
+-            padded_n=x.shape[-1] + weights_padding_bytes * 2,
+-        )
++        qa = as_quantized_activation(x, self.input_quant_key())
++        if qa is not None:
++            x_fp4, x_blockscale = qa.data, qa.scale
++            x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_bytes)
++            output_dtype = qa.orig_dtype
++            output_shape = [*qa.orig_shape[:-1], output_size]
++        else:
++            assert isinstance(x, torch.Tensor)
++            output_dtype = x.dtype
++            output_shape = [*x.shape[:-1], output_size]
++            x_fp4, x_blockscale = scaled_fp4_quant(
++                x,
++                layer.input_global_scale_inv,
++                is_sf_swizzled_layout=True,
++                backend="flashinfer-cutlass",
++                padded_n=x.shape[-1] + weights_padding_bytes * 2,
++            )
+ 
+         out = flashinfer_scaled_fp4_mm(
+             x_fp4,
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/ScaledMMLinearKernel.py b/vllm/model_executor/kernels/linear/scaled_mm/ScaledMMLinearKernel.py
+index b9f6f0c8f873..45563570c212 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/ScaledMMLinearKernel.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/ScaledMMLinearKernel.py
+@@ -8,6 +8,10 @@
+ 
+ import torch
+ 
++from vllm.model_executor.layers.fusion.quant_activation import (
++    QuantizedActivation,
++    as_quantized_activation,
++)
+ from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
+@@ -71,6 +75,17 @@ def __init__(self, c: _ConfigT, layer_param_names: Sequence[str]) -> None:
+         self.config = c
+         self.layer_param_names = layer_param_names
+ 
++    def input_quant_key(self) -> QuantKey | None:
++        """The activation quant key this kernel can consume pre-quantized.
++
++        Manual fusion uses this to decide whether to hoist activation
++        quantization out of apply_weights into an upstream fused kernel.
++        Return None when the kernel needs in-kernel quantization (custom
++        padding or swizzling, dynamic scales, etc.). Kernels that return a
++        key must consume the activation via as_quantized_activation.
++        """
++        return None
++
+     @abstractmethod
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         raise NotImplementedError
+@@ -120,30 +135,30 @@ def _get_layer_params(self, layer) -> _FP8ParamsT:
+     def apply_weights(
+         self,
+         layer: torch.nn.Module,
+-        x: torch.Tensor,
++        x: torch.Tensor | QuantizedActivation,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         fp8_dtype = self.fp8_dtype
+         maybe_out_dtype = self.config.out_dtype
+         w, w_s, x_s, x_s_ub = self._get_layer_params(layer)
+ 
+-        #   ops.scaled_fp8_quant supports both dynamic and static quant.
+-        #   If dynamic, layer.input_scale is None and x_s computed from x.
+-        #   If static, layer.input_scale is scalar and x_s is input_scale.
+-        # View input as 2D matrix for fp8 methods
+-        x_2d = x.view(-1, x.shape[-1])
+-        output_shape = [*x.shape[:-1], w.shape[1]]
+-        out_dtype = x.dtype if maybe_out_dtype is None else maybe_out_dtype
++        qa = as_quantized_activation(x, self.input_quant_key())
++        if qa is not None:
++            x_data, x_s = qa.data, qa.scale
++            orig_shape, orig_dtype = qa.orig_shape, qa.orig_dtype
++            assert x_data.dtype == fp8_dtype
++        else:
++            assert isinstance(x, torch.Tensor)
++            x_data = x
++            orig_shape, orig_dtype = x.shape, x.dtype
++
++        x_2d = x_data.view(-1, x_data.shape[-1])
++        output_shape = [*orig_shape[:-1], w.shape[1]]
++        out_dtype = orig_dtype if maybe_out_dtype is None else maybe_out_dtype
+ 
+-        # If input not quantized
+-        # TODO(luka) remove this path if not used anymore
+         x_2d_q = x_2d
+-        if x.dtype != fp8_dtype:
+-            x_2d_q, x_s = self.quant_fp8(
+-                x_2d,
+-                x_s,
+-                x_s_ub,
+-            )
++        if qa is None:
++            x_2d_q, x_s = self.quant_fp8(x_2d, x_s, x_s_ub)
+         return self.apply_scaled_mm(
+             A=x_2d_q,
+             B=w,
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py b/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
+index b52d2c5b1012..7e25541f17b5 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
+@@ -11,6 +11,8 @@
+ from vllm.model_executor.layers.quantization.utils import replace_parameter
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     GroupShape,
++    QuantKey,
++    kFp8StaticTensorSym,
+ )
+ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+     CUTLASS_BLOCK_FP8_SUPPORTED,
+@@ -171,6 +173,13 @@ def is_supported(
+     def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+         return True, None
+ 
++    def input_quant_key(self) -> QuantKey | None:
++        """Only static per-tensor activation quantization is supported for external
++        quantization."""
++        if self.config.activation_quant_key == kFp8StaticTensorSym:
++            return kFp8StaticTensorSym
++        return None
++
+     @staticmethod
+     def _pad_to_alignment(
+         x: torch.Tensor, dim: int, alignment: int, value: float = 0.0
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py b/vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py
+index c84fd5dda84e..72a3b849840d 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py
+@@ -12,6 +12,8 @@
+ )
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     GroupShape,
++    QuantKey,
++    kFp8StaticTensorSym,
+ )
+ from vllm.platforms import current_platform
+ from vllm.utils.flashinfer import (
+@@ -62,6 +64,11 @@ def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | Non
+ 
+         return True, None
+ 
++    def input_quant_key(self) -> QuantKey | None:
++        if self.config.activation_quant_key == kFp8StaticTensorSym:
++            return kFp8StaticTensorSym
++        return None
++
+     def apply_scaled_mm(
+         self,
+         *,
+diff --git a/vllm/model_executor/layers/fusion/quant_activation.py b/vllm/model_executor/layers/fusion/quant_activation.py
+new file mode 100644
+index 000000000000..4be2f4f9ffe1
+--- /dev/null
++++ b/vllm/model_executor/layers/fusion/quant_activation.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++A QuantizedActivation is a pre-quantized activation produced by a fused kernel
++and consumed directly by a linear layer, letting the layer skip its own input
++quantization. A linear advertises the key its kernel can consume via
++expose_input_quant_key; the kernel validates and reads the activation via
++as_quantized_activation.
++"""
++
++from dataclasses import dataclass
++
++import torch
++
++from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
++
++
++@dataclass
++class QuantizedActivation:
++    """A quantized activation paired with its scale and original metadata.
++
++    The quant_key describes how data and scale are to be interpreted (dtype,
++    scale granularity, value packing). Details the key does not capture, such
++    as blockscale layout or activation padding, must follow the consumer
++    kernel's convention.
++
++    TODO(mgoin): Encode layout and padding requirements in the contract so
++    producers can match consumer kernels without relying on convention.
++    """
++
++    data: torch.Tensor
++    scale: torch.Tensor
++    orig_dtype: torch.dtype
++    orig_shape: torch.Size
++    quant_key: QuantKey
++
++
++def expose_input_quant_key(layer: torch.nn.Module, kernel) -> None:
++    """Advertise the kernel's pre-quantized input key on the layer, if any.
++
++    This is the bridge from a kernel's input_quant_key() to the
++    layer.input_quant_key attribute that fusion call sites read. The attribute
++    is left unset when the kernel quantizes its own input, so non-supporting
++    backends never receive a QuantizedActivation.
++
++    TODO(mgoin): Producers also need the consumer's quantization scales (e.g.
++    static input scale, global scale). Expose those here as well so producers
++    do not reach into kernel-specific layer attributes.
++    """
++    key = kernel.input_quant_key()
++    if key is not None:
++        layer.input_quant_key = key
++
++
++def as_quantized_activation(
++    x: "torch.Tensor | QuantizedActivation", expected_key: QuantKey | None
++) -> "QuantizedActivation | None":
++    """Validate and narrow a pre-quantized activation for a consumer kernel.
++
++    Returns the QuantizedActivation when x is one whose key matches the
++    kernel's declared expected_key, and None when x is a plain tensor (the
++    caller quantizes in-kernel). Raises on a key mismatch so a wrongly routed
++    activation fails loudly instead of being silently re-quantized.
++    """
++    if not isinstance(x, QuantizedActivation):
++        return None
++    assert x.quant_key == expected_key, (
++        f"QuantizedActivation key {x.quant_key} != consumer kernel "
++        f"input_quant_key {expected_key}"
++    )
++    return x
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py
+index f682091ae304..c737b057fcf0 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py
+@@ -7,6 +7,9 @@
+ 
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
++from vllm.model_executor.layers.fusion.quant_activation import (
++    expose_input_quant_key,
++)
+ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+     CompressedTensorsScheme,
+ )
+@@ -87,6 +90,8 @@ def create_weights(
+             )
+             layer.register_parameter("input_global_scale", input_global_scale)
+ 
++        expose_input_quant_key(layer, self.kernel)
++
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         # Rename CT checkpoint names to standardized names
+         layer.weight = layer.weight_packed
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py
+index 7445634a8253..1a240f6540d6 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py
+@@ -13,6 +13,10 @@
+ from vllm.model_executor.kernels.linear import (
+     init_fp8_linear_kernel,
+ )
++from vllm.model_executor.layers.fusion.quant_activation import (
++    QuantizedActivation,
++    expose_input_quant_key,
++)
+ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+     CompressedTensorsScheme,
+ )
+@@ -143,6 +147,8 @@ def create_weights(
+             module_name=self.__class__.__name__,
+         )
+ 
++        expose_input_quant_key(layer, self.fp8_linear)
++
+     def process_weights_after_loading(self, layer) -> None:
+         if self.strategy == QuantizationStrategy.TENSOR:
+             weight, weight_scale, input_scale = process_fp8_weight_tensor_strategy(
+@@ -191,7 +197,7 @@ def process_weights_after_loading(self, layer) -> None:
+     def apply_weights(
+         self,
+         layer: torch.nn.Module,
+-        x: torch.Tensor,
++        x: torch.Tensor | QuantizedActivation,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         return self.fp8_linear.apply_weights(layer, x, bias)
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index eabaf62be78f..eb49584178af 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -42,6 +42,9 @@
+     make_nvfp4_moe_quant_config,
+     select_nvfp4_moe_backend,
+ )
++from vllm.model_executor.layers.fusion.quant_activation import (
++    expose_input_quant_key,
++)
+ from vllm.model_executor.layers.linear import (
+     LinearBase,
+     LinearMethodBase,
+@@ -1190,6 +1193,8 @@ def create_weights(
+ 
+         layer.register_parameter("weight_scale", weight_scale)
+ 
++        expose_input_quant_key(layer, self.kernel)
++
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         if (
+             torch.unique(layer.input_scale).numel() != 1

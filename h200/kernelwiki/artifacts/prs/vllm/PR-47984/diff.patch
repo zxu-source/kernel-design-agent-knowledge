@@ -1,0 +1,288 @@
+diff --git a/tests/kernels/attention/test_minimax_m3.py b/tests/kernels/attention/test_minimax_m3.py
+index 8490d4b72567..83eeab5ed0f2 100644
+--- a/tests/kernels/attention/test_minimax_m3.py
++++ b/tests/kernels/attention/test_minimax_m3.py
+@@ -1010,6 +1010,146 @@ def _build_decode_inputs(
+     return q, block_table, seq_lens, topk_idx, num_pages
+ 
+ 
++@pytest.mark.skipif(
++    not current_platform.is_rocm(),
++    reason="MiniMax-M3 AITER sparse PA is ROCm-only",
++)
++def test_aiter_sparse_block_table_handles_padded_decode_rows():
++    """Zero-length padded decode rows must produce empty sparse attention."""
++    from vllm.models.minimax_m3.amd.ops.sparse_pa import (
++        PAGES_PER_SPARSE_BLOCK,
++        minimax_m3_build_sparse_block_table,
++    )
++
++    topk_idx = torch.tensor(
++        [[[1, 0, -1], [0, 1, -1]]],
++        device="cuda",
++        dtype=torch.int32,
++    )
++    block_table = torch.tensor(
++        [[5, 7], [11, 13]],
++        device="cuda",
++        dtype=torch.int32,
++    )
++    seq_lens = torch.tensor([129, 0], device="cuda", dtype=torch.int32)
++
++    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
++        topk_idx, block_table, seq_lens
++    )
++    torch.accelerator.synchronize()
++
++    expected_bt = torch.zeros_like(sparse_bt)
++    expected_ctx = torch.tensor([129, 0], device="cuda", dtype=torch.int32)
++
++    for slot, block_id in enumerate((0, 1)):
++        base_phys = int(block_table[0, block_id]) * PAGES_PER_SPARSE_BLOCK
++        start = slot * PAGES_PER_SPARSE_BLOCK
++        expected_bt[0, start : start + PAGES_PER_SPARSE_BLOCK] = torch.arange(
++            base_phys,
++            base_phys + PAGES_PER_SPARSE_BLOCK,
++            device="cuda",
++            dtype=torch.int32,
++        )
++
++    assert torch.equal(sparse_ctx, expected_ctx)
++    assert torch.equal(sparse_bt, expected_bt)
++
++
++@pytest.mark.skipif(
++    not current_platform.is_rocm(),
++    reason="MiniMax-M3 AITER sparse PA is ROCm-only",
++)
++def test_aiter_decode_sparse_block_table_supports_spec_decode():
++    """AITER sparse PA needs one compact page-16 table per speculative query.
++
++    The decode indexer flattens speculative rows as
++    ``req_id * decode_query_len + local_q``. This verifies that the ROCm AITER
++    block-table adapter uses the same mapping before handing rows to Gluon.
++    """
++    from vllm.models.minimax_m3.amd.ops.sparse_pa import (
++        PAGES_PER_SPARSE_BLOCK,
++        minimax_m3_build_sparse_block_table_decode,
++    )
++
++    decode_query_len = 4
++    seq_lens = torch.tensor([260, 132, 0], device="cuda", dtype=torch.int32)
++    block_table = torch.tensor(
++        [
++            [5, 7, 11],
++            [13, 17, 19],
++            [0, 0, 0],
++        ],
++        device="cuda",
++        dtype=torch.int32,
++    )
++    topk_idx = torch.tensor(
++        [
++            [
++                [2, 0, 3, -1],
++                [0, 2, 3, -1],
++                [2, 1, 0, -1],
++                [1, 2, 0, -1],
++                [1, 0, 2, -1],
++                [0, 1, 2, -1],
++                [1, -1, 0, -1],
++                [0, 2, 1, -1],
++                [0, 1, -1, -1],
++                [0, 1, -1, -1],
++                [0, 1, -1, -1],
++                [0, 1, -1, -1],
++            ]
++        ],
++        device="cuda",
++        dtype=torch.int32,
++    )
++
++    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_decode(
++        topk_idx, block_table, seq_lens, decode_query_len
++    )
++    torch.accelerator.synchronize()
++
++    expected_bt = torch.zeros_like(sparse_bt)
++    expected_ctx = torch.empty_like(sparse_ctx)
++    topk_cpu = topk_idx.cpu()[0].tolist()
++    block_table_cpu = block_table.cpu()
++    seq_lens_cpu = seq_lens.cpu().tolist()
++
++    for row, selected_blocks in enumerate(topk_cpu):
++        req_id = row // decode_query_len
++        local_q = row - req_id * decode_query_len
++        query_pos = seq_lens_cpu[req_id] - decode_query_len + local_q
++        causal_len = max(query_pos + 1, 0)
++        if causal_len == 0:
++            expected_ctx[row] = 0
++            continue
++        self_block = query_pos // BLOCK_SIZE
++
++        valid = [blk for blk in selected_blocks if 0 <= blk <= self_block]
++        full_blocks = [blk for blk in valid if blk < self_block]
++        tail_blocks = [blk for blk in valid if blk == self_block]
++        ordered_blocks = full_blocks + tail_blocks
++
++        for slot, block_id in enumerate(ordered_blocks):
++            base_phys = int(block_table_cpu[req_id, block_id]) * PAGES_PER_SPARSE_BLOCK
++            start = slot * PAGES_PER_SPARSE_BLOCK
++            expected_bt[row, start : start + PAGES_PER_SPARSE_BLOCK] = torch.arange(
++                base_phys,
++                base_phys + PAGES_PER_SPARSE_BLOCK,
++                device="cuda",
++                dtype=torch.int32,
++            )
++
++        if tail_blocks:
++            expected_ctx[row] = (
++                len(full_blocks) * BLOCK_SIZE + causal_len - self_block * BLOCK_SIZE
++            )
++        else:
++            expected_ctx[row] = min(len(valid) * BLOCK_SIZE, causal_len)
++
++    assert torch.equal(sparse_ctx, expected_ctx)
++    assert torch.equal(sparse_bt, expected_bt)
++
++
+ @pytest.mark.parametrize("kv_layout", ["NHD", "HND"], indirect=True)
+ @pytest.mark.parametrize(
+     "seq_lens_list",
+diff --git a/vllm/models/minimax_m3/amd/ops/sparse_pa.py b/vllm/models/minimax_m3/amd/ops/sparse_pa.py
+index bd290ea46acd..dbfde3cd868f 100644
+--- a/vllm/models/minimax_m3/amd/ops/sparse_pa.py
++++ b/vllm/models/minimax_m3/amd/ops/sparse_pa.py
+@@ -49,7 +49,8 @@ def _build_sparse_block_table_kernel(
+ ):
+     pid_b = tl.program_id(0)
+     seq_len = tl.load(seq_lens_ptr + pid_b)
+-    last_blk = (seq_len - 1) // SPARSE_BLOCK_SIZE_C
++    has_tokens = seq_len > 0
++    last_blk = tl.maximum((seq_len - 1) // SPARSE_BLOCK_SIZE_C, 0)
+ 
+     topk_row = topk_ptr + pid_b * stride_topk_n
+     bt_row = block_table_ptr + pid_b * stride_bt_b
+@@ -57,7 +58,7 @@ def _build_sparse_block_table_kernel(
+ 
+     off_t = tl.arange(0, BLOCK_SIZE_T)
+     blk = tl.load(topk_row + off_t * stride_topk_k, mask=off_t < max_topk, other=-1)
+-    valid = blk >= 0
++    valid = has_tokens & (blk >= 0)
+     is_tail = valid & (blk == last_blk)
+     is_full = valid & (blk != last_blk)
+ 
+@@ -82,7 +83,7 @@ def _build_sparse_block_table_kernel(
+         mask=(off_w >= n_used) & (off_w < row_width),
+     )
+ 
+-    tail_tokens = seq_len - last_blk * SPARSE_BLOCK_SIZE_C
++    tail_tokens = tl.where(has_tokens, seq_len - last_blk * SPARSE_BLOCK_SIZE_C, 0)
+     has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
+     ctx = n_full * SPARSE_BLOCK_SIZE_C + tl.where(has_tail, tail_tokens, 0)
+     ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * SPARSE_BLOCK_SIZE_C, seq_len))
+@@ -140,7 +141,8 @@ def _build_sparse_block_table_prefill_kernel(
+     pid_n = tl.program_id(0)
+     req_id = tl.load(req_id_ptr + pid_n)
+     abs_pos = tl.load(abs_pos_ptr + pid_n)
+-    causal_len = abs_pos + 1
++    # Padded speculative rows can have negative positions; clamp to empty range.
++    causal_len = tl.maximum(abs_pos + 1, 0)
+     self_blk = abs_pos // SPARSE_BLOCK_SIZE_C
+ 
+     topk_row = topk_ptr + pid_n * stride_topk_n
+@@ -149,7 +151,7 @@ def _build_sparse_block_table_prefill_kernel(
+ 
+     off_t = tl.arange(0, BLOCK_SIZE_T)
+     blk = tl.load(topk_row + off_t * stride_topk_k, mask=off_t < max_topk, other=-1)
+-    valid = (blk >= 0) & (blk <= self_blk)
++    valid = (causal_len > 0) & (blk >= 0) & (blk <= self_blk)
+     is_tail = valid & (blk == self_blk)
+     is_full = valid & (blk < self_blk)
+ 
+@@ -214,6 +216,34 @@ def minimax_m3_build_sparse_block_table_prefill(
+     return sparse_bt, sparse_ctx
+ 
+ 
++@torch.no_grad()
++def minimax_m3_build_sparse_block_table_decode(
++    topk_idx: torch.Tensor,  # [1, batch * decode_query_len, topk]
++    block_table: torch.Tensor,  # [batch, max_blocks]
++    seq_lens: torch.Tensor,  # [batch]
++    decode_query_len: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Build one page-16 sparse block table row per decode query token."""
++    if decode_query_len == 1:
++        return minimax_m3_build_sparse_block_table(topk_idx, block_table, seq_lens)
++
++    total_q = topk_idx.shape[1]
++    expected_q = block_table.shape[0] * decode_query_len
++    assert total_q == expected_q, (
++        "MiniMax-M3 decode top-k rows must equal batch * decode_query_len: "
++        f"{total_q} != {expected_q}"
++    )
++    pos = torch.arange(total_q, dtype=torch.int32, device=topk_idx.device)
++    query_req_id = torch.div(pos, decode_query_len, rounding_mode="floor")
++    q_offset = pos - query_req_id * decode_query_len
++    query_abs_pos = (seq_lens[query_req_id] - decode_query_len + q_offset).to(
++        torch.int32
++    )
++    return minimax_m3_build_sparse_block_table_prefill(
++        topk_idx, block_table, query_req_id, query_abs_pos
++    )
++
++
+ @triton.jit
+ def _insert_index_cache_kernel(
+     index_k_ptr,  # [num_tokens, head_dim]
+@@ -317,20 +347,21 @@ def _gluon_scale_arg(
+ 
+ @torch.no_grad()
+ def minimax_m3_sparse_attn_decode_aiter(
+-    q: torch.Tensor,  # [batch, num_heads, head_dim]
++    q: torch.Tensor,  # [batch * decode_query_len, num_heads, head_dim]
+     k_cache: torch.Tensor,  # [phys16, num_kv_heads, head_dim // x, 16, x]
+     v_cache: torch.Tensor,  # [phys16, num_kv_heads, 16 // x, head_dim, x]
+-    topk_idx: torch.Tensor,  # [1, batch, topk]
++    topk_idx: torch.Tensor,  # [1, batch * decode_query_len, topk]
+     block_table: torch.Tensor,  # [batch, max_blocks]
+     seq_lens: torch.Tensor,  # [batch]
+     num_kv_heads: int,
+     sm_scale: float,
+-    output: torch.Tensor,  # [batch, num_heads, head_dim]
++    output: torch.Tensor,  # [batch * decode_query_len, num_heads, head_dim]
+     k_scale: torch.Tensor | None = None,
+     v_scale: torch.Tensor | None = None,
++    decode_query_len: int = 1,
+ ) -> None:
+-    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
+-        topk_idx, block_table, seq_lens
++    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_decode(
++        topk_idx, block_table, seq_lens, decode_query_len
+     )
+     _run_gluon_decode(
+         q,
+diff --git a/vllm/models/minimax_m3/amd/sparse_attention_msa.py b/vllm/models/minimax_m3/amd/sparse_attention_msa.py
+index 60a7ce0e77c8..b491b8fcb56f 100644
+--- a/vllm/models/minimax_m3/amd/sparse_attention_msa.py
++++ b/vllm/models/minimax_m3/amd/sparse_attention_msa.py
+@@ -55,11 +55,6 @@ def forward(
+         if main_md.num_decodes > 0:
+             d = main_md.decode
+             assert d is not None
+-            if d.decode_query_len != 1:
+-                raise NotImplementedError(
+-                    "MiniMax-M3 AITER sparse PA does not support speculative "
+-                    f"decode_query_len={d.decode_query_len}"
+-                )
+             minimax_m3_sparse_attn_decode_aiter(
+                 q[:nd],
+                 k_cache,
+@@ -72,6 +67,7 @@ def forward(
+                 out[:nd],
+                 k_scale=k_scale,
+                 v_scale=v_scale,
++                decode_query_len=d.decode_query_len,
+             )
+ 
+         if main_md.num_prefills > 0:

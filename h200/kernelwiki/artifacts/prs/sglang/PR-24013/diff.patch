@@ -1,0 +1,2049 @@
+diff --git a/python/sglang/srt/layers/attention/intel_amx_backend.py b/python/sglang/srt/layers/attention/intel_amx_backend.py
+index 9caa154e749f..20769b0cbf46 100644
+--- a/python/sglang/srt/layers/attention/intel_amx_backend.py
++++ b/python/sglang/srt/layers/attention/intel_amx_backend.py
+@@ -212,6 +212,9 @@ def forward_extend(
+         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
+ 
+         _, max_extend_len = self.forward_metadata
++        seq_lens = forward_batch.seq_lens
++        if seq_lens.dtype != torch.int64:
++            seq_lens = seq_lens.to(torch.int64)
+         self.extend_attention_fwd(
+             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+             k,
+@@ -255,6 +258,9 @@ def forward_decode(
+             seq_lens = forward_batch.seq_lens
+ 
+         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
++        seq_lens = forward_batch.seq_lens
++        if seq_lens.dtype != torch.int64:
++            seq_lens = seq_lens.to(torch.int64)
+ 
+         if layer.qk_head_dim != layer.v_head_dim:
+             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+diff --git a/python/sglang/srt/layers/attention/vision.py b/python/sglang/srt/layers/attention/vision.py
+index e3b36e5d33b4..27d7bae1c9f2 100644
+--- a/python/sglang/srt/layers/attention/vision.py
++++ b/python/sglang/srt/layers/attention/vision.py
+@@ -46,9 +46,17 @@
+ if _is_cuda:
+     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
+ 
+-    from sglang.jit_kernel.flash_attention import (
+-        flash_attn_varlen_func,
+-    )
++    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
++
++    def flash_attn_func(*args, ver: int = 3, **kwargs):
++        if ver == 4:
++            from sglang.jit_kernel.flash_attention_v4 import (
++                flash_attn_varlen_func as flash_attn_varlen_func_fa4,
++            )
++
++            return flash_attn_varlen_func_fa4(*args, **kwargs)
++        return flash_attn_varlen_func(*args, **kwargs)
++
+ 
+ if _is_cpu and _is_cpu_amx_available:
+     flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
+@@ -78,7 +86,7 @@
+ from sglang.srt.layers.quantization import QuantizationConfig
+ from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+ from sglang.srt.runtime_context import get_server_args
+-from sglang.srt.utils import add_prefix, get_bool_env_var
++from sglang.srt.utils import add_prefix
+ 
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+ 
+@@ -121,6 +129,42 @@ def empty(self) -> bool:
+         return self.get_data() is None
+ 
+ 
++@dataclasses.dataclass
++class VisionAttentionMetadata:
++
++    cu_seqlens: torch.Tensor
++    seq_lens: torch.Tensor
++    max_seqlen: int
++
++    # flashinfer_cudnn specific (optional)
++    packed_indptrs: Optional[torch.Tensor] = None
++    sequence_lengths: Optional[torch.Tensor] = None
++    flashinfer_max_seqlen: Optional[int] = None
++
++
++def prepare_vision_attention_metadata(
++    cu_seqlens: torch.Tensor,
++    device: torch.device,
++    *,
++    packed_indptrs: Optional[torch.Tensor] = None,
++    sequence_lengths: Optional[torch.Tensor] = None,
++    flashinfer_max_seqlen: Optional[int] = None,
++) -> VisionAttentionMetadata:
++    # Compute all attention metadata once before the encoder layer loop.
++
++    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
++    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
++    max_seqlen = int(seq_lens.max().item())
++    return VisionAttentionMetadata(
++        cu_seqlens=cu_seqlens,
++        seq_lens=seq_lens,
++        max_seqlen=max_seqlen,
++        packed_indptrs=packed_indptrs,
++        sequence_lengths=sequence_lengths,
++        flashinfer_max_seqlen=flashinfer_max_seqlen,
++    )
++
++
+ # TODO: requires real seqlens from images
+ @functools.lru_cache(maxsize=128)
+ def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Tensor:
+@@ -205,7 +249,7 @@ def __init__(
+         dropout: float = 0.0,
+         flatten_batch: bool = False,
+         softmax_in_single_precision: bool = False,
+-        softmax_scale: float | None = None,
++        softmax_scale: Optional[float] = None,
+         **kwargs,
+     ):
+         super().__init__()
+@@ -285,7 +329,6 @@ def forward(
+         bsz: int,
+         cu_seqlens: Optional[torch.Tensor] = None,
+         attention_mask: Optional[torch.Tensor] = None,
+-        softmax_scale: Optional[float] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+         r"""
+@@ -371,20 +414,25 @@ def forward(
+         q: torch.Tensor,
+         k: torch.Tensor,
+         v: torch.Tensor,
+-        cu_seqlens: torch.Tensor | SingletonCache | None,
++        cu_seqlens: torch.Tensor | SingletonCache | list | None,
+         bsz: int,
+         seq_len: int,
+         softmax_scale: Optional[float] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+         r"""
+         Args:
+             cu_seqlens: [b]
+-            softmax_scale: override softmax scale (default 1/sqrt(head_dim))
+         Returns:
+              [b * s, h, head_size]
+         """
+-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
++        if forward_metadata is not None:
++            cu_seqlens_gpu = forward_metadata.cu_seqlens
++            seq_lens = forward_metadata.seq_lens
++            max_seqlen = forward_metadata.max_seqlen
++            output = torch.empty_like(q)
++        elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+             if "output_ws" not in kwargs:
+                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
+ 
+@@ -392,42 +440,33 @@ def forward(
+                 raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
+ 
+             output = kwargs["output_ws"]
+-            context_attention_fwd(
+-                q,
+-                k,
+-                v,
+-                output,
+-                cu_seqlens[0],
+-                cu_seqlens[1],
+-                cu_seqlens[2],
+-                is_causal=False,
+-                sm_scale=softmax_scale,
+-            )
++            cu_seqlens_gpu = cu_seqlens[0]
++            seq_lens = cu_seqlens[1]
++            max_seqlen = cu_seqlens[2]
+         else:
+-            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+-
+-            # [b * s, head, head_size]
+-            output = torch.empty_like(q)
+-
++            cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+             seq_lens = kwargs.get("sequence_lengths")
+             if seq_lens is None:
+-                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
++                seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
+             else:
+                 seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
+             max_seqlen = resolve_precomputed_max_seqlen(
+-                cu_seqlens, kwargs.get("max_seqlen")
+-            )
+-            context_attention_fwd(
+-                q,
+-                k,
+-                v,
+-                output,
+-                cu_seqlens.to(q.device),
+-                seq_lens,
+-                max_seqlen,
+-                is_causal=False,
+-                sm_scale=softmax_scale,
++                cu_seqlens_gpu, kwargs.get("max_seqlen")
+             )
++            # [b * s, head, head_size]
++            output = torch.empty_like(q)
++
++        context_attention_fwd(
++            q,
++            k,
++            v,
++            output,
++            cu_seqlens_gpu,
++            seq_lens,
++            max_seqlen,
++            is_causal=False,
++            sm_scale=softmax_scale,
++        )
+ 
+         return output
+ 
+@@ -450,10 +489,11 @@ def forward(
+         q: torch.Tensor,
+         k: torch.Tensor,
+         v: torch.Tensor,
+-        cu_seqlens: torch.Tensor | SingletonCache | None,
++        cu_seqlens: torch.Tensor | SingletonCache | list | None,
+         bsz: int,
+         seq_len: int,
+         softmax_scale: Optional[float] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+         r"""
+@@ -465,37 +505,32 @@ def forward(
+         window_size = kwargs.get("window_size", (-1, -1))
+         s_aux = kwargs.get("s_aux", None)
+ 
+-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
++        if forward_metadata is not None:
++            cu_seqlens_gpu = forward_metadata.cu_seqlens
++            max_seqlen = forward_metadata.max_seqlen
++        elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
++            if not isinstance(cu_seqlens, list):
++                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
++            cu_seqlens_gpu = cu_seqlens[0]
+             max_seqlen = cu_seqlens[1]
+-            fa_kwargs = dict(
+-                cu_seqlens_q=cu_seqlens[0],
+-                cu_seqlens_k=cu_seqlens[0],
+-                max_seqlen_q=max_seqlen,
+-                max_seqlen_k=max_seqlen,
+-                softmax_scale=softmax_scale,
+-                window_size=window_size,
+-            )
+-            if s_aux is not None:
+-                fa_kwargs["sinks"] = s_aux
+-            output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
+         else:
+-            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+-            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
++            cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
++            cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
+             max_seqlen = resolve_precomputed_max_seqlen(
+-                cu_seqlens, kwargs.get("max_seqlen")
++                cu_seqlens_gpu, kwargs.get("max_seqlen")
+             )
+ 
+-            fa_kwargs = dict(
+-                cu_seqlens_q=cu_seqlens,
+-                cu_seqlens_k=cu_seqlens,
+-                max_seqlen_q=max_seqlen,
+-                max_seqlen_k=max_seqlen,
+-                softmax_scale=softmax_scale,
+-                window_size=window_size,
+-            )
+-            if s_aux is not None:
+-                fa_kwargs["sinks"] = s_aux
+-            output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
++        fa_kwargs = dict(
++            cu_seqlens_q=cu_seqlens_gpu,
++            cu_seqlens_k=cu_seqlens_gpu,
++            max_seqlen_q=max_seqlen,
++            max_seqlen_k=max_seqlen,
++            softmax_scale=softmax_scale,
++            window_size=window_size,
++        )
++        if s_aux is not None:
++            fa_kwargs["sinks"] = s_aux
++        output = flash_attn_func(q, k, v, **fa_kwargs)
+ 
+         return output
+ 
+@@ -518,6 +553,7 @@ def forward(
+         bsz: int,
+         seq_len: int,
+         softmax_scale: Optional[float] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+         r"""
+@@ -526,26 +562,22 @@ def forward(
+         Returns:
+              [b * s, h, head_size]
+         """
+-        if cu_seqlens is None:
+-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+-        elif isinstance(cu_seqlens, SingletonCache):
+-            if cu_seqlens.empty():
+-                cu_seqlens.set_data(
+-                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+-                )
+-            cu_seqlens = cu_seqlens.get_data()
+-
+-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+-        max_seqlen = resolve_precomputed_max_seqlen(
+-            cu_seqlens, kwargs.get("max_seqlen")
+-        )
++        if forward_metadata is not None:
++            cu_seqlens_gpu = forward_metadata.cu_seqlens
++            max_seqlen = forward_metadata.max_seqlen
++        else:
++            cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
++            cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
++            max_seqlen = resolve_precomputed_max_seqlen(
++                cu_seqlens_gpu, kwargs.get("max_seqlen")
++            )
+ 
+-        output = flash_attn_varlen_func(
++        output = flash_attn_func(
+             q,
+             k,
+             v,
+-            cu_seqlens_q=cu_seqlens,
+-            cu_seqlens_k=cu_seqlens,
++            cu_seqlens_q=cu_seqlens_gpu,
++            cu_seqlens_k=cu_seqlens_gpu,
+             max_seqlen_q=max_seqlen,
+             max_seqlen_k=max_seqlen,
+             softmax_scale=softmax_scale,
+@@ -576,6 +608,7 @@ def forward(
+         bsz: int,
+         seq_len: int,
+         softmax_scale: Optional[float] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+         r"""
+@@ -584,17 +617,23 @@ def forward(
+         Returns:
+              [b * s, h, head_size]
+         """
+-        if "sequence_lengths" not in kwargs:
+-            raise RuntimeError(
+-                "sequence_lengths should be prepared for vision flashinfer_cudnn attention backend"
+-            )
+-        if "max_seqlen" not in kwargs:
+-            raise RuntimeError(
+-                "max_seqlen should be prepared for vision flashinfer_cudnn attention backend"
+-            )
+-
+-        sequence_lengths = kwargs["sequence_lengths"]  # (B_padded,) or (B_padded,1,1,1)
+-        max_seqlen = kwargs["max_seqlen"]
++        # ---- resolve sequence_lengths, packed indptrs, max_seqlen ----
++        if forward_metadata is not None and forward_metadata.packed_indptrs is not None:
++            sequence_lengths = forward_metadata.sequence_lengths
++            packed_cu_seqlens = forward_metadata.packed_indptrs
++            max_seqlen = forward_metadata.flashinfer_max_seqlen
++        else:
++            if "sequence_lengths" not in kwargs:
++                raise RuntimeError(
++                    "sequence_lengths should be prepared for vision flashinfer_cudnn attention backend"
++                )
++            if "max_seqlen" not in kwargs:
++                raise RuntimeError(
++                    "max_seqlen should be prepared for vision flashinfer_cudnn attention backend"
++                )
++            sequence_lengths = kwargs["sequence_lengths"]
++            packed_cu_seqlens = cu_seqlens
++            max_seqlen = kwargs["max_seqlen"]
+ 
+         # max_seqlen must be python int
+         if isinstance(max_seqlen, torch.Tensor):
+@@ -611,7 +650,7 @@ def forward(
+             reshape_batch_size = q.shape[0]
+             q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+ 
+-        if not isinstance(cu_seqlens, torch.Tensor):
++        if not isinstance(packed_cu_seqlens, torch.Tensor):
+             raise RuntimeError(
+                 "flashinfer_cudnn expects packed indptrs as a torch.Tensor"
+             )
+@@ -624,7 +663,9 @@ def forward(
+ 
+         # cu_seqlens contains packed *element indptrs*:
+         # [qk_indptr(B+1), v_indptr(B+1), o_indptr(B+1)] => total 3*(B+1)
+-        cu_seqlens_1d = cu_seqlens.view(-1).to(device=q.device, dtype=torch.int32)
++        cu_seqlens_1d = packed_cu_seqlens.view(-1).to(
++            device=q.device, dtype=torch.int32
++        )
+         expected = 3 * (B + 1)
+         if int(cu_seqlens_1d.numel()) != expected:
+             raise RuntimeError(
+@@ -704,20 +745,24 @@ def forward(
+         bsz: int,
+         seq_len: int,
+         softmax_scale: Optional[float] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+-
+-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+-        max_seqlen = seq_lens.max().item()
++        if forward_metadata is not None:
++            cu_seqlens_gpu = forward_metadata.cu_seqlens
++            max_seqlen = forward_metadata.max_seqlen
++        else:
++            cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
++            cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
++            seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
++            max_seqlen = seq_lens.max().item()
+ 
+         return self.flash_attn_varlen_func(
+             q=q,
+             k=k,
+             v=v,
+-            cu_seqlens_q=cu_seqlens,
+-            cu_seqlens_k=cu_seqlens,
++            cu_seqlens_q=cu_seqlens_gpu,
++            cu_seqlens_k=cu_seqlens_gpu,
+             max_seqlen_q=max_seqlen,
+             max_seqlen_k=max_seqlen,
+             softmax_scale=softmax_scale,
+@@ -743,6 +788,7 @@ def forward(
+         bsz: int,
+         seq_len: int,
+         softmax_scale: Optional[float] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+         r"""
+@@ -751,7 +797,13 @@ def forward(
+         Returns:
+              [b * s, h, head_size]
+         """
+-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
++        if forward_metadata is not None:
++            seq_lens = forward_metadata.seq_lens
++            if seq_lens.is_npu:
++                seq_lens = seq_lens.to("cpu")
++            output = torch.empty_like(q)
++            seq_len_arg = seq_lens.to(torch.int32)
++        elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+             if "output_ws" not in kwargs:
+                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
+             output = kwargs["output_ws"]
+@@ -955,6 +1007,7 @@ def __init__(
+         self.dropout = dropout
+         num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+         self.head_size = head_dim if head_dim is not None else embed_dim // num_heads
++        self.softmax_scale = softmax_scale
+         self.hidden_size_per_attention_head = dist_utils.divide(
+             projection_size, num_heads
+         )
+@@ -994,7 +1047,6 @@ def __init__(
+         self.customized_position_embedding_applier = (
+             customized_position_embedding_applier
+         )
+-        self.softmax_scale = softmax_scale
+         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
+             head_dim=self.head_size,
+             num_heads=self.num_attention_heads_per_partition,
+@@ -1185,6 +1237,7 @@ def forward(
+         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
+         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+         attention_mask: Optional[torch.Tensor] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         full_attn: bool = True,
+         **kwargs,
+     ) -> torch.Tensor:
+@@ -1333,6 +1386,7 @@ def forward(
+             seq_len=s,
+             cu_seqlens=cu_seqlens,
+             attention_mask=attention_mask,
++            forward_metadata=forward_metadata,
+             sequence_lengths=sequence_lengths,
+             max_seqlen=max_seqlen,
+             output_ws=attn_output_ws,
+diff --git a/python/sglang/srt/managers/mm_utils.py b/python/sglang/srt/managers/mm_utils.py
+index 2bd3c74ae319..dd4a6bd740c5 100644
+--- a/python/sglang/srt/managers/mm_utils.py
++++ b/python/sglang/srt/managers/mm_utils.py
+@@ -9,6 +9,7 @@
+ import sys
+ from abc import abstractmethod
+ from collections import defaultdict
++from dataclasses import dataclass, field
+ from multiprocessing import shared_memory
+ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+ 
+@@ -33,10 +34,11 @@
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.multimodal.evs import EVSEmbeddingResult
+ from sglang.srt.runtime_context import get_parallel, get_server_args
+-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
++from sglang.srt.utils import flatten_nested_list, is_hip, is_npu, print_warning_once
+ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
+ from sglang.utils import logger
+ 
++_is_hip = is_hip()
+ _is_npu = is_npu()
+ 
+ # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
+@@ -581,6 +583,80 @@ def _get_chunked_embedding_full(
+     return embedding_per_req_chunk, input_ids
+ 
+ 
++@dataclass
++class PerImageRequestInfo:
++    """Metadata for a single request using the per-image encoding path."""
++
++    req_idx: int
++    items: List[MultimodalDataItem]
++    items_offset: List[Tuple[int, int]]
++    extend_prefix_len: int
++    extend_seq_len: int
++    overlapping: List[Tuple[int, MultimodalDataItem, int, int]] = field(
++        default_factory=list
++    )
++
++
++def _batch_encode_per_image_misses(
++    data_embedding_func: DataEmbeddingFunc,
++    per_image_requests: List[PerImageRequestInfo],
++    device: torch.device,
++) -> Dict[int, torch.Tensor]:
++    """
++    Collect cache misses across ALL per-image requests, deduplicate by hash,
++    encode in a single ViT call, and populate the cache.
++
++    Returns:
++        hash_to_embedding: mapping from item.hash to its full embedding tensor.
++    """
++    unique_misses: Dict[int, Tuple[MultimodalDataItem, int]] = {}
++    hash_to_embedding: Dict[int, torch.Tensor] = {}
++
++    # Phase 1a: find overlapping items per request and collect cache misses
++    for req_info in per_image_requests:
++        chunk_start = req_info.extend_prefix_len
++        chunk_end = chunk_start + req_info.extend_seq_len  # exclusive
++        overlapping = []
++        if req_info.extend_seq_len > 0:
++            for idx, (item, (start, end)) in enumerate(
++                zip(req_info.items, req_info.items_offset)
++            ):
++                if end >= chunk_start and start < chunk_end:
++                    overlapping.append((idx, item, start, end))
++        req_info.overlapping = overlapping
++
++        for _idx, item, start, end in overlapping:
++            if item.hash in hash_to_embedding:
++                continue
++            cached = embedding_cache.get_single(item.hash)
++            if cached is not None:
++                hash_to_embedding[item.hash] = cached.embedding
++            elif item.hash not in unique_misses:
++                token_count = end - start + 1
++                unique_misses[item.hash] = (item, token_count)
++
++    # Phase 1b: single ViT call for all unique cache misses
++    if unique_misses:
++        ordered_hashes = list(unique_misses.keys())
++        miss_items = [unique_misses[h][0] for h in ordered_hashes]
++        token_counts = [unique_misses[h][1] for h in ordered_hashes]
++
++        if not _can_skip_pre_embed_feature_move(data_embedding_func):
++            _move_items_to_device(miss_items, device)
++        all_miss_embedding = data_embedding_func(miss_items)
++        all_miss_embedding = all_miss_embedding.reshape(
++            -1, all_miss_embedding.shape[-1]
++        )
++
++        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
++        for h, emb in zip(ordered_hashes, split_embeddings):
++            embedding_cache.set(h, EmbeddingResult(embedding=emb))
++            # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
++            hash_to_embedding[h] = emb
++
++    return hash_to_embedding
++
++
+ def _get_chunked_embedding_by_item(
+     data_embedding_func: DataEmbeddingFunc,
+     embedding_items_per_req: List[MultimodalDataItem],
+@@ -590,8 +666,7 @@ def _get_chunked_embedding_by_item(
+     device: torch.device,
+ ) -> Optional[torch.Tensor]:
+     """
+-    Per-image chunk-aware encoding: only encode images overlapping with the
+-    current chunk, cache each image individually.
++    Per-image chunk-aware encoding for one request.
+     Items must already be split per-image (each item has exactly one offset).
+     """
+     chunk_start = extend_prefix_len
+@@ -600,20 +675,18 @@ def _get_chunked_embedding_by_item(
+     if extend_seq_len <= 0:
+         return None
+ 
+-    # 1. Find items overlapping with current chunk
+-    # offsets are (start, end) inclusive on both ends
+     overlapping = []
+-    for idx, (item, offset) in enumerate(zip(embedding_items_per_req, items_offset)):
+-        start, end = offset
++    for idx, (item, (start, end)) in enumerate(
++        zip(embedding_items_per_req, items_offset)
++    ):
+         if end >= chunk_start and start < chunk_end:
+             overlapping.append((idx, item, start, end))
+ 
+     if not overlapping:
+         return None
+ 
+-    # 2. Check per-image cache for each overlapping item
+-    cached_embeddings = {}  # idx -> tensor
+-    miss_items = []  # (idx, item, start, end)
++    cached_embeddings = {}
++    miss_items = []
+     for idx, item, start, end in overlapping:
+         cached = embedding_cache.get_single(item.hash)
+         if cached is not None:
+@@ -622,7 +695,6 @@ def _get_chunked_embedding_by_item(
+         else:
+             miss_items.append((idx, item, start, end))
+ 
+-    # 3. Batch encode all cache-miss items in one ViT call
+     if miss_items:
+         miss_item_list = [item for _, item, _, _ in miss_items]
+         if not _can_skip_pre_embed_feature_move(data_embedding_func):
+@@ -632,19 +704,44 @@ def _get_chunked_embedding_by_item(
+             -1, all_miss_embedding.shape[-1]
+         )
+ 
+-        # Split output by per-item token count
+         token_counts = [end - start + 1 for _, _, start, end in miss_items]
+         split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+ 
+         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
+             cached_embeddings[idx] = emb
+-            emb_result = EmbeddingResult(embedding=emb)
+-            embedding_cache.set(item.hash, emb_result)
++            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+ 
+-    # 4. Assemble chunk: for each overlapping item, extract the overlap slice
+     chunk_slices = []
+     for idx, _, start, end in overlapping:
+-        emb = cached_embeddings[idx]  # shape: (end - start + 1, hidden)
++        emb = cached_embeddings[idx]
++        overlap_start = max(start, chunk_start)
++        overlap_end = min(end, chunk_end - 1)  # inclusive
++        local_start = overlap_start - start
++        local_end = overlap_end - start + 1  # exclusive for slicing
++        chunk_slices.append(emb[local_start:local_end])
++
++    return torch.cat(chunk_slices, dim=0)
++
++
++def _assemble_per_image_chunk(
++    overlapping: List[Tuple[int, MultimodalDataItem, int, int]],
++    hash_to_embedding: Dict[int, torch.Tensor],
++    extend_prefix_len: int,
++    extend_seq_len: int,
++) -> Optional[torch.Tensor]:
++    """
++    Assemble the chunk embedding for one request from pre-computed embeddings.
++    All overlapping items must already have their embeddings in hash_to_embedding.
++    """
++    if not overlapping:
++        return None
++
++    chunk_start = extend_prefix_len
++    chunk_end = extend_prefix_len + extend_seq_len  # exclusive
++
++    chunk_slices = []
++    for _idx, item, start, end in overlapping:
++        emb = hash_to_embedding[item.hash]  # shape: (end - start + 1, hidden)
+         overlap_start = max(start, chunk_start)
+         overlap_end = min(end, chunk_end - 1)  # inclusive
+         local_start = overlap_start - start
+@@ -664,14 +761,19 @@ def _get_chunked_prefill_embedding(
+     input_ids: torch.Tensor,
+ ) -> tuple[torch.Tensor | None, torch.Tensor]:
+     """
+-    Chunked prefill embedding: encode per-request items and extract the chunk.
+-    Items are already split per-image at processor stage.
++    Chunked prefill embedding: encode items across all requests and extract
++    per-request chunks. Images from all requests are batched into a single
++    ViT call for efficiency.
+     """
+-    embedding_list = []
+     device = input_ids.device
+     # FIXME(Xinyuan): temporary workaround for eagle3
+     max_iterations = min(len(items_size) - 1, len(prefix_length))
+ 
++    # Phase 0: classify requests into per-image vs full/EVS path
++    per_image_requests = []  # batched ViT encoding
++    full_path_requests = []  # per-request encoding (EVS etc.)
++    all_chunks: List[Tuple[int, torch.Tensor]] = []
++
+     for i in range(max_iterations):
+         if items_size[i] == items_size[i + 1]:
+             continue
+@@ -681,39 +783,75 @@ def _get_chunked_prefill_embedding(
+ 
+         extend_prefix_len = prefix_length[i]
+         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
++        if extend_seq_len <= 0:
++            continue
+ 
+-        # Skip if all items already prefilled
++        # Skip if all items already prefilled.
+         if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
+             continue
+ 
+-        # Use per-image path when all items have exactly one offset (already
+-        # split per-image) — this avoids encoding images not in this chunk.
+-        # Fall back to combined path for non-split items or EVS.
+-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
++        req_info = PerImageRequestInfo(
++            req_idx=i,
++            items=embedding_items_per_req,
++            items_offset=items_offset,
++            extend_prefix_len=extend_prefix_len,
++            extend_seq_len=extend_seq_len,
++        )
+ 
++        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
+         if is_per_image:
+-            chunk_embedding = _get_chunked_embedding_by_item(
+-                data_embedding_func,
+-                embedding_items_per_req,
+-                items_offset,
+-                extend_prefix_len,
+-                extend_seq_len,
+-                device,
+-            )
+-            if chunk_embedding is not None:
+-                embedding_list.append(chunk_embedding)
++            if _is_hip:
++                # ROCm CI regressed with one large cross-request ViT batch; keep
++                # the previous per-request path on HIP while CUDA uses batching.
++                chunk = _get_chunked_embedding_by_item(
++                    data_embedding_func,
++                    embedding_items_per_req,
++                    items_offset,
++                    extend_prefix_len,
++                    extend_seq_len,
++                    device,
++                )
++                if chunk is not None:
++                    all_chunks.append((i, chunk))
++            else:
++                per_image_requests.append(req_info)
+         else:
+-            chunk_embedding, input_ids = _get_chunked_embedding_full(
+-                data_embedding_func,
+-                embedding_items_per_req,
+-                items_offset,
+-                extend_prefix_len,
+-                extend_seq_len,
+-                input_ids,
+-                device,
+-            )
+-            if chunk_embedding is not None:
+-                embedding_list.append(chunk_embedding)
++            full_path_requests.append(req_info)
++
++    # Phase 1: batch encode all per-image cache misses in ONE ViT call
++    hash_to_embedding: Dict[int, torch.Tensor] = {}
++    if per_image_requests:
++        hash_to_embedding = _batch_encode_per_image_misses(
++            data_embedding_func, per_image_requests, device
++        )
++
++    # Phase 2: assemble per-request chunks in original request order
++    for req_info in per_image_requests:
++        chunk = _assemble_per_image_chunk(
++            req_info.overlapping,
++            hash_to_embedding,
++            req_info.extend_prefix_len,
++            req_info.extend_seq_len,
++        )
++        if chunk is not None:
++            all_chunks.append((req_info.req_idx, chunk))
++
++    for req_info in full_path_requests:
++        chunk_embedding, input_ids = _get_chunked_embedding_full(
++            data_embedding_func,
++            req_info.items,
++            req_info.items_offset,
++            req_info.extend_prefix_len,
++            req_info.extend_seq_len,
++            input_ids,
++            device,
++        )
++        if chunk_embedding is not None:
++            all_chunks.append((req_info.req_idx, chunk_embedding))
++
++    # Sort by original request index to maintain correct output order
++    all_chunks.sort(key=lambda x: x[0])
++    embedding_list = [chunk for _, chunk in all_chunks]
+ 
+     if len(embedding_list) == 0:
+         return None, input_ids
+diff --git a/python/sglang/srt/models/dots_vlm_vit.py b/python/sglang/srt/models/dots_vlm_vit.py
+index 84e94a5c5062..4cc6bfd5ab3f 100644
+--- a/python/sglang/srt/models/dots_vlm_vit.py
++++ b/python/sglang/srt/models/dots_vlm_vit.py
+@@ -9,7 +9,11 @@
+ from transformers.modeling_utils import PreTrainedModel
+ 
+ from sglang.srt.configs.dots_vlm import DotsVisionConfig
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.conv import Conv2dLayer
+ from sglang.srt.layers.quantization import QuantizationConfig
+ from sglang.srt.runtime_context import get_parallel
+@@ -173,11 +177,18 @@ def __init__(
+         self.mlp = DotsSwiGLUFFN(config, quant_config)
+         self.norm2 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
+ 
+-    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
++    def forward(
++        self,
++        hidden_states,
++        cu_seqlens,
++        rotary_pos_emb,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
++    ) -> torch.Tensor:
+         hidden_states = hidden_states + self.attn(
+             self.norm1(hidden_states),
+             cu_seqlens=cu_seqlens,
+             position_embeddings=rotary_pos_emb,
++            forward_metadata=forward_metadata,
+         )
+         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+         return hidden_states
+@@ -319,10 +330,16 @@ def forward(
+         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+         if is_npu():
+             cu_seqlens = cu_seqlens.to("cpu")
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=hidden_states.device
++        )
+ 
+         for blk in self.blocks:
+             hidden_states = blk(
+-                hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
++                hidden_states,
++                cu_seqlens=cu_seqlens,
++                rotary_pos_emb=rotary_pos_emb,
++                forward_metadata=forward_metadata,
+             )
+ 
+         if self.config.post_norm:
+diff --git a/python/sglang/srt/models/ernie45_vl.py b/python/sglang/srt/models/ernie45_vl.py
+index e2071f416667..c798fed18d16 100644
+--- a/python/sglang/srt/models/ernie45_vl.py
++++ b/python/sglang/srt/models/ernie45_vl.py
+@@ -24,7 +24,11 @@
+ from transformers import PretrainedConfig
+ 
+ from sglang.srt.layers.activation import QuickGELU
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+@@ -123,6 +127,7 @@ def forward(
+         cu_seqlens: torch.Tensor,
+         rotary_pos_emb_cos: torch.Tensor,
+         rotary_pos_emb_sin: torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         hidden_states = self.norm1(x)
+         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+@@ -131,6 +136,7 @@ def forward(
+             cu_seqlens=cu_seqlens,
+             rotary_pos_emb_cos=rotary_pos_emb_cos,
+             rotary_pos_emb_sin=rotary_pos_emb_sin,
++            forward_metadata=forward_metadata,
+         )
+         attn = rearrange(attn, "b s ... -> s b ...")
+         x = x + attn
+@@ -481,6 +487,9 @@ def forward(
+             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+         ).cumsum(dim=0, dtype=torch.int32)
+         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=x.device
++        )
+ 
+         # transformers
+         x = x.unsqueeze(1)
+@@ -490,6 +499,7 @@ def forward(
+                 cu_seqlens=cu_seqlens,
+                 rotary_pos_emb_cos=rotary_pos_emb_cos,
+                 rotary_pos_emb_sin=rotary_pos_emb_sin,
++                forward_metadata=forward_metadata,
+             )
+ 
+         final_output = self.ln(x)
+diff --git a/python/sglang/srt/models/glm4v.py b/python/sglang/srt/models/glm4v.py
+index 8ca87e2e1c0d..598c6a22fcca 100644
+--- a/python/sglang/srt/models/glm4v.py
++++ b/python/sglang/srt/models/glm4v.py
+@@ -30,7 +30,11 @@
+ from sglang.srt.distributed.parallel_state import get_pp_group
+ from sglang.srt.layers.activation import SiluAndMul
+ from sglang.srt.layers.attention import vision_utils
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.conv import Conv3dLayer
+ from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
+ from sglang.srt.layers.linear import (
+@@ -155,6 +159,7 @@ def forward(
+         cu_seqlens: torch.Tensor,
+         rotary_pos_emb_cos: torch.Tensor,
+         rotary_pos_emb_sin: torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         S, B, H = x.shape
+         # norm1: flatten to 2D -> [S*B, H], then reshape back
+@@ -168,6 +173,7 @@ def forward(
+             cu_seqlens=cu_seqlens,
+             rotary_pos_emb_cos=rotary_pos_emb_cos,
+             rotary_pos_emb_sin=rotary_pos_emb_sin,
++            forward_metadata=forward_metadata,
+         )
+         attn = rearrange(attn, "b s h -> s b h")
+ 
+@@ -515,6 +521,10 @@ def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+         if is_npu():
+             cu_seqlens = cu_seqlens.to("cpu")
+ 
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=self.device
++        )
++
+         # x.shape: (s, b, d) where b=1 for vision processing
+         # transformers
+         x = x.unsqueeze(1)
+@@ -524,6 +534,7 @@ def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+                 cu_seqlens=cu_seqlens,
+                 rotary_pos_emb_cos=rotary_pos_emb_cos,
+                 rotary_pos_emb_sin=rotary_pos_emb_sin,
++                forward_metadata=forward_metadata,
+             )
+ 
+         # adapter
+diff --git a/python/sglang/srt/models/glm_image_vl.py b/python/sglang/srt/models/glm_image_vl.py
+index c3b0d18123f1..7402aa80b650 100644
+--- a/python/sglang/srt/models/glm_image_vl.py
++++ b/python/sglang/srt/models/glm_image_vl.py
+@@ -27,7 +27,11 @@
+ import torch.nn.functional as F
+ from einops import rearrange
+ 
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import (
+@@ -196,11 +200,16 @@ def forward(
+         self,
+         x: torch.Tensor,
+         cu_seqlens: torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         # x shape: (S, B, H) where B=1
+         hidden_states = self.norm1(x)
+         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+-        attn = self.attn(hidden_states, cu_seqlens=cu_seqlens)
++        attn = self.attn(
++            hidden_states,
++            cu_seqlens=cu_seqlens,
++            forward_metadata=forward_metadata,
++        )
+         attn = rearrange(attn, "b s ... -> s b ...")
+         x = x + attn
+ 
+@@ -294,6 +303,9 @@ def forward(
+             cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+         else:
+             cu_seqlens = cu_seqlens.to("cpu")
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=hidden_states.device
++        )
+ 
+         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+ 
+@@ -309,7 +321,11 @@ def forward(
+         hidden_states = hidden_states.unsqueeze(1)
+ 
+         for blk in self.blocks:
+-            hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens)
++            hidden_states = blk(
++                hidden_states,
++                cu_seqlens=cu_seqlens,
++                forward_metadata=forward_metadata,
++            )
+ 
+         # (S, 1, H) -> (S, H)
+         return hidden_states.squeeze(1)
+diff --git a/python/sglang/srt/models/glm_ocr.py b/python/sglang/srt/models/glm_ocr.py
+index 9a9935b6141b..e696b7c01882 100644
+--- a/python/sglang/srt/models/glm_ocr.py
++++ b/python/sglang/srt/models/glm_ocr.py
+@@ -32,7 +32,11 @@
+ 
+ from sglang.srt.distributed.parallel_state import get_pp_group
+ from sglang.srt.layers.attention import vision_utils
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+ from sglang.srt.layers.pooler import Pooler, PoolingType
+@@ -112,6 +116,7 @@ def forward(
+         cu_seqlens: torch.Tensor,
+         rotary_pos_emb_cos: torch.Tensor,
+         rotary_pos_emb_sin: torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         S, B, H = x.shape
+         # norm1: flatten to 2D -> [S*B, H], then reshape back
+@@ -125,6 +130,7 @@ def forward(
+             cu_seqlens=cu_seqlens,
+             rotary_pos_emb_cos=rotary_pos_emb_cos,
+             rotary_pos_emb_sin=rotary_pos_emb_sin,
++            forward_metadata=forward_metadata,
+         )
+         attn = rearrange(attn, "b s h -> s b h")
+ 
+@@ -236,6 +242,9 @@ def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+         ).cumsum(dim=0, dtype=torch.int32)
+         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=x.device
++        )
+ 
+         rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
+         rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
+@@ -249,6 +258,7 @@ def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+                 cu_seqlens=cu_seqlens,
+                 rotary_pos_emb_cos=rotary_pos_emb_cos,
+                 rotary_pos_emb_sin=rotary_pos_emb_sin,
++                forward_metadata=forward_metadata,
+             )
+ 
+         # adapter
+diff --git a/python/sglang/srt/models/idefics2.py b/python/sglang/srt/models/idefics2.py
+index 7288cf4f3f9f..d54aac976b37 100644
+--- a/python/sglang/srt/models/idefics2.py
++++ b/python/sglang/srt/models/idefics2.py
+@@ -25,7 +25,11 @@
+ from transformers import PretrainedConfig
+ 
+ from sglang.srt.layers.activation import get_act_fn
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.conv import Conv2dLayer
+ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+@@ -99,6 +103,7 @@ def forward(
+         self,
+         hidden_states: torch.Tensor,
+         cu_seqlens: torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         """
+         Args:
+@@ -108,7 +113,11 @@ def forward(
+         """
+         residual = hidden_states
+         hidden_states = self.layer_norm1(hidden_states)
+-        hidden_states = self.self_attn(hidden_states, cu_seqlens=cu_seqlens)
++        hidden_states = self.self_attn(
++            hidden_states,
++            cu_seqlens=cu_seqlens,
++            forward_metadata=forward_metadata,
++        )
+ 
+         hidden_states = residual + hidden_states
+         residual = hidden_states
+@@ -152,6 +161,7 @@ def forward(
+         self,
+         inputs_embeds: torch.Tensor,
+         cu_seqlens: torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         r"""
+         Args:
+@@ -163,13 +173,18 @@ def forward(
+                 internal embedding lookup matrix.
+         """
+         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
++        hidden_states = inputs_embeds
+         if is_npu():
+             cu_seqlens = cu_seqlens.to("cpu")
+-        hidden_states = inputs_embeds
++        if forward_metadata is None:
++            forward_metadata = prepare_vision_attention_metadata(
++                cu_seqlens, device=hidden_states.device
++            )
+         for encoder_layer in self.layers:
+             layer_outputs = encoder_layer(
+                 hidden_states,
+                 cu_seqlens=cu_seqlens,
++                forward_metadata=forward_metadata,
+             )
+             hidden_states = layer_outputs
+         return hidden_states
+@@ -340,6 +355,9 @@ def forward(
+         encoder_outputs = self.encoder(
+             hidden_states,
+             cu_seqlens=cu_seqlens,
++            forward_metadata=prepare_vision_attention_metadata(
++                cu_seqlens, device=hidden_states.device
++            ),
+         )
+         last_hidden_state = self.post_layernorm(encoder_outputs)
+         return last_hidden_state
+diff --git a/python/sglang/srt/models/internvl.py b/python/sglang/srt/models/internvl.py
+index e8f1d00be618..952d21b396c9 100644
+--- a/python/sglang/srt/models/internvl.py
++++ b/python/sglang/srt/models/internvl.py
+@@ -14,7 +14,13 @@
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.activation import get_act_fn
+ from sglang.srt.layers.attention import vision_utils
+-from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
++from sglang.srt.layers.attention.vision import (
++    SingletonCache,
++    VisionAttention,
++    VisionAttentionMetadata,
++    _get_cu_seqlens_for_shape,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.conv import Conv2dLayer
+ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+@@ -86,8 +92,14 @@ def forward(
+         hidden_states: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         output_ws: Optional[torch.Tensor] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+-        out = self.attn(hidden_states, cu_seqlens=cu_seqlens, output_ws=output_ws)
++        out = self.attn(
++            hidden_states,
++            cu_seqlens=cu_seqlens,
++            output_ws=output_ws,
++            forward_metadata=forward_metadata,
++        )
+         outs = self.proj_drop(out)
+         return outs
+ 
+@@ -259,11 +271,8 @@ def forward(
+         hidden_states: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         output_ws: Optional[torch.Tensor] = None,
+-    ) -> Tuple[
+-        torch.FloatTensor,
+-        Optional[torch.FloatTensor],
+-        Optional[Tuple[torch.FloatTensor]],
+-    ]:
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
++    ) -> torch.FloatTensor:
+         """
+         Args:
+             hidden_states (`Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]`): input to the layer of shape `(batch, seq_len, embed_dim)`
+@@ -274,6 +283,7 @@ def forward(
+                 self.norm1(hidden_states).to(hidden_states.dtype),
+                 cu_seqlens=cu_seqlens,
+                 output_ws=output_ws,
++                forward_metadata=forward_metadata,
+             )
+             * self.ls1
+         )
+@@ -344,7 +354,6 @@ def forward(
+                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+         """
+         if self.enable_cg and (not output_hidden_states):
+-            # graph path only returns last_hidden_state
+             hidden_states = inputs_embeds.to(device=inputs_embeds.device).contiguous()
+             hidden_states = self.cuda_graph_runner.run(hidden_states)
+             if not return_dict:
+@@ -364,12 +373,26 @@ def forward(
+         hidden_states = inputs_embeds
+ 
+         if cu_seqlens is None:
++            bsz, seq_len, _ = inputs_embeds.shape
++            cu_seqlens = _get_cu_seqlens_for_shape(
++                bsz, seq_len, device=inputs_embeds.device
++            )
++        forward_metadata = None
++        if isinstance(cu_seqlens, torch.Tensor):
++            forward_metadata = prepare_vision_attention_metadata(
++                cu_seqlens, device=inputs_embeds.device
++            )
++        elif cu_seqlens is None:
+             cu_seqlens = SingletonCache()
+ 
+         for idx, encoder_layer in enumerate(self.layers):
+             if output_hidden_states:
+                 encoder_states = encoder_states + (hidden_states,)
+-            layer_outputs = encoder_layer(hidden_states, cu_seqlens=cu_seqlens)
++            layer_outputs = encoder_layer(
++                hidden_states,
++                cu_seqlens=cu_seqlens,
++                forward_metadata=forward_metadata,
++            )
+             hidden_states = layer_outputs
+ 
+         if output_hidden_states:
+diff --git a/python/sglang/srt/models/kimi_k25.py b/python/sglang/srt/models/kimi_k25.py
+index c579c7af4153..47e49c8d37cc 100644
+--- a/python/sglang/srt/models/kimi_k25.py
++++ b/python/sglang/srt/models/kimi_k25.py
+@@ -10,8 +10,13 @@
+ 
+ from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.conv import Conv2dLayer
++from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+ from sglang.srt.layers.linear import ReplicatedLinear
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+@@ -39,8 +44,6 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
+-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+-
+ _is_npu = is_npu()
+ 
+ 
+@@ -145,6 +148,7 @@ def forward(
+         cu_seqlens: torch.Tensor,
+         max_seqlen: int,
+         rope_freqs_cis: torch.Tensor | None = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         sequence_lengths: torch.Tensor | None = None,
+     ):
+         residual = hidden_states
+@@ -154,6 +158,7 @@ def forward(
+             hidden_states,
+             cu_seqlens=cu_seqlens,
+             position_embeddings=rope_freqs_cis,
++            forward_metadata=forward_metadata,
+             max_seqlen=max_seqlen,
+             sequence_lengths=sequence_lengths,
+         )
+@@ -484,12 +489,17 @@ def forward(
+         max_seqlen = int(lengths.max().item())
+         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
+ 
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=hidden_states.device
++        )
++
+         for block in self.blocks:
+             hidden_states = block(
+                 hidden_states,
+                 cu_seqlens,
+                 max_seqlen,
+                 rope_freqs_cis=rope_freqs_cis,
++                forward_metadata=forward_metadata,
+                 sequence_lengths=sequence_lengths,
+             )
+ 
+diff --git a/python/sglang/srt/models/mimo_vl.py b/python/sglang/srt/models/mimo_vl.py
+index 7433415b31e2..b36bc9616a69 100644
+--- a/python/sglang/srt/models/mimo_vl.py
++++ b/python/sglang/srt/models/mimo_vl.py
+@@ -14,7 +14,11 @@
+     Qwen2_5_VisionRotaryEmbedding,
+ )
+ 
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.quantization import QuantizationConfig
+ from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
+@@ -194,6 +198,7 @@ def forward(
+         max_seqlen: int,
+         position_embeddings: torch.Tensor,
+         full_attn: bool = True,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         S, B, H = x.shape
+         # norm1: flatten to 2D -> [S*B, H], then reshape back
+@@ -208,6 +213,7 @@ def forward(
+             max_seqlen=max_seqlen,
+             position_embeddings=position_embeddings,
+             full_attn=full_attn,
++            forward_metadata=forward_metadata,
+         )
+         attn = rearrange(attn, "b s h -> s b h")
+ 
+@@ -429,6 +435,9 @@ def get_position_embeddings(emb, x):
+             ]
+         )
+         max_seqlen = seqlens.max().item()
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=x.device
++        )
+ 
+         row_based_embeddings = get_position_embeddings(emb, x)
+         col_based_embeddings = get_position_embeddings(
+@@ -446,6 +455,7 @@ def get_position_embeddings(emb, x):
+             reverse_window_index_1d_col,
+             cu_seqlens,
+             max_seqlen,
++            forward_metadata,
+         )
+ 
+     def run_blocks(
+@@ -457,6 +467,7 @@ def run_blocks(
+         reverse_window_index_1d_col: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         max_seqlen: int,
++        forward_metadata: VisionAttentionMetadata,
+     ) -> torch.Tensor:
+         for layer_num, blk in enumerate(self.blocks):
+             window_attn_type = self.vit_window_attn_types[layer_num]
+@@ -485,6 +496,7 @@ def run_blocks(
+                 max_seqlen=max_seqlen,
+                 position_embeddings=position_embeddings,
+                 full_attn=full_attn,
++                forward_metadata=forward_metadata,
+             )
+         x = self.merger(x)
+         return x
+@@ -502,6 +514,7 @@ def forward(
+             reverse_window_index_1d_col,
+             cu_seqlens,
+             max_seqlen,
++            forward_metadata,
+         ) = self._prepare_forward(x, grid_thw)
+ 
+         return self.run_blocks(
+@@ -512,4 +525,5 @@ def forward(
+             reverse_window_index_1d_col,
+             cu_seqlens,
+             max_seqlen,
++            forward_metadata,
+         )
+diff --git a/python/sglang/srt/models/minicpmv_vit.py b/python/sglang/srt/models/minicpmv_vit.py
+index 915dd434c0e2..9ec944da754f 100644
+--- a/python/sglang/srt/models/minicpmv_vit.py
++++ b/python/sglang/srt/models/minicpmv_vit.py
+@@ -31,7 +31,10 @@
+ from transformers import PretrainedConfig
+ 
+ from sglang.srt.layers.activation import get_act_fn
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.models.idefics2 import (
+@@ -170,7 +173,14 @@ def forward(
+             window_cu_seqlens = window_cu_seqlens.to("cpu")
+ 
+         hidden_states = hidden_states[:, window_index, :]
+-        hidden_states = self.self_attn(hidden_states, cu_seqlens=window_cu_seqlens)
++        window_metadata = prepare_vision_attention_metadata(
++            window_cu_seqlens, device=hidden_states.device
++        )
++        hidden_states = self.self_attn(
++            hidden_states,
++            cu_seqlens=window_cu_seqlens,
++            forward_metadata=window_metadata,
++        )
+         hidden_states = hidden_states[:, torch.argsort(window_index), :]
+         hidden_states = residual + hidden_states
+ 
+@@ -501,13 +511,20 @@ def forward(
+         cu_seqlens, max_seqlens = self.compute_cu_seqlens(target_sizes)
+         if is_npu():
+             cu_seqlens = cu_seqlens.to("cpu")
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=hidden_states.device
++        )
+ 
+         if use_vit_merger:
+             # Encoder loop lives here (not inside ``MiniCPMV_VisionEncoder``)
+             # so we can fire ``vit_merger`` after layer ``insert_layer_id``
+             # without coupling the encoder module to it.
+             for layer_index, layer in enumerate(self.encoder.layers):
+-                hidden_states = layer(hidden_states, cu_seqlens=cu_seqlens)
++                hidden_states = layer(
++                    hidden_states,
++                    cu_seqlens=cu_seqlens,
++                    forward_metadata=forward_metadata,
++                )
+                 if layer_index == self.insert_layer_id:
+                     (
+                         hidden_states,
+@@ -519,8 +536,15 @@ def forward(
+                     )
+                     if is_npu():
+                         cu_seqlens = cu_seqlens.to("cpu")
++                    forward_metadata = prepare_vision_attention_metadata(
++                        cu_seqlens, device=hidden_states.device
++                    )
+         else:
+-            hidden_states = self.encoder(hidden_states, cu_seqlens=cu_seqlens)
++            hidden_states = self.encoder(
++                hidden_states,
++                cu_seqlens=cu_seqlens,
++                forward_metadata=forward_metadata,
++            )
+ 
+         hidden_states = self.post_layernorm(hidden_states)
+         return hidden_states, target_sizes
+diff --git a/python/sglang/srt/models/minimax_vl_common.py b/python/sglang/srt/models/minimax_vl_common.py
+index a86831a6f995..0987165b76b2 100644
+--- a/python/sglang/srt/models/minimax_vl_common.py
++++ b/python/sglang/srt/models/minimax_vl_common.py
+@@ -14,6 +14,8 @@
+     FLASHINFER_MAX_SEQLEN_BUCKETS,
+     FLASHINFER_WORKSPACE_SIZE_BYTES,
+     VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
+ )
+ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+ from sglang.srt.layers.linear import (
+@@ -305,6 +307,7 @@ def forward(
+         rotary_pos_emb: torch.Tensor,
+         max_seqlen: Optional[int] = None,
+         sequence_lengths: Optional[torch.Tensor] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         residual = hidden_states
+         hidden_states = self.layer_norm1(hidden_states)
+@@ -314,6 +317,7 @@ def forward(
+             position_embeddings=rotary_pos_emb,
+             max_seqlen=max_seqlen,
+             sequence_lengths=sequence_lengths,
++            forward_metadata=forward_metadata,
+         )
+         hidden_states = residual + hidden_states
+ 
+@@ -361,6 +365,7 @@ def forward(
+         rotary_pos_emb: torch.Tensor,
+         max_seqlen: Optional[int] = None,
+         sequence_lengths: Optional[torch.Tensor] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         hidden_states = inputs_embeds
+         cos_sin = _prepare_rotary_cos_sin(rotary_pos_emb)
+@@ -372,6 +377,7 @@ def forward(
+                 cos_sin,
+                 max_seqlen=max_seqlen,
+                 sequence_lengths=sequence_lengths,
++                forward_metadata=forward_metadata,
+             )
+ 
+         return hidden_states
+@@ -680,12 +686,25 @@ def forward(
+                 max_seqlen,
+             ) = self._build_flashinfer_cudnn_inputs(cu_seq_len)
+ 
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seq_len,
++            device=hidden_states.device,
++            packed_indptrs=(
++                encoder_cu_seq_len
++                if get_server_args().mm_attention_backend == "flashinfer_cudnn"
++                else None
++            ),
++            sequence_lengths=sequence_lengths,
++            flashinfer_max_seqlen=max_seqlen,
++        )
++
+         return self.encoder(
+             inputs_embeds=hidden_states,
+             cu_seq_len=encoder_cu_seq_len,
+             rotary_pos_emb=rotary_pos_emb,
+             max_seqlen=max_seqlen,
+             sequence_lengths=sequence_lengths,
++            forward_metadata=forward_metadata,
+         )
+ 
+ 
+diff --git a/python/sglang/srt/models/moss_vl.py b/python/sglang/srt/models/moss_vl.py
+index d958b6f4d741..9b04905f5c07 100644
+--- a/python/sglang/srt/models/moss_vl.py
++++ b/python/sglang/srt/models/moss_vl.py
+@@ -17,7 +17,11 @@
+ 
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.activation import SiluAndMul
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+ from sglang.srt.layers.conv import Conv3dLayer
+ from sglang.srt.layers.layernorm import RMSNorm
+@@ -163,6 +167,7 @@ def forward(
+         x: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         position_embeddings: torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         hidden_states = self.norm1(x)
+         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+@@ -170,6 +175,7 @@ def forward(
+             hidden_states,
+             cu_seqlens=cu_seqlens,
+             position_embeddings=position_embeddings,
++            forward_metadata=forward_metadata,
+         )
+         attn = rearrange(attn, "b s ... -> s b ...")
+         x = x + attn
+@@ -545,12 +551,20 @@ def forward(
+                 cu_seqlens.to(torch.int32),
+             ]
+         )
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=x.device
++        )
+ 
+         x = x.unsqueeze(1)
+ 
+         deepstack_features = []
+         for layer_idx, blk in enumerate(self.blocks):
+-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
++            x = blk(
++                x,
++                cu_seqlens=cu_seqlens,
++                position_embeddings=position_embeddings,
++                forward_metadata=forward_metadata,
++            )
+             if layer_idx in self.deepstack_visual_indexes:
+                 deepstack_features.append(x)
+ 
+diff --git a/python/sglang/srt/models/paddleocr_vl.py b/python/sglang/srt/models/paddleocr_vl.py
+index 53cb8d741ca0..d6be1b5afa1a 100644
+--- a/python/sglang/srt/models/paddleocr_vl.py
++++ b/python/sglang/srt/models/paddleocr_vl.py
+@@ -25,7 +25,11 @@
+ from transformers.utils import torch_int
+ 
+ from sglang.srt.layers.activation import get_act_fn
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.conv import Conv2dLayer
+ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+@@ -345,6 +349,7 @@ def forward(
+         hidden_states: torch.Tensor,
+         cu_seqlens: Optional[List[torch.Tensor]] = None,
+         rope_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> Tuple[torch.FloatTensor]:
+ 
+         residual = hidden_states
+@@ -355,6 +360,7 @@ def forward(
+             hidden_states,
+             cu_seqlens=cu_seqlens,
+             position_embeddings=rope_emb,
++            forward_metadata=forward_metadata,
+         )
+ 
+         hidden_states = residual + hidden_states
+@@ -447,6 +453,9 @@ def forward(
+         if is_npu() and isinstance(cu_seqlens, torch.Tensor):
+             cu_seqlens = cu_seqlens.to("cpu")
+         attn_cu_seqlens = cu_seqlens
++        forward_metadata = prepare_vision_attention_metadata(
++            attn_cu_seqlens, device=hidden_states.device
++        )
+         hidden_states = inputs_embeds
+ 
+         for encoder_layer in self.layers:
+@@ -454,6 +463,7 @@ def forward(
+                 hidden_states,
+                 cu_seqlens=attn_cu_seqlens,
+                 rope_emb=rope_emb,
++                forward_metadata=forward_metadata,
+             )
+         return hidden_states
+ 
+diff --git a/python/sglang/srt/models/qwen2_5_vl.py b/python/sglang/srt/models/qwen2_5_vl.py
+index ce2fa51415e5..bba029f69a6b 100644
+--- a/python/sglang/srt/models/qwen2_5_vl.py
++++ b/python/sglang/srt/models/qwen2_5_vl.py
+@@ -45,7 +45,11 @@
+ from sglang.srt.distributed.parallel_state import get_pp_group
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.activation import SiluAndMul
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import (
+     ColumnParallelLinear,
+@@ -180,6 +184,7 @@ def forward(
+         cu_seqlens: torch.Tensor,
+         position_embeddings: torch.Tensor,
+         output_ws=None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         S, B, H = x.shape
+         # norm1: flatten to 2D -> [S*B, H], then reshape back
+@@ -193,6 +198,7 @@ def forward(
+             cu_seqlens=cu_seqlens,
+             position_embeddings=position_embeddings,
+             output_ws=output_ws,
++            forward_metadata=forward_metadata,
+         )
+         attn = rearrange(attn, "b s h -> s b h")
+ 
+@@ -469,6 +475,13 @@ def forward(
+         if is_npu():
+             cu_seqlens = cu_seqlens.to("cpu")
+             cu_window_seqlens = cu_window_seqlens.to("cpu")
++
++        # pre-compute attention metadata once for all layers (two variants)
++        full_metadata = prepare_vision_attention_metadata(cu_seqlens, device=x.device)
++        window_metadata = prepare_vision_attention_metadata(
++            cu_window_seqlens, device=x.device
++        )
++
+         # transformers
+         x = x.unsqueeze(1)
+         for layer_num, blk in enumerate(self.blocks):
+@@ -477,10 +490,15 @@ def forward(
+                 fullatt_indexes = fullatt_indexes.tolist()
+             if layer_num in fullatt_indexes:
+                 cu_seqlens_now = cu_seqlens
++                metadata_now = full_metadata
+             else:
+                 cu_seqlens_now = cu_window_seqlens
++                metadata_now = window_metadata
+             x = blk(
+-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
++                x,
++                cu_seqlens=cu_seqlens_now,
++                position_embeddings=position_embeddings,
++                forward_metadata=metadata_now,
+             )
+ 
+         # adapter
+@@ -518,8 +536,8 @@ def forward_with_cuda_graph(
+ 
+         # [G, M, hidden]
+         x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+-        x = x[window_index, :, :]  # [G, M, hidden]
+-        x = x.reshape(seq_len, -1)  # [seq_len, hidden]
++        x = x[window_index, :, :]
++        x = x.reshape(seq_len, -1)
+ 
+         rotary_pos_emb = rotary_pos_emb.reshape(
+             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+@@ -529,8 +547,6 @@ def forward_with_cuda_graph(
+ 
+         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+         position_embeddings = (emb.cos(), emb.sin())
+-        # After building position_embeddings, make sure both cos and sin are on
+-        # the same device/dtype as the attention input
+         position_embeddings = (
+             position_embeddings[0].to(x.device, x.dtype),
+             position_embeddings[1].to(x.device, x.dtype),
+diff --git a/python/sglang/srt/models/qwen2_vl.py b/python/sglang/srt/models/qwen2_vl.py
+index 3bf0367102d3..1e83b2364437 100644
+--- a/python/sglang/srt/models/qwen2_vl.py
++++ b/python/sglang/srt/models/qwen2_vl.py
+@@ -34,7 +34,11 @@
+ from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+ 
+ from sglang.srt.layers.activation import QuickGELU
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.conv import Conv3dLayer
+ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+@@ -162,6 +166,7 @@ def forward(
+         x: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         position_embeddings: torch.Tensor,
++        forward_metadata: Optional["VisionAttentionMetadata"] = None,
+     ) -> torch.Tensor:
+         hidden_states = self.norm1(x)
+         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+@@ -169,6 +174,7 @@ def forward(
+             hidden_states,
+             cu_seqlens=cu_seqlens,
+             position_embeddings=position_embeddings,
++            forward_metadata=forward_metadata,
+         )
+         attn = rearrange(attn, "b s ... -> s b ...")
+         x = x + attn
+@@ -398,10 +404,20 @@ def forward(
+         if is_npu():
+             cu_seqlens = cu_seqlens.to("cpu")
+ 
++        # pre-compute attention metadata once for all layers
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=self.device
++        )
++
+         # transformers
+         x = x.unsqueeze(1)
+         for blk in self.blocks:
+-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
++            x = blk(
++                x,
++                cu_seqlens=cu_seqlens,
++                position_embeddings=position_embeddings,
++                forward_metadata=forward_metadata,
++            )
+ 
+         # adapter
+         x = self.merger(x)
+diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
+index aa7f7c9c1917..7036cd717a1c 100644
+--- a/python/sglang/srt/models/qwen3_vl.py
++++ b/python/sglang/srt/models/qwen3_vl.py
+@@ -34,6 +34,8 @@
+     FLASHINFER_MAX_SEQLEN_BUCKETS,
+     FLASHINFER_WORKSPACE_SIZE_BYTES,
+     VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
+ )
+ from sglang.srt.layers.conv import Conv3dLayer
+ from sglang.srt.layers.dp_attention import (
+@@ -87,7 +89,6 @@
+ 
+     graph_runners_dict["npu"] = ViTNpuGraphRunner
+ 
+-
+ logger = logging.getLogger(__name__)
+ 
+ _is_cpu_amx_available = cpu_has_amx_support()
+@@ -224,6 +225,7 @@ def forward(
+         rotary_pos_emb_cos: torch.Tensor,
+         rotary_pos_emb_sin: torch.Tensor,
+         output_ws: Optional[torch.Tensor] = None,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+         max_seqlen: Optional[torch.Tensor] = None,
+         sequence_lengths: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
+@@ -235,6 +237,7 @@ def forward(
+             rotary_pos_emb_cos=rotary_pos_emb_cos,
+             rotary_pos_emb_sin=rotary_pos_emb_sin,
+             output_ws=output_ws,
++            forward_metadata=forward_metadata,
+             max_seqlen=max_seqlen,
+             sequence_lengths=sequence_lengths,
+         )
+@@ -909,8 +912,11 @@ def forward(
+             [np.zeros(1, dtype=np.int32), token_cu_seqlens]
+         )
+ 
++        # ---- pre-compute attention metadata once for all layers ----
++        packed_indptrs = None
++        flashinfer_sequence_lengths = None
+         flashinfer_max_seqlen = 0
+-        cu_seqlens = None
++
+         if get_server_args().mm_attention_backend == "flashinfer_cudnn":
+             # real token lens (B,)
+             real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
+@@ -924,11 +930,8 @@ def forward(
+             )
+ 
+             # element-per-token width on THIS ATTENTION TP rank
+-            # q/k/v in VisionAttention are sharded by attention TP
+             attn_tp_size = 1 if self.use_data_parallel else self.tp_size
+-            elem_per_token = (
+-                self.hidden_size // attn_tp_size
+-            )  # == heads_per_rank * head_dim
++            elem_per_token = self.hidden_size // attn_tp_size
+ 
+             # (3*(B_padded+1),) packed element indptrs
+             offsets_packed = self.compute_flashinfer_batch_offsets_packed(
+@@ -936,30 +939,30 @@ def forward(
+                 elem_per_token=elem_per_token,
+             )
+ 
+-            sequence_lengths = (
++            flashinfer_sequence_lengths = (
+                 torch.from_numpy(seq_lens_padded)
+                 .to(device=self.device, dtype=torch.int32, non_blocking=True)
+                 .view(-1, 1, 1, 1)
+-            )  # match cuDNN test style
+-
+-            cu_seqlens = torch.from_numpy(offsets_packed).to(
++            )
++            packed_indptrs = torch.from_numpy(offsets_packed).to(
+                 device=self.device, dtype=torch.int32, non_blocking=True
+             )
+ 
+-            max_seqlen = int(flashinfer_max_seqlen)
+-            sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
++        cu_seqlens = torch.from_numpy(token_cu_seqlens)
++        if not _is_npu:
++            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+         else:
+-            sequence_lengths = None
+-            cu_seqlens = torch.from_numpy(token_cu_seqlens)
+-            if not _is_npu:
+-                cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+-            else:
+-                cu_seqlens = cu_seqlens.to("cpu")
+-            max_seqlen = None
++            cu_seqlens = cu_seqlens.to("cpu")
+ 
+-        x = x.unsqueeze(1)
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens,
++            device=self.device,
++            packed_indptrs=packed_indptrs,
++            sequence_lengths=flashinfer_sequence_lengths,
++            flashinfer_max_seqlen=flashinfer_max_seqlen,
++        )
+ 
+-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
++        x = x.unsqueeze(1)
+ 
+         deepstack_feature_lists = []
+         num_deepstack_captured = 0
+@@ -970,8 +973,7 @@ def forward(
+                 cu_seqlens=cu_seqlens,
+                 rotary_pos_emb_cos=rotary_pos_emb_cos,
+                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+-                max_seqlen=max_seqlen,
+-                sequence_lengths=sequence_lengths,
++                forward_metadata=forward_metadata,
+             )
+ 
+             if layer_num in self.deepstack_visual_indexes:
+diff --git a/python/sglang/srt/models/siglip2.py b/python/sglang/srt/models/siglip2.py
+index dcdc5573b3a9..6b218f1d7fe0 100644
+--- a/python/sglang/srt/models/siglip2.py
++++ b/python/sglang/srt/models/siglip2.py
+@@ -30,7 +30,11 @@
+ from transformers import Siglip2VisionConfig
+ 
+ from sglang.srt.layers.activation import get_act_fn
+-from sglang.srt.layers.attention.vision import VisionAttention
++from sglang.srt.layers.attention.vision import (
++    VisionAttention,
++    VisionAttentionMetadata,
++    prepare_vision_attention_metadata,
++)
+ from sglang.srt.layers.linear import (
+     ColumnParallelLinear,
+     RowParallelLinear,
+@@ -203,6 +207,7 @@ def forward(
+         hidden_states: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         max_seqlen: int | torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         """Forward pass with variable-length attention.
+ 
+@@ -214,7 +219,11 @@ def forward(
+         Returns:
+             (1, total_tokens, embed_dim) attention output
+         """
+-        return self.attn(hidden_states, cu_seqlens=cu_seqlens)
++        return self.attn(
++            hidden_states,
++            cu_seqlens=cu_seqlens,
++            forward_metadata=forward_metadata,
++        )
+ 
+ 
+ class Siglip2MLP(nn.Module):
+@@ -279,6 +288,7 @@ def forward(
+         hidden_states: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         max_seqlen: int | torch.Tensor,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor:
+         """Forward pass for encoder layer.
+ 
+@@ -294,6 +304,7 @@ def forward(
+             hidden_states=hidden_states,
+             cu_seqlens=cu_seqlens,
+             max_seqlen=max_seqlen,
++            forward_metadata=forward_metadata,
+         )
+         hidden_states = residual + hidden_states
+ 
+@@ -339,15 +350,21 @@ def forward(
+         cu_seqlens: torch.Tensor,
+         max_seqlen: int | torch.Tensor,
+         return_all_hidden_states: bool = False,
++        forward_metadata: Optional[VisionAttentionMetadata] = None,
+     ) -> torch.Tensor | list[torch.Tensor]:
+         hidden_states_pool = [inputs_embeds]
+         hidden_states = inputs_embeds
++        if forward_metadata is None:
++            forward_metadata = prepare_vision_attention_metadata(
++                cu_seqlens, device=hidden_states.device
++            )
+ 
+         for encoder_layer in self.layers:
+             hidden_states = encoder_layer(
+                 hidden_states,
+                 cu_seqlens=cu_seqlens,
+                 max_seqlen=max_seqlen,
++                forward_metadata=forward_metadata,
+             )
+             if return_all_hidden_states:
+                 hidden_states_pool.append(hidden_states)
+@@ -464,12 +481,16 @@ def forward(
+             Vision features tensor
+         """
+         hidden_states = self.embeddings(pixel_values_packed, spatial_shapes)
++        forward_metadata = prepare_vision_attention_metadata(
++            cu_seqlens, device=hidden_states.device
++        )
+ 
+         encoder_outputs = self.encoder(
+             inputs_embeds=hidden_states,
+             cu_seqlens=cu_seqlens,
+             max_seqlen=max_seqlen,
+             return_all_hidden_states=select_layers is not None,
++            forward_metadata=forward_metadata,
+         )
+ 
+         encoder_outputs = resolve_visual_encoder_outputs(
+diff --git a/python/sglang/srt/multimodal/vit_cuda_graph_runner.py b/python/sglang/srt/multimodal/vit_cuda_graph_runner.py
+index 2401084a1338..e05171e34d95 100644
+--- a/python/sglang/srt/multimodal/vit_cuda_graph_runner.py
++++ b/python/sglang/srt/multimodal/vit_cuda_graph_runner.py
+@@ -153,6 +153,25 @@ def _create_graph(
+ 
+         override_backend = get_server_args().mm_attention_backend
+ 
++        if self._fullatt_block_indexes and 0 not in vit.fullatt_block_indexes:
++            warmup_cu_ws = [cu_window, cu_window_kk, max_window_len]
++        else:
++            warmup_cu_ws = [cu_full, cu_full_kk, max_full_len]
++        if override_backend == "fa3":
++            warmup_cu_ws = [warmup_cu_ws[0], warmup_cu_ws[2]]
++
++        warmup_kwargs = dict(
++            cu_seqlens=warmup_cu_ws, output_ws=self.block_ws[graph_key]
++        )
++        if position_embeddings is not None:
++            warmup_kwargs["position_embeddings"] = position_embeddings
++        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
++            warmup_kwargs["rotary_pos_emb_cos"] = rotary_pos_emb_cos
++            warmup_kwargs["rotary_pos_emb_sin"] = rotary_pos_emb_sin
++        with torch.no_grad():
++            vit.blocks[0](self.block_input[graph_key], **warmup_kwargs)
++        torch.cuda.synchronize()
++
+         with self._capture_context(), torch.cuda.graph(graph):
+             y = None
+             deepstack_outs: List[torch.Tensor] = []
+@@ -290,6 +309,8 @@ def create_graph(
+                 self.cu_full_len[graph_key] = cu_seqlens
+                 self.cu_full_len_kk[graph_key] = cu_seqlens[1:] - cu_seqlens[:-1]
+ 
++        self.block_input[graph_key].copy_(x_3d)
++
+         if position_embeddings is not None:
+             # make sure rotary workspace
+             head_dim = position_embeddings[0].shape[1]
+diff --git a/test/registered/unit/layers/attention/test_vision_max_seqlen.py b/test/registered/unit/layers/attention/test_vision_max_seqlen.py
+index 2d83af2fa9c2..27e9e39f2f66 100644
+--- a/test/registered/unit/layers/attention/test_vision_max_seqlen.py
++++ b/test/registered/unit/layers/attention/test_vision_max_seqlen.py
+@@ -25,6 +25,7 @@ def fake_flash_attn(q, k, v, **kwargs):
+     monkeypatch.setattr(
+         vision, "flash_attn_varlen_func", fake_flash_attn, raising=False
+     )
++    monkeypatch.setattr(vision, "flash_attn_func", fake_flash_attn, raising=False)
+ 
+     attention = vision.VisionFlash3Attention(use_data_parallel=True)
+     q = torch.zeros(3, 1, 8)
+@@ -89,6 +90,7 @@ def fake_flash_attn(q, k, v, **kwargs):
+     monkeypatch.setattr(
+         vision, "flash_attn_varlen_func", fake_flash_attn, raising=False
+     )
++    monkeypatch.setattr(vision, "flash_attn_func", fake_flash_attn, raising=False)
+ 
+     attention = vision.VisionFlash4Attention(use_data_parallel=True)
+     q = torch.zeros(3, 1, 8)
+@@ -154,6 +156,7 @@ def forward(
+             max_seqlen,
+             rope_freqs_cis,
+             sequence_lengths,
++            forward_metadata=None,
+         ):
+             recorded["cu_seqlens"] = cu_seqlens
+             recorded["max_seqlen"] = max_seqlen

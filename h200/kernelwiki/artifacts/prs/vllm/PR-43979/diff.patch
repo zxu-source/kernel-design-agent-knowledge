@@ -1,0 +1,103 @@
+diff --git a/tests/kernels/moe/test_ocp_mx_moe.py b/tests/kernels/moe/test_ocp_mx_moe.py
+index 49682dbfcd69..2f819c09aaae 100644
+--- a/tests/kernels/moe/test_ocp_mx_moe.py
++++ b/tests/kernels/moe/test_ocp_mx_moe.py
+@@ -1512,3 +1512,49 @@ class MockLayer:
+ 
+     # Check accuracy using per-backend thresholds
+     check_accuracy(ref, out, atol=0.1, rtol=config["rtol"], percent=config["percent"])
++
++
++# -----------------------------------------------------------------------------
++# MXFP4 emulation size-rounding tests
++# -----------------------------------------------------------------------------
++# Emulation needs each per-partition dim rounded up to OCP_MX_BLOCK_SIZE (32);
++# a non-block-aligned shard (e.g. GPT-OSS 2880 // 4 = 720) otherwise truncates
++# the scale buffer and fails weight loading.
++# NOTE: gated to ROCm since it is the emulation backend's current target;
++# remove this skip if the backend is enabled on non-ROCm platforms.
++@pytest.mark.skipif(not ROCM_AVAILABLE, reason="emulation backend targets ROCm")
++@pytest.mark.parametrize(
++    "hidden_size,intermediate_size,expected_hidden,expected_intermediate",
++    [
++        (2880, 720, 2880, 736),  # GPT-OSS TP=4 shard: 720 -> round_up(720, 32)
++        (2880, 360, 2880, 384),  # GPT-OSS TP=8 shard: 360 -> 384
++        (2880, 2880, 2880, 2880),  # already block-aligned: unchanged
++        (90, 90, 96, 96),  # both dims unaligned
++    ],
++)
++def test_mxfp4_emulation_rounds_up_to_block_size(
++    hidden_size: int,
++    intermediate_size: int,
++    expected_hidden: int,
++    expected_intermediate: int,
++):
++    """Emulation must block-align per-partition dims to OCP_MX_BLOCK_SIZE."""
++    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
++        Mxfp4MoeBackend,
++        mxfp4_round_up_hidden_size_and_intermediate_size,
++    )
++    from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
++        OCP_MX_BLOCK_SIZE,
++    )
++
++    rounded_hidden, rounded_intermediate = (
++        mxfp4_round_up_hidden_size_and_intermediate_size(
++            Mxfp4MoeBackend.EMULATION, hidden_size, intermediate_size
++        )
++    )
++
++    assert rounded_hidden == expected_hidden
++    assert rounded_intermediate == expected_intermediate
++    # The block-scale buffer (dim // OCP_MX_BLOCK_SIZE) must not floor-truncate.
++    assert rounded_hidden % OCP_MX_BLOCK_SIZE == 0
++    assert rounded_intermediate % OCP_MX_BLOCK_SIZE == 0
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+index 55a767f060cb..921e8f114d5a 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -27,6 +27,9 @@
+     ocp_mx_moe_quant_config,
+ )
+ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import _swizzle_mxfp4
++from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
++    OCP_MX_BLOCK_SIZE,
++)
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
+     kFp8Dynamic128Sym,
+@@ -633,7 +636,13 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
+     backend: Mxfp4MoeBackend, hidden_size: int, intermediate_size: int
+ ) -> tuple[int, int]:
+     """Round up hidden_size and intermediate_size based on backend requirements."""
+-    if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
++    if backend == Mxfp4MoeBackend.EMULATION:
++        # Emulation has no kernel tile; it only needs OCP MX block alignment so the
++        # per-block scale buffers (`dim // OCP_MX_BLOCK_SIZE`) aren't floor-truncated
++        # by a non-block-aligned TP/DP shard (e.g. 2880 // 4 = 720).
++        intermediate_size = round_up(intermediate_size, OCP_MX_BLOCK_SIZE)
++        hidden_size = round_up(hidden_size, OCP_MX_BLOCK_SIZE)
++    elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+         # DeepGEMM requires M/N/K alignment
+         intermediate_size = round_up(intermediate_size, 128)
+         hidden_size = round_up(hidden_size, 128)
+diff --git a/vllm/model_executor/layers/quantization/quark/quark_moe.py b/vllm/model_executor/layers/quantization/quark/quark_moe.py
+index 7bdf963b5121..15023d7ca39a 100644
+--- a/vllm/model_executor/layers/quantization/quark/quark_moe.py
++++ b/vllm/model_executor/layers/quantization/quark/quark_moe.py
+@@ -1063,12 +1063,9 @@ def maybe_roundup_sizes(
+             act_dtype=act_dtype,
+             moe_parallel_config=moe_parallel_config,
+         )
+-        # In case quantization emulation backend is used, there is no need to apply
+-        # MXFP4-specific padding logic as the compute happens in higher precision.
+-        if (
+-            self.mxfp4_backend is not None
+-            and self.mxfp4_backend != Mxfp4MoeBackend.EMULATION
+-        ):
++        # Round per-partition sizes up to each backend's requirement. Emulation is
++        # handled inside the helper too (OCP MX block alignment), so no special-case.
++        if self.mxfp4_backend is not None:
+             hidden_size, intermediate_size_per_partition = (
+                 mxfp4_round_up_hidden_size_and_intermediate_size(
+                     self.mxfp4_backend, hidden_size, intermediate_size_per_partition

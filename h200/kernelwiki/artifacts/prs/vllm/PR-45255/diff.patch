@@ -1,0 +1,128 @@
+diff --git a/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu b/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu
+index e3017e6ca216..902391b8f6dd 100644
+--- a/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu
++++ b/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu
+@@ -301,8 +301,9 @@ __global__ void per_token_group_quant_8bit_packed_register_kernel(
+ 
+   const int sf_k_local = local_group_id % kGroupsPerBlockX;
+   const int row_local = local_group_id / kGroupsPerBlockX;
+-  const int sf_k_idx = blockIdx.x * kGroupsPerBlockX + sf_k_local;
+-  const int mn_idx = blockIdx.y * kRowsPerBlock + row_local;
++  // Rows on grid.x: mn scales with tokens and can exceed the 65535 grid.y cap.
++  const int sf_k_idx = blockIdx.y * kGroupsPerBlockX + sf_k_local;
++  const int mn_idx = blockIdx.x * kRowsPerBlock + row_local;
+ 
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+   asm volatile("griddepcontrol.wait;");
+@@ -496,14 +497,15 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
+                   " is not a multiple of 4.");
+   const int kx = GetGroupsPerBlockX(padded_groups_per_row);
+   const int ry = 16 / kx;
+-  const int64_t blocks_x = padded_groups_per_row / kx;
+-  const int64_t blocks_y = (tma_aligned_mn + ry - 1) / ry;
++  const int64_t row_blocks = (tma_aligned_mn + ry - 1) / ry;
++  const int64_t sf_k_blocks = padded_groups_per_row / kx;
+   const int num_threads = (kx * ry) * THREADS_PER_GROUP;
+-  // CUDA caps grid.x and grid.y at 2^31 - 1; guard against pathological inputs.
+-  STD_TORCH_CHECK(blocks_x <= static_cast<int64_t>(INT32_MAX) &&
+-                      blocks_y <= static_cast<int64_t>(INT32_MAX),
++  // CUDA caps grid.x at 2^31 - 1 and grid.y at 2^16 - 1 (65535).
++  constexpr int64_t kMaxGridDimYZ = 65535;
++  STD_TORCH_CHECK(row_blocks <= static_cast<int64_t>(INT32_MAX) &&
++                      sf_k_blocks <= kMaxGridDimYZ,
+                   "per_token_group_quant_8bit_packed grid too large: (",
+-                  blocks_x, ", ", blocks_y, ").");
++                  row_blocks, ", ", sf_k_blocks, ").");
+ 
+   auto dst_type = output_q.scalar_type();
+ 
+@@ -513,8 +515,8 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
+   #define LAUNCH_REG_KERNEL_INST(T, DST_DTYPE, KX, RY)                         \
+     do {                                                                       \
+       cudaLaunchConfig_t config = {};                                          \
+-      config.gridDim = dim3(static_cast<unsigned int>(blocks_x),               \
+-                            static_cast<unsigned int>(blocks_y));              \
++      config.gridDim = dim3(static_cast<unsigned int>(row_blocks),             \
++                            static_cast<unsigned int>(sf_k_blocks));           \
+       config.blockDim = dim3(num_threads);                                     \
+       config.dynamicSmemBytes = 0;                                             \
+       config.stream = stream;                                                  \
+@@ -539,8 +541,8 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
+ #else
+   #define LAUNCH_REG_KERNEL_INST(T, DST_DTYPE, KX, RY)                         \
+     do {                                                                       \
+-      dim3 grid(static_cast<unsigned int>(blocks_x),                           \
+-                static_cast<unsigned int>(blocks_y));                          \
++      dim3 grid(static_cast<unsigned int>(row_blocks),                         \
++                static_cast<unsigned int>(sf_k_blocks));                       \
+       dim3 block(num_threads);                                                 \
+       per_token_group_quant_8bit_packed_register_kernel<T, DST_DTYPE, 128, KX, \
+                                                         RY>                    \
+diff --git a/tests/kernels/quantization/test_per_token_group_quant.py b/tests/kernels/quantization/test_per_token_group_quant.py
+index d957cefed4df..0d9b6c0c3e8f 100644
+--- a/tests/kernels/quantization/test_per_token_group_quant.py
++++ b/tests/kernels/quantization/test_per_token_group_quant.py
+@@ -345,6 +345,63 @@ def test_per_token_group_quant_fp8_packed_zero_fills_padded_output_q(
+         )
+ 
+ 
++@pytest.mark.skipif(
++    not current_platform.is_cuda_alike(),
++    reason="packed FP8 per-token-group quant kernel requires a CUDA-alike GPU",
++)
++def test_per_token_group_quant_fp8_packed_large_mn():
++    """Regression test for https://github.com/vllm-project/vllm/issues/45099.
++
++    Some background: gridDim.x and gridDim.y have different limits of 2^31 - 1 and
++    2^16 - 1, respectively.
++    Prior code introduced a bug where it incorrectly assumed grid.x and y both have
++    2^31 - 1 limits and mixed them up, which doesn't surface until the kernel is
++    launched with a large mn that exceeds grid.y limit (2^16 - 1).
++
++    This issue doesn't surface often because each forward pass only processes a
++    bounded token batch, not the full context.
++    Quantizing tensors with more rows than that will fail at launch with
++    "CUDA error: invalid argument".
++    This is a differential test that compares fp8 output against Triton output
++    reference when token size sits just above the gridDim.y 2^16 - 1 limit.
++    """
++
++    device = "cuda"
++    group_size = 128
++    # hidden 2048 -> 2048/128 = 16 groups per row -> kx=16, ry=1: one grid row per mn
++    # row, so any mn > 65535 overflowed grid.y before the fix.
++    num_tokens, hidden_dim = 65537, 2048
++    torch.manual_seed(42)
++    x = torch.randn((num_tokens, hidden_dim), device=device, dtype=torch.bfloat16) * 8
++
++    out_q, out_s_packed = fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(
++        x,
++        group_size=group_size,
++        use_ue8m0=True,
++    )
++
++    with patch("vllm.platforms.current_platform.is_cuda_alike", return_value=False):
++        ref_q, ref_s = fp8_utils.per_token_group_quant_fp8(
++            x, group_size, use_ue8m0=True
++        )
++
++    assert torch.equal(out_q, ref_q), "Quantized output mismatch"
++
++    # Vectorized packed-scale check; the per-element loop used by the smaller
++    # tests is too slow at this size. groups_per_row is a multiple of 4 here,
++    # so there is no K padding and the packed view lines up.
++    mn = num_tokens
++    groups_per_row = hidden_dim // group_size
++    k_num_packed = (groups_per_row + 3) // 4
++    assert groups_per_row % 4 == 0
++    ref_exponents = (ref_s.reshape(mn, groups_per_row).view(torch.int32) >> 23) & 0xFF
++    exp = ref_exponents.view(mn, k_num_packed, 4)
++    expected = (
++        exp[..., 0] | (exp[..., 1] << 8) | (exp[..., 2] << 16) | (exp[..., 3] << 24)
++    )
++    assert torch.equal(out_s_packed.cpu(), expected.cpu()), "Packed scale mismatch"
++
++
+ @pytest.mark.parametrize("shape", [(32, 128), (64, 256), (16, 512)])
+ @pytest.mark.parametrize("group_size", [64, 128])
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

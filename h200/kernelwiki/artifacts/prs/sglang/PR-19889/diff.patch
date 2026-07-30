@@ -1,0 +1,226 @@
+diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
+index 614be8f0ec61..401b5f1314e2 100644
+--- a/python/sglang/srt/layers/layernorm.py
++++ b/python/sglang/srt/layers/layernorm.py
+@@ -86,6 +86,53 @@
+     import torch_npu
+ 
+ 
++def _forward_with_allreduce_fusion(
++    norm_module,
++    x: torch.Tensor,
++    residual: Optional[torch.Tensor],
++    post_residual_addition: Optional[torch.Tensor],
++    weight: torch.Tensor,
++) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++    """Shared allreduce-fused RMSNorm logic usable by any norm."""
++    if residual is not None:
++        from sglang.srt.distributed import (
++            get_tensor_model_parallel_world_size,
++            tensor_model_parallel_all_reduce,
++            tensor_model_parallel_fused_allreduce_rmsnorm,
++        )
++        from sglang.srt.layers.flashinfer_comm_fusion import (
++            flashinfer_allreduce_residual_rmsnorm,
++        )
++
++        if get_tensor_model_parallel_world_size() > 1:
++            if post_residual_addition is not None:
++                residual = residual + post_residual_addition
++
++            # Prefer AITER fused AR+RMSNorm when enabled on AMD.
++            if _use_aiter:
++                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
++                    x, residual, weight, norm_module.variance_epsilon
++                )
++                if fused_result is not None:
++                    return fused_result
++            else:
++                fused_result = flashinfer_allreduce_residual_rmsnorm(
++                    input_tensor=x,
++                    residual=residual,
++                    weight=weight,
++                    eps=norm_module.variance_epsilon,
++                )
++                if fused_result[0] is not None:
++                    return fused_result
++
++            # For AITER route, preserve correctness when fused path is unavailable.
++            if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
++                x = tensor_model_parallel_all_reduce(x)
++                return norm_module.forward(x, residual, None)
++
++    return norm_module.forward(x, residual, post_residual_addition)
++
++
+ class RMSNorm(MultiPlatformOp):
+     def __init__(
+         self,
+@@ -303,53 +350,10 @@ def forward_with_allreduce_fusion(
+         residual: Optional[torch.Tensor] = None,
+         post_residual_addition: Optional[torch.Tensor] = None,
+     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+-        """
+-        Forward method with allreduce fusion, prioritizing flashinfer fused operations
+-        """
+-        if residual is not None:
+-            from sglang.srt.distributed import (
+-                get_tensor_model_parallel_world_size,
+-                tensor_model_parallel_all_reduce,
+-                tensor_model_parallel_fused_allreduce_rmsnorm,
+-            )
+-            from sglang.srt.layers.flashinfer_comm_fusion import (
+-                flashinfer_allreduce_residual_rmsnorm,
+-            )
+-
+-            if get_tensor_model_parallel_world_size() > 1:
+-                if post_residual_addition is not None:
+-                    residual = residual + post_residual_addition
+-
+-                # Prefer AITER fused AR+RMSNorm when enabled on AMD.
+-                if _use_aiter:
+-                    fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+-                        x, residual, self.weight, self.variance_epsilon
+-                    )
+-                    if fused_result is not None:
+-                        return fused_result
+-                    else:
+-                        logger.warning(
+-                            "AITER fused AR+RMSNorm failed, falling back to standard implementation"
+-                        )
+-                        x = tensor_model_parallel_all_reduce(x)
+-                        return self.forward(x, residual, None)
+-                else:
+-                    fused_result = flashinfer_allreduce_residual_rmsnorm(
+-                        input_tensor=x,
+-                        residual=residual,
+-                        weight=self.weight,
+-                        eps=self.variance_epsilon,
+-                    )
+-                    if fused_result[0] is not None:
+-                        return fused_result
+-                    else:
+-                        logger.warning(
+-                            "FlashInfer allreduce fusion failed, falling back to standard implementation"
+-                        )
+-                        x = tensor_model_parallel_all_reduce(x)
+-                        return self.forward(x, residual, None)
+-
+-        return self.forward(x, residual, post_residual_addition)
++        """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
++        return _forward_with_allreduce_fusion(
++            self, x, residual, post_residual_addition, self.weight
++        )
+ 
+ 
+ class LayerNorm(MultiPlatformOp):
+@@ -433,7 +437,6 @@ def __init__(
+         super().__init__()
+         self.weight = nn.Parameter(torch.zeros(hidden_size))
+         self.variance_epsilon = eps
+-
+         # Re-dispatch
+         if _is_hip:
+             self._forward_method = self.forward_native
+@@ -526,6 +529,18 @@ def forward_xpu(
+     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+         return self._forward_impl(x, residual, post_residual_addition)
+ 
++    def forward_with_allreduce_fusion(
++        self,
++        x: torch.Tensor,
++        residual: Optional[torch.Tensor] = None,
++        post_residual_addition: Optional[torch.Tensor] = None,
++    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++        """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
++        # TODO(brayden): we can see if TRTLLM allreduce fusion can provide gemma-style norm
++        return _forward_with_allreduce_fusion(
++            self, x, residual, post_residual_addition, self.weight + 1.0
++        )
++
+ 
+ class Gemma3RMSNorm(MultiPlatformOp):
+     def __init__(self, dim: int, eps: float = 1e-6):
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index ed94416e5e4b..4a41c12e76d1 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -54,7 +54,10 @@
+     RowParallelLinear,
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+-from sglang.srt.layers.moe import get_moe_a2a_backend
++from sglang.srt.layers.moe import (
++    get_moe_a2a_backend,
++    should_use_flashinfer_cutlass_moe_fp4_allgather,
++)
+ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+ from sglang.srt.layers.moe.topk import TopK
+@@ -310,6 +313,7 @@ def forward(
+         hidden_states: torch.Tensor,
+         forward_batch: Optional[ForwardBatch] = None,
+         use_reduce_scatter: bool = False,
++        should_allreduce_fusion: bool = False,
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+@@ -335,7 +339,12 @@ def forward(
+             # An out-of-place add would allocate a new tensor outside symm
+             # memory, breaking subsequent symmetric collective operations.
+             final_hidden_states += shared_output
+-        if self.tp_size > 1 and not use_reduce_scatter:
++        if (
++            self.tp_size > 1
++            and not should_allreduce_fusion
++            and not use_reduce_scatter
++            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
++        ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+         return final_hidden_states.view(num_tokens, hidden_dim)
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 73f22f9be2c7..fd7aaf258dd8 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -397,7 +397,12 @@ def forward(
+             )
+         )
+         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
++            hidden_states = self.mlp(
++                hidden_states,
++                forward_batch,
++                use_reduce_scatter,
++                should_allreduce_fusion,
++            )
+         else:
+             hidden_states = self.mlp(
+                 hidden_states, should_allreduce_fusion, use_reduce_scatter
+@@ -646,7 +651,12 @@ def forward(
+             )
+         )
+         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
++            hidden_states = self.mlp(
++                hidden_states,
++                forward_batch,
++                use_reduce_scatter,
++                should_allreduce_fusion,
++            )
+         else:
+             hidden_states = self.mlp(
+                 hidden_states, should_allreduce_fusion, use_reduce_scatter
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 2be1c045a0bf..55a93701e1ca 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1978,6 +1978,8 @@ def _handle_model_specific_adjustments(self):
+                 "Glm4MoeLiteForCausalLM",
+                 "Qwen3MoeForCausalLM",
+                 "KimiK25ForConditionalGeneration",
++                "Qwen3_5MoeForConditionalGeneration",
++                "Qwen3_5ForConditionalGeneration",
+             ]
+             and (is_sm90_supported() or is_sm100_supported())
+             and not self.enable_dp_attention

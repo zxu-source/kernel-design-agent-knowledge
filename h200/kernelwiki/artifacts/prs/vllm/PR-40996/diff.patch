@@ -1,0 +1,1650 @@
+diff --git a/tests/distributed/test_context_parallel.py b/tests/distributed/test_context_parallel.py
+index 484d29c5b536..007948aeba82 100644
+--- a/tests/distributed/test_context_parallel.py
++++ b/tests/distributed/test_context_parallel.py
+@@ -33,6 +33,7 @@
+     # [LANGUAGE GENERATION]
+     "deepseek-ai/DeepSeek-V2-Lite-Chat",
+     "Qwen/Qwen2.5-1.5B-Instruct",
++    "Qwen/Qwen3.5-0.8B",  # hybrid attention model
+ ]
+ 
+ # GSM8K eval configuration
+@@ -46,6 +47,7 @@
+     "deepseek-ai/DeepSeek-V2-Lite-Chat": 0.64,
+     # .buildkite/lm-eval-harness/configs/Qwen2.5-1.5B-Instruct.yaml
+     "Qwen/Qwen2.5-1.5B-Instruct": 0.52,
++    "Qwen/Qwen3.5-0.8B": 0.33,
+ }
+ 
+ 
+@@ -151,6 +153,12 @@ def iter_params(self, model_id: str):
+                 cp_kv_cache_interleave_size=16, attn_backend="FLASHINFER"
+             ),
+         ],
++        "Qwen/Qwen3.5-0.8B": [
++            CPTestSettings.detailed(
++                cp_kv_cache_interleave_size=16,
++                attn_backend="FLASH_ATTN",
++            ),
++        ],
+     }
+ 
+ 
+diff --git a/tests/distributed/test_pynccl.py b/tests/distributed/test_pynccl.py
+index d7b04f68091d..62eba4843a0b 100644
+--- a/tests/distributed/test_pynccl.py
++++ b/tests/distributed/test_pynccl.py
+@@ -16,6 +16,7 @@
+ from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+ from vllm.distributed.parallel_state import (
+     ensure_model_parallel_initialized,
++    get_tp_group,
+     get_world_group,
+     graph_capture,
+     init_distributed_environment,
+@@ -199,6 +200,52 @@ def test_pynccl_all_gather():
+     distributed_run(all_gather_worker_fn, 2)
+ 
+ 
++@worker_fn_wrapper
++def cuda_communicator_all_gather_dim_worker_fn():
++    with ensure_current_vllm_config():
++        ensure_model_parallel_initialized(2, 1)
++
++    tp_group = get_tp_group()
++    comm = tp_group.device_communicator
++    assert comm is not None
++
++    rank = tp_group.rank_in_group
++    world_size = tp_group.world_size
++    device = tp_group.device
++
++    shape = (2, 3, 4)
++    num_elems = 1
++    for size in shape:
++        num_elems *= size
++
++    for dim in (1, -1):
++        tensor = (
++            torch.arange(num_elems, dtype=torch.float32, device=device).reshape(shape)
++            + rank * num_elems
++        )
++        expected = torch.cat(
++            [
++                torch.arange(num_elems, dtype=torch.float32, device=device).reshape(
++                    shape
++                )
++                + r * num_elems
++                for r in range(world_size)
++            ],
++            dim=dim,
++        )
++
++        result = comm.all_gather(tensor, dim=dim)
++        torch.accelerator.synchronize()
++        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-8)
++
++
++@pytest.mark.skipif(
++    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
++)
++def test_cuda_communicator_all_gather_dim_not_zero():
++    distributed_run(cuda_communicator_all_gather_dim_worker_fn, 2)
++
++
+ @worker_fn_wrapper
+ def all_gatherv_worker_fn():
+     pynccl_comm = PyNcclCommunicator(
+diff --git a/tests/models/language/generation/test_hybrid.py b/tests/models/language/generation/test_hybrid.py
+index 0f19c1038ec7..f06998e07f62 100644
+--- a/tests/models/language/generation/test_hybrid.py
++++ b/tests/models/language/generation/test_hybrid.py
+@@ -43,6 +43,11 @@
+     "tiny-random/qwen3-next-moe",
+ ]
+ 
++HYBRID_MODELS_REQUIRING_CHUNKED_PREFILL = {
++    "LiquidAI/LFM2-1.2B",
++    "tiny-random/qwen3-next-moe",
++}
++
+ FULL_CUDA_GRAPH_MODELS = [
+     "ai21labs/Jamba-tiny-dev",
+     "pfnet/plamo-2-1b",
+@@ -92,8 +97,15 @@ def test_models(
+             example_prompts, max_tokens, num_logprobs
+         )
+ 
++    extra_kwargs = {}
++    if model in HYBRID_MODELS_REQUIRING_CHUNKED_PREFILL:
++        extra_kwargs["enable_chunked_prefill"] = True
++
+     with vllm_runner(
+-        model, max_num_seqs=MAX_NUM_SEQS, attention_backend=ATTN_BACKEND
++        model,
++        max_num_seqs=MAX_NUM_SEQS,
++        attention_backend=ATTN_BACKEND,
++        **extra_kwargs,
+     ) as vllm_model:
+         vllm_outputs = vllm_model.generate_greedy_logprobs(
+             example_prompts, max_tokens, num_logprobs
+diff --git a/tests/models/multimodal/generation/test_vit_cudagraph.py b/tests/models/multimodal/generation/test_vit_cudagraph.py
+index 954bbdbb9b83..387046f3e742 100644
+--- a/tests/models/multimodal/generation/test_vit_cudagraph.py
++++ b/tests/models/multimodal/generation/test_vit_cudagraph.py
+@@ -171,6 +171,7 @@ def gemma3_chat_template(content: str) -> str:
+             "Describe this video in one sentence."
+         ),
+         needs_video_metadata=True,
++        vllm_runner_kwargs={"enable_chunked_prefill": True},
+         marks=[pytest.mark.core_model],
+     ),
+     "internvl": VitCudagraphTestConfig(
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 1e93b610da56..6f2be35ae86f 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -1121,14 +1121,14 @@ def test_is_chunked_prefill_supported(
+         (
+             "Qwen/Qwen3-Next-80B-A3B-Instruct",
+             "hybrid",
+-            False,
+-            "Hybrid models do not support prefix caching since the feature is still experimental.",  # noqa: E501
++            True,
++            "Generative hybrid models support prefix caching.",  # noqa: E501
+         ),
+         (
+             "ibm-granite/granite-4.0-h-small",
+             "hybrid",
+-            False,
+-            "Hybrid models do not support prefix caching since the feature is still experimental.",  # noqa: E501
++            True,
++            "Generative hybrid models support prefix caching.",  # noqa: E501
+         ),
+         (
+             "state-spaces/mamba-130m-hf",
+diff --git a/tests/v1/streaming_input/test_gpu_model_runner_streaming.py b/tests/v1/streaming_input/test_gpu_model_runner_streaming.py
+index 9b130e570f66..fd619610b767 100644
+--- a/tests/v1/streaming_input/test_gpu_model_runner_streaming.py
++++ b/tests/v1/streaming_input/test_gpu_model_runner_streaming.py
+@@ -38,6 +38,7 @@ def mock_model_runner_with_input_batch():
+         vocab_size=32000,
+         block_sizes=[16],
+         kernel_block_sizes=[16],
++        max_num_blocks_per_req=[64],
+         logitsprocs=None,
+         is_pooling_model=False,
+     )
+diff --git a/tests/v1/worker/test_cp_utils.py b/tests/v1/worker/test_cp_utils.py
+new file mode 100644
+index 000000000000..b38ae4d0636c
+--- /dev/null
++++ b/tests/v1/worker/test_cp_utils.py
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import pytest
++import torch
++
++from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
++from vllm.v1.worker.cp_utils import should_skip_dcp_context_attention
++
++
++def test_skip_gate_only_for_zero_context():
++    assert should_skip_dcp_context_attention(torch.zeros(3, dtype=torch.int32))
++    assert not should_skip_dcp_context_attention(
++        torch.tensor([0, 5, 0], dtype=torch.int32)
++    )
++
++
++@pytest.mark.parametrize(
++    "dcp_world_size,interleave_size,context_len",
++    [(2, 16, 10), (4, 16, 10), (8, 16, 10), (4, 1, 2)],
++)
++def test_skip_gate_rank_invariant_with_divergent_local_context(
++    dcp_world_size: int, interleave_size: int, context_len: int
++):
++    """Contexts shorter than a full interleave round land entirely on a
++    subset of DCP ranks, so the per-rank local context lengths diverge:
++    some ranks hold zero local context while others hold all of it. Ranks
++    with zero local context must still take the collective (non-skip) path,
++    otherwise the query all-gather in _forward_with_dcp deadlocks across
++    ranks. The skip gate must therefore depend only on the rank-invariant
++    global context lengths, never on get_dcp_local_seq_lens output.
++    """
++    context_kv_lens = torch.tensor([context_len], dtype=torch.int32)
++    local_maxes = [
++        int(
++            get_dcp_local_seq_lens(
++                context_kv_lens, dcp_world_size, rank, interleave_size
++            ).max()
++        )
++        for rank in range(dcp_world_size)
++    ]
++    # Precondition: the local view diverges across ranks.
++    assert 0 in local_maxes
++    assert max(local_maxes) > 0
++    # The batch still has context globally, so no rank may skip.
++    assert not should_skip_dcp_context_attention(context_kv_lens)
+diff --git a/tests/v1/worker/test_gpu_input_batch.py b/tests/v1/worker/test_gpu_input_batch.py
+index 4d0a1698a70b..e7aa2e03e0e4 100644
+--- a/tests/v1/worker/test_gpu_input_batch.py
++++ b/tests/v1/worker/test_gpu_input_batch.py
+@@ -238,6 +238,7 @@ def test_sampling_metadata_in_input_batch(device: str, batch_size: int):
+         vocab_size=1024,
+         block_sizes=[1],
+         kernel_block_sizes=[1],
++        max_num_blocks_per_req=[1024],
+     )
+     reqs: list[CachedRequestState] = []
+     req_id_reqs = {}
+@@ -332,6 +333,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
+         vocab_size=1024,
+         block_sizes=[1],
+         kernel_block_sizes=[1],
++        max_num_blocks_per_req=[1024],
+     )
+     ref_input_batch: InputBatch = InputBatch(
+         max_num_reqs=batch_size,
+@@ -341,6 +343,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
+         vocab_size=1024,
+         block_sizes=[1],
+         kernel_block_sizes=[1],
++        max_num_blocks_per_req=[1024],
+     )
+ 
+     reqs: list[CachedRequestState] = []
+@@ -409,6 +412,7 @@ def test_pooling_prompt_lens_not_aliased(device: str):
+         vocab_size=VOCAB_SIZE,
+         block_sizes=[16],
+         kernel_block_sizes=[16],
++        max_num_blocks_per_req=[64],
+         is_pooling_model=True,
+     )
+ 
+@@ -444,6 +448,7 @@ def test_placeholder_spec_token_ids_written_verbatim():
+         vocab_size=VOCAB_SIZE,
+         block_sizes=[16],
+         kernel_block_sizes=[16],
++        max_num_blocks_per_req=[1],
+     )
+     req = CachedRequestState(
+         req_id="req",
+@@ -491,6 +496,7 @@ def test_pooling_metadata_token_id_buffers(
+         vocab_size=VOCAB_SIZE,
+         block_sizes=[16],
+         kernel_block_sizes=[16],
++        max_num_blocks_per_req=[64],
+         is_pooling_model=True,
+     )
+     req = _construct_pooling_request(0, PoolingParams(**pooling_params))
+diff --git a/tests/v1/worker/test_gpu_model_runner.py b/tests/v1/worker/test_gpu_model_runner.py
+index 7490cbb27be5..6e5b1aa5b882 100644
+--- a/tests/v1/worker/test_gpu_model_runner.py
++++ b/tests/v1/worker/test_gpu_model_runner.py
+@@ -89,6 +89,7 @@ def initialize_kv_cache(runner: GPUModelRunner):
+         kernel_block_sizes=[
+             kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+         ],
++        max_num_blocks_per_req=[NUM_BLOCKS],
+     )
+     runner.initialize_attn_backend(kv_cache_config)
+ 
+@@ -1397,6 +1398,7 @@ def test_input_batch_with_kernel_block_sizes():
+         vocab_size=vocab_size,
+         block_sizes=block_sizes,
+         kernel_block_sizes=kernel_block_sizes,
++        max_num_blocks_per_req=[16, 8],
+     )
+ 
+     # Verify that block tables were created with kernel block sizes
+@@ -1457,6 +1459,7 @@ def test_hybrid_cache_integration(default_vllm_config, dist_init):
+         vocab_size=runner.model_config.get_vocab_size(),
+         block_sizes=[kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size],
+         kernel_block_sizes=[16],
++        max_num_blocks_per_req=[NUM_BLOCKS],
+     )  # Use kernel block size
+ 
+     runner.initialize_attn_backend(kv_cache_config)
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index 6e3fef0dcca7..b5f4e69e031f 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -1881,11 +1881,8 @@ def is_prefix_caching_supported(self) -> bool:
+         else:
+             # for generative models
+             if attn_type == "hybrid":
+-                logger.debug(
+-                    "Hybrid models do not support prefix caching since the feature "
+-                    "is still experimental."
+-                )
+-                return False
++                logger.debug("Generative hybrid models support prefix caching.")
++                return True
+             elif attn_type == "attention_free":
+                 logger.debug(
+                     "Attention free models do not support prefix caching since the "
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 555fd0ec9489..a196a54f5091 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -341,13 +341,30 @@ def all_reduce(self, input_):
+     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+         # Route uniform dim-0 all-gathers through NVLS symmetric memory when
+         # enabled (mirrors reduce_scatter); otherwise fall back to the
+-        # base-class ring all-gather. Sequence parallelism's gather-before-GEMM
+-        # uses dim=0 with tp-aligned (uniform) shards.
++        # PyNccl/base-class all-gather. Sequence parallelism's
++        # gather-before-GEMM uses dim=0 with tp-aligned (uniform) shards.
+         if dim < 0:
+             dim += input_.dim()
+         if dim == 0 and should_nccl_symm_mem_ag_rs():
+             return self._all_gather_symm_mem(input_.contiguous())
+-        return super().all_gather(input_, dim)
++
++        pynccl_comm = self.pynccl_comm
++        if pynccl_comm is None or pynccl_comm.disabled:
++            return super().all_gather(input_, dim)
++
++        input_size = input_.size()
++        output_size = (input_size[0] * self.world_size,) + input_size[1:]
++        output_tensor = torch.empty(
++            output_size, dtype=input_.dtype, device=input_.device
++        )
++        pynccl_comm.all_gather(output_tensor, input_.contiguous())
++        output_tensor = output_tensor.reshape((self.world_size,) + input_size)
++        output_tensor = output_tensor.movedim(0, dim)
++        return output_tensor.reshape(
++            input_size[:dim]
++            + (self.world_size * input_size[dim],)
++            + input_size[dim + 1 :]
++        )
+ 
+     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+         world_size = self.world_size
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index d80ecb9c8555..c602eaf8f2ed 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -2493,7 +2493,11 @@ def _set_default_chunked_prefill_and_prefix_caching_args(
+         self, model_config: ModelConfig
+     ) -> None:
+         default_chunked_prefill = model_config.is_chunked_prefill_supported
+-        default_prefix_caching = model_config.is_prefix_caching_supported
++        # Hybrid models support prefix caching but keep it opt-in for now
++        # while the feature matures.
++        default_prefix_caching = (
++            model_config.is_prefix_caching_supported and not model_config.is_hybrid
++        )
+ 
+         if self.enable_chunked_prefill is None:
+             self.enable_chunked_prefill = default_chunked_prefill
+diff --git a/vllm/model_executor/layers/attention_layer_base.py b/vllm/model_executor/layers/attention_layer_base.py
+index 97395b641497..53994114558e 100644
+--- a/vllm/model_executor/layers/attention_layer_base.py
++++ b/vllm/model_executor/layers/attention_layer_base.py
+@@ -19,6 +19,7 @@ class AttentionLayerBase(ABC):
+     """
+ 
+     impl: "AttentionImpl"
++    supports_dcp: bool = True
+ 
+     @abstractmethod
+     def get_attn_backend(self) -> type[AttentionBackend]:
+diff --git a/vllm/model_executor/layers/mamba/abstract.py b/vllm/model_executor/layers/mamba/abstract.py
+index 8bbb21d7bc90..62fd64bd0dea 100644
+--- a/vllm/model_executor/layers/mamba/abstract.py
++++ b/vllm/model_executor/layers/mamba/abstract.py
+@@ -22,6 +22,7 @@ class MambaBase(AttentionLayerBase):
+     # Contains the KV cache (mamba state) for the layer
+     # in the shape specified by `self.get_state_shape`.
+     kv_cache: tuple[torch.Tensor, ...]
++    supports_dcp: bool = False
+ 
+     @abstractmethod
+     def get_state_shape(self) -> Iterable[tuple[int, ...]]:
+diff --git a/vllm/utils/cpu_triton_utils.py b/vllm/utils/cpu_triton_utils.py
+index 3b5012d01751..9ce33b835707 100644
+--- a/vllm/utils/cpu_triton_utils.py
++++ b/vllm/utils/cpu_triton_utils.py
+@@ -29,13 +29,17 @@ def _compute_slot_mapping_kernel_impl(
+     block_table_stride: int,  # max_num_blocks_per_req
+     block_size: int,
+     slot_mapping: torch.Tensor,  # [max_num_tokens], int64
+-    TOTAL_CP_WORLD_SIZE: int,
+-    TOTAL_CP_RANK: int,
+-    CP_KV_CACHE_INTERLEAVE_SIZE: int,
+-    PAD_ID: int,
+-    BLOCK_SIZE: int,
++    KV_CACHE_BLOCK_SIZE: int | None = None,
++    BLOCKS_PER_KV_BLOCK: int = 1,
++    TOTAL_CP_WORLD_SIZE: int = 1,
++    TOTAL_CP_RANK: int = 0,
++    CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
++    PAD_ID: int = -1,
++    BLOCK_SIZE: int = 1024,
+ ) -> None:
+     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on CPU."
++    if BLOCKS_PER_KV_BLOCK != 1:
++        assert block_size * BLOCKS_PER_KV_BLOCK == KV_CACHE_BLOCK_SIZE
+     torch.ops._C.compute_slot_mapping_kernel_impl(
+         query_start_loc,
+         positions,
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index bfecb3c952e1..ec07023f80ef 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -796,6 +796,8 @@ class AttentionImplBase(ABC, Generic[T]):
+ 
+     # Whether the attention impl supports Prefill Context Parallelism.
+     supports_pcp: bool = False
++    # Whether the attention impl supports Decode Context Parallelism.
++    supports_dcp: bool = True
+     # Whether the attention impl(or ops) supports MTP
+     # when cp_kv_cache_interleave_size > 1
+     supports_mtp_with_cp_non_trivial_interleave_size: bool = False
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index db5b0dda367e..d83d2f4d810a 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -56,10 +56,14 @@
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+ )
+-from vllm.v1.attention.backends.utils import (
+-    get_kv_cache_layout,
+-)
++from vllm.v1.attention.backends.utils import get_kv_cache_layout
+ from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.worker.cp_utils import (
++    run_split_fa2_dcp_context_attention,
++    should_skip_dcp_context_attention,
++    should_split_fa2_dcp_context_attention,
++    split_dcp_context_queries,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -245,6 +249,13 @@ class FlashAttentionMetadata:
+     max_dcp_context_kv_len: int | None = None
+     dcp_context_kv_lens: torch.Tensor | None = None
+ 
++    # Split counts for FA2 DCP context attention. num_prefill_* tracks
++    # context-bearing extend rows; pure prefills do not attend to DCP context.
++    num_decode_reqs: int = 0
++    num_prefill_reqs: int = 0
++    num_decode_tokens: int = 0
++    num_prefill_tokens: int = 0
++
+     # Optional aot scheduling
+     scheduler_metadata: torch.Tensor | None = None
+     prefix_scheduler_metadata: torch.Tensor | None = None
+@@ -513,6 +524,10 @@ def schedule(
+         use_cascade = common_prefix_len > 0
+         max_dcp_context_kv_len = 0
+         dcp_context_kv_lens = None
++        num_decode_reqs = 0
++        num_prefill_reqs = 0
++        num_decode_tokens = 0
++        num_prefill_tokens = 0
+ 
+         cu_prefix_query_lens = None
+         prefix_kv_lens = None
+@@ -532,23 +547,54 @@ def schedule(
+             self._dcp_context_kv_lens[num_reqs:] = 0
+             dcp_context_kv_lens = self._dcp_context_kv_lens[:num_reqs]
+ 
++            skip_dcp_context_attention = False
++            if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
++                query_lens_cpu = (
++                    common_attn_metadata.query_start_loc_cpu[1 : num_reqs + 1]
++                    - common_attn_metadata.query_start_loc_cpu[:num_reqs]
++                )
++                context_kv_lens_cpu = (
++                    common_attn_metadata.seq_lens_cpu_upper_bound[:num_reqs]
++                    - query_lens_cpu
++                )
++                skip_dcp_context_attention = should_skip_dcp_context_attention(
++                    context_kv_lens_cpu
++                )
++
++            if max_query_len > 1:
++                (
++                    num_decode_reqs,
++                    num_prefill_reqs,
++                    num_decode_tokens,
++                    num_prefill_tokens,
++                ) = split_dcp_context_queries(
++                    common_attn_metadata.query_start_loc_cpu,
++                    common_attn_metadata.seq_lens_cpu_upper_bound,
++                    max_query_len,
++                    num_actual_tokens,
++                )
++
+             # After DCP distribution, the maximum number of tokens for any rank is
+             # ceil(L / (N * I)) * I, where L is max_seq_len, N is dcp_world_size,
+             # and I is cp_kv_cache_interleave_size.
+             # This eliminates GPU->CPU sync while minimizing workspace over-allocation.
+-            num_partitions = self.dcp_world_size * self.cp_kv_cache_interleave_size
+-            max_dcp_context_kv_len = (
+-                (max_seq_len + num_partitions - 1) // num_partitions
+-            ) * self.cp_kv_cache_interleave_size
+-
+-            scheduler_metadata = schedule(
+-                batch_size=num_reqs,
+-                cu_query_lens=query_start_loc,
+-                max_query_len=max_query_len,
+-                seqlens=dcp_context_kv_lens,
+-                max_seq_len=max_dcp_context_kv_len,
+-                causal=False,
+-            )
++            if skip_dcp_context_attention:
++                max_dcp_context_kv_len = 0
++                scheduler_metadata = None
++            else:
++                num_partitions = self.dcp_world_size * self.cp_kv_cache_interleave_size
++                max_dcp_context_kv_len = (
++                    (max_seq_len + num_partitions - 1) // num_partitions
++                ) * self.cp_kv_cache_interleave_size
++
++                scheduler_metadata = schedule(
++                    batch_size=num_reqs,
++                    cu_query_lens=query_start_loc,
++                    max_query_len=max_query_len,
++                    seqlens=dcp_context_kv_lens,
++                    max_seq_len=max_dcp_context_kv_len,
++                    causal=False,
++                )
+         elif use_cascade:
+             cu_prefix_query_lens = torch.tensor(
+                 [0, num_actual_tokens], dtype=torch.int32, device=self.device
+@@ -614,6 +660,10 @@ def schedule(
+             slot_mapping=slot_mapping,
+             max_dcp_context_kv_len=max_dcp_context_kv_len,
+             dcp_context_kv_lens=dcp_context_kv_lens,
++            num_decode_reqs=num_decode_reqs,
++            num_prefill_reqs=num_prefill_reqs,
++            num_decode_tokens=num_decode_tokens,
++            num_prefill_tokens=num_prefill_tokens,
+             use_cascade=use_cascade,
+             common_prefix_len=common_prefix_len,
+             scheduler_metadata=scheduler_metadata,
+@@ -743,8 +793,12 @@ def __init__(
+         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
+ 
+         self._dcp_dtype: torch.dtype | None = None
++        self._dcp_max_num_tokens: int = 0
+         if vllm_config is not None and self.dcp_world_size > 1:
+             self._dcp_dtype = vllm_config.model_config.dtype
++            self._dcp_max_num_tokens = (
++                vllm_config.scheduler_config.max_num_batched_tokens
++            )
+ 
+     def forward(
+         self,
+@@ -1063,40 +1117,120 @@ def _forward_with_dcp(
+         block_table = attn_metadata.block_table
+ 
+         query = query.contiguous()
++        if attn_metadata.max_dcp_context_kv_len == 0:
++            flash_attn_varlen_func(
++                q=query,
++                k=key,
++                v=value,
++                out=output,
++                cu_seqlens_q=cu_seqlens_q,
++                max_seqlen_q=max_seqlen_q,
++                cu_seqlens_k=cu_seqlens_q,
++                max_seqlen_k=max_seqlen_q,
++                softmax_scale=self.scale,
++                causal=attn_metadata.causal,
++                alibi_slopes=self.alibi_slopes,
++                window_size=list(self.sliding_window)
++                if self.sliding_window is not None
++                else None,
++                softcap=self.logits_soft_cap,
++                return_softmax_lse=True,
++                fa_version=self.vllm_flash_attn_version,
++                q_descale=q_descale,
++                k_descale=k_descale,
++                v_descale=v_descale,
++                num_splits=attn_metadata.max_num_splits,
++            )
++            return output
++
+         query_across_dcp = get_dcp_group().all_gather(query, dim=1)
+         sliding_window_size = (
+             list(self.sliding_window) if self.sliding_window is not None else None
+         )
+         n = query_across_dcp.shape[0]
+-        (dcp_context_out,) = current_workspace_manager().get_simultaneous(
++        num_reqs = cu_seqlens_q.shape[0] - 1
++        num_decodes = attn_metadata.num_decode_reqs
++        num_context_prefills = attn_metadata.num_prefill_reqs
++        num_decode_tokens = attn_metadata.num_decode_tokens
++        num_context_prefill_tokens = attn_metadata.num_prefill_tokens
++        split_dcp_context = should_split_fa2_dcp_context_attention(
++            self.vllm_flash_attn_version,
++            max_seqlen_q,
++            num_reqs,
++            num_decodes,
++            num_context_prefills,
++        )
++        dcp_context_out_tokens = max(n, self._dcp_max_num_tokens)
++        dcp_context_out_spec = (
+             (
+-                (n, self.num_heads * self.dcp_world_size, self.head_size),
+-                self._dcp_dtype,
++                dcp_context_out_tokens,
++                self.num_heads * self.dcp_world_size,
++                self.head_size,
+             ),
++            self._dcp_dtype,
+         )
+-        context_attn_out, context_lse = flash_attn_varlen_func(
+-            q=query_across_dcp,
+-            k=key_cache,
+-            v=value_cache,
+-            out=dcp_context_out,
+-            cu_seqlens_q=cu_seqlens_q,
+-            max_seqlen_q=max_seqlen_q,
+-            seqused_k=attn_metadata.dcp_context_kv_lens,
+-            max_seqlen_k=attn_metadata.max_dcp_context_kv_len,
+-            softmax_scale=self.scale,
+-            causal=False,
+-            alibi_slopes=self.alibi_slopes,
+-            window_size=sliding_window_size,
+-            block_table=block_table,
+-            softcap=self.logits_soft_cap,
+-            return_softmax_lse=True,
+-            scheduler_metadata=attn_metadata.scheduler_metadata,
+-            fa_version=self.vllm_flash_attn_version,
+-            q_descale=q_descale,
+-            k_descale=k_descale,
+-            v_descale=v_descale,
+-            num_splits=attn_metadata.max_num_splits,
++        (dcp_context_out_workspace,) = current_workspace_manager().get_simultaneous(
++            dcp_context_out_spec,
+         )
++        dcp_context_out = dcp_context_out_workspace[:n]
++
++        if split_dcp_context:
++            # TODO: Remove this DCP + FA2 mixed decode/prefill workaround once
++            # FA4 supports this Qwen3.5 shape.
++            assert attn_metadata.dcp_context_kv_lens is not None
++            assert attn_metadata.max_dcp_context_kv_len is not None
++            assert self.vllm_flash_attn_version is not None
++            context_attn_out, context_lse = run_split_fa2_dcp_context_attention(
++                flash_attn_varlen_func,
++                query_across_dcp,
++                key_cache,
++                value_cache,
++                dcp_context_out,
++                cu_seqlens_q,
++                max_seqlen_q,
++                attn_metadata.dcp_context_kv_lens,
++                attn_metadata.max_dcp_context_kv_len,
++                self.scale,
++                self.alibi_slopes,
++                sliding_window_size,
++                block_table,
++                self.logits_soft_cap,
++                self.vllm_flash_attn_version,
++                q_descale,
++                k_descale,
++                v_descale,
++                attn_metadata.max_num_splits,
++                self.num_heads,
++                self.dcp_world_size,
++                num_decodes,
++                num_context_prefills,
++                num_decode_tokens,
++                num_context_prefill_tokens,
++            )
++        else:
++            context_attn_out, context_lse = flash_attn_varlen_func(
++                q=query_across_dcp,
++                k=key_cache,
++                v=value_cache,
++                out=dcp_context_out,
++                cu_seqlens_q=cu_seqlens_q,
++                max_seqlen_q=max_seqlen_q,
++                seqused_k=attn_metadata.dcp_context_kv_lens,
++                max_seqlen_k=attn_metadata.max_dcp_context_kv_len,
++                softmax_scale=self.scale,
++                causal=False,
++                alibi_slopes=self.alibi_slopes,
++                window_size=sliding_window_size,
++                block_table=block_table,
++                softcap=self.logits_soft_cap,
++                return_softmax_lse=True,
++                scheduler_metadata=attn_metadata.scheduler_metadata,
++                fa_version=self.vllm_flash_attn_version,
++                q_descale=q_descale,
++                k_descale=k_descale,
++                v_descale=v_descale,
++                num_splits=attn_metadata.max_num_splits,
++            )
+         # FA returns LSE in shape [ H, B ] but DCP combine wants [ B, H ]
+         context_attn_out_cor, context_lse_cor = self.dcp_combine(
+             context_attn_out,
+@@ -1106,14 +1240,11 @@ def _forward_with_dcp(
+         )
+         context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
+ 
+-        (dcp_query_out,) = current_workspace_manager().get_simultaneous(
+-            ((query.shape[0], self.num_heads, self.head_size), self._dcp_dtype),
+-        )
+         query_attn_out, query_lse = flash_attn_varlen_func(
+             q=query,
+             k=key,
+             v=value,
+-            out=dcp_query_out,
++            out=output,
+             cu_seqlens_q=cu_seqlens_q,
+             max_seqlen_q=max_seqlen_q,
+             cu_seqlens_k=cu_seqlens_q,
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 4756136f03cf..2e978451b885 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -550,12 +550,28 @@ def __init__(
+         # different KV cache groups have different block sizes, the actual block size
+         # can be a multiple of hash_block_size.
+         self.hash_block_size = hash_block_size
++        self.dcp_world_size = dcp_world_size
++        group_block_sizes = [
++            manager.block_size for manager in self.single_type_managers
++        ]
+         assert all(
+-            g.kv_cache_spec.block_size % hash_block_size == 0
+-            for g in kv_cache_config.kv_cache_groups
+-        ), "block_size must be divisible by hash_block_size"
+-        assert dcp_world_size == 1, "DCP not support hybrid attn now."
++            block_size % hash_block_size == 0 for block_size in group_block_sizes
++        ), (
++            "Each KV cache group's real block_size must be divisible by "
++            f"hash_block_size. block_sizes={group_block_sizes}, "
++            f"hash_block_size={hash_block_size}"
++        )
+         assert pcp_world_size == 1, "PCP not support hybrid attn now."
++        if dcp_world_size > 1:
++            # DCP shards full-attention KV across ranks and replicates Mamba
++            # state; other spec types (e.g. sliding window) have no DCP-aware
++            # handling yet, so reject them explicitly.
++            for g in kv_cache_config.kv_cache_groups:
++                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
++                    "DCP with hybrid KV cache layouts only supports "
++                    "full-attention and Mamba groups, got: "
++                    f"{type(g.kv_cache_spec).__name__}."
++                )
+         self.verify_and_split_kv_cache_groups()
+ 
+     def verify_and_split_kv_cache_groups(self) -> None:
+@@ -651,11 +667,11 @@ def find_longest_cache_hit(
+                 - The number of tokens of the longest cache hit.
+         """
+ 
+-        def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+-            if kv_cache_spec.block_size == self.hash_block_size:
++        def _get_block_hashes(block_size: int) -> BlockHashList:
++            if block_size == self.hash_block_size:
+                 return block_hashes
+             return BlockHashListWithBlockSize(
+-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
++                block_hashes, self.hash_block_size, block_size
+             )
+ 
+         num_groups = len(self.kv_cache_config.kv_cache_groups)
+@@ -680,13 +696,14 @@ def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+             for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
+                 self.attention_groups
+             ):
++                group_block_size = self.single_type_managers[group_ids[0]].block_size
+                 cached_blocks = hit_blocks_by_group[group_ids[0]]
+                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
+                     # Full attention is downward-closed: we only need to look
+                     # up cached blocks once; on subsequent iterations just trim
+                     # to the (reduced) current hit length.
+                     curr_hit_length = (
+-                        curr_hit_length // spec.block_size * spec.block_size
++                        curr_hit_length // group_block_size * group_block_size
+                     )
+                     continue
+ 
+@@ -696,18 +713,23 @@ def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+                 if drop_eagle_block:
+                     # Eagle needs to match one more block and then pop the last.
+                     _max_length = min(
+-                        curr_hit_length + spec.block_size, max_cache_hit_length
++                        curr_hit_length + group_block_size, max_cache_hit_length
+                     )
+                 hit_blocks = manager_cls.find_longest_cache_hit(
+-                    block_hashes=_get_block_hashes(spec),
++                    block_hashes=_get_block_hashes(group_block_size),
+                     max_length=_max_length,
+                     kv_cache_group_ids=group_ids,
+                     block_pool=self.block_pool,
+                     kv_cache_spec=spec,
+                     drop_eagle_block=drop_eagle_block,
+                     alignment_tokens=self.scheduler_block_size,
++                    dcp_world_size=(
++                        self.dcp_world_size
++                        if isinstance(spec, FullAttentionSpec)
++                        else 1
++                    ),
+                 )
+-                _new_hit_length = len(hit_blocks[0]) * spec.block_size
++                _new_hit_length = len(hit_blocks[0]) * group_block_size
+                 if drop_eagle_block:
+                     eagle_verified.add(idx)
+                 elif _new_hit_length < curr_hit_length:
+@@ -728,7 +750,10 @@ def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+         # Truncate full attention blocks to final hit_length (if present)
+         first_group = self.attention_groups[0]
+         if isinstance(first_group.spec, FullAttentionSpec):
+-            num_blocks = hit_length // first_group.spec.block_size
++            group_block_size = self.single_type_managers[
++                first_group.group_ids[0]
++            ].block_size
++            num_blocks = hit_length // group_block_size
+             for group_id in first_group.group_ids:
+                 if (blks := hit_blocks_by_group[group_id]) is not None:
+                     del blks[num_blocks:]
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 88e60987bafe..ca906b3642a2 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -613,7 +613,8 @@ def resolve_kv_cache_block_sizes(
+     - ``scheduler_block_size`` is the token-alignment invariant used by the
+       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
+       ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
+-      group's block size — context parallelism is not supported here.
++      group's effective block size. Attention groups are scaled by DCP/PCP;
++      Mamba groups keep their full per-rank state and are not scaled.
+     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
+       is computed. Single group: equals scheduler block size. Multiple groups:
+       ``cache_config.hash_block_size`` override if set, else the GCD of group
+@@ -631,13 +632,12 @@ def resolve_kv_cache_block_sizes(
+         bs = cache_config.block_size * dcp * pcp
+         return bs, bs
+ 
+-    if dcp != 1 or pcp != 1:
+-        raise ValueError(
+-            "Hybrid KV cache groups with multiple block sizes do not "
+-            "support context parallelism (dcp_world_size/pcp_world_size > 1)."
+-        )
+-
+-    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
++    group_block_sizes = [
++        g.kv_cache_spec.block_size * dcp * pcp
++        if isinstance(g.kv_cache_spec, AttentionSpec)
++        else g.kv_cache_spec.block_size
++        for g in groups
++    ]
+     scheduler_block_size = math.lcm(*group_block_sizes)
+ 
+     # Block hashes are only consumed by prefix caching and KV connectors
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 87c3f8feb725..324d0016cd0b 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1031,6 +1031,10 @@ def __init__(
+         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
+     ) -> None:
+         super().__init__(kv_cache_spec, block_pool, **kwargs)
++        # Mamba layers use TP instead of DCP, so each rank holds the full
++        # recurrent state. Undo the DCP/PCP block_size scaling that the base
++        # class applies for attention groups whose KV cache is partitioned.
++        self.block_size = kv_cache_spec.block_size
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 4204c31be58d..b0409b16dee2 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -128,6 +128,18 @@ def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+         """
+         raise NotImplementedError
+ 
++    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
++        """
++        The number of block table entries needed per request, i.e. the row
++        length of the worker-side block table for this cache group.
++
++        Args:
++            vllm_config: The vllm config.
++            max_len: The maximum sequence length to size for, including the
++                encoder length for encoder-decoder models.
++        """
++        return cdiv(max_len, self.block_size)
++
+     def copy_with_new_block_size(self, block_size: int) -> Self:
+         """
+         Create a new KVCacheSpec from self but replacing the block size.
+@@ -201,6 +213,16 @@ def real_page_size_bytes(self) -> int:
+             * get_dtype_size(self.dtype)
+         )
+ 
++    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
++        # Attention KV is token-interleaved across DCP/PCP ranks, so each rank
++        # only stores max_len // (dcp * pcp) tokens per request.
++        parallel_config = vllm_config.parallel_config
++        total_cp_size = (
++            parallel_config.decode_context_parallel_size
++            * parallel_config.prefill_context_parallel_size
++        )
++        return cdiv(max_len, self.block_size * total_cp_size)
++
+ 
+ @dataclass(frozen=True, kw_only=True)
+ class FullAttentionSpec(AttentionSpec):
+@@ -699,6 +721,18 @@ def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+         else:
+             return self.page_size_bytes * (1 + self.num_speculative_blocks)
+ 
++    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
++        # Mamba state is replicated across DCP/PCP ranks, never sharded, so
++        # no CP scaling applies.
++        if vllm_config.cache_config.mamba_cache_mode == "align":
++            # Block table rows are position-indexed over the full sequence
++            # even though only 2 + num_speculative_blocks state blocks are
++            # resident at a time (earlier states are nulled out by
++            # remove_skipped_blocks), so the row length must cover max_len
++            # rather than max_memory_usage_bytes.
++            return cdiv(max_len, self.block_size) + self.num_speculative_blocks
++        return cdiv(self.max_memory_usage_bytes(vllm_config), self.page_size_bytes)
++
+     def is_uniform_with_collection(
+         self, kv_cache_specs: dict[str, KVCacheSpec]
+     ) -> bool:
+diff --git a/vllm/v1/worker/block_table.py b/vllm/v1/worker/block_table.py
+index d9c041ba0b89..d40887879fcb 100644
+--- a/vllm/v1/worker/block_table.py
++++ b/vllm/v1/worker/block_table.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from enum import Enum
++
+ import numpy as np
+ import torch
+ 
+@@ -10,11 +12,15 @@
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.utils import CpuGpuBuffer
+-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+ 
+ logger = init_logger(__name__)
+ 
+ 
++class SlotMappingMode(Enum):
++    TOKEN_TO_KV_SLOT = "token_to_kv_slot"
++    NONE = "none"
++
++
+ class BlockTable:
+     def __init__(
+         self,
+@@ -26,6 +32,7 @@ def __init__(
+         device: torch.device,
+         kernel_block_size: int,
+         cp_kv_cache_interleave_size: int,
++        slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+     ):
+         """
+         Args:
+@@ -38,11 +45,15 @@ def __init__(
+             kernel_block_size: The block_size of underlying attention kernel.
+                 Will be the same as `block_size` if `block_size` is supported
+                 by the attention kernel.
++            slot_mapping_mode: How this cache group maps scheduled tokens to
++                cache slots. Mamba-like state caches do not use token slot
++                mappings and should use SlotMappingMode.NONE.
+         """
+         self.max_num_reqs = max_num_reqs
+         self.max_num_batched_tokens = max_num_batched_tokens
+         self.pin_memory = pin_memory
+         self.device = device
++        self.kv_cache_block_size = block_size
+ 
+         if kernel_block_size == block_size:
+             # Standard case: allocation and computation use same block size
+@@ -98,6 +109,7 @@ def __init__(
+             self.dcp_world_size = 1
+             self.dcp_rank = 0
+         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
++        self.slot_mapping_mode = slot_mapping_mode
+ 
+     def append_row(
+         self,
+@@ -145,6 +157,12 @@ def compute_slot_mapping(
+         positions: torch.Tensor,
+     ) -> None:
+         num_tokens = positions.shape[0]
++        if self.slot_mapping_mode == SlotMappingMode.NONE:
++            # Mamba/GDN groups consume the block table as recurrent state
++            # indices and do not use per-token slot mappings.
++            return
++        assert self.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT
++
+         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+         _compute_slot_mapping_kernel[(num_reqs + 1,)](
+@@ -156,6 +174,8 @@ def compute_slot_mapping(
+             self.block_table.gpu.stride(0),
+             self.block_size,
+             self.slot_mapping.gpu,
++            KV_CACHE_BLOCK_SIZE=self.kv_cache_block_size,
++            BLOCKS_PER_KV_BLOCK=self.blocks_per_kv_block,
+             TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+             TOTAL_CP_RANK=total_cp_rank,
+             CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+@@ -226,30 +246,27 @@ class MultiGroupBlockTable:
+     def __init__(
+         self,
+         max_num_reqs: int,
+-        max_model_len: int,
+         max_num_batched_tokens: int,
+         pin_memory: bool,
+         device: torch.device,
+         block_sizes: list[int],
+         kernel_block_sizes: list[int],
+-        max_num_blocks: list[int] | None = None,
++        max_num_blocks: list[int],
+         cp_kv_cache_interleave_size: int = 1,
++        slot_mapping_modes: list[SlotMappingMode] | None = None,
+     ) -> None:
+         if len(kernel_block_sizes) != len(block_sizes):
+             raise ValueError(
+                 f"kernel_block_sizes length ({len(kernel_block_sizes)}) "
+                 f"must match block_sizes length ({len(block_sizes)})"
+             )
+-        if max_num_blocks is None:
+-            # Note(hc): each dcp rank only store
+-            # (max_model_len//dcp_world_size) tokens in kvcache,
+-            # so the block_size which used for calc max_num_blocks_per_req
+-            # must be multiplied by dcp_world_size.
+-            total_cp_world_size = get_total_cp_world_size()
+-            max_num_blocks = [
+-                cdiv(max_model_len, block_size * total_cp_world_size)
+-                for block_size in block_sizes
+-            ]
++        if slot_mapping_modes is None:
++            slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT] * len(block_sizes)
++        if len(slot_mapping_modes) != len(block_sizes):
++            raise ValueError(
++                f"slot_mapping_modes length ({len(slot_mapping_modes)}) "
++                f"must match block_sizes length ({len(block_sizes)})"
++            )
+ 
+         if len(max_num_blocks) != len(block_sizes):
+             raise ValueError(
+@@ -274,9 +291,15 @@ def __init__(
+                 device,
+                 kernel_block_size,
+                 cp_kv_cache_interleave_size,
++                slot_mapping_mode=slot_mapping_mode,
+             )
+-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
+-                block_sizes, kernel_block_sizes, max_num_blocks
++            for (
++                block_size,
++                kernel_block_size,
++                max_num_blocks_per_req,
++                slot_mapping_mode,
++            ) in zip(
++                block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes
+             )
+         ]
+ 
+@@ -332,6 +355,8 @@ def _compute_slot_mapping_kernel(
+     block_table_stride,  # max_num_blocks_per_req
+     block_size,
+     slot_mapping_ptr,  # [max_num_tokens], int64
++    KV_CACHE_BLOCK_SIZE: tl.constexpr,
++    BLOCKS_PER_KV_BLOCK: tl.constexpr,
+     TOTAL_CP_WORLD_SIZE: tl.constexpr,
+     TOTAL_CP_RANK: tl.constexpr,
+     CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+@@ -354,18 +379,14 @@ def _compute_slot_mapping_kernel(
+     start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
+     end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
+ 
+-    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
++    virtual_block_size = KV_CACHE_BLOCK_SIZE * TOTAL_CP_WORLD_SIZE
+     row_offset = req_idx * block_table_stride
+     for i in range(start_idx, end_idx, BLOCK_SIZE):
+         offsets = i + tl.arange(0, BLOCK_SIZE)
+         mask = offsets < end_idx
+         pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
+-        block_indices = pos // virtual_block_size
+-        block_numbers = tl.load(block_table_ptr + row_offset + block_indices).to(
+-            tl.int64
+-        )
+-
+-        virtual_block_offsets = pos - block_indices * virtual_block_size
++        virtual_block_indices = pos // virtual_block_size
++        virtual_block_offsets = pos - virtual_block_indices * virtual_block_size
+         is_local = (
+             virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+         ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
+@@ -375,6 +396,16 @@ def _compute_slot_mapping_kernel(
+             virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+         )
+ 
+-        slot_ids = block_numbers * block_size + local_block_offsets
++        block_indices = (
++            virtual_block_indices * BLOCKS_PER_KV_BLOCK
++            + local_block_offsets // block_size
++        )
++        block_numbers = tl.load(
++            block_table_ptr + row_offset + block_indices,
++            mask=mask & is_local,
++            other=0,
++        ).to(tl.int64)
++        slot_offsets = local_block_offsets % block_size
++        slot_ids = block_numbers * block_size + slot_offsets
+         slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
+diff --git a/vllm/v1/worker/cp_utils.py b/vllm/v1/worker/cp_utils.py
+index 05cca52fc0db..11edd86a5db0 100644
+--- a/vllm/v1/worker/cp_utils.py
++++ b/vllm/v1/worker/cp_utils.py
+@@ -1,15 +1,23 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from types import SimpleNamespace
+ from typing import TYPE_CHECKING, Any, cast
+ 
++import torch
++
+ from vllm.config import VllmConfig, get_layers_from_vllm_config
+ from vllm.distributed import get_dcp_group, get_pcp_group
++from vllm.logger import init_logger
++from vllm.v1.attention.backend import CommonAttentionMetadata
++from vllm.v1.attention.backends.utils import split_decodes_prefills_and_extends
+ 
+ if TYPE_CHECKING:
+     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ else:
+     AttentionLayerBase = object
+ 
++logger = init_logger(__name__)
++
+ 
+ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
+     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+@@ -56,3 +64,232 @@ def get_total_cp_world_size():
+         # DCP might not be initialized in testing
+         dcp_world_size = 1
+     return dcp_world_size * pcp_world_size
++
++
++def get_dcp_dummy_context_len(
++    dcp_world_size: int,
++    cp_kv_cache_interleave_size: int,
++    has_kv_cache_config: bool,
++    create_mixed_batch: bool,
++    is_graph_capturing: bool,
++    uniform_decode: bool,
++) -> int:
++    if (
++        dcp_world_size <= 1
++        or not has_kv_cache_config
++        or not (create_mixed_batch or (is_graph_capturing and uniform_decode))
++    ):
++        return 0
++    return dcp_world_size * cp_kv_cache_interleave_size
++
++
++def prepare_dcp_dummy_context_metadata(
++    *,
++    input_batch: Any,
++    kv_cache_config: Any,
++    query_pos: Any,
++    positions: torch.Tensor,
++    query_start_loc: Any,
++    num_reqs: int,
++    num_tokens_unpadded: int,
++    dcp_dummy_context_len: int,
++) -> None:
++    """Populate valid fake KV metadata for DCP CUDA graph warmup/capture."""
++    if dcp_dummy_context_len == 0:
++        return
++
++    # DCP graph warmup may exercise context attention, so block-table entries
++    # must point at allocated KV blocks.
++    assert kv_cache_config is not None
++    max_valid_block_id = kv_cache_config.num_blocks - 1
++    assert max_valid_block_id > 0
++    for blk_table in input_batch.block_table.block_tables:
++        max_row_blocks = (
++            blk_table.max_num_blocks_per_req // blk_table.blocks_per_kv_block
++        )
++        block_ids = [
++            (block_idx % max_valid_block_id) + 1 for block_idx in range(max_row_blocks)
++        ]
++        for req_idx in range(num_reqs):
++            blk_table.add_row(block_ids, req_idx)
++        blk_table.commit_block_table(num_reqs)
++
++    query_pos.copy_to_gpu(num_tokens_unpadded)
++    positions[:num_tokens_unpadded] = (
++        query_pos.gpu[:num_tokens_unpadded] + dcp_dummy_context_len
++    )
++    input_batch.block_table.compute_slot_mapping(
++        num_reqs,
++        query_start_loc.gpu[: num_reqs + 1],
++        positions[:num_tokens_unpadded],
++    )
++
++
++def should_skip_dcp_context_attention(context_kv_lens_cpu: torch.Tensor) -> bool:
++    """Whether DCP context attention can be skipped for this batch.
++
++    Must be computed from rank-invariant inputs only (the global context
++    lengths, NOT this rank's local share from get_dcp_local_seq_lens): the
++    non-skip path in _forward_with_dcp issues DCP collectives (query
++    all-gather + LSE combine), so every DCP rank must take the same branch.
++    A rank can hold zero local context tokens while other ranks still hold
++    context for the same batch.
++    """
++    return int(context_kv_lens_cpu.max().item()) == 0
++
++
++def split_dcp_context_queries(
++    query_start_loc: torch.Tensor,
++    seq_lens_cpu_upper_bound: torch.Tensor | None,
++    max_query_len: int,
++    num_actual_tokens: int,
++) -> tuple[int, int, int, int]:
++    """Split reordered DCP context queries into decode and extend regions."""
++    num_reqs = query_start_loc.shape[0] - 1
++    if max_query_len <= 1:
++        return num_reqs, 0, num_actual_tokens, 0
++    if seq_lens_cpu_upper_bound is None:
++        return 0, num_reqs, 0, num_actual_tokens
++
++    common_attn_metadata = cast(
++        CommonAttentionMetadata,
++        SimpleNamespace(
++            max_query_len=max_query_len,
++            num_reqs=num_reqs,
++            num_actual_tokens=num_actual_tokens,
++            query_start_loc_cpu=query_start_loc,
++            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
++            is_prefilling=None,
++        ),
++    )
++    (
++        num_decodes,
++        num_extends,
++        _num_prefills,
++        num_decode_tokens,
++        num_extend_tokens,
++        _num_prefill_tokens,
++    ) = split_decodes_prefills_and_extends(common_attn_metadata)
++    return num_decodes, num_extends, num_decode_tokens, num_extend_tokens
++
++
++def should_split_fa2_dcp_context_attention(
++    fa_version: int | None,
++    max_query_len: int,
++    num_reqs: int,
++    num_decode_reqs: int,
++    num_context_prefill_reqs: int,
++) -> bool:
++    num_prefills = num_reqs - num_decode_reqs
++    # TODO: Remove this FA2-only DCP compatibility path once FA4 supports
++    # the Qwen3.5 head_size=256 shape on Blackwell and can be used here.
++    # FA2 paged-varlen context attention can fail for DCP mixed batches when
++    # decode rows, context-bearing extend rows, and zero-context pure prefill
++    # rows are submitted together.
++    return (
++        fa_version == 2
++        and max_query_len > 1
++        and num_prefills > 0
++        and (num_decode_reqs > 0 or num_context_prefill_reqs < num_prefills)
++    )
++
++
++def run_split_fa2_dcp_context_attention(
++    flash_attn_varlen_func: Any,
++    query_across_dcp: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    dcp_context_out: torch.Tensor,
++    cu_seqlens_q: torch.Tensor,
++    max_seqlen_q: int,
++    dcp_context_kv_lens: torch.Tensor,
++    max_dcp_context_kv_len: int,
++    softmax_scale: float,
++    alibi_slopes: torch.Tensor | None,
++    sliding_window_size: list[int] | None,
++    block_table: torch.Tensor,
++    softcap: float,
++    fa_version: int,
++    q_descale: torch.Tensor | None,
++    k_descale: torch.Tensor | None,
++    v_descale: torch.Tensor | None,
++    max_num_splits: int,
++    num_heads: int,
++    dcp_world_size: int,
++    num_decode_reqs: int,
++    num_context_prefill_reqs: int,
++    num_decode_tokens: int,
++    num_context_prefill_tokens: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    dcp_context_out.zero_()
++    context_lse = torch.full(
++        (num_heads * dcp_world_size, query_across_dcp.shape[0]),
++        -torch.inf,
++        dtype=torch.float32,
++        device=query_across_dcp.device,
++    )
++
++    if num_decode_tokens > 0:
++        _, decode_context_lse = flash_attn_varlen_func(
++            q=query_across_dcp[:num_decode_tokens],
++            k=key_cache,
++            v=value_cache,
++            out=dcp_context_out[:num_decode_tokens],
++            cu_seqlens_q=cu_seqlens_q[: num_decode_reqs + 1],
++            max_seqlen_q=1,
++            seqused_k=dcp_context_kv_lens[:num_decode_reqs],
++            max_seqlen_k=max_dcp_context_kv_len,
++            softmax_scale=softmax_scale,
++            causal=False,
++            alibi_slopes=alibi_slopes,
++            window_size=sliding_window_size,
++            block_table=block_table[:num_decode_reqs],
++            softcap=softcap,
++            return_softmax_lse=True,
++            scheduler_metadata=None,
++            fa_version=fa_version,
++            q_descale=q_descale[:num_decode_reqs] if q_descale is not None else None,
++            k_descale=k_descale[:num_decode_reqs] if k_descale is not None else None,
++            v_descale=v_descale[:num_decode_reqs] if v_descale is not None else None,
++            num_splits=max_num_splits,
++        )
++        context_lse[:, :num_decode_tokens] = decode_context_lse
++
++    if num_context_prefill_tokens > 0:
++        prefill_start = num_decode_tokens
++        prefill_end = prefill_start + num_context_prefill_tokens
++        prefill_query_start_loc = (
++            cu_seqlens_q[
++                num_decode_reqs : num_decode_reqs + num_context_prefill_reqs + 1
++            ]
++            - num_decode_tokens
++        )
++        prefill_req_slice = slice(
++            num_decode_reqs, num_decode_reqs + num_context_prefill_reqs
++        )
++        _, prefill_context_lse = flash_attn_varlen_func(
++            q=query_across_dcp[prefill_start:prefill_end],
++            k=key_cache,
++            v=value_cache,
++            out=dcp_context_out[prefill_start:prefill_end],
++            cu_seqlens_q=prefill_query_start_loc,
++            max_seqlen_q=max_seqlen_q,
++            seqused_k=dcp_context_kv_lens[prefill_req_slice],
++            max_seqlen_k=max_dcp_context_kv_len,
++            softmax_scale=softmax_scale,
++            causal=False,
++            alibi_slopes=alibi_slopes,
++            window_size=sliding_window_size,
++            block_table=block_table[prefill_req_slice],
++            softcap=softcap,
++            return_softmax_lse=True,
++            scheduler_metadata=None,
++            fa_version=fa_version,
++            q_descale=q_descale[prefill_req_slice] if q_descale is not None else None,
++            k_descale=k_descale[prefill_req_slice] if k_descale is not None else None,
++            v_descale=v_descale[prefill_req_slice] if v_descale is not None else None,
++            num_splits=max_num_splits,
++        )
++        context_lse[:, prefill_start:prefill_end] = prefill_context_lse
++
++    return dcp_context_out, context_lse
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 28d1a04b780c..bb4fb3fe453c 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -28,7 +28,7 @@
+     maybe_create_thinking_budget_state_holder,
+ )
+ from vllm.v1.utils import copy_slice
+-from vllm.v1.worker.block_table import MultiGroupBlockTable
++from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
+ 
+ 
+ @dataclass
+@@ -99,13 +99,14 @@ def __init__(
+         vocab_size: int,
+         block_sizes: list[int],  # The block_size of each kv cache group
+         kernel_block_sizes: list[int],
+-        max_num_blocks_per_req: list[int] | None = None,
++        max_num_blocks_per_req: list[int],
+         logitsprocs: LogitsProcessors | None = None,
+         logitsprocs_need_output_token_ids: bool = False,
+         num_spec_tokens: int = 0,
+         is_pooling_model: bool = False,
+         cp_kv_cache_interleave_size: int = 1,
+         reasoning_config: ReasoningConfig | None = None,
++        slot_mapping_modes: list[SlotMappingMode] | None = None,
+     ):
+         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
+             reasoning_config,
+@@ -171,7 +172,6 @@ def __init__(
+         # Block table.
+         self.block_table = MultiGroupBlockTable(
+             max_num_reqs=max_num_reqs,
+-            max_model_len=max_model_len,
+             max_num_batched_tokens=max_num_batched_tokens,
+             pin_memory=PIN_MEMORY,
+             device=device,
+@@ -179,6 +179,7 @@ def __init__(
+             kernel_block_sizes=kernel_block_sizes,
+             max_num_blocks=max_num_blocks_per_req,
+             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
++            slot_mapping_modes=slot_mapping_modes,
+         )
+ 
+         # Sampling-related.
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 199470aaf871..3da4301c062b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -153,10 +153,12 @@
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
++    KVCacheSpecKind,
+     KVQuantMode,
+     MambaSpec,
+     SlidingWindowSpec,
+     UniformTypeKVCacheSpecs,
++    get_kv_cache_spec_kind,
+ )
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ from vllm.v1.outputs import (
+@@ -200,9 +202,11 @@
+ from vllm.v1.structured_output.utils import apply_grammar_bitmask
+ from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+ from vllm.v1.worker import mamba_utils
++from vllm.v1.worker.block_table import SlotMappingMode
+ from vllm.v1.worker.cp_utils import (
+     check_attention_cp_compatibility,
+-    get_total_cp_world_size,
++    get_dcp_dummy_context_len,
++    prepare_dcp_dummy_context_metadata,
+ )
+ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+@@ -681,8 +685,13 @@ def __init__(
+         placeholder_block_size = (
+             self.cache_config.block_size or CacheConfig.DEFAULT_BLOCK_SIZE
+         )
++        placeholder_max_num_blocks = cdiv(
++            max(self.max_model_len, self.max_encoder_len), placeholder_block_size
++        )
+         self._init_block_sizes = [placeholder_block_size]
+         self._init_kernel_block_sizes = [placeholder_block_size]
++        self._init_max_num_blocks = [placeholder_max_num_blocks]
++        self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
+         self.input_batch = InputBatch(
+             max_num_reqs=self.max_num_reqs,
+             # We need to use the encoder length for encoder-decoder
+@@ -693,6 +702,7 @@ def __init__(
+             vocab_size=self.model_config.get_vocab_size(),
+             block_sizes=[placeholder_block_size],
+             kernel_block_sizes=[placeholder_block_size],
++            max_num_blocks_per_req=[placeholder_max_num_blocks],
+             num_spec_tokens=self.num_spec_tokens,
+             logitsprocs=build_logitsprocs(
+                 self.vllm_config,
+@@ -5857,6 +5867,14 @@ def _dummy_run(
+         num_reqs_padded = (
+             batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+         )
++        dcp_dummy_context_len = get_dcp_dummy_context_len(
++            self.dcp_world_size,
++            self.parallel_config.cp_kv_cache_interleave_size,
++            hasattr(self, "kv_cache_config"),
++            create_mixed_batch,
++            is_graph_capturing,
++            uniform_decode,
++        )
+         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+             should_ubatch,
+             num_scheduled_tokens,
+@@ -5899,10 +5917,19 @@ def _dummy_run(
+                     # In the mixed batch mode (used for FI warmup), we use
+                     # shorter sequence lengths to run faster.
+                     # TODO(luka) better system for describing dummy batches
+-                    seq_lens = torch.tensor(  # type: ignore[assignment]
+-                        [1] * num_decode_tokens + [num_prefill_tokens + 1],
+-                        dtype=torch.int,
+-                    )
++                    if dcp_dummy_context_len > 0:
++                        seq_lens = torch.tensor(  # type: ignore[assignment]
++                            [1 + dcp_dummy_context_len] * num_decode_tokens
++                            + [num_prefill_tokens + dcp_dummy_context_len],
++                            dtype=torch.int,
++                        )
++                    else:
++                        seq_lens = torch.tensor(  # type: ignore[assignment]
++                            [1] * num_decode_tokens + [num_prefill_tokens + 1],
++                            dtype=torch.int,
++                        )
++                elif dcp_dummy_context_len > 0:
++                    seq_lens = max_query_len + dcp_dummy_context_len  # type: ignore[assignment]
+                 else:
+                     seq_lens = max_query_len  # type: ignore[assignment]
+                 self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
+@@ -5918,6 +5945,17 @@ def _dummy_run(
+                 )
+                 self.query_start_loc.copy_to_gpu()
+ 
++                prepare_dcp_dummy_context_metadata(
++                    input_batch=self.input_batch,
++                    kv_cache_config=getattr(self, "kv_cache_config", None),
++                    query_pos=self.query_pos,
++                    positions=self.positions,
++                    query_start_loc=self.query_start_loc,
++                    num_reqs=num_reqs,
++                    num_tokens_unpadded=num_tokens_unpadded,
++                    dcp_dummy_context_len=dcp_dummy_context_len,
++                )
++
+                 # Sync block table CPU->GPU so cleared rows from
+                 # remove_request() are visible to the attention metadata
+                 # builder. Without this, stale block IDs from finished
+@@ -7028,29 +7066,34 @@ def may_reinitialize_input_batch(
+         """
+         block_sizes = []
+         max_num_blocks = []
++        slot_mapping_modes = []
+         max_model_len = max(self.max_model_len, self.max_encoder_len)
+         for kv_cache_group in kv_cache_config.kv_cache_groups:
+-            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
++            kv_cache_spec = kv_cache_group.kv_cache_spec
++            kv_cache_spec_kind = get_kv_cache_spec_kind(kv_cache_spec)
++            if kv_cache_spec_kind == KVCacheSpecKind.ENCODER_ONLY_ATTENTION:
+                 continue
+-            block_size = kv_cache_group.kv_cache_spec.block_size
++            block_size = kv_cache_spec.block_size
+             block_sizes.append(block_size)
+-            max_num_blocks_per_req = cdiv(
+-                max_model_len, block_size * get_total_cp_world_size()
+-            )
+-            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+-                max_num_blocks_per_req = (
+-                    max_num_blocks_per_req
+-                    if self.cache_config.enable_prefix_caching
+-                    else 1
+-                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
++            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
++                slot_mapping_modes.append(SlotMappingMode.NONE)
++            else:
++                slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
++            max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
++                self.vllm_config, max_model_len
++            )
+             max_num_blocks.append(max_num_blocks_per_req)
+ 
+         if (
+             block_sizes != self._init_block_sizes
+             or kernel_block_sizes != self._init_kernel_block_sizes
++            or max_num_blocks != self._init_max_num_blocks
++            or slot_mapping_modes != self._init_slot_mapping_modes
+         ):
+             self._init_block_sizes = block_sizes
+             self._init_kernel_block_sizes = kernel_block_sizes
++            self._init_max_num_blocks = max_num_blocks
++            self._init_slot_mapping_modes = slot_mapping_modes
+             self.input_batch = InputBatch(
+                 max_num_reqs=self.max_num_reqs,
+                 max_model_len=max_model_len,
+@@ -7064,7 +7107,9 @@ def may_reinitialize_input_batch(
+                 logitsprocs=self.input_batch.logitsprocs,
+                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
+                 is_pooling_model=self.is_pooling_model,
++                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+                 reasoning_config=self.vllm_config.reasoning_config,
++                slot_mapping_modes=slot_mapping_modes,
+             )
+ 
+         assert self._init_block_sizes == block_sizes, (
+diff --git a/vllm/v1/worker/tpu_input_batch.py b/vllm/v1/worker/tpu_input_batch.py
+index 3758a73ee496..1396c8ad9d5a 100644
+--- a/vllm/v1/worker/tpu_input_batch.py
++++ b/vllm/v1/worker/tpu_input_batch.py
+@@ -29,6 +29,7 @@ def __init__(
+         vocab_size: int,
+         block_sizes: list[int],  # The block_size of each kv cache group
+         kernel_block_sizes: list[int],
++        max_num_blocks_per_req: list[int],
+     ):
+         self.max_num_reqs = max_num_reqs
+         self.max_model_len = max_model_len
+@@ -64,12 +65,12 @@ def __init__(
+         # Block table.
+         self.block_table = MultiGroupBlockTable(
+             max_num_reqs=max_num_reqs,
+-            max_model_len=max_model_len,
+             max_num_batched_tokens=max_num_batched_tokens,
+             pin_memory=pin_memory,
+             device=device,
+             block_sizes=block_sizes,
+             kernel_block_sizes=kernel_block_sizes,
++            max_num_blocks=max_num_blocks_per_req,
+         )
+ 
+         # Sampling-related.

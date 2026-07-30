@@ -1,0 +1,202 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_kernel.py b/python/sglang/srt/layers/quantization/fp8_kernel.py
+index 2450697f92b0..f9eb59aa4ba3 100644
+--- a/python/sglang/srt/layers/quantization/fp8_kernel.py
++++ b/python/sglang/srt/layers/quantization/fp8_kernel.py
+@@ -28,6 +28,7 @@
+ except:
+     pass
+ 
++from sglang.jit_kernel.utils import is_arch_support_pdl
+ from sglang.srt.layers import deep_gemm_wrapper
+ from sglang.srt.utils import (
+     ceil_align,
+@@ -767,6 +768,7 @@ def _static_quant_fp8(
+     # Meta-parameters
+     BLOCK: tl.constexpr,
+     REPEAT_SCALE: tl.constexpr,
++    USE_PDL: tl.constexpr = False,
+ ):
+     """A Triton-accelerated function to perform quantization using the given scale on a
+     tensor
+@@ -783,8 +785,15 @@ def _static_quant_fp8(
+     cols = tl.arange(0, BLOCK)  # N <= BLOCK
+     mask = cols < N
+ 
++    if USE_PDL:
++        tl.extra.cuda.gdc_wait()
++
+     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+     y_s = tl.load(y_s_ptr).to(tl.float32)
++
++    if USE_PDL:
++        tl.extra.cuda.gdc_launch_dependents()
++
+     y_s_inv = 1.0 / y_s
+     y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+ 
+@@ -831,6 +840,7 @@ def static_quant_fp8(
+     # heuristics for number of warps
+     num_warps = min(max(BLOCK // 256, 1), 8)
+     num_stages = 1
++    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+     _static_quant_fp8[(M,)](
+         x,
+         x_q,
+@@ -844,6 +854,7 @@ def static_quant_fp8(
+         REPEAT_SCALE=repeat_scale,
+         num_warps=num_warps,
+         num_stages=num_stages,
++        **pdl_kwargs,
+     )
+     x_s = x_s_repeat if repeat_scale else x_s
+     return x_q, x_s
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index e4fa18c0aca8..ca16262f1699 100755
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -227,12 +227,37 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
+ 
+ if is_blackwell_supported() and is_flashinfer_available():
+     from flashinfer import SfLayout
++    from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
+     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
+     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
+     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
+ 
+     from sglang.srt.utils.custom_op import register_custom_op
+ 
++    @register_custom_op(
++        op_name="flashinfer_bmm_fp8",
++        mutates_args=[],
++        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype: (
++            q_input.new_empty((q_input.shape[0], weight.shape[1]), dtype=out_dtype)
++        ),
++    )
++    def flashinfer_bmm_fp8(
++        q_input: torch.Tensor,  # [M, K] fp8 e4m3
++        weight: torch.Tensor,  # [K, N] fp8 e4m3, column-major
++        x_scale: torch.Tensor,  # per-tensor scalar
++        weight_scale: torch.Tensor,  # per-tensor scalar
++        out_dtype: torch.dtype,
++    ) -> torch.Tensor:
++        m, n = q_input.shape[0], weight.shape[1]
++        return _raw_flashinfer_bmm_fp8(
++            q_input.unsqueeze(0),
++            weight.unsqueeze(0),
++            x_scale.reshape(1),
++            weight_scale.reshape(1),
++            out_dtype,
++            backend="auto",
++        ).view(m, n)
++
+     @lru_cache(maxsize=1)
+     def _get_flashinfer_groupwise_backend() -> str:
+         if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+@@ -1474,6 +1499,23 @@ def _apply_fallback_scaled_mm(
+     return output.to(dtype=input_dtype)
+ 
+ 
++def apply_fp8_linear_bmm_flashinfer(
++    input: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    input_scale: torch.Tensor,
++    bias: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM10X only)."""
++    output_shape = [*input.shape[:-1], weight.shape[1]]
++    input_2d = input.view(-1, input.shape[-1])
++    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
++    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
++    if bias is not None:
++        output = output + bias
++    return output.view(*output_shape)
++
++
+ def apply_fp8_linear(
+     input: torch.Tensor,
+     weight: torch.Tensor,
+diff --git a/python/sglang/srt/layers/quantization/modelopt_quant.py b/python/sglang/srt/layers/quantization/modelopt_quant.py
+index a380bb0f18dd..560e2ffc971e 100755
+--- a/python/sglang/srt/layers/quantization/modelopt_quant.py
++++ b/python/sglang/srt/layers/quantization/modelopt_quant.py
+@@ -44,6 +44,7 @@
+ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+ from sglang.srt.layers.quantization.fp8_utils import (
+     apply_fp8_linear,
++    apply_fp8_linear_bmm_flashinfer,
+     cutlass_fp8_supported,
+     is_blackwell_supported,
+ )
+@@ -66,6 +67,8 @@
+ from sglang.srt.utils.common import (
+     get_device_capability,
+     is_cuda,
++    is_flashinfer_available,
++    is_sm100_supported,
+     is_sm120_supported,
+     next_power_of_2,
+     round_up,
+@@ -510,6 +513,7 @@ def __init__(self, quant_config: ModelOptFp8Config):
+         super().__init__()
+         self.quant_config = quant_config
+         self.cutlass_fp8_supported = cutlass_fp8_supported()
++        self.enable_flashinfer_bmm = is_sm100_supported() and is_flashinfer_available()
+ 
+     def create_weights(
+         self,
+@@ -571,8 +575,7 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+             layer.weight, layer.weight_scale, layer.logical_widths
+         )
+         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
+-        # cutlass sgl-kernel only supports per-channel scale
+-        if self.cutlass_fp8_supported:
++        if self.cutlass_fp8_supported and not self.enable_flashinfer_bmm:
+             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
+         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+@@ -584,6 +587,14 @@ def apply(
+         bias: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
+         """Applies FP8 linear transformation."""
++        if self.enable_flashinfer_bmm and layer.input_scale is not None:
++            return apply_fp8_linear_bmm_flashinfer(
++                input=x,
++                weight=layer.weight,
++                weight_scale=layer.weight_scale,
++                input_scale=layer.input_scale,
++                bias=bias,
++            )
+         return apply_fp8_linear(
+             input=x,
+             weight=layer.weight,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 30f2c2d61d3d..07bab3bd9576 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -2516,7 +2516,24 @@ def _should_run_flashinfer_autotune(self) -> bool:
+             or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+         )
+ 
+-        if not (moe_needs_autotune or fp4_gemm_needs_autotune):
++        from sglang.srt.layers.quantization.fp8_utils import (
++            get_fp8_gemm_runner_backend,
++        )
++        from sglang.srt.utils import is_sm100_supported
++
++        model_uses_modelopt_fp8 = self.model_config.quantization in (
++            "modelopt",
++            "modelopt_fp8",
++            "modelopt_mixed",
++        )
++        fp8_gemm_needs_autotune = (
++            get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
++            or (model_uses_modelopt_fp8 and is_sm100_supported())
++        )
++
++        if not (
++            moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
++        ):
+             return False
+ 
+         major, _ = torch.cuda.get_device_capability()

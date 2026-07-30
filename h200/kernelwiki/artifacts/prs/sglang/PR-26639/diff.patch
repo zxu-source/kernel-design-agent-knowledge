@@ -1,0 +1,1487 @@
+diff --git a/python/sglang/jit_kernel/csrc/hisparse.cuh b/python/sglang/jit_kernel/csrc/hisparse.cuh
+index 7a41cd8d8450..50477dc44dd6 100644
+--- a/python/sglang/jit_kernel/csrc/hisparse.cuh
++++ b/python/sglang/jit_kernel/csrc/hisparse.cuh
+@@ -8,14 +8,21 @@
+ #include <dlpack/dlpack.h>
+ #include <tvm/ffi/container/tensor.h>
+ 
+-#include <cuda_runtime.h>
+ #include <stdexcept>
+ #include <stdint.h>
+ #include <string>
+ 
+ namespace {
+ 
++#ifdef USE_ROCM
++constexpr int WARP_SIZE = 64;
++using BallotMask = uint64_t;
++constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
++#else
+ constexpr int WARP_SIZE = 32;
++using BallotMask = unsigned int;
++constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
++#endif
+ constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
+ constexpr int32_t HASH_EMPTY = -1;
+ 
+@@ -24,6 +31,25 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
+   return ((uint32_t)key * 2654435761u) % (uint32_t)hash_size;
+ }
+ 
++#ifdef USE_ROCM
++__device__ __forceinline__ void transfer_item_warp(
++    int32_t lane_id, const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
++  const auto src = static_cast<const char*>(src_addr);
++  auto dst = static_cast<char*>(dst_addr);
++
++  const int64_t word_count = item_size_bytes / static_cast<int64_t>(sizeof(uint64_t));
++  const auto src_words = reinterpret_cast<const uint64_t*>(src);
++  auto dst_words = reinterpret_cast<uint64_t*>(dst);
++  for (int64_t i = lane_id; i < word_count; i += WARP_SIZE) {
++    dst_words[i] = src_words[i];
++  }
++
++  const int64_t tail_start = word_count * static_cast<int64_t>(sizeof(uint64_t));
++  for (int64_t i = tail_start + lane_id; i < item_size_bytes; i += WARP_SIZE) {
++    dst[i] = src[i];
++  }
++}
++#else
+ __device__ __forceinline__ void
+ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
+   // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
+@@ -51,6 +77,15 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
+     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
+   }
+ }
++#endif
++
++__device__ __forceinline__ int popc_mask(BallotMask mask) {
++#ifdef USE_ROCM
++  return __popcll(mask);
++#else
++  return __popc(mask);
++#endif
++}
+ 
+ template <int BLOCK_SIZE>
+ __global__ __launch_bounds__(BLOCK_SIZE, 1) void transfer_cache_dsv4_mla_kernel(
+@@ -113,15 +148,15 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
+   int val = (idx < count) ? s_data[idx] : 0;
+ 
+ #pragma unroll
+-  for (int i = 1; i < 32; i *= 2) {
+-    int n = __shfl_up_sync(0xffffffff, val, i);
++  for (int i = 1; i < WARP_SIZE; i *= 2) {
++    int n = __shfl_up_sync(FULL_WARP_MASK, val, i);
+     if (lane_id >= i) val += n;
+   }
+   val += accumulator;
+   if (idx < count) {
+     s_data[idx] = val;
+   }
+-  accumulator = __shfl_sync(0xffffffff, val, 31);
++  accumulator = __shfl_sync(FULL_WARP_MASK, val, WARP_SIZE - 1);
+   return accumulator;
+ }
+ 
+@@ -188,7 +223,7 @@ __global__ void load_cache_to_device_buffer_kernel(
+   const int tid = threadIdx.x;
+   const int warp_id = tid / WARP_SIZE;
+   const int lane_id = tid % WARP_SIZE;
+-  const unsigned int lanes_before = ((unsigned int)1 << lane_id) - 1;
++  const BallotMask lanes_before = (BallotMask(1) << lane_id) - BallotMask(1);
+ 
+   const int64_t rid = req_pool_indices[bid];
+   const int64_t seq_len = seq_lens[bid];
+@@ -316,22 +351,35 @@ __global__ void load_cache_to_device_buffer_kernel(
+     int local_hit_offset = 0;
+     int local_evict_offset = 0;
+     if (has_valid_chunk) {
+-      const unsigned int hit_mask = __ballot_sync(0xFFFFFFFF, is_hit);
+-      const unsigned int evict_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
+-      local_hit_offset = __popc(hit_mask & lanes_before);
+-      local_evict_offset = __popc(evict_mask & lanes_before);
++      const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
++      const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
++      local_hit_offset = popc_mask(hit_mask & lanes_before);
++      local_evict_offset = popc_mask(evict_mask & lanes_before);
+       if (lane_id == 0) {
+-        s_chunk_offset[chunk_idx + 1] = __popc(hit_mask);
+-        s_evict_chunk_offset[chunk_idx + 1] = __popc(evict_mask);
++        s_chunk_offset[chunk_idx + 1] = popc_mask(hit_mask);
++        s_evict_chunk_offset[chunk_idx + 1] = popc_mask(evict_mask);
+       }
+     }
+     __syncthreads();
+ 
+     if (warp_id == 0) {
++#ifdef USE_ROCM
++      // ROCm wavefront64: WARP_SIZE (64) > NUM_WARPS (16 at block_size=1024),
++      // so the wide-count form below would let lanes beyond this iteration's
++      // NUM_WARPS-wide window write the accumulator into s_chunk_offset
++      // positions belonging to future iterations, corrupting their reads.
++      // Bound the scan window to NUM_WARPS lanes.
++      const int scan_offset = iter * NUM_WARPS + 1;
++      const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
++      total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
++      total_evict_count =
++          warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
++#else
+       total_hit_count =
+           warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
+       total_evict_count =
+           warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
++#endif
+       if (tid == 0) {
+         s_total_hits = total_hit_count;
+       }
+@@ -380,9 +428,9 @@ __global__ void load_cache_to_device_buffer_kernel(
+     }
+ 
+     if (has_valid_chunk) {
+-      const unsigned int miss_mask = __ballot_sync(0xFFFFFFFF, is_miss);
+-      local_miss_offset = __popc(miss_mask & lanes_before);
+-      const int warp_miss_count = __popc(miss_mask);
++      const BallotMask miss_mask = __ballot_sync(FULL_WARP_MASK, is_miss);
++      local_miss_offset = popc_mask(miss_mask & lanes_before);
++      const int warp_miss_count = popc_mask(miss_mask);
+       if (lane_id == 0) {
+         s_chunk_offset[chunk_idx + 1] = warp_miss_count;
+       }
+@@ -390,7 +438,13 @@ __global__ void load_cache_to_device_buffer_kernel(
+     __syncthreads();
+ 
+     if (warp_id == 0) {
++#ifdef USE_ROCM
++      const int scan_offset = iter * NUM_WARPS + 1;
++      const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
++      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
++#else
+       total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
++#endif
+     }
+     __syncthreads();
+ 
+@@ -410,6 +464,24 @@ __global__ void load_cache_to_device_buffer_kernel(
+   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
+   {
+     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
++#ifdef USE_ROCM
++    // ROCm: cap writeback threads at 512 for large kernels.
++    constexpr int LRU_WRITEBACK_THREADS = (BLOCK_SIZE > 512) ? 512 : BLOCK_SIZE;
++    if (tid < LRU_WRITEBACK_THREADS) {
++      for (int i = tid; i < HOT_BUFFER_SIZE; i += LRU_WRITEBACK_THREADS) {
++        if (i < total_misses) {
++          // Misses: just loaded from host, place right before hits
++          req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
++        } else if (i < total_evictable) {
++          // Remaining evictables: truly stale, dest at LRU front
++          req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
++        } else {
++          // Hits: source at forward end, dest at MRU back
++          req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
++        }
++      }
++    }
++#else
+     for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+       if (i < total_misses) {
+         // Misses: just loaded from host, place right before hits
+@@ -422,6 +494,7 @@ __global__ void load_cache_to_device_buffer_kernel(
+         req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+       }
+     }
++#endif
+   }
+ 
+   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
+@@ -433,7 +506,20 @@ __global__ void load_cache_to_device_buffer_kernel(
+     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+ 
+     if constexpr (IsDsv4Layout) {
+-      // DSv4 path: page-padded device layout + page-padded host layout, K-only.
++#ifdef USE_ROCM
++      // ROCm path: host cache and device buffer both use the page-padded C4
++      // layout (same as the write path and the CUDA branch). We can't reuse
++      // device::hisparse::transfer_item here because its warp logic is hardcoded
++      // to a 32-lane warp; on wavefront64 we use the warp-width-agnostic
++      // transfer_item_warp with paged source and destination addressing.
++      using namespace device::hisparse;
++      const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(device_buffer_k, static_cast<int32_t>(dst_loc));
++      const auto [src_value_ptr, src_scale_ptr] =
++          get_pointer_paged(const_cast<void*>(host_cache_k), static_cast<int32_t>(src_loc));
++      transfer_item_warp(lane_id, src_value_ptr, dst_value_ptr, kValueBytes);
++      transfer_item_warp(lane_id, src_scale_ptr, dst_scale_ptr, kScaleBytes);
++#else
++      // CUDA path: page-padded device layout + page-padded host layout, K-only.
+       // The host cache is pinned DRAM but uses the same row layout as the GPU C4
+       // cache, so use the page-padded address calculation for both ends.
+       device::hisparse::transfer_item(
+@@ -441,6 +527,7 @@ __global__ void load_cache_to_device_buffer_kernel(
+           /*src_cache=*/const_cast<void*>(host_cache_k),
+           /*dst_index=*/static_cast<int32_t>(dst_loc),
+           /*src_index=*/static_cast<int32_t>(src_loc));
++#endif
+     } else {
+       // Generic path: device + host both linear, stride = item_size_bytes.
+       const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+@@ -487,9 +574,11 @@ void load_cache_to_device_buffer(
+   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
+   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
+     constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
++#ifndef USE_ROCM
+     if constexpr (smem_bytes > 48u * 1024u) {
+       cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+     }
++#endif
+     LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+         kernel_fn,
+         static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+diff --git a/python/sglang/srt/arg_groups/hisparse_hook.py b/python/sglang/srt/arg_groups/hisparse_hook.py
+index 135d172cf59a..856f35527e33 100644
+--- a/python/sglang/srt/arg_groups/hisparse_hook.py
++++ b/python/sglang/srt/arg_groups/hisparse_hook.py
+@@ -8,20 +8,34 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
+-
+-# Backend/dtype pairing: flashmla_sparse only takes BF16 KV;
+-# flashmla_kv only supports FP8 (it always reads KV as FP8 via
+-# is_fp8_kvcache=True, inline-quantizing BF16 would defeat HiSparse).
+-_HISPARSE_ALLOWED_BACKENDS_BY_DTYPE = {
++HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
+     "bfloat16": {"flashmla_sparse"},
+     "fp8_e4m3": {"flashmla_kv"},
+ }
++HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "aiter"}
++HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
++
++
++def _is_hip() -> bool:
++    from sglang.srt.server_args import is_hip
++
++    return is_hip()
+ 
+ 
+ def _hisparse_default_backend(kv_cache_dtype: str) -> str:
++    if _is_hip():
++        return "tilelang"
+     return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
+ 
+ 
++def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
++    if _is_hip():
++        return HISPARSE_ROCM_DSA_BACKENDS
++    return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(
++        kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"}
++    )
++
++
+ def apply_hisparse_dsa_backend_defaults(
+     server_args: ServerArgs,
+     user_set_prefill: bool,
+@@ -30,8 +44,8 @@ def apply_hisparse_dsa_backend_defaults(
+ ) -> bool:
+     """Pick DSA backends for --enable-hisparse based on KV dtype.
+ 
+-    BF16 KV -> flashmla_sparse, FP8 KV -> flashmla_kv. Returns True if hisparse
+-    handled backend selection (caller should skip its own default logic).
++    CUDA uses dtype-specific FlashMLA backends; ROCm uses TileLang. Returns
++    True if hisparse handled backend selection.
+     """
+     if not server_args.enable_hisparse:
+         return False
+@@ -48,6 +62,35 @@ def apply_hisparse_dsa_backend_defaults(
+     return True
+ 
+ 
++def validate_hisparse_dsa_backend(
++    server_args: ServerArgs, attr: str, label: str
++) -> None:
++    backend = getattr(server_args, attr)
++    allowed_backends = _hisparse_allowed_backends(server_args.kv_cache_dtype)
++    if backend is not None and backend not in allowed_backends:
++        raise ValueError(
++            f"HiSparse supports DSA {label} backend(s) {sorted(allowed_backends)} "
++            f"on this platform with --kv-cache-dtype={server_args.kv_cache_dtype}, "
++            f"but got --dsa-{label}-backend={backend}. "
++            f"Please use --dsa-{label}-backend="
++            f"{_hisparse_default_backend(server_args.kv_cache_dtype)} "
++            "or omit it."
++        )
++
++
++def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
++    if server_args.kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
++        return
++
++    choices = " or ".join(
++        f"--kv-cache-dtype={dtype}" for dtype in HISPARSE_KV_CACHE_DTYPES
++    )
++    raise ValueError(
++        f"HiSparse requires one of {HISPARSE_KV_CACHE_DTYPES} KV cache dtypes, "
++        f"but got --kv-cache-dtype={server_args.kv_cache_dtype}. Please use {choices}."
++    )
++
++
+ def validate_hisparse(server_args: ServerArgs) -> None:
+     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
+     if not server_args.enable_hisparse:
+@@ -60,6 +103,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
+ 
+     hf_config = server_args.get_model_config().hf_config
+     is_v4_hisparse = is_deepseek_v4(hf_config)
++    is_hip = _is_hip()
+     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
+         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
+         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
+@@ -71,27 +115,30 @@ def validate_hisparse(server_args: ServerArgs) -> None:
+ 
+     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
+     # aware checks below only apply to the DSA hisparse path.
+-    if is_v4_hisparse:
++    if is_hip and is_v4_hisparse:
++        # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
++        # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
++        # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
++        # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
++        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
++            is_unified_kv_triton,
++        )
++
++        if is_unified_kv_triton():
++            raise ValueError(
++                "--enable-hisparse is not supported with the unified-KV path on ROCm"
++                "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton) for DeepSeek-V4: "
++                "HiSparse currently requires the separate packed KV layout. "
++                "Either set SGLANG_HACK_FLASHMLA_BACKEND=triton, or run without "
++                "--enable-hisparse."
++            )
+         return
+ 
+     if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
+-        raise ValueError(
+-            f"HiSparse requires bfloat16 or fp8_e4m3 KV cache, "
+-            f"but got --kv-cache-dtype={server_args.kv_cache_dtype}. "
+-            f"Please use --kv-cache-dtype=bfloat16 or fp8_e4m3."
+-        )
++        validate_hisparse_kv_cache_dtype(server_args)
+ 
+-    allowed_backends = _HISPARSE_ALLOWED_BACKENDS_BY_DTYPE.get(
+-        server_args.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"}
+-    )
+     for attr, label in [
+         ("dsa_prefill_backend", "prefill"),
+         ("dsa_decode_backend", "decode"),
+     ]:
+-        backend = getattr(server_args, attr)
+-        if backend is not None and backend not in allowed_backends:
+-            raise ValueError(
+-                f"HiSparse with --kv-cache-dtype={server_args.kv_cache_dtype} requires "
+-                f"--dsa-{label}-backend in {sorted(allowed_backends)}, "
+-                f"but got {backend}."
+-            )
++        validate_hisparse_dsa_backend(server_args, attr, label)
+diff --git a/python/sglang/srt/layers/attention/dsa_backend.py b/python/sglang/srt/layers/attention/dsa_backend.py
+index 169019f15f70..d4300404218e 100644
+--- a/python/sglang/srt/layers/attention/dsa_backend.py
++++ b/python/sglang/srt/layers/attention/dsa_backend.py
+@@ -65,10 +65,13 @@
+ 
+ if _is_hip:
+     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
++    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+ 
+     try:
+         from aiter import (  # noqa: F401
+             flash_attn_varlen_func,
++            get_mla_metadata_info_v1,
++            get_mla_metadata_v1,
+             mha_batch_prefill_func,
+             paged_attention_ragged,
+         )
+@@ -361,6 +364,24 @@ def __init__(
+             self.head_repeat_factor = (
+                 16 // self.num_q_heads if self.num_q_heads < 16 else 1
+             )
++            self.num_head_padded = self.num_q_heads * self.head_repeat_factor
++            self.aiter_dsa_max_split_per_batch = 64
++            self.aiter_dsa_metadata_capacity = 0
++            self.aiter_dsa_metadata_max_seqlen_q = 0
++            self.aiter_dsa_metadata_q_dtype = None
++            self.aiter_dsa_metadata_kv_dtype = None
++            self.aiter_dsa_kv_last_page_lens = None
++            self.aiter_dsa_work_metadata = None
++
++            if (
++                self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
++            ) and model_runner.kv_cache_dtype == fp8_dtype:
++                self._ensure_aiter_dsa_decode_metadata_buffer(
++                    max_seqlen_q=1,
++                    batch_size=max_bs,
++                    q_dtype=torch.bfloat16,
++                    kv_dtype=fp8_dtype,
++                )
+ 
+         # Speculative decoding
+         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+@@ -387,6 +408,145 @@ def __init__(
+         else:
+             self.workspace_buffer = None
+ 
++    def _make_aiter_dsa_decode_metadata_buffer(
++        self,
++        max_seqlen_q: int,
++        batch_size: int,
++        q_dtype: torch.dtype,
++        kv_dtype: torch.dtype,
++    ):
++        (
++            (work_metadata_size, work_metadata_type),
++            (work_indptr_size, work_indptr_type),
++            (work_info_set_size, work_info_set_type),
++            (reduce_indptr_size, reduce_indptr_type),
++            (reduce_final_map_size, reduce_final_map_type),
++            (reduce_partial_map_size, reduce_partial_map_type),
++        ) = get_mla_metadata_info_v1(
++            batch_size,
++            max_seqlen_q,
++            self.num_head_padded,
++            q_dtype,
++            kv_dtype,
++            is_sparse=True,
++            fast_mode=False,
++            num_kv_splits=self.aiter_dsa_max_split_per_batch,
++            intra_batch_mode=True,
++        )
++
++        return (
++            torch.empty(
++                work_metadata_size, dtype=work_metadata_type, device=self.device
++            ),
++            torch.empty(work_indptr_size, dtype=work_indptr_type, device=self.device),
++            torch.empty(
++                work_info_set_size, dtype=work_info_set_type, device=self.device
++            ),
++            torch.empty(
++                reduce_indptr_size, dtype=reduce_indptr_type, device=self.device
++            ),
++            torch.empty(
++                reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
++            ),
++            torch.empty(
++                reduce_partial_map_size,
++                dtype=reduce_partial_map_type,
++                device=self.device,
++            ),
++        )
++
++    def _ensure_aiter_dsa_decode_metadata_buffer(
++        self,
++        max_seqlen_q: int,
++        batch_size: int,
++        q_dtype: torch.dtype,
++        kv_dtype: torch.dtype,
++    ) -> None:
++        if (
++            self.aiter_dsa_work_metadata is not None
++            and self.aiter_dsa_metadata_capacity >= batch_size
++            and self.aiter_dsa_metadata_max_seqlen_q == max_seqlen_q
++            and self.aiter_dsa_metadata_q_dtype == q_dtype
++            and self.aiter_dsa_metadata_kv_dtype == kv_dtype
++        ):
++            return
++
++        (
++            self.aiter_dsa_work_metadata,
++            self.aiter_dsa_work_indptr,
++            self.aiter_dsa_work_info_set,
++            self.aiter_dsa_reduce_indptr,
++            self.aiter_dsa_reduce_final_map,
++            self.aiter_dsa_reduce_partial_map,
++        ) = self._make_aiter_dsa_decode_metadata_buffer(
++            max_seqlen_q=max_seqlen_q,
++            batch_size=batch_size,
++            q_dtype=q_dtype,
++            kv_dtype=kv_dtype,
++        )
++        self.aiter_dsa_kv_last_page_lens = torch.ones(
++            (batch_size,), dtype=torch.int32, device=self.device
++        )
++        self.aiter_dsa_metadata_capacity = batch_size
++        self.aiter_dsa_metadata_max_seqlen_q = max_seqlen_q
++        self.aiter_dsa_metadata_q_dtype = q_dtype
++        self.aiter_dsa_metadata_kv_dtype = kv_dtype
++
++    def _prepare_aiter_dsa_decode_metadata(
++        self,
++        qo_indptr: torch.Tensor,
++        kv_indptr: torch.Tensor,
++        bs: int,
++        max_seqlen_q: int,
++        q_dtype: torch.dtype,
++        kv_dtype: torch.dtype,
++    ) -> dict:
++        self._ensure_aiter_dsa_decode_metadata_buffer(
++            max_seqlen_q=max_seqlen_q,
++            batch_size=bs,
++            q_dtype=q_dtype,
++            kv_dtype=kv_dtype,
++        )
++        self.aiter_dsa_kv_last_page_lens[:bs].fill_(1)
++        kv_last_page_lens = self.aiter_dsa_kv_last_page_lens[:bs]
++
++        get_mla_metadata_v1(
++            qo_indptr,
++            kv_indptr,
++            kv_last_page_lens,
++            self.num_head_padded,
++            1,
++            False,
++            self.aiter_dsa_work_metadata,
++            self.aiter_dsa_work_info_set,
++            self.aiter_dsa_work_indptr,
++            self.aiter_dsa_reduce_indptr,
++            self.aiter_dsa_reduce_final_map,
++            self.aiter_dsa_reduce_partial_map,
++            page_size=1,
++            kv_granularity=16,
++            max_seqlen_qo=max_seqlen_q,
++            uni_seqlen_qo=max_seqlen_q,
++            fast_mode=False,
++            topk=self.dsa_index_topk,
++            max_split_per_batch=self.aiter_dsa_max_split_per_batch,
++            intra_batch_mode=True,
++            dtype_q=q_dtype,
++            dtype_kv=kv_dtype,
++        )
++
++        return {
++            "kv_last_page_lens": kv_last_page_lens,
++            "work_meta_data": self.aiter_dsa_work_metadata,
++            "work_indptr": self.aiter_dsa_work_indptr,
++            "work_info_set": self.aiter_dsa_work_info_set,
++            "reduce_indptr": self.aiter_dsa_reduce_indptr,
++            "reduce_final_map": self.aiter_dsa_reduce_final_map,
++            "reduce_partial_map": self.aiter_dsa_reduce_partial_map,
++            "intra_batch_mode": True,
++            "num_kv_splits": self.aiter_dsa_max_split_per_batch,
++        }
++
+     def _build_paged_mqa_schedule_2d_ctx_lens(
+         self,
+         forward_mode: ForwardMode,
+@@ -420,13 +580,13 @@ def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor
+             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+         )
+ 
+-    def get_device_int32_arange(self, l: int) -> torch.Tensor:
+-        if l > len(self._arange_buf):
+-            next_pow_of_2 = 1 << (l - 1).bit_length()
++    def get_device_int32_arange(self, length: int) -> torch.Tensor:
++        if length > len(self._arange_buf):
++            next_pow_of_2 = 1 << (length - 1).bit_length()
+             self._arange_buf = torch.arange(
+                 next_pow_of_2, device=self.device, dtype=torch.int32
+             )
+-        return self._arange_buf[:l]
++        return self._arange_buf[:length]
+ 
+     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
+         page_size = self.real_page_size
+@@ -1982,6 +2142,12 @@ def _forward_aiter(
+             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+ 
++        q_scale = None
++        kv_scale = None
++        aiter_persistent_kwargs = {}
++        if kv_cache.dtype == fp8_dtype:
++            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
++
+         kv_indptr = self.kv_indptr
+ 
+         non_minus1_mask = page_table_1 != -1
+@@ -1991,6 +2157,18 @@ def _forward_aiter(
+         kv_indices = self.kv_indices
+         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
+ 
++        kv_last_page_lens = metadata.cu_seqlens_q
++        if kv_cache.dtype == fp8_dtype:
++            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
++                metadata.cu_seqlens_q,
++                kv_indptr,
++                bs,
++                metadata.max_seq_len_q,
++                q_kernel.dtype,
++                kv_cache.dtype,
++            )
++            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
++
+         mla_decode_fwd(
+             q_kernel,
+             kv_cache.view(-1, 1, 1, layer.head_dim),
+@@ -1998,10 +2176,13 @@ def _forward_aiter(
+             metadata.cu_seqlens_q,
+             kv_indptr,
+             kv_indices,
+-            metadata.cu_seqlens_q,
++            kv_last_page_lens,
+             metadata.max_seq_len_q,
+             sm_scale=layer.scaling,
+             logit_cap=layer.logit_cap,
++            q_scale=q_scale,
++            kv_scale=kv_scale,
++            **aiter_persistent_kwargs,
+         )
+ 
+         if self.need_pad_heads:
+@@ -2039,6 +2220,12 @@ def _forward_aiter_extend(
+             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+ 
++        q_scale = None
++        kv_scale = None
++        aiter_persistent_kwargs = {}
++        if kv_cache.dtype == fp8_dtype:
++            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
++
+         non_minus1_mask = page_table_1 != -1
+         non_minus1_counts = non_minus1_mask.sum(dim=1)
+ 
+@@ -2058,6 +2245,18 @@ def _forward_aiter_extend(
+         cu_seqlens_q = torch.arange(
+             0, num_tokens + 1, dtype=torch.int32, device=self.device
+         )
++        kv_last_page_lens = cu_seqlens_q
++        if kv_cache.dtype == fp8_dtype:
++            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
++                cu_seqlens_q,
++                kv_indptr,
++                num_tokens,
++                1,
++                q_kernel.dtype,
++                kv_cache.dtype,
++            )
++            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
++
+         # TODO support more forward_mode
+         mla_decode_fwd(
+             q_kernel,
+@@ -2066,10 +2265,13 @@ def _forward_aiter_extend(
+             cu_seqlens_q,
+             kv_indptr,
+             kv_indices,
+-            cu_seqlens_q,
++            kv_last_page_lens,
+             1,  # max_seq_len_q = 1 for per-token attention
+             sm_scale=layer.scaling,
+             logit_cap=layer.logit_cap,
++            q_scale=q_scale,
++            kv_scale=kv_scale,
++            **aiter_persistent_kwargs,
+         )
+ 
+         if self.need_pad_heads:
+diff --git a/python/sglang/srt/managers/hisparse_coordinator.py b/python/sglang/srt/managers/hisparse_coordinator.py
+index a67c1aa84dbd..cc1ae09f7518 100644
+--- a/python/sglang/srt/managers/hisparse_coordinator.py
++++ b/python/sglang/srt/managers/hisparse_coordinator.py
+@@ -5,6 +5,10 @@
+ 
+ import torch
+ 
++from sglang.jit_kernel.hisparse import (
++    load_cache_to_device_buffer_dsv4_mla,
++    load_cache_to_device_buffer_mla,
++)
+ from sglang.srt.managers.schedule_batch import Req
+ from sglang.srt.mem_cache.allocator.hisparse import (
+     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+@@ -13,19 +17,16 @@
+ from sglang.srt.mem_cache.hisparse_memory_pool import (
+     HiSparseDSATokenToKVPool,
+ )
++from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+ from sglang.srt.mem_cache.memory_pool_host import (
+     DeepSeekV4PagedHostPool,
+     MLATokenToKVPoolHost,
+ )
+-from sglang.srt.utils import get_device_module
++from sglang.srt.utils import get_device_module, is_hip
+ 
+ device_module = get_device_module()
+ 
+-from sglang.jit_kernel.hisparse import (
+-    load_cache_to_device_buffer_dsv4_mla,
+-    load_cache_to_device_buffer_mla,
+-)
+-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
++_is_hip = is_hip()
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -471,13 +472,25 @@ def map_last_loc_to_buffer(
+                 :, req_pool_indices, self.device_buffer_size
+             ] = reserved_buffer_loc.to(torch.int32)
+ 
+-            # No need to clear prior mappings: the only consumer of the mapping
+-            # for past tokens is the swap-in kernel, and it goes through
+-            # top_k_device_locs returned by swap_in_selected_pages -- not via
+-            # mapping[old_out_cache_loc] -- so stale entries are harmless.
+             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
+                 out_cache_loc
+             )
++            # ROCm: the decode remap creates a temporary hisparse device slot per
++            # new token (via the page_size==1 allocator path). Free the stale
++            # slot before pointing the mapping at the reserved device-buffer slot,
++            # otherwise the temporary slots leak and corrupt later swap-in lookups.
++            # CUDA keeps the original behavior: the swap-in kernel consumes only
++            # top_k_device_locs, so stale mapping entries are harmless there.
++            if _is_hip:
++                previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
++                    compressed_locs
++                )
++                stale_locs = previous_locs[
++                    (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
++                ]
++                if stale_locs.numel() > 0:
++                    self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
++
+             self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                 compressed_locs
+             ] = reserved_buffer_loc
+diff --git a/python/sglang/srt/mem_cache/allocator/hisparse.py b/python/sglang/srt/mem_cache/allocator/hisparse.py
+index 5e23ce5967a3..cf30a7de2929 100644
+--- a/python/sglang/srt/mem_cache/allocator/hisparse.py
++++ b/python/sglang/srt/mem_cache/allocator/hisparse.py
+@@ -86,10 +86,23 @@ def get_kvcache(self):
+         return self._kvcache
+ 
+     def alloc(self, need_size: int):
+-        raise NotImplementedError(
+-            "HiSparse allocator does not support direct token allocation; "
+-            "use alloc_extend or alloc_decode instead."
+-        )
++        if self.page_size != 1:
++            raise NotImplementedError(
++                "HiSparse generic allocation is only supported for page_size=1. "
++                "Use alloc_extend for paged allocation."
++            )
++
++        logical_indices = self.logical_attn_allocator.alloc(need_size)
++        if logical_indices is None:
++            return None
++
++        hisparse_indices = self.hisparse_attn_allocator.alloc(need_size)
++        if hisparse_indices is None:
++            self.logical_attn_allocator.free(logical_indices)
++            return None
++
++        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
++        return logical_indices
+ 
+     def alloc_logical_only(
+         self,
+@@ -172,8 +185,6 @@ def alloc_extend(
+         last_loc: torch.Tensor,  # last_loc for full layers
+         extend_num_tokens: int,
+     ):
+-        assert self.page_size > 1
+-
+         num_new_pages = get_num_new_pages(
+             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+         )
+@@ -555,11 +566,3 @@ def free(self, free_index: torch.Tensor):
+             self.logical_attn_allocator.free(free_index)
+         else:
+             self.free_group.append(free_index)
+-        assert (
+-            self.logical_attn_allocator.available_size()
+-            <= self.logical_attn_allocator.size
+-        )
+-        assert (
+-            self.hisparse_attn_allocator.available_size()
+-            <= self.hisparse_attn_allocator.size
+-        )
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index 36fd4dad24d7..f0320bf95863 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -227,17 +227,18 @@ def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
+         ):
+             return kv_cache_dim
+ 
+-        # On HIP with TileLang backend, keep the default MLA KV cache dimension.
+-        # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
++        # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
++        # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
+         if _is_hip and (
+-            self.server_args.dsa_prefill_backend == "tilelang"
+-            or self.server_args.dsa_decode_backend == "tilelang"
++            self.server_args.dsa_prefill_backend in ("tilelang", "aiter")
++            or self.server_args.dsa_decode_backend in ("tilelang", "aiter")
+         ):
+             return kv_cache_dim
+ 
+         quant_block_size = DSATokenToKVPool.quant_block_size
+         rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
+-        # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
++        # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
++        # (excluding TRTLLM and HIP raw-layout kernels).
+         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+         if kv_cache_dtype == torch.float8_e4m3fn:
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 752b09c51d5e..108edf2a8ab3 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1958,6 +1958,16 @@ def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+             f"Set DSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
+         )
+ 
++    def _validate_hisparse_dsa_backend(self, attr: str, label: str):
++        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_dsa_backend
++
++        validate_hisparse_dsa_backend(self, attr, label)
++
++    def _validate_hisparse_kv_cache_dtype(self):
++        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_kv_cache_dtype
++
++        validate_hisparse_kv_cache_dtype(self)
++
+     def _handle_model_specific_adjustments(self):
+         from sglang.srt.configs.model_config import (
+             get_mimo_v2_fused_qkv_expected_tp_size,
+diff --git a/test/registered/amd/accuracy/mi30x/test_glm51_hisparse_eval_mi30x.py b/test/registered/amd/accuracy/mi30x/test_glm51_hisparse_eval_mi30x.py
+new file mode 100644
+index 000000000000..058b0d650125
+--- /dev/null
++++ b/test/registered/amd/accuracy/mi30x/test_glm51_hisparse_eval_mi30x.py
+@@ -0,0 +1,90 @@
++"""AMD GLM-5.1 HiSparse GSM8K evaluation test (8-GPU MI30x)."""
++
++import unittest
++from types import SimpleNamespace
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_amd_ci
++from sglang.test.run_eval import run_eval
++from sglang.test.test_utils import (
++    DEFAULT_URL_FOR_TEST,
++    is_in_ci,
++    popen_launch_server,
++    write_github_step_summary,
++)
++
++register_amd_ci(
++    est_time=3600,
++    suite="nightly-amd-accuracy-8-gpu-glm51-hisparse",
++    nightly=True,
++)
++
++
++class TestGLM51HiSparseEvalAMD(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.model = "/models/GLM-5.1-FP8/"
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=7200,
++            other_args=[
++                "--tp",
++                "8",
++                "--model-loader-extra-config",
++                '{"enable_multithread_load": true, "num_threads": 8}',
++                "--trust-remote-code",
++                "--tool-call-parser",
++                "glm47",
++                "--reasoning-parser",
++                "glm45",
++                "--mem-fraction-static",
++                "0.65",
++                "--dsa-prefill-backend",
++                "aiter",
++                "--dsa-decode-backend",
++                "aiter",
++                "--kv-cache-dtype",
++                "fp8_e4m3",
++                "--max-running-requests",
++                "2",
++                "--watchdog-timeout",
++                "1200",
++                "--skip-server-warmup",
++                "--enable-hisparse",
++                "--hisparse-config",
++                '{"top_k": 2048, "device_buffer_size": 2048, "host_to_device_ratio": 1}',
++                "--disable-radix-cache",
++            ],
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        if hasattr(cls, "process"):
++            kill_process_tree(cls.process.pid)
++
++    def test_gsm8k_accuracy(self):
++        args = SimpleNamespace(
++            base_url=self.base_url,
++            model=self.model,
++            eval_name="gsm8k",
++            api="completion",
++            max_tokens=4000,
++            num_examples=500,
++            num_threads=100,
++            num_shots=24,
++        )
++        metrics = run_eval(args)
++        print(f"{metrics=}")
++
++        if is_in_ci():
++            write_github_step_summary(
++                f"### test_gsm8k (glm-5.1 hisparse mi30x)\n"
++                f'{metrics["score"]=:.3f}\n'
++            )
++        self.assertGreater(metrics["score"], 0.93)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/amd/accuracy/mi35x/test_glm51_hisparse_eval_mi35x.py b/test/registered/amd/accuracy/mi35x/test_glm51_hisparse_eval_mi35x.py
+new file mode 100644
+index 000000000000..a50d56d1a9dc
+--- /dev/null
++++ b/test/registered/amd/accuracy/mi35x/test_glm51_hisparse_eval_mi35x.py
+@@ -0,0 +1,90 @@
++"""MI35x GLM-5.1 HiSparse GSM8K evaluation test (8-GPU)."""
++
++import unittest
++from types import SimpleNamespace
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_amd_ci
++from sglang.test.run_eval import run_eval
++from sglang.test.test_utils import (
++    DEFAULT_URL_FOR_TEST,
++    is_in_ci,
++    popen_launch_server,
++    write_github_step_summary,
++)
++
++register_amd_ci(
++    est_time=5400,
++    suite="nightly-amd-8-gpu-mi35x-glm51-hisparse",
++    nightly=True,
++)
++
++
++class TestGLM51HiSparseEvalMI35x(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.model = "/models/GLM-5.1-FP8/"
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=7200,
++            other_args=[
++                "--tp",
++                "8",
++                "--model-loader-extra-config",
++                '{"enable_multithread_load": true, "num_threads": 8}',
++                "--trust-remote-code",
++                "--tool-call-parser",
++                "glm47",
++                "--reasoning-parser",
++                "glm45",
++                "--mem-fraction-static",
++                "0.65",
++                "--dsa-prefill-backend",
++                "aiter",
++                "--dsa-decode-backend",
++                "aiter",
++                "--kv-cache-dtype",
++                "fp8_e4m3",
++                "--max-running-requests",
++                "2",
++                "--watchdog-timeout",
++                "1200",
++                "--skip-server-warmup",
++                "--enable-hisparse",
++                "--hisparse-config",
++                '{"top_k": 2048, "device_buffer_size": 2048, "host_to_device_ratio": 1}',
++                "--disable-radix-cache",
++            ],
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        if hasattr(cls, "process"):
++            kill_process_tree(cls.process.pid)
++
++    def test_gsm8k_accuracy(self):
++        args = SimpleNamespace(
++            base_url=self.base_url,
++            model=self.model,
++            eval_name="gsm8k",
++            api="completion",
++            max_tokens=4000,
++            num_examples=500,
++            num_threads=100,
++            num_shots=24,
++        )
++        metrics = run_eval(args)
++        print(f"{metrics=}")
++
++        if is_in_ci():
++            write_github_step_summary(
++                f"### test_gsm8k (glm-5.1 hisparse mi35x)\n"
++                f'{metrics["score"]=:.3f}\n'
++            )
++        self.assertGreater(metrics["score"], 0.93)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/jit/test_hisparse.py b/test/registered/jit/test_hisparse.py
+index ec4c779d50ff..5fbbd56d47b4 100644
+--- a/test/registered/jit/test_hisparse.py
++++ b/test/registered/jit/test_hisparse.py
+@@ -9,8 +9,9 @@
+     transfer_cache_dsv4_mla,
+ )
+ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+-from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+ 
++register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+ register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
+ register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+ 
+@@ -366,6 +367,33 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
+     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+ 
+ 
++def test_load_cache_to_device_buffer_multiple_misses_copy_all_slots() -> None:
++    state = _make_state(
++        [[9, 7, 3, 5, 11]],
++        [[0, 1, 2, 3, -1]],
++        [8],
++    )
++
++    out = _run_kernel(
++        top_k_tokens=torch.tensor([[4, 5, 6, 7]], dtype=torch.int32, device=DEVICE),
++        seq_len=9,
++        **state,
++    )
++
++    assert torch.equal(out.cpu(), torch.tensor([[9, 7, 3, 5]], dtype=torch.int32))
++    assert torch.equal(
++        state["device_buffer_tokens"].cpu(),
++        torch.tensor([[4, 5, 6, 7, -1]], dtype=torch.int32),
++    )
++    assert torch.equal(
++        state["lru_slots"].cpu(), torch.tensor([[0, 1, 2, 3]], dtype=torch.int16)
++    )
++    for token, loc in zip([4, 5, 6, 7], [9, 7, 3, 5]):
++        assert torch.equal(
++            state["device_buffer"][loc].cpu(), state["host_cache"][token]
++        )
++
++
+ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
+     state = _make_state(
+         [
+@@ -422,5 +450,128 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
+     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+ 
+ 
++def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:
++    # Both the host cache and the device buffer use the page-padded C4 layout,
++    # matching DeepSeekV4PagedHostPool, the backup/write path, and the swap-in
++    # kernel on both CUDA and ROCm. The miss copy must read the host source with
++    # paged addressing (get_pointer_paged), not a linear per-item stride.
++    num_pages = (HOST_CACHE_SIZE + DSV4_PAGE_SIZE - 1) // DSV4_PAGE_SIZE
++
++    state = _long_case()
++    host_cache = torch.zeros(
++        (num_pages, DSV4_PAGE_BYTES),
++        dtype=torch.uint8,
++        device="cpu",
++        pin_memory=True,
++    )
++    for token in range(HOST_CACHE_SIZE):
++        _write_dsv4_token(host_cache, token, seed=token + 1)
++
++    device_buffer = torch.full(
++        (num_pages, DSV4_PAGE_BYTES),
++        0xFF,
++        dtype=torch.uint8,
++        device=DEVICE,
++    )
++    out = torch.full((1, 1), -1, dtype=torch.int32, device=DEVICE)
++
++    # Token 6 is a miss in _long_case(), so it should be copied into evict slot 0,
++    # whose physical device loc is 9.
++    load_cache_to_device_buffer_dsv4_mla(
++        top_k_tokens=torch.tensor([[6]], dtype=torch.int32, device=DEVICE),
++        device_buffer_tokens=state["device_buffer_tokens"],
++        host_cache_locs=state["host_cache_locs"],
++        device_buffer_locs=state["device_buffer_locs"],
++        host_cache=host_cache,
++        device_buffer=device_buffer,
++        top_k_device_locs=out,
++        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
++        seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
++        lru_slots=state["lru_slots"],
++        item_size_bytes=DSV4_ITEM_BYTES,
++        num_top_k=1,
++        hot_buffer_size=HOT_BUFFER_SIZE,
++        page_size=DSV4_PAGE_SIZE,
++        block_size=256,
++        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
++    )
++    torch.cuda.synchronize()
++
++    assert torch.equal(out.cpu(), torch.tensor([[9]], dtype=torch.int32))
++
++    # host_cache_locs[token=6] == 6 in _long_case(); evict slot 0 -> device loc 9.
++    assert torch.equal(
++        _read_dsv4_token(device_buffer, 9).cpu(),
++        _read_dsv4_token(host_cache, 6),
++    )
++
++
++@pytest.mark.skipif(
++    not is_hip(), reason="Covers a ROCm wavefront64 LRU writeback regression."
++)
++def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
++    top_k = 2048
++    hot_buffer_size = 4096
++    seq_len = 7299
++    kv_dim = 4
++    item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
++
++    top_k_tokens = torch.cat(
++        [
++            torch.arange(1000, 2000, dtype=torch.int32),
++            torch.arange(5000, 6048, dtype=torch.int32),
++        ]
++    ).view(1, -1)
++    device_buffer_tokens = torch.arange(hot_buffer_size, dtype=torch.int32).view(1, -1)
++    device_buffer_locs = torch.arange(hot_buffer_size + 1, dtype=torch.int32).view(
++        1, -1
++    )
++    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16).view(1, -1)
++    host_cache_locs = torch.arange(seq_len, dtype=torch.int64).view(1, -1)
++
++    top_k_tokens = top_k_tokens.to(DEVICE)
++    device_buffer_tokens = device_buffer_tokens.to(DEVICE)
++    device_buffer_locs = device_buffer_locs.to(DEVICE)
++    lru_slots = lru_slots.to(DEVICE)
++    host_cache_locs = host_cache_locs.to(DEVICE)
++
++    host_cache = torch.empty((seq_len, 1, kv_dim), dtype=DTYPE, pin_memory=True)
++    host_cache.zero_()
++    device_buffer = torch.empty(
++        (hot_buffer_size + 1, 1, kv_dim), dtype=DTYPE, device=DEVICE
++    )
++    out = torch.full_like(top_k_tokens, -1)
++
++    load_cache_to_device_buffer_mla(
++        top_k_tokens=top_k_tokens,
++        device_buffer_tokens=device_buffer_tokens,
++        host_cache_locs=host_cache_locs,
++        device_buffer_locs=device_buffer_locs,
++        host_cache=host_cache,
++        device_buffer=device_buffer,
++        top_k_device_locs=out,
++        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
++        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
++        lru_slots=lru_slots,
++        item_size_bytes=item_size_bytes,
++        num_top_k=top_k,
++        hot_buffer_size=hot_buffer_size,
++        page_size=1,
++        block_size=1024,
++        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
++    )
++    torch.cuda.synchronize()
++
++    expected_lru = torch.cat(
++        [
++            torch.arange(2048, 4096, dtype=torch.int16),
++            torch.arange(0, 1000, dtype=torch.int16),
++            torch.arange(2000, 2048, dtype=torch.int16),
++            torch.arange(1000, 2000, dtype=torch.int16),
++        ]
++    )
++    assert torch.equal(lru_slots.cpu().view(-1), expected_lru)
++
++
+ if __name__ == "__main__":
+     sys.exit(pytest.main([__file__, "-v", "-s"]))
+diff --git a/test/registered/unit/managers/test_hisparse_unit.py b/test/registered/unit/managers/test_hisparse_unit.py
+index e1f245ba66ea..2328cbaef012 100644
+--- a/test/registered/unit/managers/test_hisparse_unit.py
++++ b/test/registered/unit/managers/test_hisparse_unit.py
+@@ -15,9 +15,10 @@
+ import torch
+ 
+ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+-from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+ 
+ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
++register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+ 
+ # ---------------------------------------------------------------------------
+ # Test configuration (small-scale for fast CI runs)
+@@ -92,7 +93,14 @@ def setUpClass(cls):
+         cls._original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
+         ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
+ 
+-        global_page_size = 1 if is_hip() else PAGE_SIZE
++        if is_hip():
++            from sglang.srt.layers.attention.dsa.utils import (
++                aiter_can_use_preshuffle_paged_mqa,
++            )
++
++            global_page_size = 64 if aiter_can_use_preshuffle_paged_mqa() else 1
++        else:
++            global_page_size = PAGE_SIZE
+ 
+         from sglang.srt.mem_cache.allocator.hisparse import (
+             HiSparseTokenToKVPoolAllocator,
+@@ -524,6 +532,80 @@ def test_allocator_alloc_free_cycle(self):
+         self.allocator.logical_attn_allocator.free(kv_loc)
+         self._assert_sizes_restored(initial, "alloc_free_cycle")
+ 
++    def test_allocator_page_size_one_alloc_free_cycle(self):
++        """alloc() maps logical to hisparse indices for ROCm page_size=1."""
++        if self.page_size != 1:
++            self.skipTest("page_size=1 alloc path is ROCm-specific")
++
++        initial = self._get_initial_sizes()
++        need_size = 16
++
++        kv_loc = self.allocator.alloc(need_size)
++        self.assertIsNotNone(kv_loc)
++        self.assertEqual(len(kv_loc), need_size)
++
++        mapping = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
++        self.assertTrue(torch.all(mapping > 0), "Mapping should be non-zero")
++        self.assertLess(self.allocator.available_size(), initial[0])
++
++        self.allocator.free(kv_loc)
++        mapping_after = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
++        self.assertTrue(torch.all(mapping_after == 0), "Mapping should be cleared")
++        self._assert_sizes_restored(initial, "page_size_one_alloc_free_cycle")
++
++    def test_decode_remap_frees_stale_page_size_one_mapping(self):
++        """map_last_loc_to_buffer frees the temporary alloc() hisparse slot."""
++        if self.page_size != 1:
++            self.skipTest("page_size=1 decode remap path is ROCm-specific")
++
++        initial = self._get_initial_sizes()
++        device = self.allocator.device
++        fill_len = 2
++        req = _make_req("decode-remap", list(range(fill_len)))
++        self._alloc_req_slot(req)
++
++        kv_loc = self._alloc_kv(req, fill_len)
++        self.coordinator.alloc_device_buffer(req)
++        self.coordinator._skip_first_backup[req.req_pool_idx] = True
++
++        out_loc = self.allocator.alloc(1)
++        self.assertIsNotNone(out_loc)
++        stale_loc = self.allocator.full_to_hisparse_device_index_mapping[
++            out_loc
++        ].clone()
++        self.assertTrue(torch.all(stale_loc > 0), "Temporary mapping should exist")
++
++        seq_len = fill_len + 1
++        self.req_to_token_pool.write((req.req_pool_idx, fill_len), out_loc)
++        req.kv_allocated_len = seq_len
++        req.kv_committed_len = seq_len
++
++        self.coordinator.map_last_loc_to_buffer(
++            seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
++            out_cache_loc=out_loc,
++            req_pool_indices=torch.tensor(
++                [req.req_pool_idx], dtype=torch.int64, device=device
++            ),
++            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
++            req_pool_indices_cpu=torch.tensor([req.req_pool_idx], dtype=torch.int64),
++        )
++
++        remapped_loc = self.allocator.full_to_hisparse_device_index_mapping[out_loc]
++        self.assertTrue(torch.all(remapped_loc > 0), "Remapped loc should exist")
++        self.assertFalse(
++            torch.equal(stale_loc, remapped_loc),
++            "Decode loc should move from temporary mapping to device buffer",
++        )
++        self.assertEqual(
++            self.allocator.hisparse_attn_allocator.available_size(),
++            initial[1] - seq_len,
++        )
++
++        self.coordinator.request_finished(req)
++        self.allocator.logical_attn_allocator.free(torch.cat([kv_loc, out_loc]))
++        self._free_req_slot(req)
++        self._assert_sizes_restored(initial, "decode_remap")
++
+     # ==================================================================
+     # Test: Staging (PD Colocate) path
+     # ==================================================================
+@@ -596,17 +678,23 @@ def test_single_node_staging_allocates_paged_host_slots(self):
+             fill_len,
+             1,
+         )
++        # With page_size>1 the rounded-up staging allocation provides headroom,
++        # so no new pages are needed.  With page_size=1 there is no headroom and
++        # exactly one new page is allocated for the next token.
++        expected_new_pages = 0 if fill_len < rounded_len else 1
+         self.assertEqual(
+-            self.coordinator.mem_pool_host.available_size(), available_size
++            self.coordinator.mem_pool_host.available_size(),
++            available_size - expected_new_pages,
+         )
+         self.assertTrue(torch.all(next_host_index >= 0))
+ 
++        expected_total = rounded_len + expected_new_pages * self.page_size
+         allocated_host_indices = self.coordinator.mem_pool_host.allocated_host_indices(
+             self.coordinator.req_to_host_pool,
+             req.req_pool_idx,
+             int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
+         )
+-        self.assertEqual(allocated_host_indices.numel(), rounded_len)
++        self.assertEqual(allocated_host_indices.numel(), expected_total)
+ 
+         self._cleanup_req(req, kv_loc)
+         self._assert_sizes_restored(initial, "single_node_staging_pages")
+diff --git a/test/registered/unit/server_args/test_server_args.py b/test/registered/unit/server_args/test_server_args.py
+index 92a954a7c10d..299bc09f5d82 100644
+--- a/test/registered/unit/server_args/test_server_args.py
++++ b/test/registered/unit/server_args/test_server_args.py
+@@ -147,6 +147,115 @@ def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
+         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
+ 
+ 
++class TestHiSparseDsaBackendPolicy(unittest.TestCase):
++    @patch("sglang.srt.server_args.is_hip", return_value=False)
++    def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
++        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
++
++        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
++
++        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
++        self.assertEqual(server_args.dsa_decode_backend, "flashmla_sparse")
++
++    @patch("sglang.srt.server_args.is_hip", return_value=False)
++    def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
++        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
++
++        server_args._set_default_dsa_backends(kv_cache_dtype="fp8_e4m3", major=9)
++
++        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_kv")
++        self.assertEqual(server_args.dsa_decode_backend, "flashmla_kv")
++
++    @patch("sglang.srt.server_args.is_hip", return_value=True)
++    def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
++        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
++
++        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
++
++        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
++        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
++
++    @patch("sglang.srt.server_args.is_hip", return_value=True)
++    def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
++        self, _mock_is_hip
++    ):
++        server_args = ServerArgs(
++            model_path="dummy",
++            enable_hisparse=True,
++            dsa_prefill_backend="tilelang",
++        )
++
++        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
++
++        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
++        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
++
++    @patch("sglang.srt.server_args.is_hip", return_value=True)
++    def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
++        server_args = ServerArgs(
++            model_path="dummy",
++            enable_hisparse=True,
++            kv_cache_dtype="bfloat16",
++            dsa_prefill_backend="aiter",
++            dsa_decode_backend="aiter",
++        )
++
++        server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
++        server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
++
++    @patch("sglang.srt.server_args.is_hip", return_value=True)
++    def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
++        server_args = ServerArgs(
++            model_path="dummy",
++            enable_hisparse=True,
++            kv_cache_dtype="bfloat16",
++            dsa_prefill_backend="flashmla_sparse",
++        )
++
++        with self.assertRaisesRegex(ValueError, "tilelang"):
++            server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
++
++    @patch("sglang.srt.server_args.is_hip", return_value=False)
++    def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
++        server_args = ServerArgs(
++            model_path="dummy",
++            enable_hisparse=True,
++            kv_cache_dtype="bfloat16",
++            dsa_decode_backend="tilelang",
++        )
++
++        with self.assertRaisesRegex(ValueError, "flashmla_sparse"):
++            server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
++
++    def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
++        server_args = ServerArgs(
++            model_path="dummy",
++            enable_hisparse=True,
++            kv_cache_dtype="bfloat16",
++        )
++
++        server_args._validate_hisparse_kv_cache_dtype()
++
++    def test_hisparse_accepts_fp8_e4m3_kv_cache_dtype(self):
++        server_args = ServerArgs(
++            model_path="dummy",
++            enable_hisparse=True,
++            kv_cache_dtype="fp8_e4m3",
++        )
++
++        server_args._validate_hisparse_kv_cache_dtype()
++
++    def test_hisparse_rejects_unsupported_kv_cache_dtype(self):
++        server_args = ServerArgs(
++            model_path="dummy",
++            enable_hisparse=True,
++            kv_cache_dtype="float16",
++        )
++
++        with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
++            server_args._validate_hisparse_kv_cache_dtype()
++
++
+ class TestContextParallelServerArgs(CustomTestCase):
+     def setUp(self):
+         self.parser = server_args_module.argparse.ArgumentParser()

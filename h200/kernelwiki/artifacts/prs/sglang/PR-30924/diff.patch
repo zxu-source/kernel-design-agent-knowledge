@@ -1,0 +1,3520 @@
+diff --git a/python/sglang/jit_kernel/csrc/gemm/per_token_group_quant.cuh b/python/sglang/jit_kernel/csrc/gemm/per_token_group_quant.cuh
+new file mode 100644
+index 000000000000..ce4ded7423c4
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/gemm/per_token_group_quant.cuh
+@@ -0,0 +1,544 @@
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/math.cuh>
++#include <sgl_kernel/type.cuh>
++#include <sgl_kernel/utils.cuh>
++#include <sgl_kernel/vec.cuh>
++#include <sgl_kernel/warp.cuh>
++
++#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
++
++#include <dlpack/dlpack.h>
++#include <tvm/ffi/container/tensor.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <cuda_fp8.h>
++
++namespace {
++
++namespace details {
++
++SGL_DEVICE float silu(const float val) {
++  // silu(x) = x * sigmoid(x)
++#if SGL_ARCH_BLACKWELL_OR_GREATER
++  const float half = 0.5f * val;
++  return half * (1.0f + __tanhf(half));
++#else
++  return val * __frcp_rn(1.0f + __expf(-val));
++#endif
++}
++
++SGL_DEVICE float2 mul2(const float2 a, const float2 b) {
++  // Packed fp32x2 multiply: one FMUL2 on SM100+ (nvcc does not auto-vectorize
++  // the scalar form). Same round-to-nearest results as two scalar FMULs.
++#if SGL_ARCH_BLACKWELL_OR_GREATER
++  return __fmul2_rn(a, b);
++#else
++  return float2{a.x * b.x, a.y * b.y};
++#endif
++}
++
++template <typename T>
++struct WeightTrait {};
++
++template <>
++struct WeightTrait<fp8_e4m3_t> {
++  using packed2_t = fp8x2_e4m3_t;
++  static constexpr float kMaxValue = DTypeTrait<fp8_e4m3_t>::kFloatMax;
++  // SATFINITE conversion saturates to +-448, no need to clip
++  SGL_DEVICE static packed2_t quant(const float2 v) {
++    return packed2_t{v};
++  }
++};
++
++template <>
++struct WeightTrait<int8_t> {
++  using packed2_t = char2;
++  static constexpr float kMaxValue = 127.0f;
++  static constexpr float kMinValue = -128.0f;
++  // clamp + float -> int8 cast (truncation), matching the v2 kernel exactly.
++  SGL_DEVICE static packed2_t quant(const float2 v) {
++    return packed2_t{
++        static_cast<int8_t>(fminf(fmaxf(v.x, kMinValue), kMaxValue)),
++        static_cast<int8_t>(fminf(fmaxf(v.y, kMinValue), kMaxValue))};
++  }
++};
++
++template <bool kUe8m0>
++using scale_t = std::conditional_t<kUe8m0, uint8_t, float>;
++
++// Scale output accessor. Strides are host-verified; units are scale elements
++// (float) for the fp32 layouts and BYTES for the ue8m0 layouts. Stores must
++// stay pure functions of (expert, token, group, scale_inv): tail-duplicated
++// subwarps re-store identical bytes.
++struct ScaleStoreArgs {
++ public:
++  void* __restrict__ base;
++  uint32_t expert_stride;  // for masked only
++  uint32_t token_stride;   // row-major layouts: elements/bytes per token row
++  uint32_t group_stride;   // col-major layouts: stride of the group axis
++  uint32_t num_groups;
++
++  void check_overflow(uint32_t num_experts, uint32_t num_tokens) const {
++    // host_verfication: the scale index will never be out of bound
++    const uint64_t expert_bytes = static_cast<uint64_t>(expert_stride) * num_experts;
++    const uint64_t token_bytes = static_cast<uint64_t>(token_stride) * num_tokens;
++    const uint64_t group_bytes = static_cast<uint64_t>(group_stride) * num_groups;
++    const uint64_t total_bytes = expert_bytes + token_bytes + group_bytes;
++    CHECK_HOST(std::max({expert_bytes, token_bytes, group_bytes, total_bytes}) <= UINT32_MAX)
++        << "Internal Error: ScaleStoreArgs overflow. Something wild must happened.\n"
++        << "More debug info: "               //
++        << " expert_bytes=" << expert_bytes  //
++        << " token_bytes=" << token_bytes    //
++        << " group_bytes=" << group_bytes;
++  }
++
++  template <bool kUe8m0, bool kRowMajor, bool kAligned>
++  SGL_DEVICE void store(
++      const uint32_t expert_idx,  // for non-masked, should be 0
++      const uint32_t token_idx,
++      const uint32_t group_idx,
++      const scale_t<kUe8m0> scale_inv) const {
++    static_assert(kAligned || kUe8m0, "Only ue8m0 scales can be unaligned (pad to 4 bytes)");
++    using T = scale_t<kUe8m0>;
++    if constexpr (kRowMajor || !kUe8m0) {
++      // normal linear layout for scale
++      // 1. row major + fp32/ue8m0 scale
++      // 2. col major + fp32 scale
++      const auto token_stride = kRowMajor ? this->token_stride : 1;
++      const auto group_stride = kRowMajor ? 1 : this->group_stride;
++      const uint64_t offset = expert_idx * expert_stride   // expert
++                              + token_idx * token_stride   // token
++                              + group_idx * group_stride;  // group
++      static_cast<T*>(this->base)[offset] = scale_inv;
++      if constexpr (!kAligned) this->fill_unaligned(group_idx, offset);
++    } else {
++      // col major + ue8m0 scale: int32 [(E,) ceil(G/4), T] buffer viewed as
++      // bytes; byte b of int32 (g/4, t) holds group 4*(g/4)+b. All strides are
++      // already in bytes (host multiplied the int32 strides by 4), so the
++      // packed-group index is group_idx / 4 (not * 4).
++      const auto packed_group = group_idx / 4;
++      const uint64_t offset = expert_idx * expert_stride        // expert
++                              + packed_group * group_stride     // packed group
++                              + token_idx * 4 + group_idx % 4;  // token
++      static_cast<T*>(this->base)[offset] = scale_inv;
++      if constexpr (!kAligned) this->fill_unaligned(group_idx, offset);
++    }
++  }
++
++ private:
++  SGL_DEVICE void fill_unaligned(const uint32_t group_idx, const uint64_t offset) const {
++    // Zero the pack-tail bytes after the last group so uninitialized bytes of
++    // the 4-aligned buffer never reach the GEMM. Only instantiated when
++    // num_groups % 4 != 0 (kAligned = false); `offset` is the byte of the
++    // last group, i.e. byte (rem - 1) of its int32.
++    const auto rem = this->num_groups % 4;
++    if (group_idx == this->num_groups - 1) {
++      const uint64_t int32_base = offset - (rem - 1);
++#pragma unroll
++      for (uint32_t b = rem; b < 4; ++b) {
++        static_cast<uint8_t*>(this->base)[int32_base + b] = 0;
++      }
++    }
++  }
++};
++
++template <typename T2>
++struct Vec32B {
++ public:
++  static_assert(sizeof(T2) == 4, "must be packed fp16/bf16");
++  static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(T2);
++  static constexpr uint32_t kNumVecs = 32 / device::kMaxVecBytes;
++  SGL_DEVICE void load(const void* ptr, const uint32_t lane_id) {
++#pragma unroll
++    for (uint32_t v = 0; v < kNumVecs; ++v) {
++      m_vecs[v].load(ptr, lane_id * kNumVecs + v);
++    }
++  }
++  SGL_DEVICE auto operator[](const uint32_t i) -> T2& {
++    return m_vecs[i / kVecSize][i % kVecSize];
++  }
++  SGL_DEVICE auto operator[](const uint32_t i) const -> T2 {
++    return m_vecs[i / kVecSize][i % kVecSize];
++  }
++
++ private:
++  device::AlignedVector<T2, kVecSize> m_vecs[kNumVecs];
++};
++
++// Quantized-tensor accessor: strides fit uint32 (host-verified) so the row
++// base costs one widening multiply.
++struct TensorArgs {
++  void* __restrict__ ptr;
++  int64_t expert_stride;  // for masked only
++  int64_t token_stride;
++  template <typename T>
++  SGL_DEVICE T* get(const uint32_t expert_idx, const uint32_t token_idx) const {
++    const uint64_t offset = expert_idx * this->expert_stride   // expert
++                            + token_idx * this->token_stride;  // token
++    return static_cast<T*>(ptr) + offset;
++  }
++};
++
++}  // namespace details
++
++struct QuantKernelParams {
++  details::TensorArgs input;
++  details::TensorArgs output;
++  details::ScaleStoreArgs scale;
++  uint32_t num_tokens;   // tokens_pad for the masked kernel
++  uint32_t hidden_size;  // = num_groups * kGroupSize
++};
++
++struct MaskedQuantKernelParams {
++  QuantKernelParams base;
++  // masked_m[e] read as int32 with a stride: 1 for an int32 tensor, 2 for an
++  // int64 one (its low word, little-endian) -- the count never exceeds int32,
++  // so both dtypes share one kernel instead of templating on the index type.
++  const int32_t* __restrict__ masked_m;
++  uint32_t masked_m_stride;  // 1 (int32) or 2 (int64)
++};
++
++// PDL is a launch-scheduling knob, not a quant property, so it is a separate
++// template parameter of the kernels/launchers rather than part of QuantTrait.
++template <
++    typename InputType_,
++    typename QuantType_,
++    uint32_t kGroupSize_,
++    bool kUe8m0_,
++    bool kRowMajor_,
++    bool kAligned_,
++    bool kFuseSiluAndMul_>
++struct QuantTrait {
++  // rename
++  using InputType = InputType_;
++  using QuantType = QuantType_;
++  static constexpr uint32_t kGroupSize = kGroupSize_;
++  static constexpr bool kUe8m0 = kUe8m0_;
++  static constexpr bool kRowMajor = kRowMajor_;
++  static constexpr bool kAligned = kAligned_;
++  static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
++  static constexpr uint32_t kBlockSize = 256;
++  static constexpr uint32_t kVecSize = 32u / sizeof(InputType);
++  static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
++  static_assert(sizeof(InputType) == 2, "only 16-bit inputs (bf16/fp16) are supported");
++  static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
++  static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
++  static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
++
++  SGL_DEVICE static void
++  run(const QuantKernelParams& params,
++      const uint32_t expert_idx,
++      const uint32_t token_idx,
++      const uint32_t group_idx,
++      const uint32_t lane_id) {
++    using deepseek_v4::fp8::cast_to_ue8m0;
++    using deepseek_v4::fp8::inv_scale_ue8m0;
++    using namespace device;
++    using T = InputType;
++    using T2 = packed_t<T>;
++    using Q = QuantType;
++    using WTrait = details::WeightTrait<Q>;
++    using Q2 = typename WTrait::packed2_t;
++    using in_vec_t = details::Vec32B<T2>;
++    using out_vec_t = AlignedVector<Q2, kVecSize / 2>;
++    constexpr float kMaxValue = WTrait::kMaxValue;
++    constexpr float kMaxValueInv = 1.f / kMaxValue;
++
++    const T* token_in = params.input.get<const T>(expert_idx, token_idx);
++    const uint32_t group_offset = group_idx * kGroupSize;
++
++    // PDL wait/trigger is owned by the launching kernel (once around all work),
++    // not here -- the masked kernel calls run() in a loop.
++    in_vec_t in;
++    in.load(token_in + group_offset, lane_id);
++    if constexpr (kFuseSiluAndMul) {
++      in_vec_t up;
++      up.load(token_in + group_offset + params.hidden_size, lane_id);
++#pragma unroll
++      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
++        const auto gate = cast<float2>(in[i]);
++        const auto act = cast<T2>(float2{details::silu(gate.x), details::silu(gate.y)});
++        in[i] = __hmul2(act, up[i]);
++      }
++    }
++
++    // absmax in the packed 16-bit domain (abs/max of T values are exact in T)
++    T2 local_amax2 = math::abs(in[0]);
++#pragma unroll
++    for (uint32_t i = 1; i < kVecSize / 2; ++i) {
++      local_amax2 = math::max(local_amax2, math::abs(in[i]));
++    }
++    const auto amax2 = cast<float2>(warp::reduce_max<kNumLanes>(local_amax2));
++    const auto amax = math::max(math::max(amax2.x, amax2.y), 1e-10f);
++    const float raw_scale = amax * kMaxValueInv;  // the dequant scale the GEMM consumes
++
++    out_vec_t out;
++    details::scale_t<kUe8m0> scale_inv;
++    if constexpr (kUe8m0) {
++      // ue8m0 scale: pow-2 quant multiplier is exact in float16/bfloat16 type
++      static_assert(std::is_same_v<Q, fp8_e4m3_t>, "ue8m0 scales imply fp8 quantization");
++      const auto exp = cast_to_ue8m0(raw_scale);
++      scale_inv = static_cast<uint8_t>(exp);
++      const float quant_scale = inv_scale_ue8m0(exp);
++      const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
++#pragma unroll
++      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
++        out[i] = static_cast<Q2>(__hmul2(in[i], scale2));
++      }
++    } else {
++      // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
++      scale_inv = raw_scale;
++      const float quant_scale = kMaxValue * __frcp_rn(amax);
++      const float2 quant_scale2 = {quant_scale, quant_scale};
++#pragma unroll
++      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
++        out[i] = WTrait::quant(details::mul2(cast<float2>(in[i]), quant_scale2));
++      }
++    }
++
++    out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
++    params.scale.store<kUe8m0, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
++  }
++};
++
++// ---------------------------------------------------------------------------
++// Flat schedule: one subwarp (kNumLanes) per group over a linear grid.
++// ---------------------------------------------------------------------------
++template <typename Trait, bool kUsePDL>
++__global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_kernel(
++    const __grid_constant__ QuantKernelParams params) {
++  using namespace device;
++  constexpr uint32_t kNumLanes = Trait::kNumLanes;
++  constexpr uint32_t kWorkPerWarp = kWarpThreads / kNumLanes;
++  const auto num_groups = params.scale.num_groups;
++  const auto global_tid = blockIdx.x * Trait::kBlockSize + threadIdx.x;
++  // only exit when the whole warp is invalid
++  const auto global_warp_id = global_tid / kWarpThreads;
++  const auto total_work = params.num_tokens * num_groups;
++  if (global_warp_id * kWorkPerWarp >= total_work) return;
++  PDLWaitPrimary<kUsePDL>();
++  // the last partial warp duplicates the tail work (identical-byte stores)
++  const auto work_id = min(global_tid / kNumLanes, total_work - 1);
++  const auto lane_id = threadIdx.x % kNumLanes;
++  const auto token_idx = work_id / num_groups;
++  const auto group_idx = work_id % num_groups;
++  Trait::run(params, 0, token_idx, group_idx, lane_id);
++  PDLTriggerSecondary<kUsePDL>();
++}
++
++// ---------------------------------------------------------------------------
++// Masked schedule (EP-MoE): grid (groups, token_blocks, experts); the token
++// axis grid-strides up to the device-side masked_m[e].
++// ---------------------------------------------------------------------------
++template <typename Trait, bool kUsePDL>
++__global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_masked_kernel(
++    const __grid_constant__ MaskedQuantKernelParams params) {
++  using namespace device;
++  constexpr uint32_t kNumLanes = Trait::kNumLanes;
++  constexpr uint32_t kWorkPerWarp = kWarpThreads / kNumLanes;
++  const auto num_groups = params.base.scale.num_groups;
++  PDLWaitPrimary<kUsePDL>();
++  const auto expert_idx = blockIdx.y;
++  const auto num_expert_tokens = params.masked_m[expert_idx * params.masked_m_stride];
++  for (uint32_t global_tid = blockIdx.x * Trait::kBlockSize + threadIdx.x;;  // initial grid; loop
++       global_tid += gridDim.x * Trait::kBlockSize) {
++    const auto global_warp_id = global_tid / kWarpThreads;
++    const auto total_work = num_expert_tokens * num_groups;
++    if (global_warp_id * kWorkPerWarp >= total_work) break;
++    const auto work_id = min(global_tid / kNumLanes, total_work - 1);
++    const auto token_idx = work_id / num_groups;
++    const auto group_idx = work_id % num_groups;
++    const auto lane_id = threadIdx.x % kNumLanes;
++    Trait::run(params.base, expert_idx, token_idx, group_idx, lane_id);
++  }
++  PDLTriggerSecondary<kUsePDL>();
++}
++
++// ---------------------------------------------------------------------------
++// Host side. Shapes:
++//   flat:   input [T, H_in], output_q [T, H]
++//   masked: input [E, tokens_pad, H_in], output_q [E, tokens_pad, H],
++//           masked_m [E] int32
++// where H_in = H * (kFuseSiluAndMul ? 2 : 1); output_s per the layout table
++// in the header comment.
++// ---------------------------------------------------------------------------
++template <typename Trait>
++struct QuantHostContext {
++  QuantKernelParams params;
++  uint32_t num_experts;
++  DLDevice device;
++};
++
++template <typename Trait, bool kMasked>
++QuantHostContext<Trait> build_quant_context( //
++    const tvm::ffi::TensorView& input,
++    const tvm::ffi::TensorView& output_q,
++    const tvm::ffi::TensorView& output_s) {
++  using namespace host;
++  using T = typename Trait::InputType;
++  using Q = typename Trait::QuantType;
++  using S = std::conditional_t<Trait::kUe8m0, int32_t, float>;
++  constexpr int64_t kSiluFactor = Trait::kFuseSiluAndMul ? 2 : 1;
++
++  auto device = SymbolicDevice{};
++  device.set_options<kDLCUDA>();
++  auto E = SymbolicSize{"num_experts"};
++  auto N = SymbolicSize{"num_tokens"};
++  auto H = SymbolicSize{"hidden_size"};
++  auto G = SymbolicSize{"num_scale_groups"};
++
++  if constexpr (kMasked) {
++    TensorMatcher({E, N, -1}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(input);
++    TensorMatcher({E, N, H}).with_strides({-1, -1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
++    TensorMatcher({E, N, G}).with_strides({-1, -1, -1}).with_dtype<S>().with_device(device).verify(output_s);
++  } else {
++    TensorMatcher({N, -1}).with_strides({-1, 1}).with_dtype<T>().with_device(device).verify(input);
++    TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
++    TensorMatcher({N, G}).with_strides({-1, -1}).with_dtype<S>().with_device(device).verify(output_s);
++  }
++
++  const uint32_t num_tokens = N.unwrap();
++  const uint32_t hidden_size = H.unwrap();
++  const uint32_t num_experts = kMasked ? E.unwrap() : 1;
++  const uint32_t num_groups = hidden_size / Trait::kGroupSize;
++  const uint32_t num_scale_groups = G.unwrap();
++  CHECK_HOST(hidden_size % Trait::kGroupSize == 0);
++  CHECK_HOST(input.size(-1) == hidden_size * kSiluFactor);
++  CHECK_HOST(num_scale_groups == (Trait::kUe8m0 ? div_ceil(num_groups, 4) : num_groups));
++  // Pack-tail alignment only exists for the 4-per-int32 ue8m0 layouts; fp32
++  // scales are unpacked (kAligned is fixed true by the static_assert). Exact
++  // match: kAligned = false with an aligned num_groups would make
++  // fill_unaligned zero bytes past the row.
++  if constexpr (Trait::kUe8m0) {
++    CHECK_HOST(Trait::kAligned == (num_groups % 4 == 0));
++  }
++  auto scale_args = details::ScaleStoreArgs{
++      .base = output_s.data_ptr(),
++      .expert_stride = static_cast<uint32_t>(kMasked ? output_s.stride(0) : 0),
++      .token_stride = static_cast<uint32_t>(output_s.stride(-2)),
++      .group_stride = static_cast<uint32_t>(output_s.stride(-1)),
++      .num_groups = static_cast<uint32_t>(num_groups),
++  };
++  if constexpr (Trait::kRowMajor) {
++    CHECK_HOST(scale_args.group_stride == 1);
++    if constexpr (Trait::kUe8m0) {
++      scale_args.expert_stride *= 4;  // i32 -> u8
++      scale_args.token_stride *= 4;   // i32 -> u8
++    }
++  } else {  // col major
++    CHECK_HOST(scale_args.token_stride == 1);
++    if constexpr (Trait::kUe8m0) {
++      scale_args.expert_stride *= 4;  // i32 -> u8
++      scale_args.group_stride *= 4;   // i32 -> u8
++      // The device store hardcodes token_idx * 4 bytes in this layout (it
++      // never reads token_stride); mirror that so check_overflow is exact.
++      scale_args.token_stride = 4;
++    }
++  }
++  // The scale store indexes with uint32 strides; guard against overflow.
++  scale_args.check_overflow(num_experts, num_tokens);
++  const auto input_args = details::TensorArgs{
++      .ptr = input.data_ptr(),
++      .expert_stride = kMasked ? input.stride(0) : 0,
++      .token_stride = input.stride(-2),
++  };
++  const auto output_args = details::TensorArgs{
++      .ptr = output_q.data_ptr(),
++      .expert_stride = kMasked ? output_q.stride(0) : 0,
++      .token_stride = output_q.stride(-2),
++  };
++  return {
++      .params =
++          {
++              .input = input_args,
++              .output = output_args,
++              .scale = scale_args,
++              .num_tokens = num_tokens,
++              .hidden_size = hidden_size,
++          },
++      .num_experts = num_experts,
++      .device = device.unwrap(),
++  };
++}
++
++template <
++    typename InputType,
++    typename QuantType,
++    uint32_t kGroupSize,
++    bool kUe8m0,
++    bool kRowMajor,
++    bool kAligned,
++    bool kFuseSiluAndMul,
++    bool kUsePDL>
++struct PerTokenGroupQuantFlatKernel {
++  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
++
++  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
++    using namespace host;
++    const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
++    const auto& p = ctx.params;
++    const int64_t total_threads = int64_t{p.num_tokens} * p.scale.num_groups * Trait::kNumLanes;
++    if (total_threads == 0) return;
++    const uint32_t num_blocks = div_ceil(total_threads, int64_t{Trait::kBlockSize});
++    LaunchKernel(num_blocks, Trait::kBlockSize, ctx.device)
++        .config({.use_pdl = kUsePDL})(per_token_group_quant_flat_kernel<Trait, kUsePDL>, p);
++  }
++};
++
++template <
++    typename InputType,
++    typename QuantType,
++    uint32_t kGroupSize,
++    bool kUe8m0,
++    bool kRowMajor,
++    bool kAligned,
++    bool kFuseSiluAndMul,
++    bool kUsePDL>
++struct PerTokenGroupQuantMaskedKernel {
++  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
++
++  // expected_m: optional host-side expected-tokens-per-expert hint (the same
++  // hint SGLang passes to deep_gemm's masked grouped GEMM); <= 0 means
++  // unknown. It only caps the token-block count -- correctness never depends
++  // on it because the token axis grid-strides to masked_m[e].
++  static void
++  run(tvm::ffi::TensorView input,
++      tvm::ffi::TensorView output_q,
++      tvm::ffi::TensorView output_s,
++      tvm::ffi::TensorView masked_m,
++      int32_t expected_m) {
++    using namespace host;
++    using device::kWarpThreads;
++    const auto ctx = build_quant_context<Trait, /*kMasked=*/true>(input, output_q, output_s);
++    auto E = SymbolicSize{"num_experts"};
++    E.set_value(ctx.num_experts);
++    TensorMatcher({E}).with_dtype<int32_t, int64_t>().with_device(ctx.device).verify(masked_m);
++    // int64 is read as its little-endian low int32 word (stride 2); the count
++    // never overflows int32, so we avoid a second kernel instantiation.
++    const uint32_t masked_m_stride = is_type<int64_t>(masked_m.dtype()) ? 2 : 1;
++    const auto& p = ctx.params;
++    if (p.num_tokens == 0 || ctx.num_experts == 0 || p.scale.num_groups == 0) return;
++    const auto params = MaskedQuantKernelParams{p, static_cast<const int32_t*>(masked_m.data_ptr()), masked_m_stride};
++    const auto compute_blocks_per_expert = [&](uint32_t num_tokens) -> uint32_t {
++      const int64_t total_threads = static_cast<int64_t>(num_tokens) * p.scale.num_groups * Trait::kNumLanes;
++      return static_cast<uint32_t>(div_ceil(total_threads, int64_t{Trait::kBlockSize}));
++    };
++    const auto max_blocks = compute_blocks_per_expert(p.num_tokens);
++    constexpr uint32_t kTargetBlocks = 8u * 256;  // 8 occupancy * 128 SM * 2 wave, quite aggressive
++    const auto target_blocks = div_ceil(kTargetBlocks, ctx.num_experts);
++    const uint32_t num_blocks = [&] {
++      if (target_blocks >= max_blocks) return max_blocks;
++      if (expected_m <= 0) return target_blocks;
++      const auto expected = compute_blocks_per_expert(expected_m);
++      if (expected > max_blocks) return max_blocks;
++      return (expected + target_blocks) / 2;
++    }();
++    LaunchKernel({num_blocks, ctx.num_experts}, Trait::kBlockSize, ctx.device)
++        .config({.use_pdl = kUsePDL})(per_token_group_quant_masked_kernel<Trait, kUsePDL>, params);
++  }
++};
++
++}  // namespace
+diff --git a/python/sglang/jit_kernel/csrc/gemm/per_token_group_quant_8bit.cuh b/python/sglang/jit_kernel/csrc/gemm/per_token_group_quant_8bit.cuh
+deleted file mode 100644
+index 02e721de7a6e..000000000000
+--- a/python/sglang/jit_kernel/csrc/gemm/per_token_group_quant_8bit.cuh
++++ /dev/null
+@@ -1,261 +0,0 @@
+-#include <sgl_kernel/tensor.h>
+-#include <sgl_kernel/utils.h>
+-
+-#include <sgl_kernel/math.cuh>
+-#include <sgl_kernel/type.cuh>
+-#include <sgl_kernel/utils.cuh>
+-#include <sgl_kernel/vec.cuh>
+-#include <sgl_kernel/warp.cuh>
+-
+-#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+-
+-#include <cstddef>
+-#include <cstdint>
+-#include <type_traits>
+-
+-namespace {
+-
+-using deepseek_v4::fp8::cast_to_ue8m0;
+-using deepseek_v4::fp8::inv_scale_ue8m0;
+-using deepseek_v4::fp8::pack_fp8;
+-
+-// Optimized per-token-group quant to FP8-e4m3 (or int8), with optional
+-// column-major UE8M0 (int32-packed) scale. Memory-bound rewrite of the AOT
+-// `per_token_group_quant_8bit` (sgl-kernel): the previous JIT clone read the
+-// input TWICE and used 16 threads/group with only group/8 active. This version:
+-//   * loads each group once into registers (single 128-bit load per thread),
+-//   * uses exactly kGroupSize/kVec threads per group (no idle lanes),
+-//   * sub-warp shuffle-reduces the absmax over those lanes (no shared memory),
+-//   * launches warp-aligned, ~256-thread blocks for high occupancy / latency
+-//     hiding (the AOT kernel's 1-warp blocks left HBM ~80% idle at prefill).
+-// The UE8M0 path reuses the dsv4 cast_to_ue8m0/inv_scale_ue8m0 primitives and is
+-// byte-identical to `sgl_per_token_group_quant_8bit_v2` (both ceil-round the
+-// scale and store the biased exponent byte). ROCm portability comes from the
+-// portable `warp::reduce_max<kThreadsPerGroup>` used directly in the kernel
+-// (gfx942-safe; no separate GroupReduceMax helper needed).
+-
+-template <bool kUE8M0>
+-using scale_packed_t_t = std::conditional_t<kUE8M0, uint32_t, float>;
+-template <bool kUE8M0>
+-using scale_element_t_t = std::conditional_t<kUE8M0, uint8_t, float>;
+-
+-struct PerTokenGroupQuantParams {
+-  const void* __restrict__ input;
+-  void* __restrict__ output_q;
+-  void* __restrict__ output_s;
+-  int64_t num_groups;      // total groups = num_tokens * num_groups_per_row
+-  int num_groups_per_row;  // hidden / group_size
+-  int groups_per_block;    // groups handled by one CTA
+-  int scale_stride;        // output_s.stride(1), in scale_packed_t elements
+-  float eps;
+-  float min_8bit;
+-  float max_8bit;
+-};
+-
+-// kGroupSize columns per group; kThreadsPerGroup threads cover one group, each
+-// issuing kNumVec coalesced 128-bit loads. Lane loads are interleaved
+-// (chunk v at element (v*kThreadsPerGroup + lane)*kVec) so consecutive lanes hit
+-// consecutive 16B addresses -> fully coalesced even for kNumVec > 1.
+-template <typename T, typename DST, int64_t kGroupSize, int kThreadsPerGroup, bool kColMajor, bool kUE8M0, bool kUsePDL>
+-__global__ __launch_bounds__(256, 8) void per_token_group_quant_8bit_kernel(const PerTokenGroupQuantParams params) {
+-  using namespace device;
+-  namespace math = device::math;
+-
+-  constexpr uint32_t kVec = 16u / sizeof(T);  // 8 for bf16/fp16
+-  constexpr uint32_t kElemsPerThread = kGroupSize / kThreadsPerGroup;
+-  constexpr uint32_t kNumVec = kElemsPerThread / kVec;  // 128-bit loads per thread
+-  static_assert(kGroupSize % (kThreadsPerGroup * kVec) == 0, "bad tiling");
+-  static_assert(
+-      kThreadsPerGroup >= 1 && kThreadsPerGroup <= 32 && (kThreadsPerGroup & (kThreadsPerGroup - 1)) == 0,
+-      "threads-per-group must be a pow2 <= 32");
+-
+-  using InVec = AlignedVector<T, kVec>;
+-  using scale_packed_t = scale_packed_t_t<kUE8M0>;
+-  using scale_element_t = scale_element_t_t<kUE8M0>;
+-
+-  const int local_group = threadIdx.x / kThreadsPerGroup;
+-  const int lane = threadIdx.x % kThreadsPerGroup;
+-  const int64_t global_group = static_cast<int64_t>(blockIdx.x) * params.groups_per_block + local_group;
+-
+-  PDLWaitPrimary<kUsePDL>();
+-  if (global_group >= params.num_groups) {
+-    PDLTriggerSecondary<kUsePDL>();
+-    return;
+-  }
+-
+-  const T* gin = static_cast<const T*>(params.input) + global_group * kGroupSize;
+-  DST* gout = static_cast<DST*>(params.output_q) + global_group * kGroupSize;
+-
+-  // Load kNumVec interleaved 128-bit chunks into registers.
+-  float vals[kElemsPerThread];
+-  float local_absmax = params.eps;
+-#pragma unroll
+-  for (uint32_t v = 0; v < kNumVec; ++v) {
+-    InVec in_vec;
+-    in_vec.load(gin + (v * kThreadsPerGroup + lane) * kVec, 0);
+-#pragma unroll
+-    for (uint32_t j = 0; j < kVec; ++j) {
+-      const float val = static_cast<float>(in_vec[j]);
+-      vals[v * kVec + j] = val;
+-      local_absmax = math::max(local_absmax, math::abs(val));
+-    }
+-  }
+-  if constexpr (kThreadsPerGroup > 1) {
+-    local_absmax = warp::reduce_max<kThreadsPerGroup>(local_absmax);
+-  }
+-
+-  // Scale (byte-identical to sgl_per_token_group_quant_8bit_v2).
+-  const float kMaxInv = 1.0f / params.max_8bit;
+-  float inv_scale;  // multiply input by this to quantize
+-  scale_element_t scale_store;
+-  if constexpr (kUE8M0) {
+-    const int32_t exp = cast_to_ue8m0(local_absmax * kMaxInv);
+-    inv_scale = inv_scale_ue8m0(exp);
+-    scale_store = static_cast<uint8_t>(exp);
+-  } else {
+-    const float scale_inv = local_absmax * kMaxInv;  // stored scale
+-    inv_scale = params.max_8bit / local_absmax;      // quant multiplier
+-    scale_store = scale_inv;
+-  }
+-
+-  // Quantize from registers and store kNumVec interleaved chunks.
+-#pragma unroll
+-  for (uint32_t v = 0; v < kNumVec; ++v) {
+-    DST* o = gout + (v * kThreadsPerGroup + lane) * kVec;
+-    if constexpr (std::is_same_v<DST, fp8_e4m3_t>) {
+-      AlignedVector<fp8x2_e4m3_t, kVec / 2> out_vec;
+-#pragma unroll
+-      for (uint32_t j = 0; j < kVec / 2; ++j) {
+-        out_vec[j] = pack_fp8(vals[v * kVec + 2 * j] * inv_scale, vals[v * kVec + 2 * j + 1] * inv_scale);
+-      }
+-      out_vec.store(o, 0);
+-    } else {
+-      AlignedVector<DST, kVec> out_vec;
+-#pragma unroll
+-      for (uint32_t j = 0; j < kVec; ++j) {
+-        const float q = math::min(math::max(vals[v * kVec + j] * inv_scale, params.min_8bit), params.max_8bit);
+-        out_vec[j] = static_cast<DST>(q);
+-      }
+-      out_vec.store(o, 0);
+-    }
+-  }
+-
+-  // One scale write per group (the leading lane).
+-  if (lane == 0) {
+-    scale_element_t* scale_out;
+-    if constexpr (kColMajor) {
+-      constexpr int kPack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+-      const int row = static_cast<int>(global_group / params.num_groups_per_row);    // token
+-      const int col_u = static_cast<int>(global_group % params.num_groups_per_row);  // group in row
+-      const int col = col_u / kPack;
+-      const int pack = col_u % kPack;
+-      scale_out = reinterpret_cast<scale_element_t*>(params.output_s) +
+-                  (static_cast<int64_t>(col) * params.scale_stride * kPack + static_cast<int64_t>(row) * kPack + pack);
+-    } else {
+-      static_assert(!kUE8M0, "non-column-major UE8M0 is unsupported");
+-      scale_out = static_cast<scale_element_t*>(params.output_s) + global_group;
+-    }
+-    *scale_out = scale_store;
+-  }
+-
+-  PDLTriggerSecondary<kUsePDL>();
+-}
+-
+-// Threads cooperating on one group. Heuristic: ~8 elems/thread for small groups
+-// (one 128-bit load) and 16 elems/thread for group=128 (two loads), capped at 8
+-// threads/group to keep the sub-warp reduction (and register pressure) small.
+-template <int64_t kGroupSize, typename T>
+-constexpr int threads_per_group() {
+-  constexpr int kVec = 16 / sizeof(T);                  // 8 for bf16/fp16
+-  int tpg = static_cast<int>(kGroupSize) / (2 * kVec);  // ~16 elems/thread (2 vecs)
+-  if (tpg > 8) tpg = 8;
+-  if (tpg < 1) tpg = 1;
+-  return tpg;
+-}
+-
+-constexpr int kBlockThreads = 256;
+-
+-template <int64_t kGroupSize, typename T>
+-inline int pick_groups_per_block() {
+-  int gpb = kBlockThreads / threads_per_group<kGroupSize, T>();
+-  if (gpb < 1) gpb = 1;
+-  return gpb;
+-}
+-
+-template <typename T, typename DST, int64_t kGroupSize, bool kColMajor, bool kUE8M0, bool kUsePDL>
+-void launch_quant(const PerTokenGroupQuantParams& base, int64_t num_groups, int groups_per_block, DLDevice device) {
+-  using namespace host;
+-  constexpr int kThreadsPerGroup = threads_per_group<kGroupSize, T>();
+-  const int num_threads = groups_per_block * kThreadsPerGroup;
+-  const int64_t num_blocks = (num_groups + groups_per_block - 1) / groups_per_block;
+-  PerTokenGroupQuantParams params = base;
+-  params.groups_per_block = groups_per_block;
+-  constexpr auto kernel =
+-      per_token_group_quant_8bit_kernel<T, DST, kGroupSize, kThreadsPerGroup, kColMajor, kUE8M0, kUsePDL>;
+-  LaunchKernel(static_cast<uint32_t>(num_blocks), static_cast<uint32_t>(num_threads), device)
+-      .enable_pdl(kUsePDL)(kernel, params);
+-}
+-
+-template <typename DType, typename OutType, int64_t kGroupSize, bool kUsePDL>
+-void per_token_group_quant_8bit(
+-    tvm::ffi::TensorView input,
+-    tvm::ffi::TensorView output_q,
+-    tvm::ffi::TensorView output_s,
+-    int64_t group_size,
+-    double eps,
+-    double min_8bit,
+-    double max_8bit,
+-    bool scale_ue8m0) {
+-  using namespace host;
+-  static_assert(
+-      kGroupSize == 16 || kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128,
+-      "group_size template arg must be 16/32/64/128");
+-
+-  auto device = SymbolicDevice{};
+-  auto M = SymbolicSize{"num_tokens"};
+-  auto K = SymbolicSize{"hidden_dim"};
+-  device.set_options<kDLCUDA>();
+-
+-  TensorMatcher({M, K}).with_dtype<DType>().with_device(device).verify(input);
+-  TensorMatcher({M, K}).with_dtype<OutType>().with_device(device).verify(output_q);
+-
+-  RuntimeCheck(group_size == kGroupSize, "group_size does not match compiled template");
+-
+-  const int64_t num_tokens = M.unwrap();
+-  const int64_t hidden_dim = K.unwrap();
+-  const int64_t num_groups_per_row = hidden_dim / kGroupSize;
+-  const int64_t num_groups = num_tokens * num_groups_per_row;
+-  if (num_groups == 0) return;
+-
+-  const bool is_column_major = output_s.stride(0) < output_s.stride(1);
+-  const int scale_stride = static_cast<int>(output_s.stride(1));
+-
+-  PerTokenGroupQuantParams base{};
+-  base.input = input.data_ptr();
+-  base.output_q = output_q.data_ptr();
+-  base.output_s = output_s.data_ptr();
+-  base.num_groups = num_groups;
+-  base.num_groups_per_row = static_cast<int>(num_groups_per_row);
+-  base.scale_stride = scale_stride;
+-  base.eps = static_cast<float>(eps);
+-  base.min_8bit = static_cast<float>(min_8bit);
+-  base.max_8bit = static_cast<float>(max_8bit);
+-
+-  const auto dev = input.device();
+-  const int gpb = pick_groups_per_block<kGroupSize, DType>();
+-
+-  // Runtime selection between compile-time-instantiated scale-layout variants
+-  // (the group size itself is a template arg, supplied from Python).
+-  if (is_column_major) {
+-    if (scale_ue8m0) {
+-      launch_quant<DType, OutType, kGroupSize, true, true, kUsePDL>(base, num_groups, gpb, dev);
+-    } else {
+-      launch_quant<DType, OutType, kGroupSize, true, false, kUsePDL>(base, num_groups, gpb, dev);
+-    }
+-  } else {
+-    RuntimeCheck(!scale_ue8m0, "row-major UE8M0 unsupported");
+-    launch_quant<DType, OutType, kGroupSize, false, false, kUsePDL>(base, num_groups, gpb, dev);
+-  }
+-}
+-
+-}  // namespace
+diff --git a/python/sglang/jit_kernel/per_token_group_quant.py b/python/sglang/jit_kernel/per_token_group_quant.py
+new file mode 100644
+index 000000000000..a3b5eb67b9c6
+--- /dev/null
++++ b/python/sglang/jit_kernel/per_token_group_quant.py
+@@ -0,0 +1,223 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Optional, Tuple
++
++import torch
++
++from sglang.jit_kernel.utils import (
++    cache_once,
++    is_arch_support_pdl,
++    load_jit,
++    make_cpp_args,
++)
++from sglang.kernel_api_logging import debug_kernel_api
++from sglang.srt.utils.custom_op import register_custom_op
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++_SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float16)
++_SUPPORTED_OUTPUT_DTYPES = (torch.float8_e4m3fn, torch.int8)
++_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
++
++
++@cache_once
++def _jit_module(
++    in_dtype: torch.dtype,
++    out_dtype: torch.dtype,
++    group_size: int,
++    scale_ue8m0: bool,
++    row_major: bool,
++    aligned: bool,
++    fuse_silu_and_mul: bool,
++    masked_layout: bool,
++    use_pdl: bool,
++) -> Module:
++    assert in_dtype in _SUPPORTED_INPUT_DTYPES
++    assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
++    assert group_size in _SUPPORTED_GROUP_SIZES
++    trait_args = make_cpp_args(
++        in_dtype,
++        out_dtype,
++        group_size,
++        scale_ue8m0,
++        row_major,
++        aligned,
++        fuse_silu_and_mul,
++        use_pdl,
++    )
++    launcher = (
++        "PerTokenGroupQuantMaskedKernel"
++        if masked_layout
++        else "PerTokenGroupQuantFlatKernel"
++    )
++    return load_jit(
++        "per_token_group_quant",
++        *trait_args,
++        "masked" if masked_layout else "flat",
++        cuda_files=["gemm/per_token_group_quant.cuh"],
++        cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::run")],
++        extra_cuda_cflags=["--use_fast_math"],
++    )
++
++
++def _infer_scale_layout(
++    output_s: torch.Tensor, scale_ue8m0: bool, num_groups: int
++) -> Tuple[bool, bool]:
++    """Return ``(row_major, aligned)`` for ``output_s``.
++
++    Column-major (transposed) scale buffers have token stride 1 and a larger
++    group stride; row-major buffers are contiguous.
++    """
++    row_major = output_s.stride(-2) >= output_s.stride(-1)
++    if output_s.dtype == torch.int32:
++        if not scale_ue8m0:
++            raise ValueError("int32-packed scale buffers require scale_ue8m0=True")
++        aligned = num_groups % 4 == 0
++        return row_major, aligned
++    if output_s.dtype == torch.float32:
++        if scale_ue8m0:
++            raise ValueError("scale_ue8m0=True requires an int32-packed output_s")
++        return row_major, True
++    raise ValueError(f"Unsupported output_s dtype {output_s.dtype}")
++
++
++@register_custom_op(
++    op_name="per_token_group_quant",
++    mutates_args=["output_q", "output_s"],
++)
++def _per_token_group_quant_custom_op(
++    input: torch.Tensor,
++    output_q: torch.Tensor,
++    output_s: torch.Tensor,
++    group_size: int,
++    scale_ue8m0: bool = False,
++    fuse_silu_and_mul: bool = False,
++    masked_m: Optional[torch.Tensor] = None,
++    expected_m: Optional[int] = None,
++) -> None:
++    num_groups = output_q.shape[-1] // group_size
++    row_major, aligned = _infer_scale_layout(output_s, scale_ue8m0, num_groups)
++    module = _jit_module(
++        input.dtype,
++        output_q.dtype,
++        int(group_size),
++        bool(scale_ue8m0),
++        row_major,
++        aligned,
++        bool(fuse_silu_and_mul),
++        masked_m is not None,
++        is_arch_support_pdl(),
++    )
++    if masked_m is not None:
++        module.per_token_group_quant(
++            input, output_q, output_s, masked_m, int(expected_m or -1)
++        )
++    else:
++        module.per_token_group_quant(input, output_q, output_s)
++
++
++def _allocate_outputs(
++    input: torch.Tensor,
++    group_size: int,
++    out_dtype: torch.dtype,
++    scale_ue8m0: bool,
++    column_major_scales: bool,
++    fuse_silu_and_mul: bool,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Allocate ``(output_q, output_s)`` in the requested major mode / scale
++    format, selected by ``(column_major_scales, scale_ue8m0)``."""
++    hidden = input.shape[-1] // (2 if fuse_silu_and_mul else 1)
++    out_shape = (*input.shape[:-1], hidden)
++    output_q = torch.empty(out_shape, device=input.device, dtype=out_dtype)
++
++    num_groups = hidden // group_size
++    if scale_ue8m0 and not column_major_scales:
++        # Row-major packed UE8M0: int32 [..., ceil(ng/4)] contiguous (an
++        # unaligned ng leaves a partially-used last int32 that the kernel zero-
++        # pads). The shared create_*_output_scale helper does not produce this
++        # layout.
++        output_s = torch.empty(
++            (*out_shape[:-1], (num_groups + 3) // 4),
++            device=input.device,
++            dtype=torch.int32,
++        )
++    else:
++        from sglang.kernels.ops.quantization.fp8_kernel import (
++            create_per_token_group_quant_fp8_output_scale,
++        )
++
++        output_s = create_per_token_group_quant_fp8_output_scale(
++            x_shape=out_shape,
++            device=input.device,
++            group_size=group_size,
++            column_major_scales=column_major_scales,
++            scale_tma_aligned=column_major_scales,
++            scale_ue8m0=scale_ue8m0,
++        )
++    return output_q, output_s
++
++
++@debug_kernel_api
++def per_token_group_quant(
++    input: torch.Tensor,
++    output_q: Optional[torch.Tensor] = None,
++    output_s: Optional[torch.Tensor] = None,
++    group_size: int = 128,
++    scale_ue8m0: bool = False,
++    fuse_silu_and_mul: bool = False,
++    masked_m: Optional[torch.Tensor] = None,
++    expected_m: Optional[int] = None,
++    *,
++    out_dtype: Optional[torch.dtype] = None,
++    column_major_scales: bool = False,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Per-token-group quantization. Returns ``(output_q, output_s)``.
++
++    ``output_q`` / ``output_s`` are optional: pass them to quantize into
++    caller-owned buffers, or omit both to have them allocated per ``out_dtype``
++    (default fp8_e4m3), ``scale_ue8m0`` and ``column_major_scales``. Either way
++    the two tensors are returned.
++
++    Input / output shapes:
++      vanilla:            input [T, hidden],      output_q [T, hidden]
++      fuse_silu_and_mul:  input [T, hidden*2],    output_q [T, hidden]
++      masked (+ above):   input [E, T_pad, ...],  output_q [E, T_pad, hidden],
++                          masked_m [E] int32
++    ``output_s`` scale layouts (inferred from a supplied buffer's dtype/strides,
++    or allocated to match when omitted):
++      float32 contiguous  -> row-major fp32 scales
++      float32 transposed  -> col-major fp32 scales (TMA-aligned view)
++      int32 transposed    -> col-major UE8M0 bytes packed 4-per-int32
++      int32 contiguous    -> row-major UE8M0 bytes packed 4-per-int32
++    The packed layouts require ``scale_ue8m0=True``.
++
++    ``expected_m`` (masked only) is an optional expected-tokens-per-expert hint.
++
++    Inputs are bf16/fp16; group size is one of 16/32/64/128/256; the quant range
++    follows ``output_q.dtype`` (fp8_e4m3: +-448, int8: [-128, 127]).
++    """
++    if output_q is None:
++        assert output_s is None
++        output_q, output_s = _allocate_outputs(
++            input,
++            group_size,
++            out_dtype or torch.float8_e4m3fn,
++            scale_ue8m0,
++            column_major_scales,
++            fuse_silu_and_mul,
++        )
++    else:
++        assert output_s is not None
++        assert out_dtype is None or out_dtype == output_q.dtype
++    _per_token_group_quant_custom_op(
++        input=input,
++        output_q=output_q,
++        output_s=output_s,
++        group_size=group_size,
++        scale_ue8m0=scale_ue8m0,
++        fuse_silu_and_mul=fuse_silu_and_mul,
++        masked_m=masked_m,
++        expected_m=expected_m,
++    )
++    return output_q, output_s
+diff --git a/python/sglang/jit_kernel/per_token_group_quant_8bit.py b/python/sglang/jit_kernel/per_token_group_quant_8bit.py
+deleted file mode 100644
+index cf4b753a89d9..000000000000
+--- a/python/sglang/jit_kernel/per_token_group_quant_8bit.py
++++ /dev/null
+@@ -1,108 +0,0 @@
+-from __future__ import annotations
+-
+-from typing import TYPE_CHECKING
+-
+-import torch
+-
+-from sglang.jit_kernel.utils import (
+-    cache_once,
+-    is_arch_support_pdl,
+-    load_jit,
+-    make_cpp_args,
+-)
+-from sglang.kernel_api_logging import debug_kernel_api
+-from sglang.srt.utils.custom_op import register_custom_op
+-
+-if TYPE_CHECKING:
+-    from tvm_ffi.module import Module
+-
+-
+-@cache_once
+-def _jit_per_token_group_quant_8bit_module(
+-    dtype: torch.dtype, output_type: torch.dtype, group_size: int
+-) -> Module:
+-    dtype_arg = make_cpp_args(dtype)
+-    out_arg = make_cpp_args(output_type)
+-    gs_arg = make_cpp_args(group_size)
+-    pdl_arg = make_cpp_args(is_arch_support_pdl())
+-    return load_jit(
+-        "per_token_group_quant_8bit",
+-        *dtype_arg,
+-        *out_arg,
+-        *gs_arg,
+-        *pdl_arg,
+-        cuda_files=["gemm/per_token_group_quant_8bit.cuh"],
+-        cuda_wrappers=[
+-            (
+-                "per_token_group_quant_8bit",
+-                f"per_token_group_quant_8bit<{dtype_arg}, {out_arg}, {gs_arg}, {pdl_arg}>",
+-            )
+-        ],
+-    )
+-
+-
+-@register_custom_op(
+-    op_name="per_token_group_quant_8bit",
+-    mutates_args=["output_q", "output_s"],
+-)
+-def _per_token_group_quant_8bit_custom_op(
+-    input: torch.Tensor,
+-    output_q: torch.Tensor,
+-    output_s: torch.Tensor,
+-    group_size: int,
+-    eps: float,
+-    fp8_min: float,
+-    fp8_max: float,
+-    scale_ue8m0: bool = False,
+-) -> None:
+-    """
+-    Per-token-group quantization to 8-bit format.
+-
+-    Args:
+-        input: Input tensor to quantize (float, half, or bfloat16).
+-        output_q: Output quantized tensor (e.g., fp8_e4m3 or int8).
+-        output_s: Output scale tensor.
+-        group_size: The size of the group for quantization.
+-        eps: A small value to avoid division by zero.
+-        fp8_min: The minimum value of the 8-bit data type.
+-        fp8_max: The maximum value of the 8-bit data type.
+-        scale_ue8m0: Whether to use UE8M0 format for scales.
+-    """
+-    module = _jit_per_token_group_quant_8bit_module(
+-        input.dtype, output_q.dtype, group_size
+-    )
+-    module.per_token_group_quant_8bit(
+-        input,
+-        output_q,
+-        output_s,
+-        group_size,
+-        eps,
+-        fp8_min,
+-        fp8_max,
+-        scale_ue8m0,
+-    )
+-    return None
+-
+-
+-@debug_kernel_api
+-def per_token_group_quant_8bit(
+-    input: torch.Tensor,
+-    output_q: torch.Tensor,
+-    output_s: torch.Tensor,
+-    group_size: int,
+-    eps: float,
+-    fp8_min: float,
+-    fp8_max: float,
+-    scale_ue8m0: bool = False,
+-) -> tuple[torch.Tensor, torch.Tensor]:
+-    _per_token_group_quant_8bit_custom_op(
+-        input=input,
+-        output_q=output_q,
+-        output_s=output_s,
+-        group_size=group_size,
+-        eps=eps,
+-        fp8_min=fp8_min,
+-        fp8_max=fp8_max,
+-        scale_ue8m0=scale_ue8m0,
+-    )
+-    return output_q, output_s
+diff --git a/python/sglang/jit_kernel/per_token_group_quant_8bit_v2.py b/python/sglang/jit_kernel/per_token_group_quant_8bit_v2.py
+index 8c0ebbfc237b..84e6dc5fb8bc 100644
+--- a/python/sglang/jit_kernel/per_token_group_quant_8bit_v2.py
++++ b/python/sglang/jit_kernel/per_token_group_quant_8bit_v2.py
+@@ -1,3 +1,9 @@
++"""DEPRECATED: superseded by ``sglang.jit_kernel.per_token_group_quant`` (the
++default CUDA path). No sglang runtime code may call this kernel; it is kept
++only as the perf baseline for the per_token_group_quant benchmarks and its own
++bit-parity tests, and will be deleted once those move to torch references.
++"""
++
+ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING, Optional
+diff --git a/python/sglang/kernels/ops/moe/ep_moe_kernels.py b/python/sglang/kernels/ops/moe/ep_moe_kernels.py
+index cd54fc0e2e10..8fb29be5909f 100644
+--- a/python/sglang/kernels/ops/moe/ep_moe_kernels.py
++++ b/python/sglang/kernels/ops/moe/ep_moe_kernels.py
+@@ -1,5 +1,5 @@
+ import logging
+-from typing import Tuple
++from typing import Optional, Tuple
+ 
+ import torch
+ import triton
+@@ -376,13 +376,25 @@ def silu_and_mul_masked_post_quant_fwd(
+     scale_ue8m0: bool = False,
+     gemm1_alpha: float = 0.0,
+     gemm1_clamp_limit: float = 0.0,
++    num_real_tokens: Optional[int] = None,
++    topk: Optional[int] = None,
+ ):
+-    """
+-    input shape [expert_num, token_num_padded, hidden_dim]
+-    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype fp8
+-    output_scale [expert_num token_num_paddded, hidden_dim // 2 // 128] dtype float32
+-    quant_group_size  int,
+-    masked_m shape [expert_num],
++    """Masked (EP-MoE) fused silu_and_mul + per-token-group fp8 quant.
++
++    input  [expert_num, token_num_padded, hidden_dim * 2]
++    output [expert_num, token_num_padded, hidden_dim], dtype fp8
++    masked_m [expert_num]
++
++    ``output_scale``'s dtype selects the scale format and kernel schedule:
++      float32 [E, token_num_padded, G]: row-major scales (rounded to powers of
++        two when ``scale_ue8m0``); token axis grid-strides over the padded dim.
++      int32 [E, G // 4, token_num_padded]: packed UE8M0, 4 exponent bytes per
++        int32 (deep_gemm's MN-major packed layout, no separate transform
++        needed). Requires ``scale_ue8m0``, ``G % 4 == 0``, and
++        ``num_real_tokens``/``topk`` to size the dense flat-work grid.
++
++    ``gemm1_alpha > 0`` switches the activation to the gpt-oss swiglu
++    ``min(gate, limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``.
+     """
+ 
+     assert input.is_contiguous()
+@@ -395,6 +407,49 @@ def silu_and_mul_masked_post_quant_fwd(
+     size_n = input.shape[-1] // 2
+     assert size_n % quant_group_size == 0
+ 
++    finfo = torch.finfo(torch.float8_e4m3fn)
++    fp8_max = finfo.max
++    fp8_min = -fp8_max
++    gemm1_alpha = gemm1_alpha if gemm1_alpha is not None else 0.0
++    gemm1_clamp_limit = gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0
++
++    if output_scale.dtype == torch.int32:
++        assert scale_ue8m0, "packed int32 scales are UE8M0 by definition"
++        assert (
++            num_real_tokens is not None and topk is not None
++        ), "the packed schedule sizes its grid from num_real_tokens * topk"
++        E, m_max, _ = input.shape
++        G = size_n // quant_group_size
++        assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
++        BLOCK_N = quant_group_size * 4
++        assert (
++            size_n % BLOCK_N == 0
++        ), "packed UE8M0 path requires size_n % (4*group) == 0"
++        hidden_dim_split = size_n // BLOCK_N
++        assert tuple(output_scale.shape) == (E, hidden_dim_split, m_max)
++
++        grid = (num_real_tokens * topk, hidden_dim_split)
++        _silu_and_mul_post_quant_packed_kernel[grid](
++            input,
++            *input.stride(),
++            output,
++            *output.stride(),
++            output_scale,
++            *output_scale.stride(),
++            masked_m,
++            E,
++            size_n,
++            fp8_max,
++            fp8_min,
++            QUANT_GROUP_SIZE=quant_group_size,
++            BLOCK_N=BLOCK_N,
++            GEMM1_ALPHA=gemm1_alpha,
++            GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
++            E_PADDED=triton.next_power_of_2(E),
++            num_warps=1,
++        )
++        return
++
+     expert_num = len(masked_m)
+ 
+     if expert_num < 4:
+@@ -421,10 +476,6 @@ def silu_and_mul_masked_post_quant_fwd(
+         expert_num,
+     )
+ 
+-    finfo = torch.finfo(torch.float8_e4m3fn)
+-    fp8_max = finfo.max
+-    fp8_min = -fp8_max
+-
+     _silu_and_mul_post_quant_kernel[grid](
+         input,
+         *input.stride(),
+@@ -441,8 +492,8 @@ def silu_and_mul_masked_post_quant_fwd(
+         NUM_STAGE=NUM_STAGES,
+         num_warps=num_warps,
+         SCALE_UE8M0=scale_ue8m0,
+-        GEMM1_ALPHA=gemm1_alpha if gemm1_alpha is not None else 0.0,
+-        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
++        GEMM1_ALPHA=gemm1_alpha,
++        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+     )
+     return
+ 
+@@ -536,59 +587,6 @@ def _silu_and_mul_post_quant_packed_kernel(
+     tl.store(scale_ptr + scale_off, packed)
+ 
+ 
+-def silu_and_mul_masked_post_quant_packed_fwd(
+-    input: torch.Tensor,
+-    output: torch.Tensor,
+-    output_scale_packed: torch.Tensor,
+-    quant_group_size: int,
+-    masked_m: torch.Tensor,
+-    num_real_tokens: int,
+-    topk: int,
+-    gemm1_alpha: float = 0.0,
+-    gemm1_clamp_limit: float = 0.0,
+-):
+-    assert input.is_contiguous()
+-    assert output.dtype == torch.float8_e4m3fn
+-    assert output.is_contiguous()
+-    assert input.dim() == 3 and input.shape[-1] % 2 == 0
+-
+-    E, m_max, _ = input.shape
+-    size_n = input.shape[-1] // 2
+-    assert size_n % quant_group_size == 0
+-    G = size_n // quant_group_size
+-    assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
+-    BLOCK_N = quant_group_size * 4
+-    assert size_n % BLOCK_N == 0, "packed UE8M0 path requires size_n % (4*group) == 0"
+-    hidden_dim_split = size_n // BLOCK_N
+-    assert tuple(output_scale_packed.shape) == (E, hidden_dim_split, m_max)
+-    assert output_scale_packed.dtype == torch.int32
+-
+-    finfo = torch.finfo(torch.float8_e4m3fn)
+-    fp8_max = finfo.max
+-
+-    grid = (num_real_tokens * topk, hidden_dim_split)
+-    _silu_and_mul_post_quant_packed_kernel[grid](
+-        input,
+-        *input.stride(),
+-        output,
+-        *output.stride(),
+-        output_scale_packed,
+-        *output_scale_packed.stride(),
+-        masked_m,
+-        E,
+-        size_n,
+-        fp8_max,
+-        -fp8_max,
+-        QUANT_GROUP_SIZE=quant_group_size,
+-        BLOCK_N=BLOCK_N,
+-        GEMM1_ALPHA=gemm1_alpha if gemm1_alpha is not None else 0.0,
+-        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
+-        E_PADDED=triton.next_power_of_2(E),
+-        num_warps=1,
+-    )
+-    return
+-
+-
+ @triton.jit
+ def _silu_and_mul_kernel(
+     input_ptr,
+diff --git a/python/sglang/kernels/ops/quantization/__init__.py b/python/sglang/kernels/ops/quantization/__init__.py
+index 9d48b4fa3764..4187053a40e3 100644
+--- a/python/sglang/kernels/ops/quantization/__init__.py
++++ b/python/sglang/kernels/ops/quantization/__init__.py
+@@ -54,15 +54,20 @@
+ 
+ register_kernel(
+     KernelSpec(
+-        op="quantization.sgl_per_token_group_quant_8bit",
++        op="quantization.per_token_group_quant",
+         backend=KernelBackend.JIT,
+-        target="sglang.jit_kernel.per_token_group_quant_8bit:per_token_group_quant_8bit",
++        target="sglang.jit_kernel.per_token_group_quant:per_token_group_quant",
+         capabilities=_CUDA,
+         format_signature=FormatSignature(
++            supported_dtypes=("float8_e4m3fn", "int8"),
+             in_place=True,
+-            description="per-token-group 8-bit quantization (JIT variant)",
++            description=(
++                "trait-driven per-token-group quantization: bf16/fp16 input, "
++                "group size 16..256, fp32 or packed-UE8M0 scales in row/col-major "
++                "layouts, optional fused silu_and_mul and masked EP-MoE schedule"
++            ),
+         ),
+-        description="Per-token-group 8-bit quantization (sglang.jit_kernel).",
++        description="Unified per-token-group quantization (sglang.jit_kernel).",
+     )
+ )
+ 
+@@ -112,11 +117,48 @@ def sgl_per_token_group_quant_8bit(
+ sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
+ 
+ 
++def per_token_group_quant(
++    input: torch.Tensor,
++    output_q: Optional[torch.Tensor] = None,
++    output_s: Optional[torch.Tensor] = None,
++    group_size: int = 128,
++    scale_ue8m0: bool = False,
++    fuse_silu_and_mul: bool = False,
++    masked_m: Optional[torch.Tensor] = None,
++    expected_m: Optional[int] = None,
++    *,
++    out_dtype: Optional[torch.dtype] = None,
++    column_major_scales: bool = False,
++):
++    """Unified per-token-group quantization (JIT). Returns ``(x_q, x_s)``.
++
++    bf16/fp16 input, fp8_e4m3/int8 output, group size 16..256, fp32 or
++    packed-UE8M0 scales in row-/col-major layouts, optional fused
++    ``silu_and_mul`` and masked EP-MoE schedule (``masked_m`` +
++    ``expected_m`` grid hint). Pass ``output_q``/``output_s`` to quantize into
++    caller-owned buffers (layout inferred from their dtype/strides), or omit
++    both to have them allocated.
++    """
++    return get_kernel("quantization.per_token_group_quant", KernelBackend.JIT)(
++        input,
++        output_q,
++        output_s,
++        group_size,
++        scale_ue8m0,
++        fuse_silu_and_mul,
++        masked_m,
++        expected_m,
++        out_dtype=out_dtype,
++        column_major_scales=column_major_scales,
++    )
++
++
+ __all__ = [
+     "sgl_per_token_quant_fp8",
+     "sgl_per_token_group_quant_8bit",
+     "sgl_per_token_group_quant_fp8",
+     "sgl_per_token_group_quant_int8",
++    "per_token_group_quant",
+ ]
+ 
+ 
+diff --git a/python/sglang/kernels/ops/quantization/fp8_kernel.py b/python/sglang/kernels/ops/quantization/fp8_kernel.py
+index e6b5793ad313..a9f500241376 100644
+--- a/python/sglang/kernels/ops/quantization/fp8_kernel.py
++++ b/python/sglang/kernels/ops/quantization/fp8_kernel.py
+@@ -29,7 +29,6 @@
+     pass
+ 
+ from sglang.jit_kernel.utils import is_arch_support_pdl
+-from sglang.srt.environ import envs
+ from sglang.srt.layers import deep_gemm_wrapper
+ from sglang.srt.utils import (
+     ceil_align,
+@@ -59,25 +58,15 @@
+     from sglang.jit_kernel.per_tensor_quant_fp8 import (
+         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+     )
+-    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+-
+-    # Temporary
+-    try:
+-        from sgl_kernel import sgl_per_token_group_quant_8bit
+-
+-        enable_sgl_per_token_group_quant_8bit = True
+-    except ImportError:
+-        from sgl_kernel import sgl_per_token_group_quant_fp8
+-
+-        enable_sgl_per_token_group_quant_8bit = False
+-
+-    from sglang.jit_kernel.per_token_group_quant_8bit import (
+-        per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
+-    )
+-    from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+-        per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
++    from sglang.kernels.ops.quantization import (
++        per_token_group_quant,
++        sgl_per_token_quant_fp8,
+     )
+ 
++if _is_musa:
++    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
++    from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
++
+ if _is_hip:
+     _has_vllm = False
+     if _use_aiter:
+@@ -501,11 +490,13 @@ def create_per_token_group_quant_fp8_output_scale(
+             # TODO extract "align" function
+             # aligned to 4 * sizeof(float)
+             aligned_size = (x_shape[-2] + 3) // 4 * 4
++            # `...` so batched (e.g. masked [E, T, H]) shapes slice the token
++            # axis, not dim 0.
+             return torch.empty(
+                 x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
+                 device=device,
+                 dtype=torch.float32,
+-            ).transpose(-1, -2)[: x_shape[-2], :]
++            ).transpose(-1, -2)[..., : x_shape[-2], :]
+         else:
+             return torch.empty(
+                 (x_shape[-1] // group_size,) + x_shape[:-1],
+@@ -520,7 +511,10 @@ def create_per_token_group_quant_fp8_output_scale(
+         )
+ 
+ 
+-_V2_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
++# AOT v2 (the MUSA path) runtime-switches on these; the JIT
++# per_token_group_quant kernel also templates on 256.
++_MUSA_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
++_V3_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
+ 
+ 
+ def _run_per_token_group_quant_8bit_kernel(
+@@ -532,50 +526,42 @@ def _run_per_token_group_quant_8bit_kernel(
+     fp8_min: float,
+     fp8_max: float,
+     *,
+-    column_major_scales: bool,
+     scale_ue8m0: bool,
+     fuse_silu_and_mul: bool,
+     masked_m: Optional[torch.Tensor],
+-    enable_v2: Optional[bool],
+ ) -> None:
+-    # V1 JIT (.cuh) is byte-identical to V2 but CUDA-only and col-major-UE8M0-only;
+-    # gate it to opt-in plain-2D non-MUSA calls, else fall back to V2 / AOT v1.
+-    if enable_v2 is None:
+-        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
+-
+-    use_jit_per_token_group_v1_quant = (
+-        envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get()
+-        and enable_v2
+-        and not _is_musa
+-        and not fuse_silu_and_mul
+-        and masked_m is None
+-        and x.dim() == 2
+-        and group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+-        and not (scale_ue8m0 and not column_major_scales)
+-    )
++    """Quantize into caller-owned ``x_q`` / ``x_s``.
++
++    CUDA routes to the JIT per_token_group_quant kernel; MUSA stays on the AOT
++    v2 op (the JIT kernel is CUDA-only), and the fp32-pow-2 storage flavor of
++    row-major UE8M0 (float32 ``x_s``, deep_gemm ``ceil_to_ue8m0`` convention)
++    stays on the JIT v2 baseline — per_token_group_quant only packs UE8M0 as
++    int32. The kernel bakes the quant constants in at compile time, so
++    drifted constants are rejected loudly here instead of silently quantizing
++    with different ones; unsupported shapes/layouts error inside its host
++    checks. Whole-row (per-token) quantization is a different op:
++    ``sglang_per_token_quant_fp8``.
++    """
++    if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
++        from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
++            per_token_group_quant_8bit_v2,
++        )
+ 
+-    if use_jit_per_token_group_v1_quant:
+-        sgl_per_token_group_quant_8bit_jit(
++        per_token_group_quant_8bit_v2(
+             input=x,
+             output_q=x_q,
+             output_s=x_s,
+             group_size=group_size,
+             eps=eps,
+-            fp8_min=fp8_min,
+-            fp8_max=fp8_max,
++            min_8bit=fp8_min,
++            max_8bit=fp8_max,
+             scale_ue8m0=scale_ue8m0,
++            fuse_silu_and_mul=fuse_silu_and_mul,
++            masked_m=masked_m,
+         )
+         return
+ 
+-    if not enable_sgl_per_token_group_quant_8bit:
+-        assert not enable_v2
+-        sgl_per_token_group_quant_fp8(
+-            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+-        )
+-        return
+-
+-    if enable_v2 and _is_musa:
+-        # JIT v2 .cuh is CUDA-only (no MUSA fallback); AOT v2 carries the USE_MUSA path.
++    if _is_musa:
+         sgl_per_token_group_quant_8bit(
+             x,
+             x_q,
+@@ -589,34 +575,25 @@ def _run_per_token_group_quant_8bit_kernel(
+             masked_m,
+             enable_v2=True,
+         )
+-    elif enable_v2:
+-        sgl_per_token_group_quant_8bit_jit_v2(
+-            x,
+-            x_q,
+-            x_s,
+-            group_size,
+-            eps,
+-            fp8_min,
+-            fp8_max,
+-            scale_ue8m0=scale_ue8m0,
+-            fuse_silu_and_mul=fuse_silu_and_mul,
+-            masked_m=masked_m,
+-        )
+-    else:
+-        # JIT kernels static_assert on group_size in {16,32,64,128}; keep AOT v1 otherwise.
+-        sgl_per_token_group_quant_8bit(
+-            x,
+-            x_q,
+-            x_s,
+-            group_size,
+-            eps,
+-            fp8_min,
+-            fp8_max,
+-            scale_ue8m0,
+-            fuse_silu_and_mul,
+-            masked_m,
+-            enable_v2=enable_v2,
+-        )
++        return
++
++    assert (
++        eps == 1e-10
++    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
++    expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
++    assert (fp8_min, fp8_max) == expected_range, (
++        f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
++        f"got ({fp8_min}, {fp8_max})"
++    )
++    per_token_group_quant(
++        x,
++        x_q,
++        x_s,
++        group_size,
++        scale_ue8m0=scale_ue8m0,
++        fuse_silu_and_mul=fuse_silu_and_mul,
++        masked_m=masked_m,
++    )
+ 
+ 
+ def sglang_per_token_group_quant_fp8(
+@@ -628,13 +605,23 @@ def sglang_per_token_group_quant_fp8(
+     scale_ue8m0: bool = False,
+     fuse_silu_and_mul: bool = False,
+     masked_m: Optional[torch.Tensor] = None,
+-    enable_v2: Optional[bool] = None,
+ ):
+     assert (
+         x.shape[-1] % group_size == 0
+     ), "the last dimension of `x` cannot be divisible by `group_size`"
+     assert x.is_contiguous(), "`x` is not contiguous"
+ 
++    if (
++        group_size == x.shape[-1]
++        and x.dim() == 2
++        and not (column_major_scales or scale_ue8m0 or fuse_silu_and_mul)
++        and masked_m is None
++    ):
++        # Whole-row group quant is per-token quant; route to the dedicated
++        # kernel (same [T, 1] scale shape) instead of a group kernel that
++        # would need arbitrary group sizes.
++        return sglang_per_token_quant_fp8(x)
++
+     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
+ 
+     x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
+@@ -656,11 +643,9 @@ def sglang_per_token_group_quant_fp8(
+             eps,
+             fp8_min,
+             fp8_max,
+-            column_major_scales=column_major_scales,
+             scale_ue8m0=scale_ue8m0,
+             fuse_silu_and_mul=fuse_silu_and_mul,
+             masked_m=masked_m,
+-            enable_v2=enable_v2,
+         )
+ 
+     return x_q, x_s
+@@ -688,9 +673,13 @@ def sglang_per_token_group_quant_fp8_row_padded(
+     ), "the last dimension of `x` must be divisible by `group_size`"
+     assert x.is_contiguous(), "`x` is not contiguous"
+ 
+-    if not (enable_sgl_per_token_group_quant_8bit and group_size in (16, 32, 64, 128)):
+-        # No v2 kernel available: keep the legacy unpadded path and let the
+-        # GEMM wrapper do the padding.
++    supported_group_sizes = (
++        _MUSA_KERNEL_SUPPORTED_GROUP_SIZES
++        if _is_musa
++        else _V3_KERNEL_SUPPORTED_GROUP_SIZES
++    )
++    if group_size not in supported_group_sizes:
++        # Keep the legacy unpadded path and let the GEMM wrapper do the padding.
+         return sglang_per_token_group_quant_fp8(
+             x, group_size, eps, column_major_scales=True
+         )
+@@ -704,32 +693,18 @@ def sglang_per_token_group_quant_fp8_row_padded(
+         (k // group_size, m_pad), device=x.device, dtype=torch.float32
+     ).transpose(0, 1)
+     if m > 0:
+-        # V1 JIT (.cuh) is CUDA-only; MUSA must stay on the AOT v2 op below.
+-        if envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get() and not _is_musa:
+-            sgl_per_token_group_quant_8bit_jit(
+-                input=x,
+-                output_q=x_q[:m],
+-                output_s=x_s[:m],
+-                group_size=group_size,
+-                eps=eps,
+-                fp8_min=fp8_min,
+-                fp8_max=fp8_max,
+-                scale_ue8m0=False,
+-            )
+-        else:
+-            sgl_per_token_group_quant_8bit(
+-                x,
+-                x_q[:m],
+-                x_s[:m],
+-                group_size,
+-                eps,
+-                fp8_min,
+-                fp8_max,
+-                False,  # scale_ue8m0
+-                False,  # fuse_silu_and_mul
+-                None,  # masked_m
+-                enable_v2=True,
+-            )
++        _run_per_token_group_quant_8bit_kernel(
++            x,
++            x_q[:m],
++            x_s[:m],
++            group_size,
++            eps,
++            fp8_min,
++            fp8_max,
++            scale_ue8m0=False,
++            fuse_silu_and_mul=False,
++            masked_m=None,
++        )
+     if m_pad != m:
+         # Tail rows feed the cutlass GEMM's padded region; zero them so the padded
+         # GEMM stays bit-exact with the legacy pad_tensor path (torch.empty is garbage).
+@@ -747,10 +722,6 @@ def sglang_per_token_group_quant_fp8_ue8m0(
+         x.shape[-1] % group_size == 0
+     ), f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
+     assert x.is_contiguous(), "x must be contiguous"
+-    assert enable_sgl_per_token_group_quant_8bit, (
+-        "sgl_per_token_group_quant_8bit is required (v2 kernel supports "
+-        "group_size in {16, 32, 64, 128})"
+-    )
+ 
+     *x_batch, x_q_mn, x_q_k = x.shape
+     x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+@@ -766,7 +737,7 @@ def sglang_per_token_group_quant_fp8_ue8m0(
+     ).transpose(-1, -2)[..., :x_s_mn, :]
+ 
+     if x.shape[0] > 0:
+-        sgl_per_token_group_quant_8bit(
++        _run_per_token_group_quant_8bit_kernel(
+             x,
+             x_q,
+             x_s,
+@@ -774,10 +745,9 @@ def sglang_per_token_group_quant_fp8_ue8m0(
+             eps,
+             fp8_min,
+             fp8_max,
+-            True,  # scale_ue8m0
+-            False,  # fuse_silu_and_mul
+-            None,  # masked_m
+-            enable_v2=True,
++            scale_ue8m0=True,
++            fuse_silu_and_mul=False,
++            masked_m=None,
+         )
+ 
+     return x_q, x_s
+@@ -794,7 +764,6 @@ def sglang_per_token_group_quant_8bit(
+     scale_ue8m0: bool = False,
+     fuse_silu_and_mul: bool = False,
+     masked_m: Optional[torch.Tensor] = None,
+-    enable_v2: Optional[bool] = None,
+ ):
+     from sglang.kernels.ops.quantization.int8_kernel import (
+         sglang_per_token_group_quant_int8,
+@@ -810,7 +779,6 @@ def sglang_per_token_group_quant_8bit(
+             group_size=group_size,
+             eps=eps,
+             dtype=dst_dtype,
+-            enable_v2=enable_v2,
+         )
+ 
+     return sglang_per_token_group_quant_fp8(
+@@ -822,7 +790,6 @@ def sglang_per_token_group_quant_8bit(
+         scale_ue8m0=scale_ue8m0,
+         fuse_silu_and_mul=fuse_silu_and_mul,
+         masked_m=masked_m,
+-        enable_v2=enable_v2,
+     )
+ 
+ 
+@@ -2424,21 +2391,6 @@ def triton_scaled_mm(
+ 
+ 
+ if _is_cuda:
+-    if enable_sgl_per_token_group_quant_8bit:
+-
+-        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit")
+-        def _(
+-            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+-        ):
+-            return
+-
+-    else:
+-
+-        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_fp8")
+-        def _(
+-            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+-        ):
+-            return
+ 
+     @register_fake_if_exists("sgl_kernel::sgl_per_token_quant_fp8")
+     def _(input, output_q, output_s):
+diff --git a/python/sglang/kernels/ops/quantization/int8_kernel.py b/python/sglang/kernels/ops/quantization/int8_kernel.py
+index 948c1575307b..3c73744f4247 100644
+--- a/python/sglang/kernels/ops/quantization/int8_kernel.py
++++ b/python/sglang/kernels/ops/quantization/int8_kernel.py
+@@ -14,15 +14,7 @@
+ _is_cuda = is_cuda()
+ _is_hip = is_hip()
+ if _is_cuda:
+-    # Temporary
+-    try:
+-        from sgl_kernel import sgl_per_token_group_quant_8bit
+-
+-        enable_sgl_per_token_group_quant_8bit = True
+-    except ImportError:
+-        from sgl_kernel import sgl_per_token_group_quant_int8
+-
+-        enable_sgl_per_token_group_quant_8bit = False
++    from sglang.kernels.ops.quantization import per_token_group_quant
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -204,34 +196,18 @@ def sglang_per_token_group_quant_int8(
+     group_size: int,
+     eps: float = 1e-10,
+     dtype: torch.dtype = torch.int8,
+-    enable_v2: Optional[bool] = None,
+ ):
+     assert (
+         x.shape[-1] % group_size == 0
+     ), "the last dimension of `x` cannot be divisible by `group_size`"
+     assert x.is_contiguous(), "`x` is not contiguous"
++    assert dtype == torch.int8
++    # per_token_group_quant bakes the int8 constants in ([-128, 127], eps 1e-10).
++    assert (
++        eps == 1e-10
++    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+ 
+-    iinfo = torch.iinfo(dtype)
+-    int8_max = iinfo.max
+-    int8_min = iinfo.min
+-
+-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+-    x_s = torch.empty(
+-        x.shape[:-1] + (x.shape[-1] // group_size,),
+-        device=x.device,
+-        dtype=torch.float32,
+-    )
+-
+-    # Temporary
+-    if enable_sgl_per_token_group_quant_8bit:
+-        sgl_per_token_group_quant_8bit(
+-            x, x_q, x_s, group_size, eps, int8_min, int8_max, enable_v2=enable_v2
+-        )
+-    else:
+-        assert not enable_v2
+-        sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
+-
+-    return x_q, x_s
++    return per_token_group_quant(x, group_size=group_size, out_dtype=dtype)
+ 
+ 
+ @triton.jit
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 943d94506683..78cb94521e02 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1056,9 +1056,6 @@ class Envs:
+     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
+     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+ 
+-    # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
+-    # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
+-    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
+     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
+     SGLANG_DISABLE_MSA = EnvBool(False)
+@@ -1193,6 +1190,9 @@ def _convert_SGL_to_SGLANG():
+         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
+     )
+     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
++    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
++    _print_deprecated_env("SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT")
++    _print_deprecated_env("SGLANG_MASKED_GEMM_FAST_ACT")
+     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
+     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
+     _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
+diff --git a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+index b13881ed01ca..94b0b82203fc 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
++++ b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+@@ -7,6 +7,7 @@
+ import torch
+ 
+ from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
++from sglang.kernels.ops.quantization import per_token_group_quant
+ from sglang.srt.distributed import get_tp_group
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+@@ -62,7 +63,6 @@
+     _legacy_silu_and_mul = None
+ 
+ 
+-_MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
+ _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+ 
+ 
+@@ -462,11 +462,7 @@ def _run_masked_gemm(
+ 
+         swiglu_limit_arg: Optional[float] = None
+         if self.swiglu_limit is not None:
+-            # DeepSeek V4: clamped swiglu requires JIT EP activation; the
+-            # FAST_ACT fused-quant path doesn't carry a swiglu_limit arg.
+-            assert (
+-                not _MASKED_GEMM_FAST_ACT
+-            ), "DeepSeek V4 does not support SGLANG_MASKED_GEMM_FAST_ACT"
++            # DeepSeek V4: clamped swiglu requires the DSV4 JIT EP activation.
+             assert (
+                 envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+             ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+@@ -930,34 +926,6 @@ def _varlen_deep_gemm_silu_mul_quant(
+     gemm1_clamp_limit: Optional[float] = None,
+     num_real_tokens: Optional[int] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+-    from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
+-    from sglang.kernels.ops.quantization.fp8_kernel import (
+-        sglang_per_token_group_quant_8bit,
+-    )
+-
+-    if _MASKED_GEMM_FAST_ACT:
+-        assert (
+-            gemm1_alpha is None
+-        ), "gemm1_alpha is not supported with SGLANG_MASKED_GEMM_FAST_ACT"
+-        assert not swizzle, (
+-            "SGLANG_OPT_FIX_MEGA_MOE_MEMORY is incompatible with "
+-            "SGLANG_MASKED_GEMM_FAST_ACT (swizzled layout only supported by JIT act)"
+-        )
+-        assert (
+-            swiglu_limit is None
+-        ), "swiglu_limit (DeepSeek V4) is not supported together with SGLANG_MASKED_GEMM_FAST_ACT"
+-        return sglang_per_token_group_quant_8bit(
+-            x=gateup_output,
+-            dst_dtype=torch.float8_e4m3fn,
+-            group_size=group_size,
+-            masked_m=masked_m,
+-            column_major_scales=True,
+-            scale_tma_aligned=True,
+-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+-            fuse_silu_and_mul=True,
+-            enable_v2=True,
+-        )
+-
+     assert masked_m is not None
+     hidden_states_device = gateup_output.device
+     E, N, D_2 = gateup_output.shape
+@@ -965,55 +933,63 @@ def _varlen_deep_gemm_silu_mul_quant(
+     del D_2
+     G = D // group_size
+ 
+-    # Fused UE8M0 pack needs 4 groups per packed int32 (the G%4 and D guards below).
+-    if (
+-        gemm1_alpha is not None
+-        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+-        and num_real_tokens is not None
+-        and G % 4 == 0
+-        and D % (group_size * 4) == 0
+-    ):
+-        from sglang.kernels.ops.moe.ep_moe_kernels import (
+-            silu_and_mul_masked_post_quant_packed_fwd,
+-        )
+-
++    # oai-swiglu (gemm1_alpha) stays on the Triton kernel until
++    # per_token_group_quant grows an activation-kind axis. The output_scale dtype picks the schedule: packed
++    # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
++    # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
++    if gemm1_alpha is not None:
+         assert (
+             swiglu_limit is None
+         ), "swiglu_limit and gemm1_alpha are mutually exclusive"
+         assert not swizzle, "swizzle is not supported with gemm1_alpha"
++        from sglang.kernels.ops.moe.ep_moe_kernels import (
++            silu_and_mul_masked_post_quant_fwd,
++        )
++
++        use_packed = (
++            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
++            and num_real_tokens is not None
++            and G % 4 == 0
++            and D % (group_size * 4) == 0
++        )
+         down_input = torch.empty(
+             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
+         )
+-        down_input_scale_packed = torch.empty(
+-            (E, G // 4, N), device=hidden_states_device, dtype=torch.int32
++        down_input_scale = torch.empty(
++            (E, G // 4, N) if use_packed else (E, N, G),
++            device=hidden_states_device,
++            dtype=torch.int32 if use_packed else torch.float32,
+         )
+-        silu_and_mul_masked_post_quant_packed_fwd(
++        silu_and_mul_masked_post_quant_fwd(
+             gateup_output,
+             down_input,
+-            down_input_scale_packed,
++            down_input_scale,
+             group_size,
+             masked_m,
+-            num_real_tokens=num_real_tokens,
+-            topk=topk,
++            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+             gemm1_alpha=gemm1_alpha,
+             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
++            num_real_tokens=num_real_tokens,
++            topk=topk,
+         )
+-        return down_input, down_input_scale_packed.transpose(-1, -2)
+-
+-    down_input = torch.empty(
+-        (E, N, D),
+-        device=hidden_states_device,
+-        dtype=torch.float8_e4m3fn,
+-    )
+-
+-    use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+-    if N % 4 != 0 or G % 4 != 0 or D // 8 < E:
+-        use_jit_ep_activation = False
+-    if gemm1_alpha is not None:
+-        use_jit_ep_activation = False
++        if use_packed:
++            down_input_scale = down_input_scale.transpose(-1, -2)
++        return down_input, down_input_scale
+ 
+-    if use_jit_ep_activation:
++    # DSV4-specific activations (clamped swiglu, swizzled gate|up layout) stay
++    # on the DSV4 JIT kernel; it is the only implementation carrying them.
++    if swiglu_limit is not None or swizzle:
++        assert (
++            envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
++        ), "swiglu_limit / swizzle require SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
++        assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
++            "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
++            f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
++        )
+         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
++        down_input = torch.empty(
++            (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
++        )
+         down_input_scale = torch.empty(
+             (E, G // 4, N) if packed_ue8m0 else (E, N, G),
+             device=hidden_states_device,
+@@ -1033,35 +1009,22 @@ def _varlen_deep_gemm_silu_mul_quant(
+         )
+         if packed_ue8m0:
+             down_input_scale = down_input_scale.transpose(-1, -2)
+-    else:
+-        if gemm1_alpha is not None:
+-            assert (
+-                swiglu_limit is None
+-            ), "swiglu_limit and gemm1_alpha are mutually exclusive"
+-            assert not swizzle, "swizzle is not supported with gemm1_alpha"
+-        else:
+-            assert (
+-                swiglu_limit is None
+-            ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+-            assert (
+-                not swizzle
+-            ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+-        down_input_scale = torch.empty(
+-            (E, N, G),
+-            device=hidden_states_device,
+-            dtype=torch.float32,
+-        )
+-        silu_and_mul_masked_post_quant_fwd(
+-            gateup_output,
+-            down_input,
+-            down_input_scale,
+-            group_size,
+-            masked_m,
+-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+-            gemm1_alpha=gemm1_alpha or 0.0,
+-            gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+-        )
+-    return down_input, down_input_scale
++        return down_input, down_input_scale
++
++    # Default plain-silu path: the unified JIT masked fused quant. It allocates
++    # the outputs itself, with scales directly in the layout deep_gemm consumes
++    # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
++    # so the caller's get_mn_major transform short-circuits.
++    expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
++    return per_token_group_quant(
++        gateup_output,
++        group_size=group_size,
++        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
++        fuse_silu_and_mul=True,
++        masked_m=masked_m,
++        expected_m=expected_m,
++        column_major_scales=True,
++    )
+ 
+ 
+ def _apply_swiglu_limit(
+diff --git a/test/registered/jit/benchmark/bench_per_token_group_quant.py b/test/registered/jit/benchmark/bench_per_token_group_quant.py
+new file mode 100644
+index 000000000000..873ffe992d70
+--- /dev/null
++++ b/test/registered/jit/benchmark/bench_per_token_group_quant.py
+@@ -0,0 +1,76 @@
++from sglang.jit_kernel.benchmark import marker
++from sglang.jit_kernel.benchmark.utils import create_empty, create_random
++
++# per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
++# kernel is kept only as the perf baseline for this benchmark.
++from sglang.jit_kernel.per_token_group_quant import per_token_group_quant
++from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
++    per_token_group_quant_8bit_v2,
++)
++from sglang.kernels.ops.quantization.fp8_kernel import (
++    create_per_token_group_quant_fp8_output_scale,
++    fp8_dtype,
++    fp8_max,
++    fp8_min,
++)
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(
++    est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
++)
++
++HIDDEN = 2048
++LAYOUTS = {
++    "row_major_fp32": (False, False),
++    "col_major_fp32": (True, False),
++    "col_major_ue8m0": (True, True),
++}
++
++
++def _jit_v2(G, x, x_q, x_s, scale_ue8m0):
++    per_token_group_quant_8bit_v2(
++        x,
++        x_q,
++        x_s,
++        G,
++        1e-10,
++        float(fp8_min),
++        float(fp8_max),
++        scale_ue8m0=scale_ue8m0,
++    )
++
++
++def _current(G, x, x_q, x_s, scale_ue8m0):
++    per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=scale_ue8m0)
++
++
++FN = {"jit_v2": _jit_v2, "current": _current}
++
++
++@marker.parametrize("group_size", [32, 64, 128], ci_vals=[128])
++@marker.parametrize("layout", list(LAYOUTS), ci_vals=["col_major_ue8m0"])
++@marker.parametrize("num_tokens", [2**n for n in range(0, 14)], ci_vals=[1, 32, 2048])
++@marker.benchmark("impl", ["jit_v2", "current"])
++def benchmark(group_size: int, layout: str, num_tokens: int, impl: str):
++    column_major, scale_ue8m0 = LAYOUTS[layout]
++    x = create_random(num_tokens, HIDDEN)
++    x_q = create_empty(num_tokens, HIDDEN, dtype=fp8_dtype)
++    x_s = create_per_token_group_quant_fp8_output_scale(
++        x_shape=(num_tokens, HIDDEN),
++        device="cuda",
++        group_size=group_size,
++        column_major_scales=column_major,
++        scale_tma_aligned=column_major,
++        scale_ue8m0=scale_ue8m0,
++    )
++    return marker.do_bench(
++        FN[impl],
++        input_args=(group_size, x, x_q, x_s, scale_ue8m0),
++        graph_clone_args=(1,),
++        memory_args=(x,),
++        memory_output=(x_q, x_s),
++    )
++
++
++if __name__ == "__main__":
++    benchmark.run()
+diff --git a/test/registered/jit/benchmark/bench_per_token_group_quant_8bit.py b/test/registered/jit/benchmark/bench_per_token_group_quant_8bit.py
+deleted file mode 100644
+index 6ca8824426aa..000000000000
+--- a/test/registered/jit/benchmark/bench_per_token_group_quant_8bit.py
++++ /dev/null
+@@ -1,311 +0,0 @@
+-import itertools
+-from typing import Any, Dict, List
+-
+-import torch
+-import triton
+-from sgl_kernel.test_utils import create_per_token_group_quant_test_data
+-
+-from sglang.jit_kernel.benchmark.utils import get_benchmark_range
+-from sglang.jit_kernel.per_token_group_quant_8bit import (
+-    per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
+-)
+-from sglang.kernels.ops.quantization.fp8_kernel import (
+-    create_per_token_group_quant_fp8_output_scale,
+-)
+-from sglang.kernels.ops.quantization.fp8_kernel import (
+-    per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
+-)
+-from sglang.srt.utils import is_hip
+-from sglang.srt.utils.bench_utils import bench_kineto
+-from sglang.test.ci.ci_register import register_cuda_ci
+-from sglang.utils import is_in_ci
+-
+-register_cuda_ci(
+-    est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+-)
+-
+-IS_CI = is_in_ci()
+-
+-_is_hip = is_hip()
+-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+-
+-NUM_TESTS = 30 if IS_CI else 300
+-
+-GROUP_SIZE_RANGE = [128]
+-DST_DTYPE_RANGE = [fp8_type_]
+-
+-# ---- GEMM-like branch (num_ranks=None) ----
+-NUM_TOKENS_RANGE_GEMM = get_benchmark_range(
+-    full_range=[1, 4, 16, 64, 256, 768, 2048, 8192, 16384],
+-    ci_range=[768],
+-)
+-HIDDEN_DIM_RANGE_GEMM = [1536, 7168, 16384]
+-NUM_RANKS_RANGE_GEMM = [None]
+-
+-
+-FLAGS_GEMM_FULL: List[Dict[str, Any]] = [
+-    dict(
+-        column_major_scales=False,
+-        scale_tma_aligned=False,
+-        scale_ue8m0=False,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=False,
+-        scale_ue8m0=False,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=False,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-]
+-FLAGS_GEMM_CI: List[Dict[str, Any]] = [
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-]
+-FLAGS_RANGE_GEMM = get_benchmark_range(
+-    full_range=FLAGS_GEMM_FULL, ci_range=FLAGS_GEMM_CI
+-)
+-
+-CONFIGS_GEMM = list(
+-    itertools.product(
+-        NUM_TOKENS_RANGE_GEMM,
+-        HIDDEN_DIM_RANGE_GEMM,
+-        GROUP_SIZE_RANGE,
+-        NUM_RANKS_RANGE_GEMM,
+-        DST_DTYPE_RANGE,
+-        FLAGS_RANGE_GEMM,
+-    )
+-)
+-
+-# ---- MoE-like / multi-rank branch (hidden_dim=2048, num_ranks in {8,16,32,48}) ----
+-NUM_TOKENS_RANGE_MOE = get_benchmark_range(
+-    full_range=[1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+-    ci_range=[768 * 8],
+-)
+-HIDDEN_DIM_RANGE_MOE = [2048]
+-NUM_RANKS_RANGE_MOE = get_benchmark_range(
+-    full_range=[8, 16, 32, 48],
+-    ci_range=[48],
+-)
+-
+-FLAGS_MOE: List[Dict[str, Any]] = [
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=True,
+-        masked_layout_mode=None,
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=True,
+-        masked_layout_mode="balanced",
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=True,
+-        masked_layout_mode="imbalanced",
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=True,
+-        masked_layout_mode="extreme",
+-    ),
+-]
+-FLAGS_RANGE_MOE = get_benchmark_range(full_range=FLAGS_MOE, ci_range=FLAGS_MOE)
+-
+-CONFIGS_MOE = list(
+-    itertools.product(
+-        NUM_TOKENS_RANGE_MOE,
+-        HIDDEN_DIM_RANGE_MOE,
+-        GROUP_SIZE_RANGE,
+-        NUM_RANKS_RANGE_MOE,
+-        DST_DTYPE_RANGE,
+-        FLAGS_RANGE_MOE,
+-    )
+-)
+-
+-# ---- Final configs ----
+-CONFIGS = CONFIGS_GEMM + CONFIGS_MOE
+-
+-LINE_VALS = ["triton", "aot_v2", "sglang"]
+-LINE_NAMES = ["Triton (Inaccurate)", "AOT v2 (sgl-kernel)", "JIT (this repo)"]
+-STYLES = [("blue", "-"), ("red", "-"), ("green", "-")]
+-
+-
+-def _flatten_to_2d(t: torch.Tensor) -> torch.Tensor:
+-    """Reshape a tensor with 3+ dims to 2D by merging all leading dims."""
+-    if t.ndim <= 2:
+-        return t
+-    return t.reshape(-1, t.shape[-1])
+-
+-
+-def _make_sglang_bench_fn(
+-    x: torch.Tensor,
+-    group_size: int,
+-    dst_dtype: torch.dtype,
+-    flags: dict,
+-    provider: str = "sglang",
+-):
+-    """
+-    Adapter that pre-allocates output tensors and returns a zero-arg callable
+-    matching the JIT kernel's signature.
+-
+-    The JIT kernel does not support fuse_silu_and_mul, so when enabled we
+-    pre-compute silu+mul on the input. bench_kineto only times the kernel
+-    matching the given name, so the pre-processing is not included.
+-
+-    The JIT kernel expects 2D tensors, so any higher-dimensional inputs
+-    (e.g. from masked_layout_mode) are flattened to 2D.
+-    """
+-    fuse_silu_and_mul = flags.get("fuse_silu_and_mul", False)
+-    column_major_scales = flags.get("column_major_scales", False)
+-    scale_tma_aligned = flags.get("scale_tma_aligned", False)
+-    scale_ue8m0 = flags.get("scale_ue8m0", False)
+-
+-    # JIT kernel does not support fuse_silu_and_mul; pre-compute it
+-    if fuse_silu_and_mul:
+-        half = x.shape[-1] // 2
+-        x_input = torch.nn.functional.silu(x[..., :half]) * x[..., half:]
+-    else:
+-        x_input = x
+-
+-    # JIT kernel expects 2D (num_tokens, hidden_dim); flatten if needed
+-    x_input = _flatten_to_2d(x_input.contiguous())
+-
+-    out_shape = x_input.shape
+-    output_q = torch.empty(out_shape, device=x.device, dtype=dst_dtype)
+-
+-    fp8_max = torch.finfo(dst_dtype).max
+-    fp8_min = -fp8_max
+-
+-    output_s = create_per_token_group_quant_fp8_output_scale(
+-        x_shape=out_shape,
+-        device=x.device,
+-        group_size=group_size,
+-        column_major_scales=column_major_scales,
+-        scale_tma_aligned=scale_tma_aligned,
+-        scale_ue8m0=scale_ue8m0,
+-    )
+-
+-    if provider == "aot_v2":
+-        from sgl_kernel import sgl_per_token_group_quant_8bit as aot_quant
+-
+-        def _run():
+-            aot_quant(
+-                x_input,
+-                output_q,
+-                output_s,
+-                group_size,
+-                1e-10,
+-                fp8_min,
+-                fp8_max,
+-                scale_ue8m0,
+-                False,  # fuse_silu_and_mul (already applied to x_input)
+-                None,  # masked_m (flattened to 2D)
+-                enable_v2=True,
+-            )
+-
+-    else:
+-
+-        def _run():
+-            sglang_per_token_group_quant_8bit(
+-                input=x_input,
+-                output_q=output_q,
+-                output_s=output_s,
+-                group_size=group_size,
+-                eps=1e-10,
+-                fp8_min=fp8_min,
+-                fp8_max=fp8_max,
+-                scale_ue8m0=scale_ue8m0,
+-            )
+-
+-    return _run
+-
+-
+-@triton.testing.perf_report(
+-    triton.testing.Benchmark(
+-        x_names=[
+-            "num_tokens",
+-            "hidden_dim",
+-            "group_size",
+-            "num_ranks",
+-            "dst_dtype",
+-            "flags",
+-        ],
+-        x_vals=CONFIGS,
+-        line_arg="provider",
+-        line_vals=LINE_VALS,
+-        # Triton has multi kernels and we only report the time for the core one
+-        line_names=LINE_NAMES,
+-        styles=STYLES,
+-        ylabel="us",
+-        plot_name="per-token-group-quant-8bit-performance",
+-        args={},
+-    )
+-)
+-def benchmark(
+-    num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags, provider
+-):
+-    print(
+-        f"Testing: {num_tokens=} {hidden_dim=} {group_size=} {num_ranks=} {dst_dtype=} {flags=} {provider=}"
+-    )
+-
+-    x, masked_m = create_per_token_group_quant_test_data(
+-        num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
+-    )
+-
+-    if provider == "triton":
+-        fn = triton_per_token_group_quant_8bit
+-        kernel_names = "_per_token_group_quant_8bit|_silu_and_mul_post_quant_kernel"
+-        bench_fn = lambda: fn(
+-            x=x,
+-            masked_m=masked_m,
+-            group_size=group_size,
+-            dst_dtype=dst_dtype,
+-            **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
+-        )
+-    elif provider in ("sglang", "aot_v2"):
+-        kernel_names = "per_token_group_quant_8bit_kernel"
+-        bench_fn = _make_sglang_bench_fn(
+-            x=x,
+-            group_size=group_size,
+-            dst_dtype=dst_dtype,
+-            flags=flags,
+-            provider=provider,
+-        )
+-    else:
+-        raise ValueError(f"Unknown provider: {provider}")
+-
+-    time_s = bench_kineto(bench_fn, kernel_names=kernel_names, num_tests=NUM_TESTS)
+-    return time_s * 1e6
+-
+-
+-if __name__ == "__main__":
+-    benchmark.run(print_data=True)
+diff --git a/test/registered/jit/benchmark/bench_per_token_group_quant_masked.py b/test/registered/jit/benchmark/bench_per_token_group_quant_masked.py
+new file mode 100644
+index 000000000000..461130a507a0
+--- /dev/null
++++ b/test/registered/jit/benchmark/bench_per_token_group_quant_masked.py
+@@ -0,0 +1,121 @@
++import math
++
++import torch
++
++from sglang.jit_kernel.benchmark import marker
++from sglang.jit_kernel.benchmark.utils import create_empty, create_random
++
++# per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
++# kernel is kept only as the perf baseline for this benchmark.
++from sglang.jit_kernel.per_token_group_quant import per_token_group_quant
++from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
++    per_token_group_quant_8bit_v2,
++)
++from sglang.kernels.ops.quantization.fp8_kernel import (
++    create_per_token_group_quant_fp8_output_scale,
++    fp8_dtype,
++    fp8_max,
++    fp8_min,
++)
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(
++    est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
++)
++
++# name -> (moe_intermediate_size, topk, num_experts, group_size)
++MODELS = {
++    "deepseek_v4": (3072, 6, 384, 32),  # DeepSeek-V4 Pro
++    "deepseek_v3": (2048, 8, 256, 128),  # DeepSeek-V3/R1
++    "qwen3_235b": (1536, 8, 128, 128),  # Qwen3-235B-A22B
++}
++
++
++def _jit_v2(G, x, x_q, x_s, masked_m, expected_m, fuse):
++    per_token_group_quant_8bit_v2(
++        x,
++        x_q,
++        x_s,
++        G,
++        1e-10,
++        float(fp8_min),
++        float(fp8_max),
++        scale_ue8m0=True,
++        fuse_silu_and_mul=fuse,
++        masked_m=masked_m,
++    )
++
++
++def _current(G, x, x_q, x_s, masked_m, expected_m, fuse):
++    per_token_group_quant(
++        x,
++        x_q,
++        x_s,
++        G,
++        scale_ue8m0=True,
++        fuse_silu_and_mul=fuse,
++        masked_m=masked_m,
++        expected_m=expected_m,
++    )
++
++
++FN = {"jit_v2": _jit_v2, "current": _current}
++
++
++@marker.parametrize("model", list(MODELS), ci_vals=["deepseek_v3"])
++@marker.parametrize("num_gpus", [4, 8], ci_vals=[4])
++@marker.parametrize("fuse_silu", [True, False], ci_vals=[False])
++@marker.parametrize("balanced", [True, False], ci_vals=[True])
++@marker.parametrize("num_tokens", [2**n for n in range(8)], ci_vals=[1, 128])
++@marker.benchmark("impl", ["jit_v2", "current"], unit="us")
++def benchmark(
++    model: str,
++    fuse_silu: bool,
++    num_gpus: int,
++    num_tokens: int,
++    balanced: bool,
++    impl: str,
++) -> marker.BenchResult:
++    torch.cuda.random.manual_seed(42)
++    max_tokens = 128  # TODO: test other size
++    hidden_size, topk, num_experts, group_size = MODELS[model]
++    if num_experts % num_gpus != 0 or topk * num_gpus > num_experts:
++        marker.skip("Incompatible model configuration")
++    if impl == "jit_v2" and (hidden_size // group_size) % 16 != 0:
++        marker.skip("v2 masked requires num_groups % 16 == 0")
++    if num_tokens > max_tokens:
++        marker.skip("num_tokens exceeds max_tokens")
++
++    num_local_experts = num_experts // num_gpus
++    padded_tokens = max_tokens * num_gpus
++    expected_m = math.ceil(max_tokens * topk / num_local_experts)
++    in_hidden = hidden_size * (2 if fuse_silu else 1)
++    x = create_random(num_local_experts, padded_tokens, in_hidden)
++    x_q = create_empty(num_local_experts, padded_tokens, hidden_size, dtype=fp8_dtype)
++    x_s = create_per_token_group_quant_fp8_output_scale(
++        x_shape=(num_local_experts, padded_tokens, hidden_size),
++        device="cuda",
++        group_size=group_size,
++        column_major_scales=True,
++        scale_tma_aligned=True,
++        scale_ue8m0=True,
++    )
++    if balanced:  # simulation
++        topk_ids = torch.randint(0, num_local_experts, (num_tokens * topk,))
++        masked_m = torch.bincount(topk_ids, minlength=num_local_experts)
++        masked_m = masked_m.cuda().int()
++    else:  # only the last few experts receive all tokens
++        masked_m = create_empty(num_local_experts, dtype=torch.int32)
++        masked_m[:-topk].zero_()
++        masked_m[-topk:].fill_(num_tokens)
++    return marker.do_bench(
++        FN[impl],
++        input_args=(group_size, x, x_q, x_s, masked_m, expected_m, fuse_silu),
++        graph_clone_args=(0,),
++        memory_args=(x[:topk, :num_tokens], masked_m),
++        memory_output=(x_q[:topk, :num_tokens], x_s[:topk, :num_tokens]),
++    )
++
++
++if __name__ == "__main__":
++    benchmark.run()
+diff --git a/test/registered/jit/test_per_token_group_quant.py b/test/registered/jit/test_per_token_group_quant.py
+new file mode 100644
+index 000000000000..3ce4824807c6
+--- /dev/null
++++ b/test/registered/jit/test_per_token_group_quant.py
+@@ -0,0 +1,473 @@
++"""Correctness tests for the trait-driven per_token_group_quant JIT kernel.
++
++The reference is computed in pure PyTorch (the quantization math itself), NOT by
++calling the v2 / minimax kernels -- those are being deprecated, so the tests
++must outlive them.
++
++Two guard strengths, chosen by what the kernel's numerics can actually pin:
++  - UE8M0 paths: the quant multiplier is an exact power of two (a bit shift, no
++    division), so codes and packed exponent bytes are compared BIT-EXACT
++    against the torch reference. These are the production paths (DeepGEMM dense,
++    EP-MoE), so this is where bit-exactness matters.
++  - fp32 / int8 scale paths: the kernel divides under ``--use_fast_math`` (fast
++    reciprocal), so codes are not bit-reproducible from an exact torch divide.
++    Those tests pin the exactly-reproducible parts -- the stored scale (a single
++    multiply) -- and the dequant round-trip error, which is what downstream
++    actually consumes.
++"""
++
++import itertools
++
++import pytest
++import torch
++
++from sglang.jit_kernel.per_token_group_quant import per_token_group_quant
++from sglang.jit_kernel.utils import get_ci_test_range
++from sglang.kernels.ops.quantization.fp8_kernel import (
++    create_per_token_group_quant_fp8_output_scale,
++    fp8_dtype,
++    fp8_max,
++)
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
++register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
++
++G = 128
++FMAX = float(fp8_max)  # 448 for e4m3
++I8_MAX, I8_MIN = 127.0, -128.0
++EPS = 1e-10
++
++
++# --------------------------------------------------------------------------- #
++# Pure-torch references (match the kernel's expression order).
++# --------------------------------------------------------------------------- #
++def _group_amax(x: torch.Tensor, gs: int) -> torch.Tensor:
++    """Per-group absmax over the last dim, floored at EPS. Returns [..., ng]."""
++    xf = x.float().unflatten(-1, (-1, gs))
++    return xf.abs().amax(-1).clamp_min(EPS)
++
++
++def _quantize(x: torch.Tensor, gs: int, quant_scale: torch.Tensor, out_dtype, lo, hi):
++    xf = x.float().unflatten(-1, (-1, gs))
++    q = (xf * quant_scale.unsqueeze(-1)).clamp(lo, hi).to(out_dtype)
++    return q.flatten(-2)
++
++
++def ref_fp8_fp32_scale(x, gs):
++    """fp8 codes + fp32 stored scale (scale = amax / FMAX, a single multiply)."""
++    amax = _group_amax(x, gs)
++    scale_inv = amax * (1.0 / FMAX)
++    q = _quantize(x, gs, FMAX / amax, fp8_dtype, -FMAX, FMAX)
++    return q, scale_inv
++
++
++def ref_int8(x, gs):
++    amax = _group_amax(x, gs)
++    scale_inv = amax * (1.0 / I8_MAX)
++    q = _quantize(x, gs, I8_MAX / amax, torch.int8, I8_MIN, I8_MAX)
++    return q, scale_inv
++
++
++def ref_fp8_ue8m0(x, gs):
++    """fp8 codes + UE8M0 exponent bytes [..., ng]. The multiplier 2^-e is exact
++    in fp32, so codes are bit-reproducible (unlike the fp32-scale path)."""
++    amax = _group_amax(x, gs)
++    raw = (amax / FMAX).contiguous()
++    bits = raw.view(torch.int32)
++    exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(
++        torch.int32
++    )  # ceil to ue8m0
++    quant_scale = ((127 + 127 - exp) << 23).view(torch.float32)  # 2^(127 - (exp-127))
++    q = _quantize(x, gs, quant_scale, fp8_dtype, -FMAX, FMAX)
++    return q, exp.to(torch.uint8)
++
++
++def _decode_packed_exp(s_int32: torch.Tensor, ng: int) -> torch.Tensor:
++    """Decode an int32 packed-UE8M0 scale (logical [..., ceil(ng/4)]) to the
++    [..., ng] exponent grid, independent of the physical (row/col-major) layout:
++    exponent[..., g] = byte (g % 4) of int32[..., g // 4]."""
++    g = torch.arange(ng, device=s_int32.device)
++    col = s_int32.index_select(-1, g // 4)
++    return ((col >> (8 * (g % 4))) & 0xFF).to(torch.uint8)
++
++
++def _dequant_rel_err(q, scale_inv, x, gs) -> float:
++    deq = (q.float().unflatten(-1, (-1, gs)) * scale_inv.unsqueeze(-1)).flatten(-2)
++    return ((x.float() - deq).abs() / (x.float().abs() + 1e-6)).mean().item()
++
++
++def _packed_exp_to_dequant_scale(x_s, ng) -> torch.Tensor:
++    """Decode a packed-UE8M0 scale buffer to the fp32 dequant scale 2^(e-127)."""
++    exp = _decode_packed_exp(x_s, ng).to(torch.int32)
++    return torch.exp2(exp.float() - 127.0)
++
++
++def _alloc_scale(x_shape, *, column_major, scale_ue8m0):
++    s = create_per_token_group_quant_fp8_output_scale(
++        x_shape=x_shape,
++        device="cuda",
++        group_size=G,
++        column_major_scales=column_major,
++        scale_tma_aligned=column_major,
++        scale_ue8m0=scale_ue8m0,
++    )
++    s.zero_()
++    return s
++
++
++# --------------------------------------------------------------------------- #
++# UE8M0 paths: bit-exact vs the torch reference.
++# --------------------------------------------------------------------------- #
++# hidden 768 (Qwen3-30B-A3B moe_intermediate: 6 groups) exercises the non-4
++# aligned col-packed tail; 128 is a single group.
++UE8M0_CASES = get_ci_test_range(
++    list(
++        itertools.product(
++            [torch.bfloat16, torch.float16],
++            [1, 7, 38, 333],
++            [128, 768, 2048, 7168],
++        )
++    ),
++    [
++        (torch.bfloat16, 1, 128),
++        (torch.bfloat16, 38, 768),
++        (torch.bfloat16, 333, 7168),
++        (torch.float16, 7, 2048),
++    ],
++)
++
++
++@pytest.mark.parametrize("dtype,num_tokens,hidden", UE8M0_CASES)
++def test_ue8m0_bitexact(dtype, num_tokens, hidden):
++    """Col-major packed UE8M0: fp8 codes and decoded exponent bytes are
++    bit-exact with the torch reference (exact pow-2 multiplier). Covers the
++    aligned and non-4-aligned (hidden=768) pack-tail layouts."""
++    torch.manual_seed(hidden * 10 + num_tokens)
++    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
++    q_ref, exp_ref = ref_fp8_ue8m0(x, G)
++
++    x_q = torch.zeros_like(x, dtype=fp8_dtype)
++    x_s = _alloc_scale((num_tokens, hidden), column_major=True, scale_ue8m0=True)
++    per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
++    torch.cuda.synchronize()
++
++    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
++    exp = _decode_packed_exp(x_s, hidden // G)
++    assert torch.equal(exp, exp_ref), "exponent bytes differ"
++
++
++@pytest.mark.parametrize("group_size", get_ci_test_range([16, 32, 64, 128], [16, 64]))
++def test_ue8m0_group_sizes(group_size):
++    """Group size is a template axis (v2 dispatched a runtime switch). Each size
++    maps a group onto a different subwarp lane count; codes/exponents must stay
++    bit-exact -- a wrong lane span would fold the wrong elements into absmax."""
++    torch.manual_seed(group_size)
++    num_tokens, hidden = 9, 4096
++    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
++    q_ref, exp_ref = ref_fp8_ue8m0(x, group_size)
++
++    x_q = torch.zeros_like(x, dtype=fp8_dtype)
++    x_s = create_per_token_group_quant_fp8_output_scale(
++        x_shape=(num_tokens, hidden),
++        device="cuda",
++        group_size=group_size,
++        column_major_scales=True,
++        scale_tma_aligned=True,
++        scale_ue8m0=True,
++    )
++    x_s.zero_()
++    per_token_group_quant(x, x_q, x_s, group_size, scale_ue8m0=True)
++    torch.cuda.synchronize()
++
++    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
++    exp = _decode_packed_exp(x_s, hidden // group_size)
++    assert torch.equal(exp, exp_ref), "exponent bytes differ"
++
++
++# hidden 4096 -> 32 groups (aligned); 768 -> 6 groups (6 % 4 = 2, unaligned:
++# the last int32 holds 2 real exponent bytes + 2 zero-padded tail bytes).
++@pytest.mark.parametrize("hidden", [4096, 768])
++def test_ue8m0_row_packed_bitexact(hidden):
++    """Row-major packed UE8M0 (int32 [T, ceil(G/4)] contiguous, the minimax
++    layout): bit-exact vs the torch reference. The unaligned hidden exercises
++    the row-major pack-tail zeroing (fill_unaligned)."""
++    torch.manual_seed(hidden)
++    num_tokens = 17
++    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
++    q_ref, exp_ref = ref_fp8_ue8m0(x, G)
++
++    x_q = torch.zeros_like(x, dtype=fp8_dtype)
++    x_s = torch.zeros(
++        num_tokens, (hidden // G + 3) // 4, device="cuda", dtype=torch.int32
++    )
++    per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
++    torch.cuda.synchronize()
++
++    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
++    exp = _decode_packed_exp(x_s, hidden // G)
++    assert torch.equal(exp, exp_ref), "exponent bytes differ"
++    # unaligned tail bytes of the last int32 must be zero-padded, not garbage.
++    ng = hidden // G
++    if ng % 4:
++        last_bytes = x_s[:, -1].contiguous().view(torch.uint8).view(num_tokens, 4)
++        assert torch.all(last_bytes[:, ng % 4 :] == 0), "pack-tail bytes not zeroed"
++
++
++# --------------------------------------------------------------------------- #
++# fp32 / int8 scale paths: exact stored scale + dequant round-trip (the codes
++# are not bit-reproducible under fast-math division).
++# --------------------------------------------------------------------------- #
++@pytest.mark.parametrize("hidden", [4096, 768])
++@pytest.mark.parametrize("column_major", [False, True])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_fp32_scale(dtype, column_major, hidden):
++    """fp32 scale (row-major contiguous / col-major TMA view): the stored scale
++    is amax/FMAX (a single multiply, bit-exact) and dequant round-trips within
++    fp8 error.
++
++    hidden=768 (6 groups, ng % 4 != 0) is a bug regression: the host check
++    used to apply the ue8m0 pack-tail alignment requirement to fp32 scales,
++    which have no packing, and rejected this shape outright."""
++    torch.manual_seed(int(column_major) + 2 * (dtype == torch.float16))
++    num_tokens = 128
++    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
++    _, scale_ref = ref_fp8_fp32_scale(x, G)
++
++    x_q = torch.zeros_like(x, dtype=fp8_dtype)
++    x_s = _alloc_scale(
++        (num_tokens, hidden), column_major=column_major, scale_ue8m0=False
++    )
++    per_token_group_quant(x, x_q, x_s, G)
++    torch.cuda.synchronize()
++
++    torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
++    assert _dequant_rel_err(x_q, x_s, x, G) < 0.05
++
++
++@pytest.mark.parametrize("column_major", [False, True])
++def test_int8_scale(column_major):
++    """int8 output (row-major / col-major fp32 scale): exact stored scale
++    (amax/127) + dequant round-trip. Pins the multiply-by-inverse family (v1
++    divided by the scale and differed by a ULP) without depending on v2."""
++    torch.manual_seed(2 + int(column_major))
++    num_tokens, hidden = 33, 4096
++    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
++    _, scale_ref = ref_int8(x, G)
++
++    x_q = torch.zeros(num_tokens, hidden, device="cuda", dtype=torch.int8)
++    x_s = _alloc_scale(
++        (num_tokens, hidden), column_major=column_major, scale_ue8m0=False
++    )
++    per_token_group_quant(x, x_q, x_s, G)
++    torch.cuda.synchronize()
++
++    torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
++    # int8 group-quant is coarser than fp8 (127 vs 448 levels), so its mean
++    # relative round-trip error on randn data sits a little above the fp8 0.05.
++    assert _dequant_rel_err(x_q, x_s, x, G) < 0.08
++
++
++def test_group_size_256_roundtrip():
++    """Group 256 (32 lanes on H100, 16 on Blackwell) is above v2's old cap of
++    128. Pin the derived property: the fp32 scale equals absmax/FMAX and dequant
++    round-trips. A mis-mapped wide subwarp would fold the wrong elements into
++    the group absmax and move the scale."""
++    torch.manual_seed(256)
++    num_tokens, hidden, gs = 9, 4096, 256
++    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
++    _, scale_ref = ref_fp8_fp32_scale(x, gs)
++
++    x_q = torch.zeros_like(x, dtype=fp8_dtype)
++    x_s = torch.zeros(num_tokens, hidden // gs, device="cuda", dtype=torch.float32)
++    per_token_group_quant(x, x_q, x_s, gs)
++    torch.cuda.synchronize()
++
++    torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
++    assert _dequant_rel_err(x_q, x_s, x, gs) < 0.05
++
++
++# --------------------------------------------------------------------------- #
++# Fused silu+mul.
++# --------------------------------------------------------------------------- #
++def _ref_silu_mul(x, hidden):
++    """silu in fp32, round to the input dtype, multiply in the input dtype --
++    matching the kernel's fused path exactly."""
++    gate, up = x[..., :hidden], x[..., hidden:]
++    return torch.nn.functional.silu(gate.float()).to(x.dtype) * up
++
++
++@pytest.mark.parametrize("column_major", [True, False])
++@pytest.mark.parametrize("scale_ue8m0", [True, False])
++def test_fused_silu(scale_ue8m0, column_major):
++    """fuse_silu_and_mul quantizes ``silu(x[..., :h]) * x[..., h:]`` (SGLang's
++    SiluAndMul: first half is the gated half). Covered across all four scale
++    layouts so the fused [gate | up] input layout is pinned everywhere.
++
++    The kernel's silu uses the fast ``__tanhf`` intrinsic on Blackwell, which
++    is not bit-reproducible from torch's sigmoid-based silu, so this is a
++    property test: dequant the kernel output through its own scale and check it
++    round-trips to the torch activation within fp8 error. (The quant math is
++    pinned bit-exact by the non-fused ue8m0 tests; a wrong gate/up split or
++    offset would move the round-trip well past tolerance.)"""
++    torch.manual_seed(int(scale_ue8m0) * 2 + int(column_major))
++    num_tokens, hidden = 37, 4096
++    x = torch.randn(num_tokens, hidden * 2, device="cuda", dtype=torch.bfloat16)
++    act = _ref_silu_mul(x, hidden)
++
++    x_q = torch.zeros(num_tokens, hidden, device="cuda", dtype=fp8_dtype)
++    if scale_ue8m0 and not column_major:
++        x_s = torch.zeros(
++            num_tokens, hidden // G // 4, device="cuda", dtype=torch.int32
++        )
++    else:
++        x_s = _alloc_scale(
++            (num_tokens, hidden), column_major=column_major, scale_ue8m0=scale_ue8m0
++        )
++    per_token_group_quant(
++        x, x_q, x_s, G, scale_ue8m0=scale_ue8m0, fuse_silu_and_mul=True
++    )
++    torch.cuda.synchronize()
++
++    deq_scale = _packed_exp_to_dequant_scale(x_s, hidden // G) if scale_ue8m0 else x_s
++    assert _dequant_rel_err(x_q, deq_scale, act, G) < 0.05
++
++
++# --------------------------------------------------------------------------- #
++# Masked EP-MoE schedule.
++# --------------------------------------------------------------------------- #
++MASKED_CASES = get_ci_test_range(
++    list(itertools.product([2, 5], [2048, 4096], [128, 384])),
++    [(2, 2048, 128), (5, 4096, 384)],
++)
++
++
++@pytest.mark.parametrize("masked_m_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("expected_m", [None, 4])
++@pytest.mark.parametrize("num_experts,hidden,tokens_pad", MASKED_CASES)
++def test_masked(num_experts, hidden, tokens_pad, expected_m, masked_m_dtype):
++    """Masked EP-MoE schedule (col-packed ue8m0, plain quant -- no silu, so the
++    quant is bit-reproducible): rows < masked_m[e] are bit-exact vs the torch
++    reference; rows >= masked_m[e] stay zero (untouched). Fusion numerics are
++    covered by test_fused_silu; here the schedule is what's under test.
++
++    masked_m is accepted as int32 or int64 (the latter read as its low word),
++    so both dtypes are exercised.
++
++    expected_m=4 shrinks the grid's token axis far below masked_m, so the
++    grid-stride token loop must still cover every valid token -- guards the
++    host-hint-only contract (a wrong hint can never drop tokens)."""
++    torch.manual_seed(num_experts * 1000 + hidden + tokens_pad)
++    x = torch.randn(
++        num_experts, tokens_pad, hidden, device="cuda", dtype=torch.bfloat16
++    )
++    masked_m = torch.randint(
++        0, tokens_pad + 1, (num_experts,), device="cuda", dtype=masked_m_dtype
++    )
++    out_shape = (num_experts, tokens_pad, hidden)
++
++    x_q = torch.zeros(out_shape, device="cuda", dtype=fp8_dtype)
++    x_s = _alloc_scale(out_shape, column_major=True, scale_ue8m0=True)
++    per_token_group_quant(
++        x, x_q, x_s, G, scale_ue8m0=True, masked_m=masked_m, expected_m=expected_m
++    )
++    torch.cuda.synchronize()
++
++    q_ref, exp_ref = ref_fp8_ue8m0(x, G)
++    exp = _decode_packed_exp(x_s, hidden // G)
++    for e in range(num_experts):
++        m = int(masked_m[e])
++        assert torch.equal(
++            x_q[e, :m].view(torch.int8), q_ref[e, :m].view(torch.int8)
++        ), "written codes differ"
++        assert torch.equal(exp[e, :m], exp_ref[e, :m]), "written exponents differ"
++        assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding codes touched"
++
++
++def _as_int32(t: torch.Tensor) -> torch.Tensor:
++    return t.view(torch.int32) if t.dtype == torch.int32 else t
++
++
++# (out_dtype, column_major_scales, scale_ue8m0); ue8m0 implies fp8 output.
++AUTO_ALLOC_CASES = [
++    (torch.float8_e4m3fn, True, True),
++    (torch.float8_e4m3fn, False, True),
++    (torch.float8_e4m3fn, True, False),
++    (torch.float8_e4m3fn, False, False),
++    (torch.int8, True, False),
++    (torch.int8, False, False),
++]
++
++
++def test_masked_fused():
++    """The production EP-MoE path: masked schedule + fuse_silu_and_mul +
++    col-packed ue8m0. silu is not bit-reproducible, so check the written rows
++    round-trip to the torch activation and padding rows stay zero."""
++    torch.manual_seed(7)
++    num_experts, tokens_pad, hidden = 3, 256, 2048
++    x = torch.randn(
++        num_experts, tokens_pad, hidden * 2, device="cuda", dtype=torch.bfloat16
++    )
++    masked_m = torch.randint(
++        0, tokens_pad + 1, (num_experts,), device="cuda", dtype=torch.int32
++    )
++    out_shape = (num_experts, tokens_pad, hidden)
++
++    x_q = torch.zeros(out_shape, device="cuda", dtype=fp8_dtype)
++    x_s = _alloc_scale(out_shape, column_major=True, scale_ue8m0=True)
++    per_token_group_quant(
++        x, x_q, x_s, G, scale_ue8m0=True, fuse_silu_and_mul=True, masked_m=masked_m
++    )
++    torch.cuda.synchronize()
++
++    act = _ref_silu_mul(x, hidden)
++    deq_scale = _packed_exp_to_dequant_scale(x_s, hidden // G)
++    for e in range(num_experts):
++        m = int(masked_m[e])
++        if m > 0:
++            assert _dequant_rel_err(x_q[e, :m], deq_scale[e, :m], act[e, :m], G) < 0.05
++        assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
++
++
++@pytest.mark.parametrize("out_dtype,column_major_scales,scale_ue8m0", AUTO_ALLOC_CASES)
++def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
++    """Omitting output_q/output_s allocates them per out_dtype / major mode /
++    scale format and returns (q, s). The auto-allocated run must be bit-
++    identical to quantizing into caller-supplied buffers of the same layout --
++    guards that _allocate_outputs picks the layout the kernel decodes."""
++    torch.manual_seed(int(column_major_scales) * 2 + int(scale_ue8m0))
++    num_tokens, hidden = 38, 2048  # 16 groups, %4 == 0 for row-packed ue8m0
++    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
++
++    q_buf = torch.zeros(num_tokens, hidden, device="cuda", dtype=out_dtype)
++    if scale_ue8m0 and not column_major_scales:
++        s_buf = torch.zeros(
++            num_tokens, hidden // G // 4, device="cuda", dtype=torch.int32
++        )
++    else:
++        s_buf = _alloc_scale(
++            (num_tokens, hidden),
++            column_major=column_major_scales,
++            scale_ue8m0=scale_ue8m0,
++        )
++    per_token_group_quant(x, q_buf, s_buf, G, scale_ue8m0=scale_ue8m0)
++
++    q_auto, s_auto = per_token_group_quant(
++        x,
++        group_size=G,
++        scale_ue8m0=scale_ue8m0,
++        column_major_scales=column_major_scales,
++        out_dtype=out_dtype,
++    )
++    torch.cuda.synchronize()
++
++    assert q_auto.dtype == out_dtype and q_auto.shape == x.shape
++    assert s_auto.dtype == s_buf.dtype and s_auto.shape == s_buf.shape
++    assert torch.equal(q_auto.view(torch.int8), q_buf.view(torch.int8)), "codes differ"
++    assert torch.equal(_as_int32(s_auto), _as_int32(s_buf)), "scales differ"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v", "-s"]))
+diff --git a/test/registered/jit/test_per_token_group_quant_8bit.py b/test/registered/jit/test_per_token_group_quant_8bit.py
+deleted file mode 100644
+index 41b5d7dc576b..000000000000
+--- a/test/registered/jit/test_per_token_group_quant_8bit.py
++++ /dev/null
+@@ -1,334 +0,0 @@
+-import itertools
+-import sys
+-
+-import pytest
+-import torch
+-
+-from sglang.jit_kernel.per_token_group_quant_8bit import (
+-    per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
+-)
+-from sglang.jit_kernel.utils import get_ci_test_range
+-from sglang.srt.utils import is_hip
+-from sglang.test.ci.ci_register import register_cuda_ci
+-
+-register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+-# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
+-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+-
+-if not torch.cuda.is_available():
+-    pytest.skip("CUDA required", allow_module_level=True)
+-
+-from sgl_kernel import (  # noqa: E402
+-    sgl_per_token_group_quant_8bit as aot_per_token_group_quant_8bit,
+-)
+-from sgl_kernel.test_utils import (  # noqa: E402
+-    assert_all_close_or_tiny_diff,
+-    create_per_token_group_quant_test_data,
+-)
+-
+-from sglang.jit_kernel.per_token_group_quant_8bit import (  # noqa: E402
+-    per_token_group_quant_8bit as jit_per_token_group_quant_8bit,
+-)
+-from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
+-    create_per_token_group_quant_fp8_output_scale,
+-)
+-from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
+-    per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
+-)
+-
+-_is_hip = is_hip()
+-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+-
+-BASE_FLAGS = [
+-    dict(
+-        column_major_scales=False,
+-        scale_tma_aligned=False,
+-        scale_ue8m0=False,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=False,
+-        scale_ue8m0=False,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=False,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=False,
+-        masked_layout_mode=None,
+-    ),
+-]
+-FUSED_FLAGS = [
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=True,
+-        masked_layout_mode=None,
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=True,
+-        masked_layout_mode="balanced",
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=True,
+-        masked_layout_mode="imbalanced",
+-    ),
+-    dict(
+-        column_major_scales=True,
+-        scale_tma_aligned=True,
+-        scale_ue8m0=True,
+-        fuse_silu_and_mul=True,
+-        masked_layout_mode="extreme",
+-    ),
+-]
+-
+-configs = get_ci_test_range(
+-    list(
+-        itertools.product(
+-            [1, 4, 16, 17, 38, 51, 64, 127, 128, 512, 1024, 4096, 8192],
+-            [128, 256, 384, 512, 768, 1024, 1536, 1664, 2048, 4096, 7168, 16384],
+-            [16, 32, 64, 128],
+-            [None],
+-            [fp8_type_],
+-            BASE_FLAGS,
+-        )
+-    )
+-    + list(
+-        itertools.product(
+-            [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+-            [2048],
+-            [128],
+-            [8, 16, 32, 48],
+-            [fp8_type_],
+-            FUSED_FLAGS,
+-        )
+-    ),
+-    [
+-        (1, 128, 128, None, fp8_type_, BASE_FLAGS[0]),
+-        (17, 1536, 128, None, fp8_type_, BASE_FLAGS[2]),
+-        (38, 4096, 128, None, fp8_type_, BASE_FLAGS[2]),
+-        (51, 4096, 128, None, fp8_type_, BASE_FLAGS[2]),
+-        (512, 2048, 128, 8, fp8_type_, FUSED_FLAGS[0]),
+-        (2048, 2048, 128, 16, fp8_type_, FUSED_FLAGS[1]),
+-    ],
+-)
+-
+-
+-@pytest.mark.parametrize(
+-    "num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags", configs
+-)
+-def test_per_token_group_quant_with_column_major(
+-    num_tokens,
+-    hidden_dim,
+-    group_size,
+-    num_ranks,
+-    dst_dtype,
+-    flags,
+-):
+-    arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+-    if flags["scale_ue8m0"] and (arch_major <= 9):
+-        pytest.skip("Only Blackwell need ue8m0 fusion")
+-        return
+-
+-    if (flags["scale_ue8m0"] and (group_size != 128)) or (
+-        (dst_dtype == torch.int8) and flags["column_major_scales"]
+-    ):
+-        pytest.skip()
+-        return
+-
+-    x, masked_m = create_per_token_group_quant_test_data(
+-        num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
+-    )
+-
+-    execute_kwargs = dict(
+-        x=x,
+-        masked_m=masked_m,
+-        group_size=group_size,
+-        eps=1e-10,
+-        dst_dtype=dst_dtype,
+-        **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
+-    )
+-
+-    def _postprocess(x_q, x_s):
+-        if masked_m is not None:
+-            print(f"Mask tokens after {masked_m} to be zero")
+-            for i in range(len(masked_m)):
+-                x_q[i, masked_m[i] :, :] = 0
+-                x_s[i, masked_m[i] :, :] = 0
+-        return x_q, x_s
+-
+-    x_q_triton, x_s_triton = _postprocess(
+-        *triton_per_token_group_quant_8bit(**execute_kwargs)
+-    )
+-
+-    fuse_silu_and_mul = False
+-    out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
+-
+-    fp8_dtype = torch.float8_e4m3fn
+-    fp8_max = torch.finfo(fp8_dtype).max
+-    fp8_min = -fp8_max
+-    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
+-    x_s = create_per_token_group_quant_fp8_output_scale(
+-        x_shape=out_shape,
+-        device=x.device,
+-        group_size=group_size,
+-        column_major_scales=False,
+-        scale_tma_aligned=False,
+-        scale_ue8m0=False,
+-    )
+-
+-    execute_kwargs = dict(
+-        input=x,
+-        output_q=x_q,
+-        output_s=x_s,
+-        group_size=group_size,
+-        eps=1e-10,
+-        fp8_max=fp8_max,
+-        fp8_min=fp8_min,
+-    )
+-    x_q_sglang, x_s_sglang = _postprocess(
+-        *sglang_per_token_group_quant_8bit(**execute_kwargs)
+-    )
+-
+-    try:
+-        assert_all_close_or_tiny_diff(x_q_triton, x_q_sglang)
+-        torch.testing.assert_close(
+-            x_s_triton.contiguous(),
+-            x_s_sglang.contiguous(),
+-            rtol=1e-3,
+-            atol=1e-5,
+-            msg=lambda message: message + f" {x_s_triton=} {x_s_sglang=}",
+-        )
+-    except AssertionError:
+-        print(
+-            f"{x.shape=} {x_q_triton.shape=} {x_s_triton.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}"
+-        )
+-        print(f"{x=}")
+-        print(f"{masked_m=}")
+-        print(f"{x_q_triton=}")
+-        print(f"{x_s_triton=}")
+-        print(f"{x_q_sglang=}")
+-        print(f"{x_s_sglang=}")
+-
+-        raise
+-
+-
+-LAYOUTS = [
+-    (False, False, False),
+-    (True, False, False),
+-    (True, True, False),
+-    (True, True, True),
+-]
+-
+-CONFIGS = list(
+-    itertools.product(
+-        [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],
+-        [512, 1536, 2048, 4096, 6144, 7168, 16384],
+-        [16, 32, 64, 128],
+-        LAYOUTS,
+-        [fp8_type_],
+-    )
+-)
+-
+-
+-@pytest.mark.parametrize(
+-    "num_tokens, hidden_dim, group_size, layout, dst_dtype", CONFIGS
+-)
+-def test_jit_matches_aot_v2_byte_identical(
+-    num_tokens, hidden_dim, group_size, layout, dst_dtype
+-):
+-    column_major_scales, scale_tma_aligned, scale_ue8m0 = layout
+-
+-    arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+-    if scale_ue8m0 and arch_major <= 9:
+-        pytest.skip("UE8M0 fusion is Blackwell-only")
+-    if hidden_dim % group_size != 0:
+-        pytest.skip("hidden_dim must be divisible by group_size")
+-
+-    torch.manual_seed(num_tokens * 131 + hidden_dim + group_size)
+-    x = (torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)) * 3.0
+-
+-    fp8_max = torch.finfo(dst_dtype).max
+-    fp8_min = -fp8_max
+-
+-    def _alloc():
+-        q = torch.empty_like(x, dtype=dst_dtype)
+-        s = create_per_token_group_quant_fp8_output_scale(
+-            x_shape=x.shape,
+-            device=x.device,
+-            group_size=group_size,
+-            column_major_scales=column_major_scales,
+-            scale_tma_aligned=scale_tma_aligned,
+-            scale_ue8m0=scale_ue8m0,
+-        )
+-        return q, s
+-
+-    q_aot, s_aot = _alloc()
+-    aot_per_token_group_quant_8bit(
+-        x,
+-        q_aot,
+-        s_aot,
+-        group_size,
+-        1e-10,
+-        fp8_min,
+-        fp8_max,
+-        scale_ue8m0,
+-        False,
+-        None,
+-        enable_v2=True,
+-    )
+-
+-    q_jit, s_jit = _alloc()
+-    jit_per_token_group_quant_8bit(
+-        x, q_jit, s_jit, group_size, 1e-10, fp8_min, fp8_max, scale_ue8m0=scale_ue8m0
+-    )
+-
+-    # AOT v2 uses -use_fast_math reciprocal; this JIT uses precise division, so an
+-    # exact fp8 midpoint can round to an adjacent code (1-ULP, JIT more accurate).
+-    qj = q_jit.view(torch.uint8)
+-    qa = q_aot.view(torch.uint8)
+-    if not torch.equal(qj, qa):
+-        mism = qj != qa
+-        bj = qj[mism].to(torch.int16)
+-        ba = qa[mism].to(torch.int16)
+-        same_sign = (bj & 0x80) == (ba & 0x80)
+-        one_ulp = (bj - ba).abs() == 1
+-        assert bool(
+-            (same_sign & one_ulp).all()
+-        ), f"q mismatch > 1 fp8 ULP {num_tokens=} {hidden_dim=} {group_size=} {layout=}"
+-        assert mism.float().mean() < 0.01, (
+-            f"too many fp8 ties ({int(mism.sum())}/{mism.numel()}) "
+-            f"{num_tokens=} {hidden_dim=} {group_size=} {layout=}"
+-        )
+-
+-    if scale_ue8m0:
+-        assert torch.equal(
+-            s_jit[:num_tokens].reshape(num_tokens, -1).view(torch.int32),
+-            s_aot[:num_tokens].reshape(num_tokens, -1).view(torch.int32),
+-        ), f"ue8m0 scale mismatch {num_tokens=} {hidden_dim=} {group_size=}"
+-    else:
+-        assert torch.equal(
+-            s_jit[:num_tokens].float(), s_aot[:num_tokens].float()
+-        ), f"float scale mismatch {num_tokens=} {hidden_dim=} {group_size=}"
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+diff --git a/test/registered/jit/test_per_token_group_quant_8bit_v2.py b/test/registered/jit/test_per_token_group_quant_8bit_v2.py
+index e87adeb7eedb..075dcec0cdef 100644
+--- a/test/registered/jit/test_per_token_group_quant_8bit_v2.py
++++ b/test/registered/jit/test_per_token_group_quant_8bit_v2.py
+@@ -26,7 +26,6 @@
+     fp8_dtype,
+     fp8_max,
+     fp8_min,
+-    sglang_per_token_group_quant_fp8,
+ )
+ 
+ G = 128
+@@ -115,44 +114,17 @@ def test_v2_jit_matches_aot(dtype, num_tokens, hidden, fuse_silu_and_mul, scale_
+     assert torch.equal(x_s, s_ref), "scales differ"
+ 
+ 
+-ROW_MAJOR_UE8M0_CASES = get_ci_test_range(
+-    list(
+-        itertools.product(
+-            [torch.bfloat16, torch.float16], [1, 33, 128], [128, 512, 4096, 7168]
+-        )
+-    ),
+-    [
+-        (torch.bfloat16, 1, 128),
+-        (torch.bfloat16, 17, 1536),
+-        (torch.bfloat16, 33, 7168),
+-        (torch.bfloat16, 38, 4096),
+-        (torch.float16, 128, 4096),
+-    ],
+-)
+-
+-
+-@pytest.mark.parametrize("dtype,num_tokens,hidden", ROW_MAJOR_UE8M0_CASES)
+-def test_sglang_per_token_group_quant_fp8_row_major_ue8m0(dtype, num_tokens, hidden):
+-    """Row-major scale_ue8m0=True quantizes WITH the rounded (power-of-2) scale.
+-    Verify: (1) scales are exact powers of 2, (2) dequant ≈ original within FP8 tolerance.
+-    """
+-    torch.manual_seed(num_tokens * 1000 + hidden)
+-    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
+-
+-    x_q, x_s = sglang_per_token_group_quant_fp8(x, G, scale_ue8m0=True)
+-    torch.cuda.synchronize()
+-
+-    # Scales must be exact powers of 2
+-    log2_s = torch.log2(x_s.abs())
+-    assert torch.equal(log2_s, log2_s.round()), "scales are not power-of-2"
+-
+-    # Dequant should approximate original within FP8 precision
+-    x_deq = x_q.float().view(num_tokens, -1, G) * x_s.unsqueeze(-1)
+-    x_deq = x_deq.view(num_tokens, hidden)
+-    rel_err = (x.float() - x_deq).abs() / (x.float().abs() + 1e-6)
+-    assert (
+-        rel_err.mean() < 0.05
+-    ), f"mean relative dequant error too large: {rel_err.mean():.4f}"
++# NOTE: "row-major + scale_ue8m0=True" names two different formats:
++#   1. packed int32 [T, ceil(G/4)] (4 exponent bytes per int32) -- supported by
++#      the JIT per_token_group_quant kernel and pinned bit-exact in test_per_token_group_quant
++#      (test_v3_ue8m0_row_packed_bitexact);
++#   2. fp32 [T, G] storing power-of-two VALUES (the deep_gemm.fp8_einsum
++#      format) -- v2-only. No srt caller requests it (production ties
++#      scale_ue8m0 and column_major_scales to the same DEEPGEMM_SCALE_UE8M0
++#      flag), so the srt entry `sglang_per_token_group_quant_fp8`, which now
++#      routes to the JIT kernel, rejects it loudly instead of allocating an fp32
++#      buffer the kernel cannot fill. The v2 JIT kernel itself still implements it and is
++#      covered by test_v2_jit_matches_aot above.
+ 
+ 
+ # Masked (EP-MoE) path: the v2 op only has a masked scheduler for the

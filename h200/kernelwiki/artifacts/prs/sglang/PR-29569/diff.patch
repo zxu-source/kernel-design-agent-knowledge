@@ -1,0 +1,255 @@
+diff --git a/python/sglang/srt/arg_groups/deepseek_v4_hook.py b/python/sglang/srt/arg_groups/deepseek_v4_hook.py
+index 0ede772fbc3e..8908b9bb2672 100644
+--- a/python/sglang/srt/arg_groups/deepseek_v4_hook.py
++++ b/python/sglang/srt/arg_groups/deepseek_v4_hook.py
+@@ -11,6 +11,98 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def validate_deepseek_v4_mega_moe_token_budget(
++    server_args: ServerArgs,
++) -> None:
++    """Ensure the DSV4 prefill budget fits MegaMoE's per-rank buffer."""
++    mega_moe_enabled = (
++        server_args.moe_a2a_backend == "megamoe"
++        or envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
++    )
++    if not mega_moe_enabled or server_args.disaggregation_mode == "decode":
++        # decode node will skip the check because decode bs is not relevant with --chunk-prefill-size
++        return
++
++    if server_args.pp_size > 1 and server_args.enable_dynamic_chunking:
++        return
++
++    if (
++        server_args.chunked_prefill_size is None
++        or server_args.chunked_prefill_size <= 0
++    ):
++        raise ValueError(
++            "DeepSeekV4 with MegaMoE requires chunked prefill to be enabled. "
++            "Set --chunked-prefill-size to a positive value; "
++            "--chunked-prefill-size=-1 is unsafe because MegaMoE's per-rank "
++            "token requirement would not have a strict prefill-forward bound."
++        )
++
++    if server_args.enable_prefill_cp:
++        token_partition_size = server_args.attn_cp_size
++        token_partition_name = "attn_cp_size"
++        token_alignment = 1
++        local_chunked_prefill_size = (
++            server_args.chunked_prefill_size + token_partition_size - 1
++        ) // token_partition_size
++    elif server_args.enable_dp_attention:
++        token_partition_size = server_args.dp_size
++        token_partition_name = "dp_size"
++        token_alignment = max(
++            server_args.tp_size // server_args.dp_size // server_args.attn_cp_size,
++            1,
++        )
++        local_chunked_prefill_size = (
++            server_args.chunked_prefill_size // token_partition_size
++        )
++    else:
++        # Pure TP and PP with static chunking are handled here.
++        token_partition_size = 1
++        token_partition_name = "none"
++        # global_num_tokens will ceil_align to attn_tp_size so the validation needs to do alignment as well
++        token_alignment = max(
++            server_args.tp_size // token_partition_size // server_args.attn_cp_size,
++            1,
++        )
++        local_chunked_prefill_size = server_args.chunked_prefill_size
++
++    if local_chunked_prefill_size <= 0:
++        raise ValueError(
++            "DeepSeekV4 with MegaMoE requires a positive effective per-rank "
++            "chunked prefill size. "
++            f"Current values: chunked_prefill_size="
++            f"{server_args.chunked_prefill_size}, "
++            f"token_partition={token_partition_name}, "
++            f"token_partition_size={token_partition_size}."
++        )
++
++    required_tokens_per_rank = (
++        (local_chunked_prefill_size + token_alignment - 1)
++        // token_alignment
++        * token_alignment
++    )
++    max_tokens_per_rank = (
++        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
++    )
++    if max_tokens_per_rank < required_tokens_per_rank:
++        raise ValueError(
++            "DeepSeekV4 with MegaMoE requires "
++            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to "
++            "cover each rank's effective prefill token budget. "
++            f"Current values: chunked_prefill_size="
++            f"{server_args.chunked_prefill_size}, "
++            f"token_partition={token_partition_name}, "
++            f"token_partition_size={token_partition_size}, "
++            f"token_alignment={token_alignment}, "
++            f"required_per_rank={required_tokens_per_rank}, "
++            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
++            f"{max_tokens_per_rank}. Set "
++            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at "
++            f"least {required_tokens_per_rank}, or lower "
++            "--chunked-prefill-size until the effective per-rank budget fits. "
++            "Otherwise MegaMoE falls back to the fused MoE path at runtime."
++        )
++
++
+ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
+     """Residual imperative arm of the DeepSeek V4 defaults.
+ 
+@@ -85,6 +177,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
+     assert (
+         server_args.tp_size <= 8
+     ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
++    if server_args.moe_a2a_backend not in ("none", "deepep", "megamoe"):
++        raise ValueError(
++            "DeepSeekV4 CP supports moe_a2a_backend in "
++            "('none', 'deepep', 'megamoe'), "
++            f"got {server_args.moe_a2a_backend!r}."
++        )
+     logger.warning(
+         "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+         "context parallelism is enabled."
+diff --git a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/moe/mega_moe.py
+index d0876d1b881a..7bbe4ae49755 100644
+--- a/python/sglang/srt/layers/moe/mega_moe.py
++++ b/python/sglang/srt/layers/moe/mega_moe.py
+@@ -24,6 +24,7 @@
+ from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
+ from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
++from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+ from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+ from sglang.srt.model_executor.runner import get_is_capture_mode
+@@ -103,7 +104,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
+         return True
+ 
+     global_num_tokens = get_dp_global_num_tokens()
+-    if global_num_tokens:
++    if global_num_tokens and not is_dsa_enable_prefill_cp():
+         max_tokens_per_rank = max(global_num_tokens)
+     else:
+         max_tokens_per_rank = hidden_states.shape[0]
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index e3c11aae396f..a90826116bdd 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -1748,12 +1748,14 @@ def _run_moe_ffn_dp_sync(
+             and getattr(self.mlp, "_shared_expert_tp1", False)
+         )
+         if _use_cp:
+-            if get_moe_a2a_backend().is_none():
++            moe_a2a_backend = get_moe_a2a_backend()
++            if moe_a2a_backend.is_none():
+                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+             else:
+-                assert get_moe_a2a_backend().is_deepep(), (
+-                    "CP requires DeepEP (moe_a2a_backend == deepep). "
+-                    "Only DeepEP is tested with CP's per-rank token split."
++                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
++                    "CP requires DeepEP or megaMoE "
++                    "(moe_a2a_backend == deepep or megamoe). "
++                    f"Got {moe_a2a_backend.value}."
+                 )
+         elif _use_tp_moe_gather:
+             hidden_states, local_hidden_states = (
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 1d24447629c9..7d3f00fac786 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -4934,9 +4934,13 @@ def _handle_model_specific_adjustments(self):
+         elif model_arch in [
+             "DeepseekV4ForCausalLM",
+         ]:
+-            from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
++            from sglang.srt.arg_groups.deepseek_v4_hook import (
++                validate_deepseek_v4_cp,
++                validate_deepseek_v4_mega_moe_token_budget,
++            )
+ 
+             validate_deepseek_v4_cp(self)
++            validate_deepseek_v4_mega_moe_token_budget(self)
+ 
+             # The SM120 marlin fallback moved to the resolution pipeline
+             # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
+diff --git a/test/registered/cp/test_deepseek_v4_flash_fp4_b200_cp.py b/test/registered/cp/test_deepseek_v4_flash_fp4_b200_cp.py
+index 6f79cdb4b80a..cfac77f383fd 100644
+--- a/test/registered/cp/test_deepseek_v4_flash_fp4_b200_cp.py
++++ b/test/registered/cp/test_deepseek_v4_flash_fp4_b200_cp.py
+@@ -37,8 +37,14 @@
+     "SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH": "1",
+ }
+ 
++_MEGAMOE_ENV = {
++    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
++    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
++    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
++}
++
+ 
+-class TestDSV4FlashFP4B200Balanced_CP(
++class TestDSV4FlashFP4B200Balanced_CP_DeepEP(
+     SpecDecodingMixin,
+     BasicDecodeCorrectnessMixin,
+     GSM8KMixin,
+@@ -92,6 +98,55 @@ def tearDownClass(cls):
+             kill_process_tree(cls.process.pid)
+ 
+ 
++class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
++    BasicDecodeCorrectnessMixin,
++    GSM8KMixin,
++    CustomTestCase,
++):
++    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
++
++    gsm8k_accuracy_thres = 0.93
++
++    @classmethod
++    def setUpClass(cls):
++        cls.model = try_cached_model(MODEL)
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=SERVER_LAUNCH_TIMEOUT,
++            other_args=[
++                "--trust-remote-code",
++                "--tp",
++                "4",
++                "--attn-cp-size",
++                "4",
++                "--enable-dp-attention",
++                "--moe-a2a-backend",
++                "megamoe",
++                "--speculative-algorithm",
++                "EAGLE",
++                "--speculative-num-steps",
++                "1",
++                "--speculative-eagle-topk",
++                "1",
++                "--speculative-num-draft-tokens",
++                "2",
++                "--enable-dsa-prefill-context-parallel",
++                "--dsa-prefill-cp-mode",
++                "round-robin-split",
++                "--deepep-config",
++                DEEPEP_CONFIG,
++            ],
++            env=_MEGAMOE_ENV,
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        if hasattr(cls, "process") and cls.process:
++            kill_process_tree(cls.process.pid)
++
++
+ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
+     SpecDecodingMixin,
+     BasicDecodeCorrectnessMixin,

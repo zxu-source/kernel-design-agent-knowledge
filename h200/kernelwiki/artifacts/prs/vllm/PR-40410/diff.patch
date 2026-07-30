@@ -1,0 +1,335 @@
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index d918131c68d4..6bd404985dcd 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -3,7 +3,7 @@
+ from collections import defaultdict
+ from collections.abc import Callable
+ from dataclasses import dataclass
+-from typing import Any
++from typing import Any, NamedTuple
+ 
+ import torch
+ import torch.nn as nn
+@@ -32,6 +32,11 @@
+ logger = init_logger(__name__)
+ 
+ 
++class CapturedAttentionState(NamedTuple):
++    attn_metadata: dict[str, Any]
++    slot_mappings: dict[str, torch.Tensor]
++
++
+ @dataclass(frozen=True)
+ class BatchExecutionDescriptor:
+     """Describes the shape of the batch and CG mode to run; this is used to make shape
+@@ -177,16 +182,20 @@ def needs_capture(self) -> bool:
+     def capture(
+         self,
+         create_forward_fn: Callable[
+-            [BatchExecutionDescriptor], Callable[[CUDAGraphMode], None]
++            [BatchExecutionDescriptor],
++            tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState],
+         ],
+         progress_bar_desc: str = "Capturing CUDA graphs",
+-    ) -> None:
++    ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
+         """Capture CUDA graphs.
+ 
+         Args:
+             create_forward_fn: Factory that prepares inputs (OUTSIDE graph) and
+-                returns a function that runs forward with a given CUDAGraphMode.
++                returns a tuple of (forward_fn, captured_attn_state).
+         """
++        captured_attn_states: dict[
++            BatchExecutionDescriptor, CapturedAttentionState
++        ] = {}
+         with graph_capture(device=self.device):
+             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
+             # activations so FULL activations should fit in already allocated
+@@ -200,7 +209,8 @@ def capture(
+                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
+                 for desc in descs:
+                     # Prepare inputs and get forward function
+-                    forward_fn = create_forward_fn(desc)
++                    forward_fn, attn_state = create_forward_fn(desc)
++                    captured_attn_states[desc] = attn_state
+ 
+                     # Warmup
+                     forward_fn(CUDAGraphMode.NONE)
+@@ -228,6 +238,7 @@ def capture(
+                             get_offloader().join_after_forward()
+                         self.graphs[desc] = graph
+         self._graphs_captured = True
++        return captured_attn_states
+ 
+     def dispatch(
+         self,
+@@ -289,13 +300,16 @@ def capture(
+         has_lora: bool = False,
+         use_aux_hidden_state_outputs: bool = False,
+         progress_bar_desc: str = "Capturing CUDA graphs",
+-    ) -> None:
++    ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
+         """Capture CUDA graphs for model forward pass."""
+         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+ 
+         def create_forward_fn(
+             desc: BatchExecutionDescriptor,
+-        ) -> Callable[[CUDAGraphMode], None]:
++        ) -> tuple[
++            Callable[[CUDAGraphMode], None],
++            CapturedAttentionState,
++        ]:
+             num_tokens = desc.num_tokens
+             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+             num_tokens_across_dp = (
+@@ -375,9 +389,9 @@ def forward_fn(cg_mode: CUDAGraphMode) -> None:
+                     for k, v in intermediate_tensors.tensors.items():
+                         self.intermediate_tensors[k][:num_tokens] = v
+ 
+-            return forward_fn
++            return forward_fn, CapturedAttentionState(attn_metadata, slot_mappings)
+ 
+-        super().capture(create_forward_fn, progress_bar_desc)
++        return super().capture(create_forward_fn, progress_bar_desc)
+ 
+     def run_fullgraph(
+         self, desc: BatchExecutionDescriptor
+@@ -403,7 +417,7 @@ def prepare_inputs_to_capture(
+     block_tables: BlockTables,
+     attn_groups: list[list[AttentionGroup]],
+     kv_cache_config: KVCacheConfig,
+-) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
++) -> CapturedAttentionState:
+     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+@@ -432,4 +446,4 @@ def prepare_inputs_to_capture(
+         kv_cache_config,
+         for_capture=True,
+     )
+-    return attn_metadata, slot_mappings_by_layer
++    return CapturedAttentionState(attn_metadata, slot_mappings_by_layer)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index a0025d8c795f..9d1439a7ee39 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -580,7 +580,7 @@ def capture_model(self) -> int:
+         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+ 
+         with self.maybe_setup_dummy_loras(self.lora_config):
+-            self.cudagraph_manager.capture(
++            captured_attn_states = self.cudagraph_manager.capture(
+                 self.model,
+                 self.model_state,
+                 self.input_buffers,
+@@ -592,7 +592,7 @@ def capture_model(self) -> int:
+                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+             )
+             if self.speculator is not None:
+-                self.speculator.capture_model()
++                self.speculator.capture(captured_attn_states)
+ 
+         end_time = time.perf_counter()
+         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py
+index 655007109e56..8a29ccb39858 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py
+@@ -10,6 +10,7 @@
+ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+     BatchExecutionDescriptor,
++    CapturedAttentionState,
+     CudaGraphManager,
+     prepare_inputs_to_capture,
+ )
+@@ -18,8 +19,8 @@
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ 
+-class EagleCudaGraphManager(CudaGraphManager):
+-    """CudaGraphManager for Eagle speculative decoding."""
++class EagleCudaGraphManagerBase(CudaGraphManager):
++    """Base CudaGraphManager for Eagle with a dedicated graph pool."""
+ 
+     def __init__(
+         self,
+@@ -37,6 +38,46 @@ def __init__(
+         if cudagraph_mode:
+             self.pool = torch.cuda.graph_pool_handle()
+ 
++
++class PrefillEagleCudaGraphManager(EagleCudaGraphManagerBase):
++    """Eagle CudaGraphManager for prefill, using pre-built attention states
++    from the target model's capture."""
++
++    def capture(
++        self,
++        forward_fn: Callable,
++        full_cg_attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
++        progress_bar_desc: str = "Capturing CUDA graphs",
++    ) -> None:
++        def create_forward_fn(
++            desc: BatchExecutionDescriptor,
++        ) -> tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState]:
++            num_tokens = desc.num_tokens
++            num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
++            num_tokens_across_dp = (
++                torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")
++                if self.dp_size > 1
++                else None
++            )
++            attn_state = full_cg_attn_states[desc]
++            attn_metadata, slot_mappings = attn_state
++            fwd = lambda cg_mode: forward_fn(
++                num_reqs,
++                num_tokens,
++                attn_metadata,
++                slot_mappings,
++                num_tokens_across_dp,
++                cg_mode,
++            )
++            return fwd, attn_state
++
++        super().capture(create_forward_fn, progress_bar_desc)
++
++
++class DecodeEagleCudaGraphManager(EagleCudaGraphManagerBase):
++    """Eagle CudaGraphManager for decode draft generation, building its own
++    attention metadata from scratch."""
++
+     def capture(
+         self,
+         forward_fn: Callable,
+@@ -47,11 +88,9 @@ def capture(
+         kv_cache_config: KVCacheConfig,
+         progress_bar_desc: str = "Capturing CUDA graphs",
+     ) -> None:
+-        """Capture CUDA graphs for Eagle."""
+-
+         def create_forward_fn(
+             desc: BatchExecutionDescriptor,
+-        ) -> Callable[[CUDAGraphMode], None]:
++        ) -> tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState]:
+             num_tokens = desc.num_tokens
+             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+             num_tokens_across_dp = (
+@@ -59,7 +98,7 @@ def create_forward_fn(
+                 if self.dp_size > 1
+                 else None
+             )
+-            attn_metadata, slot_mappings = prepare_inputs_to_capture(
++            attn_state = prepare_inputs_to_capture(
+                 num_reqs,
+                 num_tokens,
+                 model_state,
+@@ -68,8 +107,9 @@ def create_forward_fn(
+                 attn_groups,
+                 kv_cache_config,
+             )
++            attn_metadata, slot_mappings = attn_state
+ 
+-            return lambda cg_mode: forward_fn(
++            fwd = lambda cg_mode: forward_fn(
+                 num_reqs,
+                 num_tokens,
+                 attn_metadata,
+@@ -77,5 +117,6 @@ def create_forward_fn(
+                 num_tokens_across_dp,
+                 cg_mode,
+             )
++            return fwd, attn_state
+ 
+         super().capture(create_forward_fn, progress_bar_desc)
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py b/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
+index b1126983539f..127f95865d80 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
+@@ -20,6 +20,8 @@
+ )
+ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cudagraph_utils import (
++    BatchExecutionDescriptor,
++    CapturedAttentionState,
+     get_uniform_token_count,
+ )
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+@@ -27,7 +29,8 @@
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
+-    EagleCudaGraphManager,
++    DecodeEagleCudaGraphManager,
++    PrefillEagleCudaGraphManager,
+ )
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+ 
+@@ -103,13 +106,13 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):
+                 device=device,
+             )
+ 
+-        self.prefill_cudagraph_manager: EagleCudaGraphManager | None = None
+-        self.decode_cudagraph_manager: EagleCudaGraphManager | None = None
++        self.prefill_cudagraph_manager: PrefillEagleCudaGraphManager | None = None
++        self.decode_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
+ 
+     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+         # Initialize cudagraph manager for draft prefill (draft position 0).
+-        self.prefill_cudagraph_manager = EagleCudaGraphManager(
++        self.prefill_cudagraph_manager = PrefillEagleCudaGraphManager(
+             self.vllm_config,
+             self.device,
+             cudagraph_mode,
+@@ -126,7 +129,7 @@ def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+             cudagraph_mode = CUDAGraphMode.NONE
+ 
+         # Initialize cudagraph manager for draft decodes (draft positions > 0).
+-        self.decode_cudagraph_manager = EagleCudaGraphManager(
++        self.decode_cudagraph_manager = DecodeEagleCudaGraphManager(
+             self.vllm_config,
+             self.device,
+             cudagraph_mode,
+@@ -347,7 +350,10 @@ def _build_draft_attn_metadata(
+         )
+         return attn_metadata
+ 
+-    def capture_model(self) -> None:
++    def capture(
++        self,
++        attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
++    ) -> None:
+         logger.info("Capturing model for Eagle speculator...")
+         # Reset indices to zeros to prevent stale values from prior
+         # dummy runs to cause out-of-bounds indexing during capture.
+@@ -361,11 +367,7 @@ def capture_model(self) -> None:
+         assert self.prefill_cudagraph_manager is not None
+         self.prefill_cudagraph_manager.capture(
+             self.prefill,
+-            self.model_state,
+-            self.input_buffers,
+-            self.block_tables,
+-            self.attn_groups,
+-            self.kv_cache_config,
++            attn_states,
+             progress_bar_desc="Capturing eagle prefill CUDA graphs",
+         )
+ 
+@@ -470,15 +472,6 @@ def propose(
+         )
+ 
+         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
+-            # It is necessary to rebuild the attention metadata when
+-            # replaying the FULL graph so that any attention metadata
+-            # builder state is updated.
+-            self._build_draft_attn_metadata(
+-                num_reqs=num_reqs,
+-                num_reqs_padded=prefill_batch_desc.num_reqs or num_reqs,
+-                num_tokens_padded=prefill_batch_desc.num_tokens,
+-                max_query_len=self.num_speculative_steps + 1,
+-            )
+             # Replay the full graph for draft prefill.
+             assert self.prefill_cudagraph_manager is not None
+             self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)

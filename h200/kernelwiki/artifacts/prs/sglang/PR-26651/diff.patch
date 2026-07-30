@@ -1,0 +1,183 @@
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index 1ec56763478e..d08c15e00709 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -704,12 +704,26 @@ def init_forward_metadata_capture_cuda_graph(
+                 device=self.device,
+             )
+             kv_indptr = self.kv_indptr[: bs + 1]
+-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
++            if forward_mode.is_draft_extend_v2():
++                # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
++                # Triton extend kernel receives extend K/V as separate tensors, so
++                # kv_indptr/kv_indices must cover only the prefix portion.
++                extend_seq_lens = (
++                    spec_info.extend_seq_lens_tensor[:bs].to(torch.int32)
++                    if spec_info is not None
++                    and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
++                    else torch.zeros(bs, dtype=torch.int32, device=self.device)
++                )
++                kv_lens = (seq_lens - extend_seq_lens).to(torch.int32)
++            else:
++                # DRAFT_EXTEND_V1: seq_lens = prefix only.
++                kv_lens = seq_lens
++            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+             kv_indices = self.cuda_graph_kv_indices
+             create_flashinfer_kv_indices_triton[(bs,)](
+                 self.req_to_token,
+                 req_pool_indices,
+-                seq_lens,
++                kv_lens,
+                 kv_indptr,
+                 None,
+                 kv_indices,
+@@ -859,12 +873,31 @@ def init_forward_metadata_replay_cuda_graph(
+                 device=self.device,
+             )
+             kv_indptr = self.kv_indptr[: bs + 1]
+-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
++            if forward_mode.is_draft_extend_v2():
++                # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
++                # Triton extend kernel receives extend K/V as separate tensors, so
++                # kv_indptr/kv_indices must cover only the prefix portion.
++                # Clamp at 0 because padded rows (raw_bs..bs) leave seq_lens at
++                # the fill value (1) while extend_seq_lens stays at num_tokens_per_bs,
++                # which would otherwise produce negative kv_lens; padded rows
++                # reference reserved req-pool slot 0 and their output is discarded.
++                assert (
++                    spec_info is not None
++                    and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
++                ), "DRAFT_EXTEND_V2 replay requires spec_info.extend_seq_lens_tensor"
++                kv_lens = torch.clamp(
++                    seq_lens - spec_info.extend_seq_lens_tensor[:bs].to(torch.int32),
++                    min=0,
++                ).to(torch.int32)
++            else:
++                # DRAFT_EXTEND_V1: seq_lens = prefix only.
++                kv_lens = seq_lens
++            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+             kv_indices = self.cuda_graph_kv_indices
+             create_flashinfer_kv_indices_triton[(bs,)](
+                 self.req_to_token,
+                 req_pool_indices,
+-                seq_lens,
++                kv_lens,
+                 kv_indptr,
+                 None,
+                 kv_indices,
+diff --git a/python/sglang/test/kits/attention_unittest/runner_modes/speculative_draft_extend_runner.py b/python/sglang/test/kits/attention_unittest/runner_modes/speculative_draft_extend_runner.py
+index dc52c9ab7487..050031759bf1 100644
+--- a/python/sglang/test/kits/attention_unittest/runner_modes/speculative_draft_extend_runner.py
++++ b/python/sglang/test/kits/attention_unittest/runner_modes/speculative_draft_extend_runner.py
+@@ -226,10 +226,12 @@ def _make_eagle_draft_extend_v2_input(case, batch, *, device: str):
+ 
+ 
+ def _set_draft_extend_v2_prefix_lens(batch, case, *, device: str):
+-    prefix_lens = torch.tensor(case.prefix_lens, dtype=torch.int32, device=device)
+-    batch.seq_lens = prefix_lens
+-    batch.seq_lens_cpu = torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu")
+-    batch.seq_lens_sum = sum(case.prefix_lens)
++    # Production sets seq_lens = prefix + extend before init_forward_metadata
++    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
++    seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
++    batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
++    batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
++    batch.seq_lens_sum = sum(seq_lens)
+ 
+ 
+ def _prepare_draft_extend_batch(
+@@ -1404,9 +1406,12 @@ def _set_draft_extend_v2_prefix_lens(
+     *,
+     device: str,
+ ) -> None:
+-    batch.seq_lens = torch.tensor(case.prefix_lens, dtype=torch.int32, device=device)
+-    batch.seq_lens_cpu = torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu")
+-    batch.seq_lens_sum = sum(case.prefix_lens)
++    # Production sets seq_lens = prefix + extend before init_forward_metadata
++    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
++    seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
++    batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
++    batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
++    batch.seq_lens_sum = sum(seq_lens)
+ 
+ 
+ def _make_dense_eagle_draft_extend_forward_batch(
+diff --git a/test/registered/attention/unittests/KNOWN_FAILURES.md b/test/registered/attention/unittests/KNOWN_FAILURES.md
+index 64c679d231ab..3e67c9c0af5c 100644
+--- a/test/registered/attention/unittests/KNOWN_FAILURES.md
++++ b/test/registered/attention/unittests/KNOWN_FAILURES.md
+@@ -161,8 +161,6 @@ fixture investigation; no test in the suite).
+ 
+ | Backend | Mode | Status | Root cause |
+ |---|---|---|---|
+-| FA3 | `DRAFT_EXTEND_V2` CUDA-graph replay | `[gated]` `dense/test_fa3.py::test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases` | `init_forward_metadata_replay_cuda_graph` sets `cache_seqlens_int32 = seq_lens` (prefix only); effective KV extent must be `prefix + extend` for DRAFT_EXTEND_V2. Kernel reads prefix-only KV → ~82% wrong values. Fix: `cache_seqlens = seq_lens + extend_seq_lens` in `flashattention_backend.py`. |
+-| FA4 | `DRAFT_EXTEND_V2` CUDA-graph replay | `[gated]` `dense/test_fa4.py::test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases` | Same root cause as FA3 (FA4 inherits the same `init_forward_metadata_replay_cuda_graph` path). |
+ | FlashInfer MLA | EAGLE draft CG, chain | `[gated on SM≥10]` `mla/test_flashinfer.py::test_runner_mode_eagle_draft_cuda_graph_runner_cases` | FlashInfer MLA decode kernel in container targets SM9x; on Blackwell falls back to a generic path that doesn't restore metadata buffers under graph replay (~22 abs-diff vs reference) |
+ | FlashMLA | MLA `DRAFT_EXTEND` CUDA-graph replay | `[no test]` (`mla/README.md` Next Work) | Capture falls through to `FlashInferMLAAttnBackend.init_forward_metadata_capture_cuda_graph` (1D `cuda_graph_kv_indices`); FlashMLA decode uses 2D `[max_bs, (max_context + PAGE_SIZE) // PAGE_SIZE]` layout — buffer mismatch |
+ | GDN / KDA / Lightning / Mamba2 | `DRAFT_EXTEND` and `DRAFT_EXTEND_V2` graph capture | `[no test]` for CG; eager-only paths covered | `HybridLinearAttnBackend` raises `ValueError("Invalid forward mode")` at `hybrid_linear_attn_backend.py:509,572` |
+diff --git a/test/registered/attention/unittests/dense/README.md b/test/registered/attention/unittests/dense/README.md
+index 09d07ef22832..fd50d0f83999 100644
+--- a/test/registered/attention/unittests/dense/README.md
++++ b/test/registered/attention/unittests/dense/README.md
+@@ -17,8 +17,8 @@ Columns are runner modes; rows are attention backends. Cells use:
+ | `torch_native` | ✓ full MHA/GQA/MQA input sweep + decode/extend runner-eager cases | — (no `init_cuda_graph_state` / capture / replay hooks) | — (no CG path) | — (no CG path) | deferred: extend-metadata mismatch in `TARGET_VERIFY` reference | — | — | — | — | — | — | — |
+ | `triton` | ✓ MHA/GQA/MQA + 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ MHA/GQA/MQA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | ✓ EAGLE chain+tree, Frozen-KV-MTP chain, DFlash chain, NGRAM chain | ✓ EAGLE tree, DFlash chain, NGRAM chain | deferred: Triton `DRAFT_EXTEND` HF-ref mismatch on narrow accept layouts | — (V1 not enabled; Triton uses V2) | ✓ fixed-tokens-per-req | ✓ chain (topk=1) + tree (topk=2) | ✓ via `DRAFT_EXTEND_V2` graph runner | — (production dispatcher only wires Frozen-KV-MTP through FlashInfer-style draft backends) |
+ | `flashinfer` | ✓ MHA/GQA/MQA + 10 input layouts (`head_dim=64` for SM90 prefill constraints) | ✓ MHA/GQA/MQA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | ✓ EAGLE chain+tree, Frozen-KV-MTP chain, DFlash chain, NGRAM chain | ✓ EAGLE tree, Frozen-KV-MTP chain, DFlash chain | ✓ EAGLE ragged-accept, Frozen-KV-MTP ragged-accept | ✓ EAGLE ragged-accept, Frozen-KV-MTP ragged-accept | blocked: `is_draft_extend()` default `include_v2=False` → `raise ValueError` (`flashinfer_backend.py:651,748`) | ✓ chain (topk=1) + tree (topk=2) | ✓ EAGLE ragged-accept (V1) | ✓ chain (topk=1) |
+-| `fa3` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | ✓ MHA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: EAGLE tree (topk=2) eager diffs ~0.16 vs the bf16 HF reference — kernel-level drift, not a CG issue | deferred: same kernel-level drift | — | — | deferred: `init_forward_metadata_replay_cuda_graph` sets `cache_seqlens = prefix` only; needs `prefix + extend` for DRAFT_EXTEND_V2. Kernel reads stale KV → ~82% wrong values. See KNOWN_FAILURES.md §C.3. | — | — | — |
+-| `fa4` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | ✓ MHA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: same EAGLE tree eager drift as fa3 | deferred: same | — | — | deferred: same `DRAFT_EXTEND_V2` cache-extent issue as fa3 (see KNOWN_FAILURES.md §C.3) | — | — | — |
++| `fa3` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | ✓ MHA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: EAGLE tree (topk=2) eager diffs ~0.16 vs the bf16 HF reference — kernel-level drift, not a CG issue | deferred: same kernel-level drift | — | — | ✓ fixed-tokens-per-req | — | ✓ via `DRAFT_EXTEND_V2` graph runner | — |
++| `fa4` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | ✓ MHA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: same EAGLE tree eager drift as fa3 | deferred: same | — | — | ✓ fixed-tokens-per-req | — | ✓ via `DRAFT_EXTEND_V2` graph runner | — |
+ | `flex_attention` | ✓ MHA/GQA/MQA input sweep | blocked: no `init_cuda_graph_state` / capture / replay hooks (`torch_flex_backend.py`) | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | blocked: no CG capture/replay path | blocked: no CG capture/replay path | — | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path |
+ | `trtllm_mha` | ✓ decode-only MHA/GQA/MQA + page-32 boundary (prefill blocked by `Unsupported architecture`) | deferred: replay mismatches HF-ref on SM90 | — (no extend backend) | — (no extend backend) | blocked: `topk=1` only (`server_args.py:2391-2392`, `trtllm_mha_backend.py:459,492`) | blocked: same `topk=1` constraint | — | — | — | deferred: requires chain-only graph capture wiring | — | — |
+ 
+@@ -79,15 +79,5 @@ shims.
+ - Debug Triton `DRAFT_EXTEND` metadata/reference mismatch.
+ - Debug remaining FA3/FA4 speculative-graph mismatches: EAGLE tree
+   verify (eager) diffs ~0.16 vs the bf16 HF reference (kernel-level
+-  drift, NOT a CG issue — fires before any capture/replay). And
+-  `DRAFT_EXTEND_V2` eager mismatches ~0.55 vs HF-ref when using the
+-  production `seq_lens=prefix_lens` convention; isolated to FA
+-  (Triton handles the same convention correctly). The eager
+-  `init_forward_metadata` at `flashattention_backend.py:506` reads
+-  `seqlens_in_batch = forward_batch.seq_lens` and assigns it to
+-  `cache_seqlens_int32` as a full-cache length, but for V2 it's
+-  prefix only — FA needs `cache_seqlens = prefix_lens + extend_lens`
+-  for the kernel call, since the new extend K is written to cache by
+-  `set_kv_buffer` at line 683 right before the kernel reads. CG
+-  decode replay is unblocked.
++  drift, NOT a CG issue — fires before any capture/replay).
+ - Add backend-specific graph coverage for `trtllm_mha` once local hardware and metadata behavior allow it.
+diff --git a/test/registered/attention/unittests/dense/test_fa3.py b/test/registered/attention/unittests/dense/test_fa3.py
+index 79bb7d3dd5ce..f4d8e6df10a8 100644
+--- a/test/registered/attention/unittests/dense/test_fa3.py
++++ b/test/registered/attention/unittests/dense/test_fa3.py
+@@ -428,12 +428,6 @@ def test_runner_mode_split_op_extend_cases(self):
+                     )
+ 
+     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
+-        self.skipTest(
+-            "deferred: FA3 DRAFT_EXTEND_V2 CUDA-graph replay requires "
+-            "`cache_seqlens = prefix + extend` in init_forward_metadata_replay_cuda_graph "
+-            "(flashattention_backend.py); without that fix the kernel reads prefix-only KV "
+-            "and produces ~82 % wrong attention values. Tracked in KNOWN_FAILURES.md §C.3."
+-        )
+         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
+             with self.subTest(case=case.name, backend=case.backend):
+                 run_dense_draft_extend_v2_cuda_graph_case(
+diff --git a/test/registered/attention/unittests/dense/test_fa4.py b/test/registered/attention/unittests/dense/test_fa4.py
+index dabacf530739..4ea21e951970 100644
+--- a/test/registered/attention/unittests/dense/test_fa4.py
++++ b/test/registered/attention/unittests/dense/test_fa4.py
+@@ -417,12 +417,6 @@ def test_runner_mode_split_op_extend_cases(self):
+                     )
+ 
+     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
+-        self.skipTest(
+-            "deferred: FA4 DRAFT_EXTEND_V2 CUDA-graph replay requires "
+-            "`cache_seqlens = prefix + extend` in init_forward_metadata_replay_cuda_graph "
+-            "(flashattention_backend.py); without that fix the kernel reads prefix-only KV "
+-            "and produces ~82 % wrong attention values. Tracked in KNOWN_FAILURES.md §C.3."
+-        )
+         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
+             with self.subTest(case=case.name, backend=case.backend):
+                 run_dense_draft_extend_v2_cuda_graph_case(

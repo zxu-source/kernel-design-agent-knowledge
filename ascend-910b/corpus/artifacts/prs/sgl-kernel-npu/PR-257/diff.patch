@@ -1,0 +1,644 @@
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk.py
+index 50012f91..b7d50b67 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk.py
+@@ -5,6 +5,7 @@ from typing import Optional
+ 
+ import torch
+ import torch.nn.functional as F
++from einops import rearrange
+ from sgl_kernel_npu.fla.chunk_delta_h import (
+     chunk_gated_delta_rule_fwd_h_npu as chunk_gated_delta_rule_fwd_h,
+ )
+@@ -15,7 +16,7 @@ from sgl_kernel_npu.fla.chunk_scaled_dot_kkt import (
+ from sgl_kernel_npu.fla.cumsum import chunk_local_cumsum
+ from sgl_kernel_npu.fla.l2norm import l2norm_fwd
+ from sgl_kernel_npu.fla.solve_tril import solve_tril_npu as solve_tril
+-from sgl_kernel_npu.fla.utils import SUPPRESS_LEVEL
++from sgl_kernel_npu.fla.utils import SUPPRESS_LEVEL, input_guard
+ from sgl_kernel_npu.fla.wy_fast import recompute_w_u_fwd_npu as recompute_w_u_fwd
+ 
+ 
+@@ -112,7 +113,7 @@ def chunk_gated_delta_rule_native(
+     return core_attn_out, last_recurrent_state
+ 
+ 
+-def chunk_gated_delta_rule_npu(
++def chunk_gated_delta_rule_npu_native(
+     q: torch.Tensor,
+     k: torch.Tensor,
+     v: torch.Tensor,
+@@ -218,13 +219,14 @@ def chunk_gated_delta_rule_fwd(
+         cu_seqlens=cu_seqlens,
+     )
+     if SUPPRESS_LEVEL < 3:
+-        return g, o, A, final_state, None, None, None
++        return g, o, A, final_state, None, h, None
+     elif SUPPRESS_LEVEL >= 3:
+         return g, o, A, final_state, w, h, v_new
+ 
+ 
++@input_guard
+ @torch.compiler.disable
+-def chunk_gated_delta_rule(
++def chunk_gated_delta_rule_npu(
+     q: torch.Tensor,
+     k: torch.Tensor,
+     v: torch.Tensor,
+@@ -300,7 +302,6 @@ def chunk_gated_delta_rule(
+             cu_seqlens=cu_seqlens
+         )
+     """
+-    from einops import rearrange
+ 
+     assert q.dtype == k.dtype == v.dtype
+     assert (
+@@ -343,10 +344,12 @@ def chunk_gated_delta_rule(
+         q = l2norm_fwd(q)
+         k = l2norm_fwd(k)
+ 
+-    _, o, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
++    _, o, _, final_state, _, h, _ = chunk_gated_delta_rule_fwd(
+         q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens
+     )
+     o = o.to(q.dtype)
+     if head_first:
+         o = rearrange(o, "b t h ... -> b h t ...")
+-    return o, final_state
++    act_sq = cu_seqlens[-1].cpu().item()
++    o = o[:, :act_sq, :, :]
++    return o, final_state, h
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
+index 14f5ceb1..ff3e3012 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
+@@ -2,6 +2,7 @@
+ from typing import Optional
+ 
+ import torch
++import torch.nn.functional as F
+ import triton
+ import triton.language as tl
+ from sgl_kernel_npu.fla.utils import input_guard
+@@ -14,7 +15,7 @@ from sgl_kernel_npu.fla.utils import input_guard
+     }
+ )
+ @triton.jit(do_not_specialize=["T"])
+-def fused_sigmoid_gating_delta_rule_update_kernel(
++def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+     A_log,
+     a,
+     dt_bias,
+@@ -37,6 +38,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+     V: tl.constexpr,
+     BK: tl.constexpr,
+     BV: tl.constexpr,
++    BHV: tl.constexpr,
+     USE_INITIAL_STATE: tl.constexpr,
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+@@ -44,126 +46,115 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+     """
+     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
+     """
+-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+-    i_n, i_hv = i_nh // HV, i_nh % HV
+-    i_h = i_hv // (HV // H)
++    i_k = 0
++    i_v, i_n, i_nhv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+ 
+     if IS_VARLEN:
+         bos, eos = (
+             tl.load(cu_seqlens + i_n).to(tl.int64),
+             tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+-        )
+-        all = T
+-        T = eos - bos
++        )  # 0 1
++        all = T  # 1
++        T = eos - bos  # 1
+     else:
+         bos, eos = i_n * T, i_n * T + T
+         all = B * T
+ 
+-    o_k = i_k * BK + tl.arange(0, BK)
+-    o_v = i_v * BV + tl.arange(0, BV)
+-
+-    p_q = q + (bos * H + i_h) * K + o_k
+-    p_k = k + (bos * H + i_h) * K + o_k
+-    p_v = v + (bos * HV + i_hv) * V + o_v
+-    p_b = b + bos * HV + i_hv
+-    p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+-
+-    # Gating computation pointers
+-    p_A_log = A_log + i_hv
+-    p_a = a + bos * HV + i_hv
+-    p_dt_bias = dt_bias + i_hv
+-
++    o_k = i_k * BK + tl.arange(0, BK)  # 0 ~ 127
++    o_v = i_v * BV + tl.arange(0, BV)  # 0 ~ 15 * 8 + 0 ~ 7
+     mask_k = o_k < K
+     mask_v = o_v < V
+     mask_h = mask_k[:, None] & mask_v[None, :]
+ 
+-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+-    if USE_INITIAL_STATE:
+-        idx = tl.load(h0_indices + i_n)
+-        # if idx >= 0:
+-        tmp0 = tl.where(idx < 0, 0, idx)
+-        p_h0 = (
+-            h0_source
+-            + tmp0 * HV * K * V
+-            + i_hv * K * V
+-            + o_k[:, None] * V
+-            + o_v[None, :]
+-        )
+-        temp1 = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+-        temp2 = tl.zeros_like(temp1)
+-        value0 = tl.where(idx < 0, temp2, temp1)
+-        b_h += value0  # tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+-
+-    for i in range(0, T):
+-        # Load inputs
+-        b_q = tl.load(p_q + i * H * K, mask=mask_k, other=0).to(tl.float32)
+-        b_k = tl.load(p_k + i * H * K, mask=mask_k, other=0).to(tl.float32)
+-        b_v = tl.load(p_v + i * HV * V, mask=mask_v, other=0).to(tl.float32)
+-        b_b = tl.load(p_b + i * HV).to(tl.float32)
+-
+-        # Compute sigmoid gating
+-        # Load gating parameters
+-        b_A_log = tl.load(p_A_log).to(tl.float32)
+-        b_a = tl.load(p_a + i * HV).to(tl.float32)
+-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+-
+-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
+-        x = b_a + b_dt_bias
+-        beta_x = softplus_beta * x
+-        # Apply softplus with numerical stability
+-        softplus_x = tl.where(
+-            beta_x <= softplus_threshold,
+-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+-            x,
+-        )
+-        b_g = -tl.exp(b_A_log) * softplus_x
+-
+-        # Compute beta = sigmoid(b)
+-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+-
+-        # Apply L2 normalization if enabled
+-        if USE_QK_L2NORM_IN_KERNEL:
+-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q)) + 1e-6)
+-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k)) + 1e-6)
+-
+-        b_q = b_q * scale
+-
+-        # Apply gating to hidden state: h *= exp(g)
+-        b_h *= tl.exp(b_g)
+-
+-        # Delta rule: v -= sum(h * k, dim=0)
+-        b_v -= tl.sum(b_h * b_k[:, None], 0)
+-
+-        # Apply beta gating: v *= beta
+-        b_v *= b_beta
+-
+-        # Update hidden state: h += k[:, None] * v[None, :]
+-        b_h += b_k[:, None] * b_v[None, :]
+-
+-        # Compute output: o = sum(h * q, dim=0)
+-        b_o = tl.sum(b_h * b_q[:, None], 0)
+-        tl.store(p_o + i * HV * V, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+-
+-        # # Update pointers for next timestep
+-        # p_q += H * K
+-        # p_k += H * K
+-        # p_o += HV * V
+-        # p_v += HV * V
+-        # p_b += HV
+-        # p_a += HV
+-
+-    # Store final state back to h0_source with bounds checking
+-    if USE_INITIAL_STATE:
+-        idx = tl.load(h0_indices + i_n)
+-        if idx >= 0:
+-            p_h0 = (
+-                h0_source
+-                + idx * HV * K * V
+-                + i_hv * K * V
+-                + o_k[:, None] * V
+-                + o_v[None, :]
++    for i_bhv in range(BHV):
++        i_hv = i_nhv * BHV + i_bhv
++        i_h = i_hv // (HV // H)
++        p_q = q + (bos * H + i_h) * K + o_k  # q + 0 ~ 127
++        p_k = k + (bos * H + i_h) * K + o_k  # k + 0 ~ 127
++        p_v = v + (bos * HV + i_hv) * V + o_v  # v + i_nh * 128 + 0 ~ 15 * 8 + 0 ~ 7
++        p_b = b + bos * HV + i_hv
++        p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
++
++        # Gating computation pointers
++        p_A_log = A_log + i_hv
++        p_a = a + bos * HV + i_hv
++        p_dt_bias = dt_bias + i_hv
++
++        for i in range(T):
++            # Load inputs
++            b_q = tl.load(p_q + i * H * K, mask=mask_k).to(tl.float32)  # 128 * float32
++            b_k = tl.load(p_k + i * H * K, mask=mask_k).to(tl.float32)  # 128 * float32
++            b_v = tl.load(p_v + i * HV * V, mask=mask_v).to(tl.float32)  # 64 * float32
++            b_b = tl.load(p_b + i * HV).to(tl.float32)
++
++            # Compute sigmoid gating
++            # Load gating parameters
++            b_A_log = tl.load(p_A_log).to(tl.float32)
++            b_a = tl.load(p_a + i * HV).to(tl.float32)
++            b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
++
++            b_h = tl.zeros([BK, BV], dtype=tl.float32)
++            if USE_INITIAL_STATE:
++                idx = tl.load(h0_indices + i_n)  #
++                if idx >= 0:
++                    p_h0 = (
++                        h0_source
++                        + idx * HV * K * V
++                        + i_hv * K * V
++                        + o_k[:, None] * V
++                        + o_v[None, :]
++                    )  # 128 * 64 * int32
++                    b_h = tl.load(p_h0, mask=mask_h).to(tl.float32)
++
++            # Compute g = -exp(A_log) * softplus(a + dt_bias)
++            x = b_a + b_dt_bias
++            beta_x = softplus_beta * x
++            # Apply softplus with numerical stability
++            softplus_x = tl.where(
++                beta_x <= softplus_threshold,
++                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
++                x,
+             )
+-            tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
++            b_g = -tl.exp(b_A_log) * softplus_x
++
++            # Compute beta = sigmoid(b)
++            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
++
++            # Apply L2 normalization if enabled
++            if USE_QK_L2NORM_IN_KERNEL:
++                b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q)) + 1e-6)
++                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k)) + 1e-6)
++
++            b_q = b_q * scale
++
++            # Apply gating to hidden state: h *= exp(g)
++            b_h *= tl.exp(b_g)
++
++            # Delta rule: v -= sum(h * k, dim=0)
++            b_v -= tl.sum(b_h * b_k[:, None], 0)
++
++            # Apply beta gating: v *= beta
++            b_v *= b_beta
++
++            # Update hidden state: h += k[:, None] * v[None, :]
++            b_h += b_k[:, None] * b_v[None, :]
++
++            # Compute output: o = sum(h * q, dim=0)
++            b_o = tl.sum(b_h * b_q[:, None], 0)
++
++            if USE_INITIAL_STATE:
++                idx = tl.load(h0_indices + i_n)
++                if idx >= 0:
++                    p_h0 = (
++                        h0_source
++                        + idx * HV * K * V
++                        + i_hv * K * V
++                        + o_k[:, None] * V
++                        + o_v[None, :]
++                    )  # 128 * 64 * int32
++                    tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
++
++            tl.store(p_o + i * HV * V, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+ 
+ 
+ @input_guard
+@@ -203,9 +194,11 @@ def fused_sigmoid_gating_delta_rule_update_npu(
+         assert scale > 0, "scale must be positive"
+ 
+     o = q.new_empty(NK, *v.shape)
+-    grid = (NK, NV, N * HV)
++    BHV = 2
++    NHV = HV // BHV
++    grid = (NV, N, NHV)
+ 
+-    fused_sigmoid_gating_delta_rule_update_kernel[grid](
++    fused_sigmoid_gating_delta_rule_update_npu_kernel[grid](
+         A_log=A_log,
+         a=a,
+         dt_bias=dt_bias,
+@@ -228,9 +221,11 @@ def fused_sigmoid_gating_delta_rule_update_npu(
+         V=V,
+         BK=BK,
+         BV=BV,
++        BHV=BHV,
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+         num_warps=num_warps,
+         num_stages=num_stages,
++        multibuffer=False,
+     )
+     o = o.squeeze(0)
+     return o
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/layernorm_gated.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/layernorm_gated.py
+index b07a4951..ed84f1ce 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/fla/layernorm_gated.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/layernorm_gated.py
+@@ -16,7 +16,7 @@ from sgl_kernel_npu.utils.triton_utils import get_device_properties
+ @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
+ @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
+ @triton.jit
+-def _layer_norm_fwd_1pass_kernel_npu_smid(
++def _layer_norm_fwd_1pass_kernel_npu_simd(
+     X,  # pointer to the input
+     Y,  # pointer to the output
+     W,  # pointer to the weights
+@@ -81,7 +81,7 @@ def _layer_norm_fwd_1pass_kernel_npu_smid(
+         tl.store(start_y + cols, y, mask=mask)
+ 
+ 
+-def layer_norm_fwd_npu(
++def layer_norm_fwd_npu_simd(
+     x,
+     weight,
+     bias,
+@@ -126,7 +126,7 @@ def layer_norm_fwd_npu(
+ 
+     _, num_vectorcore = get_device_properties()
+     grid = (triton.cdiv(num_vectorcore, ngroups), ngroups)
+-    _layer_norm_fwd_1pass_kernel_npu_smid[grid](
++    _layer_norm_fwd_1pass_kernel_npu_simd[grid](
+         x,
+         out,
+         weight,
+@@ -146,3 +146,165 @@ def layer_norm_fwd_npu(
+         multibuffer=True,
+     )
+     return out, mean, rstd
++
++
++@triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
++@triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
++@triton.jit
++def _layer_norm_fwd_1pass_kernel_npu(
++    X,  # pointer to the input
++    Y,  # pointer to the output
++    W,  # pointer to the weights
++    B,  # pointer to the biases
++    Z,  # pointer to the other branch
++    Mean,  # pointer to the mean
++    Rstd,  # pointer to the 1/std
++    stride_x_row,  # how much to increase the pointer when moving by 1 row
++    stride_y_row,
++    stride_z_row,
++    M,  # number of rows in X
++    N,  # number of columns in X
++    eps,  # epsilon to avoid division by zero
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    HAS_BIAS: tl.constexpr,
++    HAS_Z: tl.constexpr,
++    NORM_BEFORE_GATE: tl.constexpr,
++    IS_RMS_NORM: tl.constexpr,
++):
++    # Map the program id to the row of X and Y it should compute.
++    pid_m = tl.program_id(0)
++    group = tl.program_id(1)
++    if not IS_RMS_NORM:
++        Mean += group * M
++    Rstd += group * M
++    W += group * N
++    if HAS_BIAS:
++        B += group * N
++
++    # Compute row indices for this program
++    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    cols = tl.arange(0, BLOCK_N)
++
++    # Mask for valid rows and cols
++    row_mask = rows < M
++    col_mask = cols < N
++
++    # Load weight once (broadcasted over rows)
++    w = tl.load(W + cols, mask=col_mask).to(tl.float32)
++    if HAS_BIAS:
++        b = tl.load(B + cols, mask=col_mask).to(tl.float32)
++
++    # Load X: shape [BLOCK_M, BLOCK_N]
++    x_ptrs = X + rows[:, None] * stride_x_row + cols[None, :] + group * N
++    x = tl.load(x_ptrs, mask=row_mask[:, None] & col_mask[None, :]).to(tl.float32)
++
++    # Load Z if needed
++    if HAS_Z:
++        z_ptrs = Z + rows[:, None] * stride_z_row + cols[None, :] + group * N
++        z = tl.load(z_ptrs, mask=row_mask[:, None] & col_mask[None, :]).to(tl.float32)
++        if not NORM_BEFORE_GATE:
++            x *= z * tl.sigmoid(z)
++
++    # Compute statistics per row
++    if not IS_RMS_NORM:
++        mean = tl.sum(x, axis=1) / N  # [BLOCK_M]
++        xbar = tl.where(col_mask[None, :], x - mean[:, None], 0.0)
++        var = tl.sum(xbar * xbar, axis=1) / N
++        tl.store(Mean + rows, mean, mask=row_mask)
++    else:
++        xbar = tl.where(col_mask[None, :], x, 0.0)
++        var = tl.sum(xbar * xbar, axis=1) / N
++
++    rstd = 1.0 / tl.sqrt(var + eps)  # [BLOCK_M]
++    tl.store(Rstd + rows, rstd, mask=row_mask)
++
++    # Normalize
++    if not IS_RMS_NORM:
++        x_hat = (x - mean[:, None]) * rstd[:, None]
++    else:
++        x_hat = x * rstd[:, None]
++
++    y = x_hat * w[None, :]
++    if HAS_BIAS:
++        y += b[None, :]
++
++    # Post-gate
++    if HAS_Z and NORM_BEFORE_GATE:
++        y *= z * tl.sigmoid(z)
++
++    # Store output
++    y_ptrs = Y + rows[:, None] * stride_y_row + cols[None, :] + group * N
++    tl.store(y_ptrs, y, mask=row_mask[:, None] & col_mask[None, :])
++
++
++def layer_norm_fwd_npu(
++    x,
++    weight,
++    bias,
++    eps,
++    z=None,
++    out=None,
++    group_size=None,
++    norm_before_gate=True,
++    is_rms_norm=False,
++):
++    M, N = x.shape
++    if group_size is None:
++        group_size = N
++    assert N % group_size == 0
++    ngroups = N // group_size
++
++    assert x.stride(-1) == 1
++    if z is not None:
++        assert z.stride(-1) == 1
++        assert z.shape == (M, N)
++    assert weight.shape == (N,)
++    assert weight.stride(-1) == 1
++    if bias is not None:
++        assert bias.stride(-1) == 1
++        assert bias.shape == (N,)
++    # allocate output
++    if out is not None:
++        assert out.shape == x.shape
++    else:
++        out = torch.empty_like(x)
++    assert out.stride(-1) == 1
++    mean = (
++        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
++        if not is_rms_norm
++        else None
++    )
++    rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
++
++    MAX_FUSED_SIZE = 65536 // x.element_size()
++    BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
++    if group_size > BLOCK_N:
++        raise RuntimeError("Feature dim too large.")
++
++    # Choose BLOCK_M: e.g., 16, 32, 64 — depends on NPU vector core capacity
++    BLOCK_M = 64  # Tune this based on your NPU's register/shared memory
++
++    # Now grid is (num blocks over M, num groups)
++    grid = (triton.cdiv(M, BLOCK_M), ngroups)
++    _layer_norm_fwd_1pass_kernel_npu[grid](
++        x,
++        out,
++        weight,
++        bias,
++        z,
++        mean,
++        rstd,
++        x.stride(0),
++        out.stride(0),
++        z.stride(0) if z is not None else 0,
++        M,
++        group_size,
++        eps,
++        BLOCK_M=BLOCK_M,
++        BLOCK_N=BLOCK_N,
++        NORM_BEFORE_GATE=norm_before_gate,
++        IS_RMS_NORM=is_rms_norm,
++        # Remove multibuffer if not needed
++    )
++    return out, mean, rstd
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/mamba/causal_conv1d.py b/python/sgl_kernel_npu/sgl_kernel_npu/mamba/causal_conv1d.py
+index 5ab5cc73..6070f34c 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/mamba/causal_conv1d.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/mamba/causal_conv1d.py
+@@ -152,22 +152,22 @@ def _causal_conv1d_update_kernel_no_cache_len_no_mtp(
+     batch: tl.constexpr,
+     dim: tl.constexpr,
+     align_val: tl.constexpr,
+-    state_len: tl.constexpr,  # 3 4 5
+-    seq_len: tl.constexpr,  # 1 2
+-    width: tl.constexpr,  # 4, <= seq_len + state_len
++    state_len: tl.constexpr,
++    seq_len: tl.constexpr,
++    width: tl.constexpr,
+     out_len: tl.constexpr,
+     x_batch_stride: tl.constexpr,
+     conv_batch_stride: tl.constexpr,
+     out_batch_stride: tl.constexpr,
+-    DIM_BLOCK: tl.constexpr,  # dim % DIM_BLOCK must be 0
++    DIM_BLOCK: tl.constexpr,
+     HAS_BIAS: tl.constexpr,
+     SILU_ACTIVATION: tl.constexpr,
+     IS_CONTINUOUS_BATCHING: tl.constexpr,
+     USE_PAD_SLOT: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
+-    cat_len: tl.constexpr = state_len + seq_len  # 4
+-    sub_state_len: tl.constexpr = state_len - seq_len  # 3
++    cat_len: tl.constexpr = state_len + seq_len
++    sub_state_len: tl.constexpr = state_len - seq_len
+     sub_align_dim: tl.constexpr = DIM_BLOCK // align_val
+ 
+     conv_begin: tl.constexpr = (cat_len - width + 1) - seq_len
+@@ -564,6 +564,31 @@ def _causal_conv1d_update_kernel(
+                 tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
+ 
+ 
++def torch_causal_conv1d_update_npu(
++    hidden_state: torch.Tensor,
++    conv_state: torch.Tensor,
++    weight: torch.Tensor,
++    conv_state_update: Optional[torch.Tensor] = None,
++    bias: Optional[torch.Tensor] = None,
++):
++    bsz, hidden_size, seq_len = hidden_state.shape
++    state_len = conv_state.shape[-1]
++    hidden_states_new = torch.cat([conv_state, hidden_state], dim=-1).to(weight.dtype)
++    if conv_state_update is not None:
++        for i in range(seq_len):
++            end = i - seq_len + 1
++            start = end - state_len
++            slice_range = slice(start, end if end != 0 else None)
++            conv_state_update[:, i] = hidden_states_new[:, :, slice_range]
++    else:
++        conv_state_update = hidden_states_new[:, :, -state_len:]
++
++    out = torch.sum(hidden_states_new * weight, dim=-1, keepdim=True)
++    out = F.silu(out)
++    out = out.to(hidden_state.dtype)
++    return out, conv_state_update
++
++
+ def causal_conv1d_update_npu(
+     x: torch.Tensor,
+     conv_state: torch.Tensor,
+@@ -668,30 +693,12 @@ def causal_conv1d_update_npu(
+         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+ 
+     if cache_seqlens is None and num_accepted_tokens is None:
+-        DIM_BLOCK = dim
+-        _causal_conv1d_update_kernel_no_cache_len_no_mtp[(batch, 1, 1)](
++        conv_state_update = conv_state[conv_state_indices]
++        out, conv_state[conv_state_indices] = torch_causal_conv1d_update_npu(
+             x,
+-            conv_state,
++            conv_state_update,
+             weight,
+-            bias,
+-            conv_state_indices,
+-            out,
+-            pad_slot_id,
+-            batch=batch,
+-            dim=dim,
+-            align_val=16,
+-            state_len=conv_state.shape[-1],  # 3 4 5
+-            seq_len=x.shape[-1],  # 1 2
+-            width=width,  # 4, <= seq_len + state_len
+-            out_len=out.shape[-1],
+-            x_batch_stride=x.stride()[0],
+-            conv_batch_stride=conv_state.stride()[0],
+-            out_batch_stride=out.stride()[0],
+-            DIM_BLOCK=DIM_BLOCK,  # dim % DIM_BLOCK must be 0
+-            HAS_BIAS=bias is not None,
+-            SILU_ACTIVATION=activation in ["silu", "swish"],
+-            IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
+-            USE_PAD_SLOT=pad_slot_id is not None,
++            bias=bias,
+         )
+     else:
+         _causal_conv1d_update_kernel[grid](

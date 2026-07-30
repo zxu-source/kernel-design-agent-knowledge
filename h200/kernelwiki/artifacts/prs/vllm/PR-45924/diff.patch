@@ -1,0 +1,543 @@
+diff --git a/docs/design/moe_kernel_features.md b/docs/design/moe_kernel_features.md
+index 279ab2d0d6f4..d49790e833af 100644
+--- a/docs/design/moe_kernel_features.md
++++ b/docs/design/moe_kernel_features.md
+@@ -89,6 +89,7 @@ To be used with a particular `FusedMoEPrepareAndFinalizeModular` subclass, MoE k
+ | gpt oss triton | standard | N/A | N/A | <sup>5</sup> | Y | Y | [`triton_kernel_fused_experts`][vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe.triton_kernel_fused_experts],</br>[`OAITritonExperts`][vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe.OAITritonExperts] |
+ | marlin | standard,</br>batched | <sup>3</sup> / N/A | <sup>3</sup> / N/A | silu,</br>swigluoai | Y | Y | [`fused_marlin_moe`][vllm.model_executor.layers.fused_moe.experts.marlin_moe.fused_marlin_moe],</br>[`MarlinExperts`][vllm.model_executor.layers.fused_moe.experts.marlin_moe.MarlinExperts],</br>[`BatchedMarlinExperts`][vllm.model_executor.layers.fused_moe.experts.marlin_moe.BatchedMarlinExperts] |
+ | trtllm | standard | mxfp4,</br>nvfp4 | G(16),G(32) | <sup>5</sup> | N | Y | [`TrtLlmMxfp4ExpertsMonolithic`][vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe.TrtLlmMxfp4ExpertsMonolithic],</br>[`TrtLlmMxfp4ExpertsModular`][vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe.TrtLlmMxfp4ExpertsModular],</br>[`TrtLlmNvFp4ExpertsMonolithic`][vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe.TrtLlmNvFp4ExpertsMonolithic],</br>[`TrtLlmNvfp4ExpertsModular`][vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe.TrtLlmNvFp4ExpertsModular] |
++| hpc | standard | fp8 | G(128),T | silu | Y | Y | [`HPCExperts`][vllm.model_executor.layers.fused_moe.experts.hpc.HPCExperts] |
+ | rocm aiter moe | standard | mxfp4,</br>fp8 | G(32),G(128),A,T | silu, gelu,</br>swigluoai | Y | N | `rocm_aiter_fused_experts`,</br>`AiterExperts` |
+ | cpu_fused_moe | standard | N/A | N/A | silu | N | N | [`CPUFusedMOE`][vllm.model_executor.layers.fused_moe.cpu_fused_moe.CPUFusedMOE] |
+ | naive batched<sup>4</sup> | batched | int8,</br>fp8 | G,A,T | silu, gelu | <sup>6</sup> | Y | [`NaiveBatchedExperts`][vllm.model_executor.layers.fused_moe.experts.fused_batched_moe.NaiveBatchedExperts] |
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index e9f41c538ad9..770daad1cef3 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -134,6 +134,7 @@ def with_default(
+     "triton_unfused",
+     "aiter",
+     "flydsl",
++    "hpc",
+     "emulation",
+ ]
+ 
+@@ -189,6 +190,7 @@ class KernelConfig:
+     - "triton_unfused": Use Triton unfused MoE kernels
+     - "aiter": Use AMD AITer kernels (ROCm only)
+     - "flydsl": Use AMD FlyDSL kernels (ROCm only)
++    - "hpc": Use HPC kernels (FP8 and Hopper only)
+     - "emulation": use BF16/FP16 GEMM, dequantizing weights and
+                    running QDQ on activations.
+     """
+diff --git a/vllm/model_executor/layers/fused_moe/hpc_moe.py b/vllm/model_executor/layers/fused_moe/hpc_moe.py
+new file mode 100644
+index 000000000000..6c7e20fa3c11
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/hpc_moe.py
+@@ -0,0 +1,211 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++
++import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++from vllm.model_executor.layers.fused_moe.config import (
++    FusedMoEParallelConfig,
++    FusedMoEQuantConfig,
++)
++from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
++    TopKWeightAndReduceNoOP,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    QuantKey,
++    kFp8Dynamic128Sym,
++    kFp8Static128BlockSym,
++    kFp8StaticTensorSym,
++)
++from vllm.platforms import current_platform
++from vllm.utils.hpc import has_hpc, hpc_fuse_moe, hpc_fuse_moe_blockwise
++
++logger = init_logger(__name__)
++
++
++class HPCExperts(mk.FusedMoEExpertsModular):
++    """MoE implementation powered by [HPC](https://github.com/Tencent/hpc-ops).
++
++    Only supported on NVIDIA Hopper GPUs (e.g. H20, H200), and currently limited to
++    FP8 models such as Hy3-FP8, Qwen3-235B-A22B-FP8, etc.
++    """
++
++    def __init__(
++        self,
++        moe_config: mk.FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++    ):
++        super().__init__(moe_config, quant_config)
++
++        assert quant_config.weight_quant_dtype in (torch.float8_e4m3fn,), (
++            "Only fp8 quantization is currently supported."
++        )
++
++        self.device = moe_config.device
++        self.num_experts = moe_config.num_local_experts
++        self.ep_rank = moe_config.moe_parallel_config.ep_rank
++        self.ep_size = moe_config.moe_parallel_config.ep_size
++        self.tp_rank = moe_config.moe_parallel_config.tp_rank
++        self.tp_size = moe_config.moe_parallel_config.tp_size
++        self.out_dtype = moe_config.in_dtype
++
++    @property
++    def expects_unquantized_inputs(self) -> bool:
++        return False
++
++    @staticmethod
++    def activation_format() -> mk.FusedMoEActivationFormat:
++        return mk.FusedMoEActivationFormat.Standard
++
++    @staticmethod
++    def _supports_current_device() -> bool:
++        p = current_platform
++        return (
++            p.is_cuda()
++            and (p.is_device_capability(90) or p.is_device_capability_family(100))
++            and has_hpc()
++        )
++
++    @staticmethod
++    def _supports_no_act_and_mul() -> bool:
++        return False
++
++    @staticmethod
++    def _supports_quant_scheme(
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        scheme = (weight_key, activation_key)
++        # The following are supported by HPCExperts:
++        return scheme in [
++            # fp8 static per-tensor on 9.0+
++            (kFp8StaticTensorSym, kFp8StaticTensorSym),
++            (kFp8Static128BlockSym, kFp8Dynamic128Sym),
++        ]
++
++    @staticmethod
++    def _supports_activation(activation: MoEActivation) -> bool:
++        return activation in [
++            MoEActivation.SILU,
++        ]
++
++    @staticmethod
++    def _supports_shape(hidden_dim: int) -> bool:
++        # HPC fused MoE kernels process hidden_size in blocks of 128:
++        # block-wise fp8 requires hidden_size % 128 == 0 (per-128 quant), and
++        # the group GEMM tiles N by 128. Require 128-alignment to cover all
++        # code paths.
++        return hidden_dim % 128 == 0
++
++    @staticmethod
++    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
++        return True
++
++    def supports_expert_map(self) -> bool:
++        return False
++
++    def supports_chunking(self) -> bool:
++        # This refers to TP chunking; DP chunking is handled separately.
++        return True
++
++    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
++        return TopKWeightAndReduceNoOP()
++
++    def workspace_shapes(
++        self,
++        M: int,
++        N: int,
++        K: int,
++        topk: int,
++        global_num_experts: int,
++        local_num_experts: int,
++        expert_tokens_meta: mk.ExpertTokensMetadata | None,
++        activation: MoEActivation,
++    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
++        # We use global_num_experts due to how moe_align_block_size handles
++        # expert_maps.
++        """
++        Compute the shapes for the temporary and final outputs of the two gemms
++        and activation in the fused expert function.  Since the gemms are
++        independent, the workspace for the first gemm can be shared with the
++        workspace for the last gemm.
++
++        Returns a tuple of:
++        - workspace13 shape tuple: must be large enough to hold the
++          result of either expert gemm.
++        - workspace2 shape tuple: must be large enough to hold the
++          result of the activation function.
++        - output shape tuple: must be exact size of the final gemm output.
++        - Workspace type: The dtype to use for the workspace tensors.
++        - Note: in order for activation chunking to work, the first dimension
++          of each tuple must be the number of tokens.
++        """
++        workspace1 = (M, K)
++        workspace2 = (0,)
++        output_shape = (M, K)
++        # The workspace is determined by `aq`, since it comes after any
++        # potential communication op and is involved in the expert computation.
++        return (workspace1, workspace2, output_shape)
++
++    def apply(
++        self,
++        output: torch.Tensor,
++        hidden_states: torch.Tensor,
++        w1: torch.Tensor,
++        w2: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        activation: MoEActivation,
++        global_num_experts: int,
++        expert_map: torch.Tensor | None,
++        a1q_scale: torch.Tensor | None,
++        a2_scale: torch.Tensor | None,
++        workspace13: torch.Tensor | None,
++        workspace2: torch.Tensor | None,
++        expert_tokens_meta: mk.ExpertTokensMetadata | None,
++        apply_router_weight_on_input: bool | None,
++    ):
++        assert self._supports_activation(activation), f"{activation=} not supported"
++        assert self.quant_config.w1_scale is not None, (
++            "w13_weight_scale must be provided"
++        )
++        assert self.quant_config.w2_scale is not None, (
++            "w2_weight_scale must be provided"
++        )
++
++        if self.quant_config.is_block_quantized:
++            hpc_fuse_moe_blockwise(
++                x=hidden_states,
++                x_scale=a1q_scale,
++                gate_up_weight=w1,
++                gate_up_weight_scale=self.quant_config.w1_scale,
++                down_weight=w2,
++                down_weight_scale=self.quant_config.w2_scale,
++                topk_ids=topk_ids,
++                topk_scale=topk_weights,
++                rank_ep=self.ep_rank,
++                num_expert_total=global_num_experts,
++                output=output,
++            )
++        else:
++            assert self.quant_config.a1_scale is not None, (
++                "w13_input_scale must be provided"
++            )
++            assert self.quant_config.a2_scale is not None, (
++                "w2_input_scale must be provided"
++            )
++            hpc_fuse_moe(
++                x=hidden_states,
++                gate_up_weight=w1,
++                down_weight=w2,
++                gate_up_scale=self.quant_config.g1_alphas,
++                down_scale=self.quant_config.g2_alphas,
++                act_and_mul_scale=self.quant_config.a2_gscale,
++                topk_ids=topk_ids,
++                topk_scale=topk_weights,
++                rank_ep=self.ep_rank,
++                num_expert_total=global_num_experts,
++                output=output,
++            )
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+index 1b5030b19096..9f930f1d58cf 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+@@ -52,6 +52,7 @@ class Fp8MoeBackend(Enum):
+     BATCHED_VLLM_CUTLASS = "BATCHED_VLLM_CUTLASS"
+     XPU = "XPU"
+     CPU = "CPU"
++    HPC = "HPC"
+     # Dequantize-to-BF16 emulation for MXFP8 on devices without a native
+     # MXFP8 MoE kernel (e.g. ROCm). Weights pass through unchanged here.
+     EMULATION = "EMULATION"
+@@ -85,6 +86,7 @@ def _get_priority_backends(
+         Fp8MoeBackend.BATCHED_TRITON,
+         Fp8MoeBackend.XPU,
+         Fp8MoeBackend.CPU,
++        Fp8MoeBackend.HPC,
+     ]
+ 
+     def _move_to_front(backends: list[Fp8MoeBackend], backend: Fp8MoeBackend) -> None:
+@@ -216,6 +218,13 @@ def backend_to_kernel_cls(
+ 
+         return [CPUExpertsFp8]
+ 
++    elif backend == Fp8MoeBackend.HPC:
++        from vllm.model_executor.layers.fused_moe.hpc_moe import (
++            HPCExperts,
++        )
++
++        return [HPCExperts]
++
+     else:
+         raise ValueError(f"Unknown FP8 MoE backend: {backend.value}")
+ 
+@@ -230,6 +239,7 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
+         "flashinfer_cutlass": Fp8MoeBackend.FLASHINFER_CUTLASS,
+         "marlin": Fp8MoeBackend.MARLIN,
+         "aiter": Fp8MoeBackend.AITER,
++        "hpc": Fp8MoeBackend.HPC,
+     }
+     if backend := mapping.get(runner_backend):
+         return backend
+@@ -470,6 +480,7 @@ def convert_to_fp8_moe_kernel_format(
+             Fp8MoeBackend.VLLM_CUTLASS,
+             Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
+             Fp8MoeBackend.XPU,
++            Fp8MoeBackend.HPC,
+             # EMULATION dequantizes weights at runtime; NATIVE_MXFP8 consumes
+             # the MXFP8 weights as-is — neither needs a load-time layout change.
+             Fp8MoeBackend.EMULATION,
+@@ -521,9 +532,12 @@ def make_fp8_moe_quant_config(
+             gemm1_clamp_limit=swiglu_limit,
+         )
+ 
+-    # Flashinfer CUTLASS per-tensor uses single dq scale
++    # Flashinfer CUTLASS or HPC per-tensor uses single dq scale
+     # (alpha = w_scale * a_scale) and inverse a2 scale.
+-    if fp8_backend == Fp8MoeBackend.FLASHINFER_CUTLASS and block_shape is None:
++    if (
++        fp8_backend in [Fp8MoeBackend.FLASHINFER_CUTLASS, Fp8MoeBackend.HPC]
++        and block_shape is None
++    ):
+         assert a1_scale is not None and a2_scale is not None
+         return fp8_w8a8_moe_quant_config(
+             w1_scale=w1_scale,
+diff --git a/vllm/utils/hpc.py b/vllm/utils/hpc.py
+new file mode 100644
+index 000000000000..abe546c91658
+--- /dev/null
++++ b/vllm/utils/hpc.py
+@@ -0,0 +1,223 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Compatibility wrapper for HPC API changes.
++
++Users of vLLM should always import **only** these wrappers.
++"""
++
++import functools
++import importlib
++import importlib.util
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++@functools.cache
++def has_hpc() -> bool:
++    """Return `True` if hpc package is available."""
++    # Use find_spec to check if the module exists without importing it
++    # This avoids potential CUDA initialization side effects
++    if importlib.util.find_spec("hpc") is None:
++        logger.warning_once(
++            "HPC attention requires the hpc module to be installed. "
++            "Please install it from https://github.com/Tencent/hpc-ops"
++        )
++        return False
++    return True
++
++
++# Remove 'torch._library.custom_ops':
++# The output of this custom operator (1) must not also be an input to
++# this custom operator and (2) may not alias any inputs to this custom
++# operator or other returns. The most common way to trigger this error
++# is if we have y = custom_op(x) and y and x are the same Tensor.
++# Please instead return a clone of the offending output tensor(s) (e.g.
++# return x.clone()) or refactor the custom operator to not return y.
++# @torch.library.custom_op(
++#     "vllm::fuse_moe_impl",
++#     mutates_args=[],
++#     device_types="cuda",
++# )
++def fuse_moe_impl(
++    x: torch.Tensor,
++    gate_up_weight: torch.Tensor,
++    down_weight: torch.Tensor,
++    gate_up_scale: torch.Tensor,
++    down_scale: torch.Tensor,
++    act_and_mul_scale: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_scale: torch.Tensor,
++    rank_ep: int,
++    num_expert_total: int,
++    use_bf16_mul: bool = True,
++    shared_output: torch.Tensor = None,
++    output: torch.Tensor = None,
++) -> torch.Tensor:
++    from hpc import fuse_moe as fuse_moe_
++
++    return fuse_moe_(
++        x,
++        gate_up_weight,
++        down_weight,
++        gate_up_scale,
++        down_scale,
++        act_and_mul_scale,
++        topk_ids,
++        topk_scale,
++        rank_ep,
++        num_expert_total,
++        use_bf16_mul,
++        shared_output,
++        output=output,
++    )
++
++
++# @torch.library.register_fake(
++#     "vllm::fuse_moe_impl",
++# )
++def fuse_moe_impl_fake(
++    x: torch.Tensor,
++    gate_up_weight: torch.Tensor,
++    down_weight: torch.Tensor,
++    gate_up_scale: torch.Tensor,
++    down_scale: torch.Tensor,
++    act_and_mul_scale: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_scale: torch.Tensor,
++    rank_ep: int,
++    num_expert_total: int,
++    use_bf16_mul: bool = True,
++    shared_output: torch.Tensor = None,
++    output: torch.Tensor = None,
++) -> torch.Tensor:
++    return torch.empty_like(x)
++
++
++def hpc_fuse_moe(
++    x: torch.Tensor,
++    gate_up_weight: torch.Tensor,
++    down_weight: torch.Tensor,
++    gate_up_scale: torch.Tensor,
++    down_scale: torch.Tensor,
++    act_and_mul_scale: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_scale: torch.Tensor,
++    rank_ep: int,
++    num_expert_total: int,
++    use_bf16_mul: bool = True,
++    shared_output: torch.Tensor = None,
++    output: torch.Tensor = None,
++) -> torch.Tensor:
++    return fuse_moe_impl(
++        x,
++        gate_up_weight,
++        down_weight,
++        gate_up_scale,
++        down_scale,
++        act_and_mul_scale,
++        topk_ids,
++        topk_scale,
++        rank_ep,
++        num_expert_total,
++        use_bf16_mul,
++        shared_output,
++        output=output,
++    )
++
++
++# @torch.library.custom_op(
++#     "vllm::fuse_moe_blockwise_impl",
++#     mutates_args=[],
++#     device_types="cuda",
++# )
++def fuse_moe_blockwise_impl(
++    x: torch.Tensor,
++    x_scale: torch.Tensor,
++    gate_up_weight: torch.Tensor,
++    gate_up_weight_scale: torch.Tensor,
++    down_weight: torch.Tensor,
++    down_weight_scale: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_scale: torch.Tensor,
++    rank_ep: int,
++    num_expert_total: int,
++    shared_output: torch.Tensor = None,
++    output: torch.Tensor = None,
++) -> torch.Tensor:
++    from hpc import fuse_moe_blockwise as fuse_moe_blockwise_
++
++    return fuse_moe_blockwise_(
++        x,
++        x_scale,
++        gate_up_weight,
++        gate_up_weight_scale,
++        down_weight,
++        down_weight_scale,
++        topk_ids,
++        topk_scale,
++        rank_ep,
++        num_expert_total,
++        shared_output,
++        output=output,
++    )
++
++
++# @torch.library.register_fake(
++#     "vllm::fuse_moe_blockwise_impl",
++# )
++def fuse_moe_blockwise_impl_fake(
++    x: torch.Tensor,
++    x_scale: torch.Tensor,
++    gate_up_weight: torch.Tensor,
++    gate_up_weight_scale: torch.Tensor,
++    down_weight: torch.Tensor,
++    down_weight_scale: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_scale: torch.Tensor,
++    rank_ep: int,
++    num_expert_total: int,
++    shared_output: torch.Tensor = None,
++    output: torch.Tensor = None,
++) -> torch.Tensor:
++    return torch.empty_like(x)
++
++
++def hpc_fuse_moe_blockwise(
++    x: torch.Tensor,
++    x_scale: torch.Tensor,
++    gate_up_weight: torch.Tensor,
++    gate_up_weight_scale: torch.Tensor,
++    down_weight: torch.Tensor,
++    down_weight_scale: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_scale: torch.Tensor,
++    rank_ep: int,
++    num_expert_total: int,
++    shared_output: torch.Tensor = None,
++    output: torch.Tensor = None,
++) -> torch.Tensor:
++    return fuse_moe_blockwise_impl(
++        x,
++        x_scale,
++        gate_up_weight,
++        gate_up_weight_scale,
++        down_weight,
++        down_weight_scale,
++        topk_ids,
++        topk_scale,
++        rank_ep,
++        num_expert_total,
++        shared_output,
++        output=output,
++    )
++
++
++__all__ = [
++    "has_hpc",
++    "hpc_fuse_moe",
++    "hpc_fuse_moe_blockwise",
++]

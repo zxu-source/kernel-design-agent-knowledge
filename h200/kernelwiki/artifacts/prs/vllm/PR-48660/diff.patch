@@ -1,0 +1,321 @@
+diff --git a/csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu b/csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu
+index 785bbf2f6e07..b6878eb2d2fd 100644
+--- a/csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu
++++ b/csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu
+@@ -71,6 +71,73 @@ __device__ __forceinline__ float toFloat(T value) {
+   }
+ }
+ 
++#ifndef USE_ROCM
++// Adapted from:
++// https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/csrc/deepseek_v4/hash_topk.cuh
++template <typename OutIndType, typename HashIndType>
++__launch_bounds__(128) __global__
++    void dsv4HashTopkSoftplusSqrt(const float* input, float* output,
++                                  OutIndType* indices, int num_rows,
++                                  int num_experts, float routed_scaling_factor,
++                                  const HashIndType* input_ids,
++                                  const HashIndType* tid2eid) {
++  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
++  const int lane = threadIdx.x % 32;
++  if (warp >= num_rows) return;
++  const int64_t token_id = load_index_as_int64(input_ids, warp);
++
++  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++  cudaGridDependencySynchronize();
++  #endif
++  int expert = 0;
++  float weight = 0.f;
++  if (lane < 6) {
++    // only load and calculate for 6 experts
++    expert = static_cast<int>(tid2eid[token_id * 6 + lane]);
++    const float x = input[warp * num_experts + expert];
++    weight = sqrtf(fmaxf(x, 0.f) + __logf(1.f + __expf(-fabsf(x))));
++  }
++  float weight_sum = weight;
++  #pragma unroll
++  for (int mask = 16; mask > 0; mask >>= 1) {
++    // sum in warp
++    weight_sum += VLLM_SHFL_XOR_SYNC(weight_sum, mask);
++  }
++
++  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++  cudaTriggerProgrammaticLaunchCompletion();
++  #endif
++  if (lane < 6) {
++    const int offset = warp * 6 + lane;
++    output[offset] =
++        weight * routed_scaling_factor / (weight_sum > 0.f ? weight_sum : 1.f);
++    indices[offset] = static_cast<OutIndType>(expert);
++  }
++}
++
++template <typename OutIndType, typename HashIndType>
++void launchDsv4HashTopk(const float* input, float* output, OutIndType* indices,
++                        int num_rows, int num_experts,
++                        double routed_scaling_factor,
++                        const HashIndType* input_ids,
++                        const HashIndType* tid2eid, cudaStream_t stream) {
++  if (num_rows == 0) return;
++  auto* kernel = &dsv4HashTopkSoftplusSqrt<OutIndType, HashIndType>;
++  cudaLaunchConfig_t config = {};
++  config.gridDim = (num_rows + 3) / 4;
++  config.blockDim = 128;
++  config.stream = stream;
++  cudaLaunchAttribute attr;
++  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
++  attr.val.programmaticStreamSerializationAllowed = 1;
++  config.attrs = &attr;
++  config.numAttrs = 1;
++  const float scale = static_cast<float>(routed_scaling_factor);
++  cudaLaunchKernelEx(&config, kernel, input, output, indices, num_rows,
++                     num_experts, scale, input_ids, tid2eid);
++}
++#endif
++
+ // ====================== TopK softplus_sqrt things
+ // ===============================
+ 
+@@ -556,6 +623,17 @@ void topkGatingSoftplusSqrtKernelLauncher(
+     const float* correction_bias, const bool use_hash,
+     const HashIndType* input_ids, const HashIndType* tid2eid,
+     cudaStream_t stream) {
++#ifndef USE_ROCM
++  if constexpr (std::is_same_v<InputType, float>) {
++    if (use_hash && topk == 6 && renormalize &&
++        (num_experts == 256 || num_experts == 384)) {
++      launchDsv4HashTopk<IndType, HashIndType>(
++          gating_output, topk_weights, topk_indices, num_tokens, num_experts,
++          routed_scaling_factor, input_ids, tid2eid, stream);
++      return;
++    }
++  }
++#endif
+   static constexpr int WARPS_PER_TB = 4;
+   static constexpr int BYTES_PER_LDG_POWER_OF_2 = 16;
+   // for bfloat16 dtype, we need 4 bytes loading to make sure num_experts
+diff --git a/tests/kernels/moe/test_topk_softplus_sqrt.py b/tests/kernels/moe/test_topk_softplus_sqrt.py
+index 46ca934c1462..5c6691bbc32e 100644
+--- a/tests/kernels/moe/test_topk_softplus_sqrt.py
++++ b/tests/kernels/moe/test_topk_softplus_sqrt.py
+@@ -10,6 +10,7 @@
+     RoutingMethodType,
+     get_routing_method_type,
+ )
++from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
+ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+     fused_topk_bias,
+ )
+@@ -186,3 +187,47 @@ def test_fused_topk_softplus_sqrt_hash(
+     sorted_w_ref = topk_weights_ref.gather(1, idx_ref)
+     sorted_w = topk_weights.gather(1, idx_ops)
+     torch.testing.assert_close(sorted_w_ref, sorted_w, atol=2e-2, rtol=1e-2)
++
++
++@pytest.mark.skipif(
++    not current_platform.is_cuda(),
++    reason="The DeepSeek V4 fast path is CUDA-only.",
++)
++@pytest.mark.parametrize(
++    ("num_tokens", "num_experts", "indices_type"),
++    [
++        (0, 256, torch.uint32),
++        (17, 256, torch.uint32),
++        (17, 384, torch.int64),
++    ],
++)
++def test_dsv4_fast_topk(
++    num_tokens: int,
++    num_experts: int,
++    indices_type: torch.dtype,
++):
++    torch.manual_seed(0)
++    gating_output = torch.randn(
++        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
++    )
++    correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
++
++    topk_weights_ref, topk_ids_ref = _torch_topk_softplus_sqrt(
++        gating_output=gating_output,
++        topk=6,
++        renormalize=True,
++        routed_scaling_factor=1.5,
++        e_score_correction_bias=correction_bias,
++    )
++    topk_weights, topk_ids = dsv4_topk(
++        gating_output, correction_bias, indices_type, 1.5
++    )
++
++    assert topk_ids.dtype == indices_type
++    torch.testing.assert_close(topk_ids_ref.to(indices_type), topk_ids, atol=0, rtol=0)
++    torch.testing.assert_close(
++        topk_weights_ref,
++        topk_weights,
++        atol=2e-5,
++        rtol=2e-5,
++    )
+diff --git a/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py b/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+new file mode 100644
+index 000000000000..dd861d4ebcf7
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+@@ -0,0 +1,121 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++
++_TOPK = 6
++
++# Adapted from:
++# https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/moe_fused_gate.py
++
++
++def can_use_dsv4_topk(
++    gating_output: torch.Tensor,
++    correction_bias: torch.Tensor | None,
++    topk: int,
++    renormalize: bool,
++    indices_dtype: torch.dtype,
++) -> bool:
++    return (
++        current_platform.is_cuda()
++        and gating_output.dtype == torch.float32
++        and gating_output.ndim == 2
++        and gating_output.shape[1] in (256, 384)
++        and gating_output.is_contiguous()
++        and correction_bias is not None
++        and correction_bias.dtype == torch.float32
++        and correction_bias.shape == (gating_output.shape[1],)
++        and correction_bias.is_contiguous()
++        and topk == _TOPK
++        and renormalize
++        and indices_dtype in (torch.int32, torch.uint32, torch.int64)
++    )
++
++
++if current_platform.is_cuda():
++
++    @triton.jit
++    def _dsv4_topk_kernel(
++        gating_output_ptr,
++        correction_bias_ptr,
++        topk_weights_ptr,
++        topk_ids_ptr,
++        routed_scaling_factor,
++        NUM_EXPERTS: tl.constexpr,
++        BLOCK_N: tl.constexpr,
++        launch_pdl: tl.constexpr,
++    ):
++        row = tl.program_id(0)
++        expert_offsets = tl.arange(0, BLOCK_N)
++        expert_mask = expert_offsets < NUM_EXPERTS
++        bias = tl.load(
++            correction_bias_ptr + expert_offsets, mask=expert_mask, other=0.0
++        ).to(tl.float32)
++
++        if launch_pdl:
++            tl.extra.cuda.gdc_wait()
++
++        logits = tl.load(
++            gating_output_ptr + row * NUM_EXPERTS + expert_offsets,
++            mask=expert_mask,
++            other=0.0,
++        ).to(tl.float32)
++        weights = tl.sqrt(tl.where(logits > 20.0, logits, tl.log(1.0 + tl.exp(logits))))
++        current = tl.where(expert_mask, weights + bias, -float("inf"))
++        current = tl.where(current == current, current, -1e30)
++
++        topk_offsets = tl.arange(0, 8)
++        selected_weights = tl.zeros([8], dtype=tl.float32)
++        selected_ids = tl.zeros([8], dtype=tl.int32)
++        for slot in tl.static_range(6):
++            max_value = tl.max(current, axis=0)
++            candidate = tl.where(current == max_value, expert_offsets, NUM_EXPERTS)
++            expert_id = tl.min(candidate, axis=0).to(tl.int32)
++            selected_weight = tl.sum(
++                tl.where(expert_offsets == expert_id, weights, 0.0), axis=0
++            )
++            is_slot = topk_offsets == slot
++            selected_weights = tl.where(is_slot, selected_weight, selected_weights)
++            selected_ids = tl.where(is_slot, expert_id, selected_ids)
++            current = tl.where(expert_offsets == expert_id, -float("inf"), current)
++
++        weight_sum = tl.sum(selected_weights, axis=0)
++        selected_weights *= routed_scaling_factor / tl.where(
++            weight_sum > 0.0, weight_sum, 1.0
++        )
++        output_mask = topk_offsets < 6
++        output_offsets = row * 6 + topk_offsets
++
++        if launch_pdl:
++            tl.extra.cuda.gdc_launch_dependents()
++
++        tl.store(topk_weights_ptr + output_offsets, selected_weights, mask=output_mask)
++        tl.store(topk_ids_ptr + output_offsets, selected_ids, mask=output_mask)
++
++
++def dsv4_topk(
++    gating_output: torch.Tensor,
++    correction_bias: torch.Tensor,
++    indices_dtype: torch.dtype,
++    routed_scaling_factor: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    num_tokens, num_experts = gating_output.shape
++    shape = (num_tokens, _TOPK)
++    topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
++    topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)
++    if num_tokens > 0:
++        _dsv4_topk_kernel[(num_tokens,)](
++            gating_output,
++            correction_bias,
++            topk_weights,
++            topk_ids,
++            routed_scaling_factor,
++            NUM_EXPERTS=num_experts,
++            BLOCK_N=triton.next_power_of_2(num_experts),
++            num_warps=1,
++            launch_pdl=current_platform.is_arch_support_pdl(),
++        )
++    return topk_weights, topk_ids
+diff --git a/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py b/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py
+index 1ddcaa50e83b..f89eb4910b35 100644
+--- a/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py
++++ b/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py
+@@ -14,6 +14,10 @@
+     get_routing_method_type,
+ )
+ from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
++from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
++    can_use_dsv4_topk,
++    dsv4_topk,
++)
+ 
+ 
+ def vllm_topk_softmax(
+@@ -182,6 +186,22 @@ def fused_topk_bias(
+             "Number of tokens mismatch"
+         )
+ 
++        output_indices_dtype = torch.int32 if indices_type is None else indices_type
++        if scoring_func == "sqrtsoftplus" and can_use_dsv4_topk(
++            gating_output,
++            e_score_correction_bias,
++            topk,
++            renormalize,
++            output_indices_dtype,
++        ):
++            assert e_score_correction_bias is not None
++            return dsv4_topk(
++                gating_output,
++                e_score_correction_bias,
++                output_indices_dtype,
++                routed_scaling_factor,
++            )
++
+         M, _ = hidden_states.size()
+ 
+         topk_weights = torch.empty(

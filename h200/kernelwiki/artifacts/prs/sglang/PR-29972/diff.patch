@@ -1,0 +1,841 @@
+diff --git a/python/sglang/srt/distributed/device_communicators/pynccl.py b/python/sglang/srt/distributed/device_communicators/pynccl.py
+index 7ac2256fb616..53eafe6d590c 100644
+--- a/python/sglang/srt/distributed/device_communicators/pynccl.py
++++ b/python/sglang/srt/distributed/device_communicators/pynccl.py
+@@ -222,33 +222,6 @@ def all_gather(
+                 cudaStream_t(stream.cuda_stream),
+             )
+ 
+-    def cp_all_gather_into_tensor(
+-        self,
+-        output_tensor: torch.Tensor,
+-        input_tensor: torch.Tensor,
+-        stream: torch.cuda.Stream,
+-        sizes: Optional[list[int]] = None,
+-    ):
+-        """
+-        Currently, it is mainly used in context parallelism,
+-        primarily leveraging pynccl to implement non-blocking allgather communication.
+-        """
+-        # nccl communicator created on a specific device
+-        # will only work on tensors on the same device
+-        # otherwise it will cause "illegal memory access"
+-        assert input_tensor.device == self.device, (
+-            f"this nccl communicator is created to work on {self.device}, "
+-            f"but the input tensor is on {input_tensor.device}"
+-        )
+-        self.nccl.ncclAllGather(
+-            buffer_type(input_tensor.data_ptr()),
+-            buffer_type(output_tensor.data_ptr()),
+-            input_tensor.numel(),
+-            ncclDataTypeEnum.from_torch(input_tensor.dtype),
+-            self.comm,
+-            cudaStream_t(stream.cuda_stream),
+-        )
+-
+     def reduce_scatter(
+         self,
+         output_tensor: torch.Tensor,
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index 3be32d3f1f5f..b1d26d32f723 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -1060,21 +1060,6 @@ def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
+             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
+ 
+-    def cp_all_gather_into_tensor_async(
+-        self, output: torch.Tensor, input: torch.Tensor, stream: torch.cuda.Stream
+-    ):
+-        """
+-        Implement an asynchronous `allgather` operation on a specified stream.
+-        (the default `torch.distributed.all_gather_into_tensor` will trigger event synchronization),
+-        eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
+-        The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
+-        """
+-        pynccl_comm = self.pynccl_comm
+-        if pynccl_comm is None or pynccl_comm.disabled:
+-            self.all_gather_into_tensor(output, input)
+-        else:
+-            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
+-
+     def all_gather(
+         self,
+         input_: torch.Tensor,
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index e1dee61848fc..9e35f2263fd3 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -2095,7 +2095,13 @@ def _execute_server_warmup(server_args: ServerArgs):
+     model_info = res.json()
+ 
+     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
+-    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
++    # A language-only worker may advertise VLM capability for encoder
++    # disaggregation, but its local warmup must stay on the text path.
++    is_vlm = (
++        bool(model_info.get("has_image_understanding", False))
++        and not server_args.language_only
++        and not is_mps()
++    )
+     if model_info["is_generation"]:
+         if is_vlm and not server_args.skip_tokenizer_init:
+             request_name = "/v1/chat/completions"
+diff --git a/python/sglang/srt/layers/attention/dsa/utils.py b/python/sglang/srt/layers/attention/dsa/utils.py
+index 402d152b97b3..d5b0b72b3ccf 100644
+--- a/python/sglang/srt/layers/attention/dsa/utils.py
++++ b/python/sglang/srt/layers/attention/dsa/utils.py
+@@ -153,7 +153,7 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
+ def cal_padded_tokens(forward_batch: "ForwardBatch"):
+     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
+     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
+-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
++    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+ 
+     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
+     sync_group_size = len(global_num_tokens)
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 526bb5d1c319..4f05511aa983 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -812,7 +812,8 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+             # (req_to_token is zero-init) and outputs for padding queries are
+             # discarded downstream.
+             if (
+-                self.attn_cp_size > 1
++                not is_cp_v2_active(forward_batch)
++                and self.attn_cp_size > 1
+                 and forward_batch.global_num_tokens_cpu is not None
+                 and forward_batch.extend_num_tokens is not None
+                 and forward_batch.extend_seq_lens_cpu is not None
+diff --git a/python/sglang/srt/layers/cp/base.py b/python/sglang/srt/layers/cp/base.py
+index 59825c9cedcb..4fb2a9da2cbe 100644
+--- a/python/sglang/srt/layers/cp/base.py
++++ b/python/sglang/srt/layers/cp/base.py
+@@ -70,11 +70,11 @@ class CPAttentionBackendKind(IntEnum):
+ 
+     @classmethod
+     def from_string(cls, value: str) -> CPAttentionBackendKind:
+-        if value in ("fa3", "flashinfer"):
++        if value in ("fa3", "fa4", "flashinfer"):
+             return cls.FLASH_ATTENTION
+         raise ValueError(
+             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
+-            "of {'fa3', 'flashinfer'}"
++            "of {'fa3', 'fa4', 'flashinfer'}"
+         )
+ 
+ 
+diff --git a/python/sglang/srt/layers/cp/padding.py b/python/sglang/srt/layers/cp/padding.py
+new file mode 100644
+index 000000000000..b482fe9ed1c5
+--- /dev/null
++++ b/python/sglang/srt/layers/cp/padding.py
+@@ -0,0 +1,63 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Padding helpers shared by context-parallel strategies."""
++
++from typing import Any
++
++import torch
++
++from sglang.srt.runtime_context import get_parallel
++
++
++def get_cp_padding_align_size() -> int:
++    """Return the token-count alignment required by the active CP strategy."""
++    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
++    from sglang.srt.layers.utils.cp_utils import is_prefill_cp_in_seq_split
++
++    attn_cp_size = get_parallel().attn_cp_size
++    if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
++        return attn_cp_size * 2
++    return attn_cp_size
++
++
++def pad_logical_token_to_physical(metadata: Any) -> None:
++    """Align each CP rank's physical token count for CP collectives."""
++    logical_tokens = list(metadata.per_rank_actual_token)
++    align_size = get_cp_padding_align_size()
++    physical_rank_len = (
++        (max(logical_tokens) + align_size - 1) // align_size * align_size
++    )
++    metadata.per_rank_logical_token = logical_tokens
++    metadata.per_rank_actual_token = [physical_rank_len] * len(logical_tokens)
++    metadata.max_rank_len = [physical_rank_len] * len(logical_tokens)
++
++
++def pad_local_rows(x: torch.Tensor, metadata: Any, dim: int) -> torch.Tensor:
++    """Pad a local CP tensor from its logical length to its physical length."""
++    if (
++        metadata.per_rank_logical_token is None
++        or metadata.per_rank_logical_token == metadata.per_rank_actual_token
++    ):
++        return x
++
++    target_len = metadata.per_rank_actual_token[0]
++    pad_size = target_len - x.shape[dim]
++    assert pad_size >= 0
++    if pad_size == 0:
++        return x
++
++    pad_shape = list(x.shape)
++    pad_shape[dim] = pad_size
++    return torch.cat([x, x.new_zeros(pad_shape)], dim=dim)
+diff --git a/python/sglang/srt/layers/cp/utils.py b/python/sglang/srt/layers/cp/utils.py
+index 1ba7545cac81..24de66560846 100644
+--- a/python/sglang/srt/layers/cp/utils.py
++++ b/python/sglang/srt/layers/cp/utils.py
+@@ -27,6 +27,7 @@
+     InterleaveContextParallelMetadata,
+     InterleaveCPStrategy,
+ )
++from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
+ from sglang.srt.layers.cp.zigzag import (
+     ContextParallelMetadata,
+     ZigzagContextParallelMetadata,
+@@ -39,6 +40,8 @@
+ 
+ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
+     {
++        "MiMoV2FlashForCausalLM",
++        "MiMoV2ForCausalLM",
+         "Qwen3MoeForCausalLM",
+         "DeepseekV3ForCausalLM",
+     }
+@@ -152,15 +155,33 @@ def prepare_cp_forward(forward_batch) -> None:
+     assert is_cp_v2_active(forward_batch)
+     strategy = get_cp_strategy()
+     assert strategy is not None
+-    num_tokens = len(forward_batch.input_ids)
+ 
+     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
+     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
+-    forward_batch.attn_cp_metadata = strategy.build_metadata(
+-        num_tokens=num_tokens,
+-        seqs_len=seq_lens_cpu,
+-        extend_seqs_len=extend_lens_cpu,
++    num_tokens = (
++        sum(extend_lens_cpu)
++        if extend_lens_cpu is not None
++        else len(forward_batch.input_ids)
+     )
++    if forward_batch.attn_cp_metadata is None:
++        forward_batch.attn_cp_metadata = strategy.build_metadata(
++            num_tokens=num_tokens,
++            seqs_len=seq_lens_cpu,
++            extend_seqs_len=extend_lens_cpu,
++        )
++        pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
++
++    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
++        from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
++
++        set_local_dp_buffer_len(
++            forward_batch.attn_cp_metadata.per_rank_actual_token[
++                get_parallel().attn_cp_rank
++            ]
++        )
++
++    if getattr(forward_batch, "out_cache_loc", None) is not None:
++        forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
+ 
+ 
+ def cp_split_before_forward(
+@@ -191,6 +212,9 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
+         hidden_states = strategy.gather_hidden_states(
+             hidden_states, forward_batch, stream
+         )
++        # MiMo's text-only body returns (hidden_states, None); logits expects a tensor.
++        if len(rest) == 1 and rest[0] is None:
++            return hidden_states
+         return (hidden_states, *rest)
+ 
+     return strategy.gather_hidden_states(x, forward_batch, stream)
+diff --git a/python/sglang/srt/layers/cp/zigzag.py b/python/sglang/srt/layers/cp/zigzag.py
+index d353f0d7965c..0f279fcb55bb 100644
+--- a/python/sglang/srt/layers/cp/zigzag.py
++++ b/python/sglang/srt/layers/cp/zigzag.py
+@@ -47,6 +47,7 @@
+     ContextParallelStrategyKind,
+     CPAttentionBackendKind,
+ )
++from sglang.srt.layers.cp.padding import pad_local_rows
+ from sglang.srt.layers.dp_attention import (
+     is_allocation_symmetric,
+ )
+@@ -66,6 +67,7 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
+     # Per-rank aggregate lists have length cp_size.
+     per_rank_actual_token: Optional[List[int]] = None
+     max_rank_len: Optional[List[int]] = None
++    per_rank_logical_token: Optional[List[int]] = None
+ 
+     # Per-sequence FlashAttention tensors (shape [bs] or [bs + 1]).
+     kv_len_prev_tensor: Optional[Any] = None
+@@ -263,23 +265,23 @@ def build_metadata(
+         )
+ 
+     def shard_hidden_states(self, x: Any, forward_batch) -> Any:
+-        chunks = torch.split(x, forward_batch.attn_cp_metadata.split_list, dim=0)
+-        return torch.cat(
+-            [chunks[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
+-        )
++        metadata = forward_batch.attn_cp_metadata
++        x = x[: metadata.total_seq_lens]
++        chunks = torch.split(x, metadata.split_list, dim=0)
++        local_x = torch.cat([chunks[i] for i in metadata.zigzag_index], dim=0)
++        return pad_local_rows(local_x, metadata, dim=0)
+ 
+     def shard_position_ids(self, positions: Any, forward_batch) -> Any:
+-        chunks = torch.split(
+-            positions, forward_batch.attn_cp_metadata.split_list, dim=-1
+-        )
+-        return torch.cat(
+-            [chunks[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=-1
+-        )
++        metadata = forward_batch.attn_cp_metadata
++        positions = positions[..., : metadata.total_seq_lens]
++        chunks = torch.split(positions, metadata.split_list, dim=-1)
++        local_positions = torch.cat([chunks[i] for i in metadata.zigzag_index], dim=-1)
++        return pad_local_rows(local_positions, metadata, dim=-1)
+ 
+     def gather_hidden_states(
+         self, x: Any, forward_batch, stream: Optional[Any] = None
+     ) -> Any:
+-        gathered = self._all_gather_reorganized(x, forward_batch, stream)
++        gathered = self._all_gather_reorganized(x, forward_batch)
+         chunks = torch.split(
+             gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
+         )
+@@ -290,7 +292,7 @@ def gather_hidden_states(
+     def gather_kv_cache(
+         self, x: Any, forward_batch, stream: Optional[Any] = None
+     ) -> Any:
+-        gathered = self._all_gather_reorganized(x, forward_batch, stream)
++        gathered = self._all_gather_reorganized(x, forward_batch)
+         chunks = torch.split(
+             gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
+         )
+@@ -315,7 +317,8 @@ def run_attention(
+ 
+         meta = forward_batch.attn_cp_metadata
+         q_prev = q[: meta.total_q_prev_tokens]
+-        q_next = q[meta.total_q_prev_tokens :]
++        logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
++        q_next = q[meta.total_q_prev_tokens : logical_tokens]
+ 
+         result_prev = attn_fn(
+             q_prev,
+@@ -329,7 +332,14 @@ def run_attention(
+             meta.kv_len_next_tensor,
+             meta.max_seqlen_q_next,
+         )
+-        return torch.cat([result_prev, result_next], dim=0)
++        result = torch.cat([result_prev, result_next], dim=0)
++        pad_size = q.shape[0] - logical_tokens
++        assert pad_size >= 0
++        if pad_size > 0:
++            result = torch.cat(
++                [result, result.new_zeros(pad_size, *result.shape[1:])], dim=0
++            )
++        return result
+ 
+     def materialize_full_kv(
+         self, forward_batch, layer: Any, k: Any, v: Any, swa_loc: Optional[Any] = None
+@@ -339,12 +349,16 @@ def materialize_full_kv(
+             if not layer.is_cross_attention
+             else forward_batch.encoder_out_cache_loc
+         )
+-        key_cache_full = self.gather_kv_cache(
+-            k.contiguous(), forward_batch, torch.cuda.current_stream()
+-        )
+-        value_cache_full = self.gather_kv_cache(
+-            v.contiguous(), forward_batch, torch.cuda.current_stream()
+-        )
++        if swa_loc is not None:
++            swa_loc = swa_loc[: cache_loc.shape[0]]
++        k_dim = k.shape[-1]
++        v_dim = v.shape[-1]
++        kv_cache = torch.cat([k, v], dim=-1).contiguous()
++        key_cache_full, value_cache_full = self.gather_kv_cache(
++            kv_cache, forward_batch
++        ).split([k_dim, v_dim], dim=-1)
++        key_cache_full = key_cache_full.contiguous()
++        value_cache_full = value_cache_full.contiguous()
+         get_token_to_kv_pool().set_kv_buffer(
+             layer,
+             KVWriteLoc(cache_loc, swa_loc),
+@@ -359,9 +373,7 @@ def materialize_full_mla_kv(
+     ) -> None:
+         kv_lora_rank = k_nope.shape[-1]
+         latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
+-        latent_full = self.gather_kv_cache(
+-            latent, forward_batch, torch.cuda.current_stream()
+-        )
++        latent_full = self.gather_kv_cache(latent, forward_batch)
+         get_token_to_kv_pool().set_mla_kv_buffer(
+             layer,
+             forward_batch.out_cache_loc,
+@@ -369,9 +381,16 @@ def materialize_full_mla_kv(
+             latent_full[..., kv_lora_rank:],
+         )
+ 
+-    def _all_gather_reorganized(self, x: torch.Tensor, forward_batch, stream):
++    def _all_gather_reorganized(self, x: torch.Tensor, forward_batch):
+         meta = forward_batch.attn_cp_metadata
+-        max_len = meta.max_rank_len[0]
++        per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
++        max_len = max(per_rank_token)
++        if per_rank_token == meta.per_rank_actual_token:
++            local_len = x.shape[0]
++        else:
++            local_len = per_rank_token[self.cp_rank]
++        assert x.shape[0] >= local_len
++        x = x[:local_len]
+         pad_size = max_len - x.shape[0]
+         if pad_size > 0:
+             padding = [0, 0] * (x.ndim - 1) + [0, pad_size]
+@@ -390,13 +409,13 @@ def _all_gather_reorganized(self, x: torch.Tensor, forward_batch, stream):
+                 device=x.device,
+                 dtype=x.dtype,
+             )
+-        group.cp_all_gather_into_tensor_async(gathered, x, stream)
++        group.all_gather_into_tensor(gathered, x)
+ 
+-        chunks = torch.split(gathered, meta.max_rank_len, dim=0)
++        chunks = torch.split(gathered, [max_len] * self.cp_size, dim=0)
+         return torch.cat(
+             [
+                 chunks[rank][:per_rank_len]
+-                for rank, per_rank_len in enumerate(meta.per_rank_actual_token)
++                for rank, per_rank_len in enumerate(per_rank_token)
+             ],
+             dim=0,
+         )
+diff --git a/python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py b/python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
+index f06407087990..dec6bb512421 100644
+--- a/python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
++++ b/python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
+@@ -436,7 +436,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
+     # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
+     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
+     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
+-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
++    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+     from sglang.srt.utils.common import require_mlp_sync
+ 
+     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
+diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
+index 01c542d65047..4000fec92c0e 100644
+--- a/python/sglang/srt/layers/dp_attention.py
++++ b/python/sglang/srt/layers/dp_attention.py
+@@ -193,6 +193,10 @@ def get_global_dp_buffer_len(cls) -> int:
+     def get_local_dp_buffer_len(cls) -> int:
+         return cls._local_dp_buffer_len
+ 
++    @classmethod
++    def set_local_dp_buffer_len(cls, local_dp_buffer_len: int) -> None:
++        cls._local_dp_buffer_len = local_dp_buffer_len
++
+     @classmethod
+     def get_dp_global_num_tokens(cls) -> List[int]:
+         return cls._global_num_tokens
+@@ -247,6 +251,10 @@ def get_local_dp_buffer_len() -> int:
+     return _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+ 
+ 
++def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
++    _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
++
++
+ def get_dp_global_num_tokens() -> List[int]:
+     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
+ 
+diff --git a/python/sglang/srt/layers/utils/cp_utils.py b/python/sglang/srt/layers/utils/cp_utils.py
+index 237665d57682..0f289f6023db 100644
+--- a/python/sglang/srt/layers/utils/cp_utils.py
++++ b/python/sglang/srt/layers/utils/cp_utils.py
+@@ -68,21 +68,6 @@ def is_prefill_cp_in_seq_split():
+     )
+ 
+ 
+-def get_cp_padding_align_size() -> int:
+-    """Token-count alignment for CP padding of global_num_tokens: 2 * cp_size
+-    for zigzag (in-seq-split) CP, otherwise cp_size (1 when CP is off, so the
+-    padding is a no-op; extra padding breaks EAGLE/MTP draft prefill, see
+-    #23269). Keep prepare_mlp_sync_batch and cal_padded_tokens consistent
+-    through this helper.
+-    """
+-    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+-
+-    attn_cp_size = get_parallel().attn_cp_size
+-    if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
+-        return attn_cp_size * 2
+-    return attn_cp_size
+-
+-
+ def is_mla_prefill_cp_enabled() -> bool:
+     sa = get_server_args()
+     return sa.enable_prefill_context_parallel and sa.use_mla_backend()
+@@ -215,7 +200,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch,
+     Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
+     This implementation mainly consists of three parts:
+     Step 1, padding the input shape to unify the shape for allgather communication (the shape must be the same).
+-    Step 2, allgather communication(async).
++    Step 2, synchronized allgather communication.
+     Step 3, removing the padding and reassembling the data according to the actual tokens.
+     """
+     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
+@@ -224,9 +209,8 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch,
+         input_tensor = F.pad(
+             input_tensor, (0, 0, 0, pad_size), mode="constant", value=0
+         )
+-    with use_symmetric_memory(
+-        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
+-    ):
++    group = get_parallel().attn_cp_group
++    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+         input_tensor_full = torch.empty(
+             max_len * cp_size,
+             input_tensor.shape[1],
+@@ -234,9 +218,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch,
+             dtype=input_tensor.dtype,
+         )
+ 
+-    get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
+-        input_tensor_full, input_tensor, stream
+-    )
++    group.all_gather_into_tensor(input_tensor_full, input_tensor)
+ 
+     outputs_list_max = list(
+         torch.split(
+@@ -273,9 +255,8 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
+         input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
+ 
+     # Create output tensor with proper shape for all dimensions
+-    with use_symmetric_memory(
+-        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
+-    ):
++    group = get_parallel().attn_cp_group
++    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+         input_tensor_full = torch.empty(
+             max_len * cp_size,
+             *input_tensor.shape[1:],
+@@ -283,9 +264,7 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
+             dtype=input_tensor.dtype,
+         )
+ 
+-    get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
+-        input_tensor_full, input_tensor, stream
+-    )
++    group.all_gather_into_tensor(input_tensor_full, input_tensor)
+ 
+     outputs_list_max = list(
+         torch.split(
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 85204c0d0b60..d3c884fbf871 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -1160,8 +1160,9 @@ def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0
+     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+ 
+-        # Local import: a module-level cp_utils import here is circular (#27014).
+-        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
++        # Local imports: module-level CP helper imports here are circular (#27014).
++        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
++        from sglang.srt.layers.cp.utils import enable_cp_v2
+ 
+         assert self.global_num_tokens_cpu is not None
+         assert self.global_num_tokens_for_logprob_cpu is not None
+@@ -1181,9 +1182,10 @@ def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+         # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
+         # prefill with NaN draft logits, see #23269).
+         # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
+-        cp_align_size = get_cp_padding_align_size()
+-        for i in range(sync_group_size):
+-            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
++        if not enable_cp_v2():
++            cp_align_size = get_cp_padding_align_size()
++            for i in range(sync_group_size):
++                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+ 
+         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+             self.is_extend_in_batch, global_num_tokens
+@@ -1235,7 +1237,10 @@ def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+ 
+         self.global_dp_buffer_len = buffer_len
+         set_dp_buffer_len(
+-            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
++            buffer_len,
++            num_tokens,
++            dp_padding_mode.is_max_len(),
++            global_num_tokens,
+         )
+         set_is_extend_in_batch(self.is_extend_in_batch)
+ 
+diff --git a/python/sglang/srt/model_executor/runner/eager_runner.py b/python/sglang/srt/model_executor/runner/eager_runner.py
+index 7d10c28464f2..21173ba0092c 100644
+--- a/python/sglang/srt/model_executor/runner/eager_runner.py
++++ b/python/sglang/srt/model_executor/runner/eager_runner.py
+@@ -102,7 +102,7 @@ def __init__(self, model_runner: ModelRunner) -> None:
+             max_bs *= sa.speculative_eagle_topk
+         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
+         if require_mlp_sync(sa):
+-            from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
++            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+ 
+             max_bs = ceil_align(max_bs, self.attn_tp_size)
+             max_bs = ceil_align(max_bs, get_cp_padding_align_size())
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 6375412650a0..f2cedff017b6 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -5315,6 +5315,21 @@ def _handle_context_parallelism(self):
+             ):
+                 envs.SGLANG_ENABLE_CP_V2.set(True)
+ 
++            if (
++                self.enable_prefill_cp
++                and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
++                and envs.SGLANG_ENABLE_CP_V2.get()
++            ):
++                if self.cp_strategy != "zigzag":
++                    raise ValueError(
++                        "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
++                    )
++                if model_config.is_multimodal and not self.language_only:
++                    raise ValueError(
++                        "MiMo V2 CP-v2 only supports text inference; add "
++                        "--language-only."
++                    )
++
+         if self.enable_prefill_cp and self.cp_strategy is None:
+             raise ValueError(
+                 "--cp-strategy must be set when --enable-prefill-cp is enabled."
+diff --git a/test/registered/cp/test_cp_strategy_unit.py b/test/registered/cp/test_cp_strategy_unit.py
+index 6750e23fbf55..a4c1ba50e6db 100644
+--- a/test/registered/cp/test_cp_strategy_unit.py
++++ b/test/registered/cp/test_cp_strategy_unit.py
+@@ -13,12 +13,18 @@
+     is_interleave,
+     is_zigzag,
+ )
++from sglang.srt.layers.cp.padding import (
++    get_cp_padding_align_size,
++    pad_local_rows,
++    pad_logical_token_to_physical,
++)
+ from sglang.srt.layers.cp.utils import (
+     cp_split_before_forward,
+     enable_cp_v2,
+     is_cp_v2_active,
+ )
+ from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
++from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+ from sglang.srt.runtime_context import get_parallel
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+@@ -35,8 +41,8 @@ class _FakeCPGroup:
+     def __init__(self, all_rank_tensors):
+         self.all_rank_tensors = all_rank_tensors
+ 
+-    def cp_all_gather_into_tensor_async(self, output, input_tensor, stream):
+-        del input_tensor, stream
++    def all_gather_into_tensor(self, output, input_tensor):
++        del input_tensor
+         torch.cat(self.all_rank_tensors, dim=0, out=output)
+ 
+ 
+@@ -418,6 +424,92 @@ def test_zigzag_gathers_kv_cache_to_original_order(self):
+ 
+             self.assertTrue(torch.equal(gathered, kv))
+ 
++    def test_zigzag_padding_aligns_local_tensors(self):
++        cp_size = 2
++        metadata = SimpleNamespace(
++            per_rank_actual_token=[7, 6],
++            per_rank_logical_token=None,
++            max_rank_len=[7, 7],
++        )
++
++        with (
++            get_parallel().override(attn_cp_size=cp_size),
++            patch(
++                "sglang.srt.layers.utils.cp_utils.is_prefill_cp_in_seq_split",
++                return_value=True,
++            ),
++            patch(
++                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_in_seq_split",
++                return_value=False,
++            ),
++        ):
++            align_size = get_cp_padding_align_size()
++            pad_logical_token_to_physical(metadata)
++
++        self.assertEqual(align_size, 2 * cp_size)
++        self.assertEqual(metadata.per_rank_logical_token, [7, 6])
++        self.assertEqual(metadata.per_rank_actual_token, [8, 8])
++        self.assertEqual(metadata.max_rank_len, [8, 8])
++        for logical_len in metadata.per_rank_logical_token:
++            local_hidden = torch.arange(logical_len * 2).view(logical_len, 2)
++            padded_hidden = pad_local_rows(local_hidden, metadata, dim=0)
++            physical_len = metadata.per_rank_actual_token[0]
++            self.assertEqual(padded_hidden.shape, (physical_len, 2))
++            self.assertTrue(torch.equal(padded_hidden[:logical_len], local_hidden))
++            self.assertTrue(
++                torch.equal(
++                    padded_hidden[logical_len:],
++                    local_hidden.new_zeros(physical_len - logical_len, 2),
++                )
++            )
++
++    def test_zigzag_materialize_full_kv_gathers_once_and_preserves_swa_location(self):
++        key = torch.arange(6).view(3, 2)
++        value = torch.arange(9).view(3, 3) + 10
++        local_kv = torch.cat([key, value], dim=-1)
++        cache_loc = torch.arange(3)
++        swa_loc = torch.arange(5) + 16
++        forward_batch = SimpleNamespace(
++            out_cache_loc=cache_loc,
++            encoder_out_cache_loc=torch.arange(3) + 32,
++        )
++        layer = SimpleNamespace(
++            is_cross_attention=False,
++            k_scale="key-scale",
++            v_scale="value-scale",
++        )
++        writes = []
++        pool = SimpleNamespace(set_kv_buffer=lambda *args: writes.append(args))
++        strategy = ZigzagCPStrategy(cp_size=2)
++
++        with (
++            patch.object(strategy, "gather_kv_cache", return_value=local_kv) as gather,
++            patch(
++                "sglang.srt.layers.cp.zigzag.get_token_to_kv_pool",
++                return_value=pool,
++            ),
++        ):
++            strategy.materialize_full_kv(forward_batch, layer, key, value, swa_loc)
++
++        gather.assert_called_once()
++        gathered_kv, gathered_forward_batch = gather.call_args.args
++        self.assertTrue(gathered_kv.is_contiguous())
++        self.assertTrue(torch.equal(gathered_kv, local_kv))
++        self.assertIs(gathered_forward_batch, forward_batch)
++        self.assertEqual(len(writes), 1)
++        written_layer, write_loc, written_key, written_value, k_scale, v_scale = writes[
++            0
++        ]
++        self.assertIs(written_layer, layer)
++        self.assertIsInstance(write_loc, KVWriteLoc)
++        self.assertIs(write_loc.loc, cache_loc)
++        self.assertTrue(torch.equal(write_loc.swa_loc, swa_loc[:3]))
++        self.assertTrue(written_key.is_contiguous())
++        self.assertTrue(written_value.is_contiguous())
++        self.assertTrue(torch.equal(written_key, key))
++        self.assertTrue(torch.equal(written_value, value))
++        self.assertEqual((k_scale, v_scale), ("key-scale", "value-scale"))
++
+     def test_zigzag_attention_dispatch_runs_prev_then_next(self):
+         cp_size = 2
+         seq_lens = [8]
+diff --git a/test/registered/cp/test_mimo_cp.py b/test/registered/cp/test_mimo_cp.py
+new file mode 100644
+index 000000000000..b311a9ba1fa6
+--- /dev/null
++++ b/test/registered/cp/test_mimo_cp.py
+@@ -0,0 +1,80 @@
++import unittest
++from types import SimpleNamespace
++
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.run_eval import run_eval
++from sglang.test.test_utils import (
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    kill_process_tree,
++    popen_launch_server,
++)
++
++register_cuda_ci(est_time=500, suite="nightly-8-gpu-b200", nightly=True)
++
++MIMO_V2_MODEL_PATH = "XiaomiMiMo/MiMo-V2.5"
++GSM8K_BASELINE_ACCURACY = 0.93
++
++
++class TestMiMoV2ContextParallel(CustomTestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.model = MIMO_V2_MODEL_PATH
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++            other_args=[
++                "--trust-remote-code",
++                "--language-only",
++                "--tp",
++                "8",
++                "--attn-cp-size",
++                "2",
++                "--attention-backend",
++                "fa4",
++                "--enable-prefill-cp",
++                "--cp-strategy",
++                "zigzag",
++                "--moe-runner-backend",
++                "flashinfer_trtllm",
++                "--moe-dense-tp-size",
++                "1",
++                "--mem-fraction-static",
++                "0.8",
++                "--chunked-prefill-size",
++                "8192",
++            ],
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        if hasattr(cls, "process") and cls.process:
++            kill_process_tree(cls.process.pid)
++
++    def test_gsm8k(self):
++        metrics = run_eval(
++            SimpleNamespace(
++                model=self.model,
++                eval_name="gsm8k",
++                api="chat",
++                num_shots=5,
++                num_examples=200,
++                max_tokens=4096,
++                num_threads=8,
++                repeat=1,
++                temperature=0.0,
++                top_p=1.0,
++                base_url=self.base_url,
++                host="http://127.0.0.1",
++                port=int(self.base_url.split(":")[-1]),
++            )
++        )
++        print(f"{metrics=}")
++        self.assertGreaterEqual(metrics["score"], GSM8K_BASELINE_ACCURACY)
++
++
++if __name__ == "__main__":
++    unittest.main()

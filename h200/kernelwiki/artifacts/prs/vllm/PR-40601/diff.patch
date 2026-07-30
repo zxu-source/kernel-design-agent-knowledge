@@ -1,0 +1,2841 @@
+diff --git a/.buildkite/intel_jobs/test-intel.yaml b/.buildkite/intel_jobs/test-intel.yaml
+index 4bf14f7064be..afeb11e06d59 100644
+--- a/.buildkite/intel_jobs/test-intel.yaml
++++ b/.buildkite/intel_jobs/test-intel.yaml
+@@ -87,3 +87,20 @@ steps:
+         cd tests &&
+         pytest -v -s entrypoints/multimodal/openai/chat_completion/test_audio_in_video.py &&
+         pytest -v -s benchmarks/test_serve_cli.py'
++  - label: "XPU quantization test"
++    depends_on:
++      - image-build-xpu
++    timeout_in_minutes: 30
++    device: intel_gpu
++    no_plugin: true
++    env:
++      REGISTRY: "public.ecr.aws/q9t5s3a7"
++      REPO: "vllm-ci-test-repo"
++    source_file_dependencies:
++      - vllm/
++      - .buildkite/intel_jobs/test-intel.yaml 
++    commands:
++      - >-
++        bash .buildkite/scripts/hardware_ci/run-intel-test.sh
++        'cd tests &&
++        pytest -v -s quantization/test_auto_round.py'
+\ No newline at end of file
+diff --git a/requirements/xpu.txt b/requirements/xpu.txt
+index 33a808866c4d..f17e2281f7a8 100644
+--- a/requirements/xpu.txt
++++ b/requirements/xpu.txt
+@@ -16,5 +16,5 @@ torch==2.12.0
+ torchaudio
+ torchvision
+ 
+-auto_round_lib>=0.13.0
++auto_round_lib>=0.13.3
+ vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.9.1/vllm_xpu_kernels-0.1.9.1-cp38-abi3-manylinux_2_28_x86_64.whl
+diff --git a/tests/quantization/test_auto_round.py b/tests/quantization/test_auto_round.py
+index 9f5db8219501..5cd599f7211a 100644
+--- a/tests/quantization/test_auto_round.py
++++ b/tests/quantization/test_auto_round.py
+@@ -10,23 +10,765 @@
+ 
+ import pytest
+ 
++from vllm.model_executor.layers.fused_moe import RoutedExperts
++from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
++from vllm.model_executor.layers.quantization.inc import INCConfig
++from vllm.model_executor.layers.quantization.inc.config_parser import INCLayerConfig
++from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
++from vllm.model_executor.layers.quantization.inc.schemes import (
++    INCWna16Scheme,
++    resolve_scheme,
++)
++from vllm.model_executor.layers.quantization.inc.schemes.inc_scheme import (
++    INCLinearScheme,
++)
++from vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear import (
++    INCARKLinearMethod,
++    INCWNA16LinearScheme,
++    INCXPULinearMethod,
++)
++from vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_scheme import (
++    _resolve_awq_moe,
++    _resolve_gptq_moe,
++)
++from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+ from vllm.platforms import current_platform
+ 
+ MODELS = [
+-    "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",  ##auto_round:auto_gptq
+-    "Intel/Qwen2-0.5B-Instruct-int4-sym-AutoRound",  ##auto_round:auto_awq
++    pytest.param(
++        "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",
++        id="auto_round:auto_gptq",
++    ),
++    pytest.param(
++        "Intel/Qwen2-0.5B-Instruct-int4-sym-AutoRound",
++        marks=pytest.mark.skipif(
++            not current_platform.is_cuda(),
++            reason="AWQ AutoRound model only supports CUDA backend for now.",
++        ),
++        id="auto_round:auto_awq",
++    ),
+ ]
+ 
+ 
+ @pytest.mark.skipif(
+-    not current_platform.is_cpu()
+-    and not current_platform.is_xpu()
+-    and not current_platform.is_cuda(),
+-    reason="only supports CPU/XPU/CUDA backend.",
++    not (
++        current_platform.is_cpu()
++        or current_platform.is_xpu()
++        or current_platform.is_cuda()
++    ),
++    reason="Only supports CPU/XPU/CUDA backend.",
+ )
+ @pytest.mark.parametrize("model", MODELS)
+-def test_auto_round(vllm_runner, model):
++def test_auto_round_model(vllm_runner, model):
+     with vllm_runner(model, enforce_eager=True) as llm:
+         output = llm.generate_greedy(["The capital of France is"], max_tokens=8)
++
+     assert output
+-    print(f"{output[0][1]}")
++    print(output[0][1])
++
++
++# ---------------------------------------------------------------------------
++# Unit tests for INCConfig and related classes
++# ---------------------------------------------------------------------------
++
++
++class DummyLayer:
++    pass
++
++
++class DummyFusedMoE:
++    pass
++
++
++def make_config(**overrides) -> INCConfig:
++    kwargs = {
++        "weight_bits": 4,
++        "group_size": 128,
++        "sym": True,
++        "packing_format": "auto_round:auto_gptq",
++        "block_name_to_quantize": None,
++        "extra_config": None,
++        "data_type": "int",
++        "backend": "auto",
++    }
++    kwargs.update(overrides)
++    return INCConfig(**kwargs)
++
++
++def make_layer_config(**overrides) -> INCLayerConfig:
++    kwargs = {
++        "bits": 4,
++        "group_size": 128,
++        "sym": True,
++        "packing_format": "auto_round:auto_gptq",
++        "backend": "auto",
++        "data_type": "int",
++        "quantized": True,
++    }
++    kwargs.update(overrides)
++    return INCLayerConfig(**kwargs)
++
++
++def test_inc_config_parser_exact_match() -> None:
++    config = make_config(
++        extra_config={
++            "layers.0.self_attn.q_proj": {
++                "bits": 8,
++                "group_size": 64,
++                "sym": False,
++            }
++        }
++    )
++
++    layer_config = config.config_parser.resolve(
++        DummyLayer(), "layers.0.self_attn.q_proj"
++    )
++
++    assert layer_config.bits == 8
++    assert layer_config.group_size == 64
++    assert layer_config.sym is False
++    assert layer_config.quantized is True
++
++
++def test_inc_model_prefix_early_exit() -> None:
++    """extra_config keys with model. prefix trigger early unquantized return."""
++    config = make_config(
++        extra_config={
++            "model.layers.1.mlp.gate_proj": {
++                "bits": 16,
++            },
++        }
++    )
++
++    # get_quant_method checks model. prefix for unquantized early-exit
++    result = config.get_quant_method(DummyLayer(), "layers.1.mlp.gate_proj")
++    assert isinstance(result, UnquantizedLinearMethod)
++
++
++def test_inc_config_parser_regex_match() -> None:
++    config = make_config(
++        extra_config={
++            r"layers\.\d+\.self_attn\.(q|k|v)_proj": {
++                "bits": 8,
++                "group_size": 64,
++                "sym": False,
++            }
++        }
++    )
++
++    layer_config = config.config_parser.resolve(
++        DummyLayer(), "layers.3.self_attn.q_proj"
++    )
++
++    assert layer_config.bits == 8
++    assert layer_config.group_size == 64
++    assert layer_config.sym is False
++
++
++def test_inc_config_parser_invalid_regex_ignored() -> None:
++    config = make_config(
++        extra_config={
++            "[invalid": {
++                "bits": 8,
++                "group_size": 64,
++                "sym": False,
++            }
++        }
++    )
++
++    layer_config = config.config_parser.resolve(
++        DummyLayer(), "layers.0.self_attn.q_proj"
++    )
++
++    assert layer_config.bits == 4
++    assert layer_config.group_size == 128
++    assert layer_config.sym is True
++
++
++def test_inc_config_parser_block_name_to_quantize_marks_unquantized() -> None:
++    config = make_config(block_name_to_quantize=["layers.1"])
++
++    layer_config = config.config_parser.resolve(
++        DummyLayer(), "layers.0.self_attn.q_proj"
++    )
++
++    assert layer_config.bits == 16
++    assert layer_config.group_size == -1
++    assert layer_config.sym is True
++    assert layer_config.quantized is False
++
++
++def test_inc_config_parser_parallel_lm_head_defaults_to_unquantized() -> None:
++    layer = object.__new__(ParallelLMHead)
++    config = make_config()
++
++    layer_config = config.config_parser.resolve(layer, "lm_head")
++
++    assert layer_config.quantized is False
++    assert layer_config.bits == 16
++
++
++def test_inc_config_parser_fused_moe_requires_consistent_configs() -> None:
++    config = make_config(
++        extra_config={
++            "layers.0.block_sparse_moe.experts.0.w1": {
++                "bits": 4,
++                "group_size": 128,
++                "sym": True,
++            },
++            "layers.0.block_sparse_moe.experts.0.w2": {
++                "bits": 8,
++                "group_size": 128,
++                "sym": True,
++            },
++        }
++    )
++
++    with pytest.raises(ValueError, match="requires consistent quant config"):
++        config.config_parser.resolve(DummyFusedMoE(), "layers.0.block_sparse_moe")
++
++
++def test_inc_config_parser_fused_module_requires_consistent_configs() -> None:
++    config = make_config(
++        extra_config={
++            "layers.0.self_attn.q_proj": {
++                "bits": 4,
++                "group_size": 128,
++                "sym": True,
++            },
++            "layers.0.self_attn.k_proj": {
++                "bits": 8,
++                "group_size": 128,
++                "sym": True,
++            },
++            "layers.0.self_attn.v_proj": {
++                "bits": 4,
++                "group_size": 128,
++                "sym": True,
++            },
++        }
++    )
++    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
++
++    with pytest.raises(ValueError, match="requires consistent quant config"):
++        config.config_parser.resolve(DummyLayer(), "layers.0.self_attn.qkv_proj")
++
++
++def test_inc_layer_config_mx_fp_helpers() -> None:
++    layer_config = INCLayerConfig(
++        bits=4,
++        group_size=32,
++        sym=True,
++        packing_format="",
++        backend="",
++        data_type="mx_fp",
++        quantized=True,
++    )
++
++    assert layer_config.is_mxfp4 is True
++    assert layer_config.is_mxfp8 is False
++
++
++def test_inc_resolve_scheme_selects_wna16() -> None:
++    layer_config = INCLayerConfig(
++        bits=4,
++        group_size=128,
++        sym=True,
++        packing_format="auto_round:auto_gptq",
++        backend="auto",
++        data_type="int",
++        quantized=True,
++    )
++
++    scheme = resolve_scheme(layer_config)
++
++    assert isinstance(scheme, INCWna16Scheme)
++
++
++class DummyLinearScheme(INCLinearScheme):
++    def __init__(self) -> None:
++        self.calls: list[tuple] = []
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 0
++
++    def create_weights(self, *args, **kwargs) -> None:
++        self.calls.append(("create_weights", args, kwargs))
++
++    def process_weights_after_loading(self, layer) -> None:
++        self.calls.append(("process_weights_after_loading", layer))
++
++    def apply_weights(self, layer, x, bias=None):
++        self.calls.append(("apply_weights", layer, x, bias))
++        return "applied"
++
++
++def test_inc_linear_method_delegates() -> None:
++    scheme = DummyLinearScheme()
++    method = INCLinearMethod(scheme)
++    layer = DummyLayer()
++
++    method.create_weights(
++        layer,
++        input_size_per_partition=1,
++        output_partition_sizes=[2],
++        input_size=1,
++        output_size=2,
++        params_dtype=None,
++    )
++    method.process_weights_after_loading(layer)
++    result = method.apply(layer, "x", "b")
++
++    assert result == "applied"
++    assert [call[0] for call in scheme.calls] == [
++        "create_weights",
++        "process_weights_after_loading",
++        "apply_weights",
++    ]
++
++
++def test_wna16_xpu_prefers_ark_when_available(monkeypatch) -> None:
++    class DummyQuantLinear:
++        pass
++
++    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
++    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.get_ark_state",
++        lambda: (True, None, object(), DummyQuantLinear),
++    )
++
++    method = INCWna16Scheme().get_linear_method(
++        make_config(),
++        object(),
++        "layer",
++        make_layer_config(),
++    )
++
++    assert isinstance(method, INCLinearMethod)
++    assert isinstance(method.scheme, INCARKLinearMethod)
++
++
++def test_wna16_xpu_falls_back_when_ark_unavailable(monkeypatch) -> None:
++    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
++    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.get_ark_state",
++        lambda: (False, "missing", None, None),
++    )
++
++    method = INCWna16Scheme().get_linear_method(
++        make_config(),
++        object(),
++        "layer",
++        make_layer_config(),
++    )
++
++    assert isinstance(method, INCLinearMethod)
++    assert isinstance(method.scheme, INCXPULinearMethod)
++
++
++def test_wna16_cpu_gptq_prefers_ark_when_available(monkeypatch) -> None:
++    class DummyQuantLinear:
++        pass
++
++    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
++    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.get_ark_state",
++        lambda: (True, None, object(), DummyQuantLinear),
++    )
++
++    method = INCWna16Scheme().get_linear_method(
++        make_config(),
++        object(),
++        "layer",
++        make_layer_config(),
++    )
++
++    assert isinstance(method, INCLinearMethod)
++    assert isinstance(method.scheme, INCARKLinearMethod)
++
++
++def test_wna16_cpu_gptq_raises_when_ark_and_marlin_unavailable(
++    monkeypatch,
++) -> None:
++    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
++    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.get_ark_state",
++        lambda: (False, "missing", None, None),
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.check_marlin_supported",
++        lambda *args, **kwargs: False,
++    )
++
++    with pytest.raises(NotImplementedError, match="Only 4-bit and 8-bit symmetric"):
++        INCWna16Scheme().get_linear_method(
++            make_config(),
++            object(),
++            "layer",
++            make_layer_config(),
++        )
++
++
++def test_wna16_linear_gptq_uses_auto_gptq_when_supported(monkeypatch) -> None:
++    captured = {}
++
++    class DummyMethod:
++        def __init__(self, cfg):
++            captured["cfg"] = cfg
++
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear."
++        "check_marlin_supported",
++        lambda *args, **kwargs: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.auto_gptq.AutoGPTQLinearMethod",
++        DummyMethod,
++    )
++
++    scheme = INCWNA16LinearScheme(make_layer_config())
++
++    assert isinstance(scheme.inner_method, DummyMethod)
++    assert isinstance(captured["cfg"], AutoGPTQConfig)
++    assert captured["cfg"].weight_bits == 4
++    assert captured["cfg"].group_size == 128
++    assert captured["cfg"].is_sym is True
++
++
++def test_wna16_linear_gptq_unsupported_config_raises() -> None:
++    with pytest.raises(NotImplementedError, match="Only 4-bit and 8-bit symmetric"):
++        INCWNA16LinearScheme(make_layer_config(sym=False))
++
++
++def test_wna16_xpu_unsupported_config_still_raises(monkeypatch) -> None:
++    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
++    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
++
++    with pytest.raises(NotImplementedError, match="unsupported config"):
++        INCWna16Scheme().get_linear_method(
++            make_config(sym=False),
++            object(),
++            "layer",
++            make_layer_config(sym=False),
++        )
++
++
++def test_inc_get_quant_method_unquantized_linear_returns_unquantized() -> None:
++    config = make_config(extra_config={"layer": {"bits": 16}})
++    layer = object.__new__(LinearBase)
++
++    method = config.get_quant_method(layer, "layer")
++
++    assert isinstance(method, UnquantizedLinearMethod)
++
++
++def test_inc_get_quant_method_unquantized_moe_returns_unquantized(
++    monkeypatch,
++) -> None:
++    """Early-exit returns UnquantizedFusedMoEMethod for FusedMoE layers
++    when extra_config has bits >= 16."""
++    config = make_config(extra_config={"layer": {"bits": 16}})
++    layer = object.__new__(RoutedExperts)
++    layer.moe_config = None  # UnquantizedFusedMoEMethod accepts moe_config
++
++    class DummyUnquantizedFusedMoEMethod:
++        def __init__(self, moe_config) -> None:
++            self.moe_config = moe_config
++
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.inc.UnquantizedFusedMoEMethod",
++        DummyUnquantizedFusedMoEMethod,
++    )
++
++    method = config.get_quant_method(layer, "layer")
++
++    assert isinstance(method, DummyUnquantizedFusedMoEMethod)
++    assert method.moe_config is None
++
++
++def test_inc_get_quant_method_linear_uses_resolved_scheme(monkeypatch) -> None:
++    config = make_config()
++    layer = object.__new__(LinearBase)
++    sentinel = object()
++
++    class DummyScheme:
++        def get_linear_method(self, _config, _layer, _prefix, _layer_config):
++            return sentinel
++
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.schemes.factory.resolve_scheme",
++        lambda _layer_config: DummyScheme(),
++    )
++
++    method = config.get_quant_method(layer, "layer")
++
++    assert method is sentinel
++
++
++def test_inc_get_quant_method_moe_uses_resolved_scheme(monkeypatch) -> None:
++    config = make_config()
++    layer = object.__new__(RoutedExperts)
++    sentinel = object()
++
++    class DummyScheme:
++        def get_moe_method(self, _config, _layer, _prefix, _layer_config):
++            return sentinel
++
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.inc.schemes.factory.resolve_scheme",
++        lambda _layer_config: DummyScheme(),
++    )
++
++    method = config.get_quant_method(layer, "layer")
++
++    assert method is sentinel
++
++
++def test_resolve_gptq_moe_falls_back_to_moe_wna16(monkeypatch) -> None:
++    captured = {}
++
++    class DummyMoeConfig:
++        pass
++
++    class DummyLayer:
++        moe_config = DummyMoeConfig()
++
++    class DummyBuiltConfig:
++        pass
++
++    built_config = DummyBuiltConfig()
++
++    class DummyMethod:
++        def __init__(self, cfg, moe):
++            captured["cfg"] = cfg
++            captured["moe"] = moe
++
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.utils.marlin_utils.check_marlin_supported",
++        lambda *args, **kwargs: False,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Config.from_config",
++        lambda cfg: captured.update({"from_config": cfg}) or built_config,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Method",
++        DummyMethod,
++    )
++
++    layer_config = INCLayerConfig(
++        bits=4,
++        group_size=128,
++        sym=True,
++        packing_format="auto_round:auto_gptq",
++        backend="auto",
++        data_type="int",
++        quantized=True,
++    )
++
++    _resolve_gptq_moe(DummyLayer(), layer_config)
++
++    assert captured["from_config"] == {
++        "quant_method": "gptq",
++        "bits": 4,
++        "group_size": 128,
++        "sym": True,
++        "lm_head": False,
++    }
++    assert captured["cfg"] is built_config
++    assert captured["moe"] is DummyLayer.moe_config
++
++
++def test_resolve_gptq_moe_uses_auto_gptq_when_supported(monkeypatch) -> None:
++    captured = {}
++
++    class DummyMoeConfig:
++        pass
++
++    class DummyLayer:
++        moe_config = DummyMoeConfig()
++
++    class DummyMethod:
++        def __init__(self, cfg, moe):
++            captured["cfg"] = cfg
++            captured["moe"] = moe
++
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.utils.marlin_utils.check_marlin_supported",
++        lambda *args, **kwargs: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.utils.marlin_utils."
++        "check_moe_marlin_supports_layer",
++        lambda *args, **kwargs: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.auto_gptq.AutoGPTQMoEMethod",
++        DummyMethod,
++    )
++
++    _resolve_gptq_moe(DummyLayer(), make_layer_config())
++
++    assert isinstance(captured["cfg"], AutoGPTQConfig)
++    assert captured["cfg"].weight_bits == 4
++    assert captured["cfg"].group_size == 128
++    assert captured["cfg"].is_sym is True
++    assert captured["moe"] is DummyLayer.moe_config
++
++
++def test_resolve_awq_moe_uses_marlin_when_supported(monkeypatch) -> None:
++    captured = {}
++
++    class DummyMoeConfig:
++        pass
++
++    class DummyLayer:
++        moe_config = DummyMoeConfig()
++
++    class DummyMethod:
++        def __init__(self, cfg, moe):
++            captured["cfg"] = cfg
++            captured["moe"] = moe
++
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.utils.marlin_utils.check_marlin_supported",
++        lambda *args, **kwargs: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.utils.marlin_utils.check_moe_marlin_supports_layer",
++        lambda *args, **kwargs: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.awq_marlin.verify_marlin_supported",
++        lambda *args, **kwargs: None,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.awq_marlin.AWQMarlinMoEMethod",
++        DummyMethod,
++    )
++
++    layer_config = INCLayerConfig(
++        bits=4,
++        group_size=128,
++        sym=False,
++        packing_format="auto_round:auto_awq",
++        backend="auto",
++        data_type="int",
++        quantized=True,
++    )
++
++    _resolve_awq_moe(DummyLayer(), layer_config)
++
++    assert captured["cfg"].weight_bits == 4
++    assert captured["cfg"].zero_point is True
++    assert captured["moe"] is DummyLayer.moe_config
++
++
++# ---------------------------------------------------------------------------
++# Tests for get_layer_config step 4 (fused QKV / packed_modules_mapping)
++# ---------------------------------------------------------------------------
++
++
++class TestGetLayerConfigFusedQKV:
++    """Tests for step-4 (fused QKV / packed_modules_mapping) logic.
++
++    Focused on preventing false-positive substring matches.
++    """
++
++    def test_exact_fusion_key_match(self):
++        """A layer whose name contains 'qkv' maps to its extra_config entry."""
++        config = make_config(
++            extra_config={
++                "model.layers.0.self_attn.qkv_proj": {"bits": 8},
++            }
++        )
++        config.packed_modules_mapping = {
++            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++        }
++        bits, _, _ = config.get_layer_config(
++            DummyLayer(), "model.layers.0.self_attn.qkv_proj"
++        )
++        assert bits == 8
++
++    def test_false_substring_match_does_not_override(self):
++        """Regression test for the false-substring-match bug.
++
++        Scenario (Qwen3.6-35B-A3B VLM):
++        - packed_modules_mapping has "qkv" → ["qkv"] (from vision encoder).
++        - The GDN text-attention layer is named "in_proj_qkvz".
++        - "qkv" is a substring of "in_proj_qkvz", so old code would enter
++          step 4 and generate sub_name "in_proj_qkvz" (replacing "qkv" with
++          "qkv"). That name is NOT in extra_config, so get_config() falls
++          back to the global default (bits=4), even though correct is 16.
++        - Fix: skip the fusion key when none of the generated sub_names
++          actually exist in extra_config.
++        """
++        config = make_config(
++            extra_config={
++                "model.layers.0.in_proj_qkv": {"bits": 16},
++                "model.layers.0.in_proj_z": {"bits": 16},
++            }
++        )
++        config.packed_modules_mapping = {
++            "qkv": ["qkv"],
++        }
++        bits, _, _ = config.get_layer_config(
++            DummyLayer(), "model.layers.0.in_proj_qkvz"
++        )
++        # bits should be the global default (4) – no erroneous fusion match
++        assert bits == 4
++
++    def test_real_qkv_fusion_key_still_resolves(self):
++        """The true "qkv" fusion (vision encoder) still resolves correctly."""
++        config = make_config(
++            extra_config={
++                "vision_model.encoder.layers.0.self_attn.qkv": {"bits": 8},
++            }
++        )
++        config.packed_modules_mapping = {
++            "qkv": ["qkv"],
++        }
++        bits, _, _ = config.get_layer_config(
++            DummyLayer(), "vision_model.encoder.layers.0.self_attn.qkv"
++        )
++        assert bits == 8
++
++    def test_mixed_fp16_and_int4_fused_layer(self):
++        """All sub-keys must agree; inconsistent configs raise ValueError."""
++        config = make_config(
++            extra_config={
++                "model.layers.0.self_attn.q_proj": {"bits": 16},
++                "model.layers.0.self_attn.k_proj": {"bits": 4},
++                "model.layers.0.self_attn.v_proj": {"bits": 4},
++            }
++        )
++        config.packed_modules_mapping = {
++            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++        }
++        with pytest.raises(ValueError, match="consistent quant config"):
++            config.get_layer_config(DummyLayer(), "model.layers.0.self_attn.qkv_proj")
++
++    def test_fusion_triggered_by_regex_configured_sub_name(self):
++        """Fusion step 4 is still triggered when sub_names match via regex.
++
++        Ensures the guard does not regress when extra_config uses regex
++        patterns instead of exact keys to configure sub-modules.
++        """
++        config = make_config(
++            extra_config={
++                r"model\.layers\.\d+\.self_attn\.(q|k|v)_proj": {"bits": 8},
++            }
++        )
++        config.packed_modules_mapping = {
++            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++        }
++        bits, _, _ = config.get_layer_config(
++            DummyLayer(), "model.layers.0.self_attn.qkv_proj"
++        )
++        assert bits == 8
+diff --git a/vllm/model_executor/layers/quantization/inc.py b/vllm/model_executor/layers/quantization/inc.py
+deleted file mode 100644
+index 3a4d7d4039ff..000000000000
+--- a/vllm/model_executor/layers/quantization/inc.py
++++ /dev/null
+@@ -1,794 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-
+-from fractions import Fraction
+-from functools import lru_cache
+-from typing import TYPE_CHECKING, Any
+-
+-import regex as re
+-import torch
+-from torch.nn.parameter import Parameter
+-
+-from vllm.logger import init_logger
+-from vllm.model_executor.layers.fused_moe import RoutedExperts
+-from vllm.model_executor.layers.linear import (
+-    LinearBase,
+-    LinearMethodBase,
+-    UnquantizedLinearMethod,
+-)
+-from vllm.model_executor.layers.quantization import (
+-    QuantizationConfig,
+-    QuantizationMethods,
+-)
+-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+-from vllm.model_executor.parameter import (
+-    GroupQuantScaleParameter,
+-    PackedvLLMParameter,
+-    RowvLLMParameter,
+-)
+-from vllm.platforms import current_platform
+-from vllm.scalar_type import scalar_types
+-
+-if TYPE_CHECKING:
+-    from vllm.model_executor.models.utils import WeightsMapper
+-
+-logger = init_logger(__name__)
+-
+-
+-class INCConfig(QuantizationConfig):
+-    """Config class for Intel Neural Compressor (INC).
+-    Repo: https://github.com/intel/neural-compressor
+-    """
+-
+-    SUPPORTED_BITS = {2, 3, 4, 8}
+-    SUPPORTED_DTYPES = {"int"}
+-    SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq"}
+-    SUPPORTED_BACKENDS = {
+-        "auto",
+-        "gptq",
+-        "gptq:marlin",
+-        "awq",
+-        "awq:marlin",
+-        "marlin",
+-    }
+-
+-    def __init__(
+-        self,
+-        weight_bits: int,
+-        group_size: int,
+-        sym: bool = True,
+-        packing_format: str = "auto_round:auto_gptq",
+-        block_name_to_quantize: str | list[str] | None = None,
+-        extra_config: dict[str, Any] | None = None,
+-        data_type: str = "int",
+-        backend: str = "auto",
+-    ) -> None:
+-        super().__init__()
+-        if weight_bits not in self.SUPPORTED_BITS:
+-            raise ValueError(
+-                f"Unsupported weight_bits: {weight_bits}, "
+-                f"currently only support {self.SUPPORTED_BITS}."
+-            )
+-        if data_type not in self.SUPPORTED_DTYPES:
+-            raise ValueError(
+-                f"Unsupported data_type: {data_type},"
+-                f" currently only support  {self.SUPPORTED_DTYPES}."
+-            )
+-        if packing_format not in self.SUPPORTED_FORMATS:
+-            raise ValueError(
+-                f"Unsupported packing_format: {packing_format}, "
+-                f"currently only support {self.SUPPORTED_FORMATS}."
+-            )
+-        if backend not in self.SUPPORTED_BACKENDS:
+-            raise ValueError(
+-                f"Unsupported backend: {backend},  "
+-                f"currently only support {self.SUPPORTED_BACKENDS}."
+-            )
+-
+-        self.weight_bits = weight_bits
+-        self.group_size = group_size
+-        self.sym = sym
+-        self.packing_format = packing_format
+-        self.block_name_to_quantize = (
+-            block_name_to_quantize.split(",")
+-            if isinstance(block_name_to_quantize, str)
+-            else block_name_to_quantize
+-        )
+-        self.extra_config = extra_config
+-        self.data_type = data_type
+-        self.backend = backend
+-        self.pack_factor = Fraction(32, weight_bits)
+-
+-    def __repr__(self) -> str:
+-        return (
+-            f"INCConfig(weight_bits={self.weight_bits}, "
+-            f"group_size={self.group_size}, sym={self.sym})"
+-        )
+-
+-    @classmethod
+-    def get_name(cls) -> QuantizationMethods:
+-        return "inc"
+-
+-    @classmethod
+-    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+-        return [torch.half, torch.bfloat16]
+-
+-    @classmethod
+-    def get_min_capability(cls) -> int:
+-        return 60
+-
+-    @classmethod
+-    def get_config_filenames(cls) -> list[str]:
+-        return ["quantization_config.json"]
+-
+-    @classmethod
+-    def from_config(cls, config: dict[str, Any]) -> "INCConfig":
+-        return cls(
+-            weight_bits=cls.get_from_keys(config, ["bits"]),
+-            group_size=cls.get_from_keys(config, ["group_size"]),
+-            sym=cls.get_from_keys(config, ["sym"]),
+-            packing_format=cls.get_from_keys_or(
+-                config, ["packing_format"], "auto_round:auto_gptq"
+-            ),
+-            block_name_to_quantize=cls.get_from_keys_or(
+-                config, ["block_name_to_quantize", "to_quant_block_names"], None
+-            ),
+-            extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
+-            data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
+-            backend=cls.get_from_keys_or(config, ["backend", "vllm_backend"], "auto"),
+-        )
+-
+-    def get_layer_config(self, layer, layer_name: str):
+-        def get_config(name: str, quantized: bool = True):
+-            if not self.extra_config:
+-                return (
+-                    self.weight_bits if quantized else 16,
+-                    self.group_size if quantized else -1,
+-                    self.sym if quantized else True,
+-                )
+-
+-            # exact match first
+-            if name in self.extra_config:
+-                cfg = self.extra_config[name]
+-                return (
+-                    cfg.get("bits", self.weight_bits if quantized else 16),
+-                    cfg.get("group_size", self.group_size if quantized else -1),
+-                    cfg.get("sym", self.sym if quantized else True),
+-                )
+-
+-            REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
+-            for pattern, cfg in self.extra_config.items():
+-                if not isinstance(pattern, str) or not any(
+-                    c in REGEX_SPECIAL_CHARS for c in pattern
+-                ):
+-                    continue
+-
+-                try:
+-                    if re.search(re.compile(pattern), name) is not None:
+-                        return (
+-                            cfg.get("bits", self.weight_bits if quantized else 16),
+-                            cfg.get("group_size", self.group_size if quantized else -1),
+-                            cfg.get("sym", self.sym if quantized else True),
+-                        )
+-                except re.error:
+-                    # Invalid regex, ignore.
+-                    continue
+-
+-            return (
+-                self.weight_bits if quantized else 16,
+-                self.group_size if quantized else -1,
+-                self.sym if quantized else True,
+-            )
+-
+-        # 1. Exact match from config
+-        if self.extra_config and layer_name in self.extra_config:
+-            return get_config(layer_name)
+-
+-        # 2. Determine whether layer should be quantized
+-        quantized = not isinstance(layer, ParallelLMHead)
+-        if self.block_name_to_quantize:
+-            quantized = any(
+-                layer_name.startswith(name) for name in self.block_name_to_quantize
+-            )
+-
+-        # 3. Handle fused MoE
+-        if self.extra_config and "fusedmoe" in layer.__class__.__name__.lower():
+-            moe_configs = [
+-                get_config(name, quantized)
+-                for name in self.extra_config
+-                if name.startswith(layer_name)
+-            ]
+-            if moe_configs:
+-                if len(set(moe_configs)) == 1:
+-                    return moe_configs[0]
+-                raise ValueError(
+-                    f"Fused MoE layer '{layer_name}' requires "
+-                    f"consistent quant config for all sub-layers"
+-                )
+-
+-        # 4. Handle fused QKV or other patterns
+-        if self.extra_config:
+-            for fusion_key, sub_keys in self.packed_modules_mapping.items():
+-                if fusion_key in layer_name and layer_name.count(fusion_key) == 1:
+-                    sub_names = [
+-                        layer_name.replace(fusion_key, sub_key) for sub_key in sub_keys
+-                    ]
+-                    sub_configs = [get_config(name, quantized) for name in sub_names]
+-                    if len(set(sub_configs)) == 1:
+-                        return sub_configs[0]
+-                    raise ValueError(
+-                        f"Fused module '{layer_name}' requires "
+-                        f"consistent quant config for {sub_names}"
+-                    )
+-
+-        # 5. Fallback or try a regular expression match
+-        return get_config(layer_name, quantized)
+-
+-    def check_quantized(self, weight_bits: int) -> bool:
+-        return weight_bits < 16
+-
+-    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
+-        if self.block_name_to_quantize is not None:
+-            self.block_name_to_quantize = hf_to_vllm_mapper.apply_list(
+-                self.block_name_to_quantize
+-            )
+-        if self.extra_config is not None:
+-            self.extra_config = hf_to_vllm_mapper.apply_dict(self.extra_config)
+-
+-    def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+-            check_marlin_supported,
+-            check_moe_marlin_supports_layer,
+-        )
+-
+-        weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
+-        if not self.check_quantized(weight_bits):
+-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+-                return UnquantizedLinearMethod()
+-            else:
+-                return None
+-
+-        logger.debug(
+-            "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
+-            prefix,
+-            layer.__class__.__name__,
+-            weight_bits,
+-            group_size,
+-            sym,
+-        )
+-        if backend == "auto" or "marlin" in backend:
+-            AWQ_TYPE_MAP = {
+-                4: scalar_types.uint4,
+-                8: scalar_types.uint8,
+-            }
+-            use_marlin = (weight_bits in AWQ_TYPE_MAP) and check_marlin_supported(
+-                AWQ_TYPE_MAP[weight_bits], group_size, not sym
+-            )
+-
+-            if isinstance(layer, RoutedExperts):
+-                use_marlin = use_marlin and check_moe_marlin_supports_layer(
+-                    layer, group_size
+-                )
+-
+-        else:
+-            use_marlin = False
+-        if use_marlin:
+-            from vllm.model_executor.layers.quantization.awq_marlin import (
+-                AWQMarlinConfig,
+-                AWQMarlinLinearMethod,
+-                AWQMarlinMoEMethod,
+-            )
+-
+-            quant_args_marlin = AWQMarlinConfig(
+-                weight_bits=weight_bits,
+-                group_size=group_size,
+-                zero_point=not sym,
+-                lm_head_quantized=False,
+-                full_config={},
+-                modules_to_not_convert=[],
+-            )
+-        else:
+-            from vllm.model_executor.layers.quantization.awq import (
+-                AWQConfig,
+-                AWQLinearMethod,
+-            )
+-
+-            quant_args = AWQConfig(
+-                weight_bits=weight_bits,
+-                group_size=group_size,
+-                zero_point=not sym,
+-            )
+-
+-        if isinstance(layer, RoutedExperts):
+-            if use_marlin:
+-                return AWQMarlinMoEMethod(quant_args_marlin, layer.moe_config)
+-            from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+-
+-            config = {
+-                "quant_method": "awq",
+-                "bits": weight_bits,
+-                "group_size": group_size,
+-                "zero_point": not sym,
+-                "lm_head": False,
+-            }
+-            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
+-
+-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+-            if use_marlin:
+-                return AWQMarlinLinearMethod(quant_args_marlin)
+-            else:
+-                return AWQLinearMethod(quant_args)
+-        return None
+-
+-    def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+-            check_marlin_supported,
+-            check_moe_marlin_supports_layer,
+-        )
+-
+-        weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
+-        if not self.check_quantized(weight_bits):
+-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+-                return UnquantizedLinearMethod()
+-            else:
+-                return None
+-
+-        logger.debug(
+-            "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
+-            prefix,
+-            layer.__class__.__name__,
+-            weight_bits,
+-            group_size,
+-            sym,
+-        )
+-        if backend == "auto" or "marlin" in backend:
+-            GPTQ_TYPE_MAP = {
+-                (4, True): scalar_types.uint4b8,
+-                (8, True): scalar_types.uint8b128,
+-            }
+-            use_marlin = (weight_bits, sym) in GPTQ_TYPE_MAP and check_marlin_supported(
+-                GPTQ_TYPE_MAP[(weight_bits, sym)], group_size, has_zp=not sym
+-            )
+-            if isinstance(layer, RoutedExperts):
+-                use_marlin = use_marlin and check_moe_marlin_supports_layer(
+-                    layer, group_size
+-                )
+-        else:
+-            use_marlin = False
+-        if use_marlin:
+-            from vllm.model_executor.layers.quantization.auto_gptq import (
+-                AutoGPTQConfig,
+-                AutoGPTQLinearMethod,
+-                AutoGPTQMoEMethod,
+-            )
+-
+-            quant_args_marlin = AutoGPTQConfig(
+-                weight_bits=weight_bits,
+-                group_size=group_size,
+-                is_sym=sym,
+-                lm_head_quantized=False,
+-                desc_act=False,
+-                dynamic={},
+-                full_config={},
+-            )
+-
+-        if isinstance(layer, RoutedExperts):
+-            if use_marlin:
+-                return AutoGPTQMoEMethod(quant_args_marlin, layer.moe_config)
+-            else:
+-                from vllm.model_executor.layers.quantization.moe_wna16 import (
+-                    MoeWNA16Config,
+-                )
+-
+-                config = {
+-                    "quant_method": "gptq",
+-                    "bits": weight_bits,
+-                    "group_size": group_size,
+-                    "sym": sym,
+-                    "lm_head": False,
+-                }
+-                return MoeWNA16Config.from_config(config).get_quant_method(
+-                    layer, prefix
+-                )
+-
+-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+-            if use_marlin:
+-                return AutoGPTQLinearMethod(quant_args_marlin)
+-            else:
+-                raise NotImplementedError(
+-                    f"INC quantization with bits={weight_bits}, sym={sym} "
+-                    "is not supported. Only 4-bit and 8-bit symmetric "
+-                    "quantization is supported with Marlin kernels."
+-                )
+-
+-        return None
+-
+-    def apply_xpu_w4a16_quant_layer(self, layer, prefix: str):
+-        weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
+-
+-        if not self.check_quantized(weight_bits):
+-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+-                return UnquantizedLinearMethod()
+-            else:
+-                return None
+-
+-        if weight_bits != 4:
+-            raise NotImplementedError(
+-                f"INC on XPU only supports 4-bit quantization, "
+-                f"got weight_bits={weight_bits}."
+-            )
+-        if not sym:
+-            raise NotImplementedError(
+-                "INC W4A16 on XPU only supports symmetric quantization for now."
+-            )
+-
+-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+-            is_ark_available, ark_error, _, _ = get_ark_state()
+-            if is_ark_available:
+-                return INCARKLinearMethod(
+-                    weight_bits=weight_bits,
+-                    group_size=group_size,
+-                    sym=sym,
+-                )
+-
+-            logger.debug(
+-                "ARK backend is unavailable for layer %s; "
+-                "falling back to the default XPU INC path. Error: %s",
+-                prefix,
+-                ark_error or "unknown error",
+-            )
+-
+-            return INCXPULinearMethod(
+-                weight_bits=weight_bits,
+-                group_size=group_size,
+-                sym=sym,
+-            )
+-        return None
+-
+-    def apply_cpu_w4a16_quant_layer(self, layer, prefix: str):
+-        weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
+-        if not self.check_quantized(weight_bits):
+-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+-                return UnquantizedLinearMethod()
+-            else:
+-                return None
+-
+-        if weight_bits != 4:
+-            raise NotImplementedError(
+-                f"INC on CPU only supports 4-bit quantization, "
+-                f"got weight_bits={weight_bits}."
+-            )
+-        if not sym:
+-            raise NotImplementedError(
+-                "INC W4A16 on CPU only supports symmetric quantization for now."
+-            )
+-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+-            is_ark_available, ark_error, _, _ = get_ark_state()
+-            if is_ark_available:
+-                return INCARKLinearMethod(
+-                    weight_bits=weight_bits,
+-                    group_size=group_size,
+-                    sym=sym,
+-                )
+-
+-            logger.debug(
+-                "ARK backend is unavailable for layer %s; "
+-                "falling back to the default CPU INC path. Error: %s",
+-                prefix,
+-                ark_error or "unknown error",
+-            )
+-
+-            return self.apply_gptq_quant_layer(layer, prefix)
+-        return None
+-
+-    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+-        if prefix and self.extra_config:
+-            for layer_name in self.extra_config:
+-                if (
+-                    layer_name == prefix or layer_name == f"model.{prefix}"
+-                ) and self.extra_config[layer_name].get("bits", 16) >= 16:
+-                    return UnquantizedLinearMethod()
+-
+-        if current_platform.is_xpu():
+-            return self.apply_xpu_w4a16_quant_layer(layer, prefix)
+-        is_gptq = "gptq" in self.packing_format or "gptq" in self.backend
+-        if current_platform.is_cpu() and is_gptq:
+-            return self.apply_cpu_w4a16_quant_layer(layer, prefix)
+-        if is_gptq:
+-            return self.apply_gptq_quant_layer(layer, prefix)
+-        if "awq" in self.packing_format or "awq" in self.backend:
+-            return self.apply_awq_quant_layer(layer, prefix)
+-
+-        raise NotImplementedError(
+-            f"Unsupported quantization configuration for layer '{prefix}'. "
+-            f"Platform: CPU={current_platform.is_cpu()}. "
+-            f"Platform: XPU={current_platform.is_xpu()}. "
+-            f"Format: {self.packing_format}, Backend: {self.backend}."
+-        )
+-
+-    @classmethod
+-    def override_quantization_method(
+-        cls, hf_quant_cfg, user_quant, hf_config=None
+-    ) -> "QuantizationMethods | None":
+-        """Override the `auto-round` method to `inc`."""
+-        is_auto_round_format = hf_quant_cfg.get("quant_method", None) == "auto-round"
+-        if is_auto_round_format:
+-            return cls.get_name()
+-        return None
+-
+-
+-class INCXPULinearBase(LinearMethodBase):
+-    def __init__(self, weight_bits: int, group_size: int, sym: bool):
+-        self.weight_bits = weight_bits
+-        self.group_size = group_size
+-        self.sym = sym
+-        self.pack_factor = 32 // weight_bits
+-
+-    def _create_inc_weights(
+-        self,
+-        layer: torch.nn.Module,
+-        input_size_per_partition: int,
+-        output_partition_sizes: list[int],
+-        params_dtype: torch.dtype,
+-        weight_loader: Any,
+-        group_size: int,
+-        pack_factor: int,
+-    ) -> None:
+-        output_size_per_partition = sum(output_partition_sizes)
+-        scales_and_zp_size = input_size_per_partition // group_size
+-
+-        qweight = PackedvLLMParameter(
+-            data=torch.empty(
+-                input_size_per_partition // pack_factor,
+-                output_size_per_partition,
+-                dtype=torch.int32,
+-            ),
+-            input_dim=0,
+-            output_dim=1,
+-            packed_dim=0,
+-            packed_factor=pack_factor,
+-            weight_loader=weight_loader,
+-        )
+-
+-        scales = GroupQuantScaleParameter(
+-            data=torch.empty(
+-                scales_and_zp_size,
+-                output_size_per_partition,
+-                dtype=params_dtype,
+-            ),
+-            input_dim=0,
+-            output_dim=1,
+-            weight_loader=weight_loader,
+-        )
+-
+-        qzeros = PackedvLLMParameter(
+-            data=torch.empty(
+-                scales_and_zp_size,
+-                output_size_per_partition // pack_factor,
+-                dtype=torch.int32,
+-            ),
+-            input_dim=0,
+-            output_dim=1,
+-            packed_dim=1,
+-            packed_factor=pack_factor,
+-            weight_loader=weight_loader,
+-        )
+-
+-        layer.register_parameter("qweight", qweight)
+-        layer.register_parameter("scales", scales)
+-        layer.register_parameter("qzeros", qzeros)
+-
+-        g_idx = RowvLLMParameter(
+-            data=torch.tensor(
+-                [i // group_size for i in range(input_size_per_partition)],
+-                dtype=torch.int32,
+-            ),
+-            input_dim=0,
+-            weight_loader=weight_loader,
+-        )
+-        layer.register_parameter("g_idx", g_idx)
+-
+-    def create_weights(
+-        self,
+-        layer: torch.nn.Module,
+-        input_size_per_partition: int,
+-        output_partition_sizes: list[int],
+-        input_size: int,
+-        output_size: int,
+-        params_dtype: torch.dtype,
+-        **extra_weight_attrs,
+-    ):
+-        self._create_inc_weights(
+-            layer=layer,
+-            input_size_per_partition=input_size_per_partition,
+-            output_partition_sizes=output_partition_sizes,
+-            params_dtype=params_dtype,
+-            weight_loader=extra_weight_attrs.get("weight_loader"),
+-            group_size=self.group_size,
+-            pack_factor=self.pack_factor,
+-        )
+-
+-
+-@lru_cache(maxsize=1)
+-def get_ark_state() -> tuple[bool, str | None, Any | None, Any | None]:
+-    """Return ARK availability, error details, cached instance, and QuantLinear."""
+-    try:
+-        import auto_round_kernel
+-        from auto_round_kernel.qlinear import QuantLinear
+-
+-        logger.info("Successfully imported auto_round_kernel.")
+-    except ImportError as error:
+-        return False, str(error), None, None
+-
+-    ark_loader = getattr(auto_round_kernel, "_ark_instance", None)
+-    if not callable(ark_loader):
+-        return False, "auto_round_kernel does not expose _ark_instance().", None, None
+-
+-    try:
+-        ark_instance = ark_loader()
+-    except Exception as error:
+-        return False, str(error), None, None
+-
+-    if ark_instance is None:
+-        return False, "auto_round_kernel._ark_instance() returned None.", None, None
+-
+-    return True, None, ark_instance, QuantLinear
+-
+-
+-class INCXPULinearMethod(INCXPULinearBase):
+-    """XPU linear method for INC w4a16 GPTQ quantization (symmetric only).
+-
+-    Repacks GPTQ weights from [in_packed, out] to oneDNN [out, in_packed]
+-    layout and calls torch.ops._xpu_C.int4_gemm_w4a16.
+-
+-    GPTQ format: qweight [in_packed, out] with sequential nibble order.
+-
+-    Note: Asymmetric quantization (sym=false) is not for now.
+-
+-    FIXME(yiliu30): Refine the implementation to reuse XPUwNa16LinearKernel.
+-    """
+-
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+-        """Repack GPTQ weights into kernel-ready NT layout."""
+-        device = layer.qweight.data.device
+-
+-        # oneDNN int4 kernel requires strides[0]==1 ("NT format"), but GPTQ
+-        # checkpoint is [K_packed, N] contiguous with strides (N, 1).
+-        # Two transposes are needed — neither alone can achieve this:
+-        #   1. .t().contiguous() → [N, K_packed] contiguous in memory
+-        #   2. .t()              → [K_packed, N] view with strides (1, K_packed)
+-        # The result has the same logical shape but strides[0]==1 as required.
+-        qweight_ct = layer.qweight.data.t().contiguous()
+-        layer.qweight = Parameter(qweight_ct.t(), requires_grad=False)
+-
+-        # Scales: [num_groups, out] — no change needed
+-        layer.scales = Parameter(layer.scales.data, requires_grad=False)
+-
+-        # Symmetric: GPTQ v1 stores qzeros=7, effective zp = 7+1 = 8
+-        # Kernel expects int8 scalar = 8
+-        layer.qzeros = Parameter(
+-            torch.tensor([8], dtype=torch.int8, device=device),
+-            requires_grad=False,
+-        )
+-
+-    def apply(
+-        self,
+-        layer: torch.nn.Module,
+-        x: torch.Tensor,
+-        bias: torch.Tensor | None = None,
+-    ) -> torch.Tensor:
+-        # qweight is already in NT layout [K_packed, N] (strides (1, K_packed))
+-        # from process_weights_after_loading — pass directly to kernel.
+-        out_shape = x.shape[:-1] + (layer.qweight.shape[1],)
+-        reshaped_x = x.reshape(-1, x.shape[-1])
+-        out = torch.ops._xpu_C.int4_gemm_w4a16(
+-            reshaped_x,
+-            layer.qweight,
+-            bias,
+-            layer.scales,
+-            layer.qzeros,
+-            self.group_size,
+-            None,  # g_idx not needed: desc_act is always False for INC models
+-        )
+-        return out.reshape(out_shape)
+-
+-
+-class INCARKLinearMethod(INCXPULinearBase):
+-    """XPU & CPU w4a16 linear method for INC quantization utilizing the ARK backend.
+-
+-    See: https://github.com/intel/auto-round/blob/main/auto_round_extension/ark/README.md
+-
+-    Repacks GPTQ/INC weights into ARK's layout.
+-    """
+-
+-    def __init__(self, weight_bits: int, group_size: int, sym: bool):
+-        super().__init__(weight_bits=weight_bits, group_size=group_size, sym=sym)
+-
+-        is_available, error_str, _, quant_linear_cls = get_ark_state()
+-        if not is_available or quant_linear_cls is None:
+-            reason = error_str or "unknown error"
+-            raise ImportError(f"Failed to import auto_round_kernel. {reason}")
+-
+-        self.QuantLinear = quant_linear_cls
+-
+-    def create_weights(
+-        self,
+-        layer: torch.nn.Module,
+-        input_size_per_partition: int,
+-        output_partition_sizes: list[int],
+-        input_size: int,
+-        output_size: int,
+-        params_dtype: torch.dtype,
+-        **extra_weight_attrs,
+-    ):
+-        super().create_weights(
+-            layer=layer,
+-            input_size_per_partition=input_size_per_partition,
+-            output_partition_sizes=output_partition_sizes,
+-            input_size=input_size,
+-            output_size=output_size,
+-            params_dtype=params_dtype,
+-            **extra_weight_attrs,
+-        )
+-        layer.in_features = input_size_per_partition
+-        layer.out_features = sum(output_partition_sizes)
+-        layer.params_dtype = params_dtype
+-
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+-        if hasattr(layer, "input_size_per_partition"):
+-            in_features = layer.input_size_per_partition
+-        elif hasattr(layer, "input_size"):
+-            in_features = layer.input_size
+-        else:
+-            raise AttributeError("Cannot determine in_features for layer.")
+-
+-        if hasattr(layer, "output_partition_sizes"):
+-            out_features = sum(layer.output_partition_sizes)
+-        elif hasattr(layer, "output_size_per_partition"):
+-            out_features = layer.output_size_per_partition
+-        elif hasattr(layer, "output_size"):
+-            out_features = layer.output_size
+-        else:
+-            out_features = layer.scales.shape[-1]
+-
+-        ark_linear = self.QuantLinear(
+-            bits=self.weight_bits,
+-            group_size=self.group_size,
+-            sym=self.sym,
+-            in_features=in_features,
+-            out_features=out_features,
+-            bias=layer.bias is not None,
+-            weight_dtype=layer.params_dtype,
+-        )
+-
+-        ark_linear.to(layer.qweight.device)
+-
+-        with torch.no_grad():
+-            ark_linear.qweight.copy_(layer.qweight.detach())
+-
+-            if hasattr(layer, "qzeros") and layer.qzeros is not None:
+-                ark_linear.qzeros.copy_(layer.qzeros.detach())
+-            else:
+-                ark_linear.qzeros = None
+-
+-            ark_linear.scales.copy_(layer.scales.detach())
+-
+-            if hasattr(layer, "bias") and layer.bias is not None:
+-                ark_linear.bias.copy_(layer.bias.detach())
+-
+-        ark_linear.post_init()
+-
+-        layer.ark_linear = ark_linear
+-
+-        del layer.qweight
+-        if hasattr(layer, "qzeros"):
+-            del layer.qzeros
+-        del layer.scales
+-
+-    def apply(
+-        self,
+-        layer: torch.nn.Module,
+-        x: torch.Tensor,
+-        bias: torch.Tensor | None = None,
+-    ) -> torch.Tensor:
+-        return layer.ark_linear.forward(x)
+diff --git a/vllm/model_executor/layers/quantization/inc/__init__.py b/vllm/model_executor/layers/quantization/inc/__init__.py
+new file mode 100644
+index 000000000000..e7d9f4707f50
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/__init__.py
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from .inc import INCConfig
++
++__all__ = ["INCConfig"]
+diff --git a/vllm/model_executor/layers/quantization/inc/config_parser.py b/vllm/model_executor/layers/quantization/inc/config_parser.py
+new file mode 100644
+index 000000000000..603b80b7cd00
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/config_parser.py
+@@ -0,0 +1,188 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from dataclasses import dataclass
++from typing import TYPE_CHECKING
++
++import regex as re
++
++from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
++
++if TYPE_CHECKING:
++    import torch
++
++    from .inc import INCConfig
++
++
++@dataclass(frozen=True)
++class INCLayerConfig:
++    bits: int
++    group_size: int
++    sym: bool
++    packing_format: str
++    backend: str
++    data_type: str
++    quantized: bool
++
++    @property
++    def is_gptq(self) -> bool:
++        return "gptq" in self.packing_format or "gptq" in self.backend
++
++    @property
++    def is_awq(self) -> bool:
++        return "awq" in self.packing_format or "awq" in self.backend
++
++    @property
++    def is_wna16_int(self) -> bool:
++        return self.data_type == "int" and self.quantized
++
++    @property
++    def is_mxfp4(self) -> bool:
++        return self.data_type == "mx_fp" and self.bits == 4
++
++    @property
++    def is_mxfp8(self) -> bool:
++        return self.data_type == "mx_fp" and self.bits == 8
++
++
++class INCConfigParser:
++    def __init__(self, config: "INCConfig") -> None:
++        self._config = config
++
++    def resolve(self, layer: "torch.nn.Module", layer_name: str) -> INCLayerConfig:
++        bits, group_size, sym = self._resolve_raw(layer, layer_name)
++        return INCLayerConfig(
++            bits=bits,
++            group_size=group_size,
++            sym=sym,
++            packing_format=self._config.packing_format,
++            backend=self._config.backend,
++            data_type=self._config.data_type,
++            quantized=bits < 16,
++        )
++
++    def get_layer_config(
++        self, layer: "torch.nn.Module", layer_name: str
++    ) -> tuple[int, int, bool]:
++        layer_config = self.resolve(layer, layer_name)
++        return layer_config.bits, layer_config.group_size, layer_config.sym
++
++    def _resolve_raw(
++        self, layer: "torch.nn.Module", layer_name: str
++    ) -> tuple[int, int, bool]:
++        REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
++
++        def is_explicitly_configured(name: str) -> bool:
++            """Return True if *name* has an explicit entry in extra_config,
++            either via exact key match or via a regex pattern key."""
++            if not self._config.extra_config:
++                return False
++            if name in self._config.extra_config:
++                return True
++            for pattern in self._config.extra_config:
++                if not isinstance(pattern, str) or not any(
++                    c in REGEX_SPECIAL_CHARS for c in pattern
++                ):
++                    continue
++                try:
++                    if re.search(re.compile(pattern), name) is not None:
++                        return True
++                except re.error:
++                    continue
++            return False
++
++        def get_config(name: str, quantized: bool = True) -> tuple[int, int, bool]:
++            if not self._config.extra_config:
++                return (
++                    self._config.weight_bits if quantized else 16,
++                    self._config.group_size if quantized else -1,
++                    self._config.sym if quantized else True,
++                )
++
++            if name in self._config.extra_config:
++                cfg = self._config.extra_config[name]
++                return (
++                    cfg.get("bits", self._config.weight_bits if quantized else 16),
++                    cfg.get(
++                        "group_size",
++                        self._config.group_size if quantized else -1,
++                    ),
++                    cfg.get("sym", self._config.sym if quantized else True),
++                )
++
++            regex_special_chars = set(r"*+?^$()[]{}|\\")
++            for pattern, cfg in self._config.extra_config.items():
++                if not isinstance(pattern, str) or not any(
++                    c in regex_special_chars for c in pattern
++                ):
++                    continue
++
++                try:
++                    if re.search(re.compile(pattern), name) is not None:
++                        return (
++                            cfg.get(
++                                "bits",
++                                self._config.weight_bits if quantized else 16,
++                            ),
++                            cfg.get(
++                                "group_size",
++                                self._config.group_size if quantized else -1,
++                            ),
++                            cfg.get("sym", self._config.sym if quantized else True),
++                        )
++                except re.error:
++                    continue
++
++            return (
++                self._config.weight_bits if quantized else 16,
++                self._config.group_size if quantized else -1,
++                self._config.sym if quantized else True,
++            )
++
++        if self._config.extra_config and layer_name in self._config.extra_config:
++            return get_config(layer_name)
++
++        quantized = not isinstance(layer, ParallelLMHead)
++        if self._config.block_name_to_quantize:
++            quantized = any(
++                layer_name.startswith(name)
++                for name in self._config.block_name_to_quantize
++            )
++
++        if self._config.extra_config and "fusedmoe" in layer.__class__.__name__.lower():
++            moe_configs = [
++                get_config(name, quantized)
++                for name in self._config.extra_config
++                if name.startswith(layer_name)
++            ]
++            if moe_configs:
++                if len(set(moe_configs)) == 1:
++                    return moe_configs[0]
++                raise ValueError(
++                    f"Fused MoE layer '{layer_name}' requires "
++                    f"consistent quant config for all sub-layers"
++                )
++
++        if self._config.extra_config:
++            for fusion_key, sub_keys in self._config.packed_modules_mapping.items():
++                if fusion_key in layer_name and layer_name.count(fusion_key) == 1:
++                    sub_names = [
++                        layer_name.replace(fusion_key, sub_key) for sub_key in sub_keys
++                    ]
++                    # Only trigger if at least one sub_name is explicitly
++                    # configured in extra_config (via exact match or regex).
++                    # This prevents false matches when a short fusion_key
++                    # (e.g. "qkv") is merely a substring of a longer layer
++                    # name (e.g. "in_proj_qkvz") and none of the generated
++                    # sub_names are actually configured.
++                    if not any(is_explicitly_configured(n) for n in sub_names):
++                        continue
++                    sub_configs = [get_config(name, quantized) for name in sub_names]
++                    if len(set(sub_configs)) == 1:
++                        return sub_configs[0]
++                    raise ValueError(
++                        f"Fused module '{layer_name}' requires "
++                        f"consistent quant config for {sub_names}"
++                    )
++
++        return get_config(layer_name, quantized)
+diff --git a/vllm/model_executor/layers/quantization/inc/inc.py b/vllm/model_executor/layers/quantization/inc/inc.py
+new file mode 100644
+index 000000000000..86fa7cefcfce
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/inc.py
+@@ -0,0 +1,192 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from fractions import Fraction
++from typing import TYPE_CHECKING, Any
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe import (
++    RoutedExperts,
++    UnquantizedFusedMoEMethod,
++)
++from vllm.model_executor.layers.linear import (
++    LinearBase,
++    UnquantizedLinearMethod,
++)
++from vllm.model_executor.layers.quantization import (
++    QuantizationConfig,
++    QuantizationMethods,
++)
++from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
++
++from .config_parser import INCConfigParser
++
++if TYPE_CHECKING:
++    from vllm.model_executor.models.utils import WeightsMapper
++
++logger = init_logger(__name__)
++
++
++class INCConfig(QuantizationConfig):
++    """Config class for Intel Neural Compressor (INC).
++    Repo: https://github.com/intel/neural-compressor
++    """
++
++    SUPPORTED_BITS = {2, 3, 4, 8}
++    SUPPORTED_DTYPES = {"int"}
++    SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq"}
++    SUPPORTED_BACKENDS = {
++        "auto",
++        "gptq",
++        "gptq:marlin",
++        "awq",
++        "awq:marlin",
++        "marlin",
++    }
++
++    def __init__(
++        self,
++        weight_bits: int,
++        group_size: int,
++        sym: bool = True,
++        packing_format: str = "auto_round:auto_gptq",
++        block_name_to_quantize: str | list[str] | None = None,
++        extra_config: dict[str, Any] | None = None,
++        data_type: str = "int",
++        backend: str = "auto",
++    ) -> None:
++        super().__init__()
++        if weight_bits not in self.SUPPORTED_BITS:
++            raise ValueError(
++                f"Unsupported weight_bits: {weight_bits}, "
++                f"currently only support {self.SUPPORTED_BITS}."
++            )
++        if data_type not in self.SUPPORTED_DTYPES:
++            raise ValueError(
++                f"Unsupported data_type: {data_type},"
++                f" currently only support  {self.SUPPORTED_DTYPES}."
++            )
++        if packing_format not in self.SUPPORTED_FORMATS:
++            raise ValueError(
++                f"Unsupported packing_format: {packing_format}, "
++                f"currently only support {self.SUPPORTED_FORMATS}."
++            )
++        if backend not in self.SUPPORTED_BACKENDS:
++            raise ValueError(
++                f"Unsupported backend: {backend},  "
++                f"currently only support {self.SUPPORTED_BACKENDS}."
++            )
++
++        self.weight_bits = weight_bits
++        self.group_size = group_size
++        self.sym = sym
++        self.packing_format = packing_format
++        self.block_name_to_quantize = (
++            block_name_to_quantize.split(",")
++            if isinstance(block_name_to_quantize, str)
++            else block_name_to_quantize
++        )
++        self.extra_config = extra_config
++        self.data_type = data_type
++        self.backend = backend
++        self.pack_factor = Fraction(32, weight_bits)
++        self.config_parser = INCConfigParser(self)
++
++    def __repr__(self) -> str:
++        return (
++            f"INCConfig(weight_bits={self.weight_bits}, "
++            f"group_size={self.group_size}, sym={self.sym})"
++        )
++
++    @classmethod
++    def get_name(cls) -> QuantizationMethods:
++        return "inc"
++
++    @classmethod
++    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
++        return [torch.half, torch.bfloat16]
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 60
++
++    @classmethod
++    def get_config_filenames(cls) -> list[str]:
++        return ["quantization_config.json"]
++
++    @classmethod
++    def from_config(cls, config: dict[str, Any]) -> "INCConfig":
++        return cls(
++            weight_bits=cls.get_from_keys(config, ["bits"]),
++            group_size=cls.get_from_keys(config, ["group_size"]),
++            sym=cls.get_from_keys(config, ["sym"]),
++            packing_format=cls.get_from_keys_or(
++                config, ["packing_format"], "auto_round:auto_gptq"
++            ),
++            block_name_to_quantize=cls.get_from_keys_or(
++                config, ["block_name_to_quantize", "to_quant_block_names"], None
++            ),
++            extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
++            data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
++            backend=cls.get_from_keys_or(config, ["backend", "vllm_backend"], "auto"),
++        )
++
++    def get_layer_config(self, layer, layer_name: str):
++        return self.config_parser.get_layer_config(layer, layer_name)
++
++    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
++        if self.block_name_to_quantize is not None:
++            self.block_name_to_quantize = hf_to_vllm_mapper.apply_list(
++                self.block_name_to_quantize
++            )
++        if self.extra_config is not None:
++            self.extra_config = hf_to_vllm_mapper.apply_dict(self.extra_config)
++
++    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
++        from .schemes.factory import resolve_scheme
++
++        # Match original: check model.-prefixed names for unquantized layers
++        if prefix and self.extra_config:
++            for layer_name in self.extra_config:
++                if (
++                    layer_name == prefix or layer_name == f"model.{prefix}"
++                ) and self.extra_config[layer_name].get("bits", 16) >= 16:
++                    if isinstance(layer, RoutedExperts):
++                        return UnquantizedFusedMoEMethod(layer.moe_config)
++                    return UnquantizedLinearMethod()
++
++        layer_config = self.config_parser.resolve(layer, prefix)
++        if not layer_config.quantized:
++            if isinstance(layer, (LinearBase, ParallelLMHead)):
++                return UnquantizedLinearMethod()
++            if isinstance(layer, RoutedExperts):
++                return UnquantizedFusedMoEMethod(layer.moe_config)
++            return None
++
++        logger.debug(
++            "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
++            prefix,
++            layer.__class__.__name__,
++            layer_config.bits,
++            layer_config.group_size,
++            layer_config.sym,
++        )
++
++        scheme = resolve_scheme(layer_config)
++        if isinstance(layer, (LinearBase, ParallelLMHead)):
++            return scheme.get_linear_method(self, layer, prefix, layer_config)
++        if isinstance(layer, RoutedExperts):
++            return scheme.get_moe_method(self, layer, prefix, layer_config)
++        return None
++
++    @classmethod
++    def override_quantization_method(
++        cls, hf_quant_cfg, user_quant, hf_config=None
++    ) -> "QuantizationMethods | None":
++        """Override the `auto-round` method to `inc`."""
++        is_auto_round_format = hf_quant_cfg.get("quant_method", None) == "auto-round"
++        if is_auto_round_format:
++            return cls.get_name()
++        return None
+diff --git a/vllm/model_executor/layers/quantization/inc/inc_linear.py b/vllm/model_executor/layers/quantization/inc/inc_linear.py
+new file mode 100644
+index 000000000000..9917a70194d7
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/inc_linear.py
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from typing import TYPE_CHECKING
++
++import torch
++
++from vllm.model_executor.layers.linear import LinearMethodBase
++
++if TYPE_CHECKING:
++    from .schemes.inc_scheme import INCLinearScheme
++
++
++class INCLinearMethod(LinearMethodBase):
++    def __init__(self, scheme: "INCLinearScheme") -> None:
++        self.scheme = scheme
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        return self.scheme.create_weights(
++            layer=layer,
++            input_size_per_partition=input_size_per_partition,
++            output_partition_sizes=output_partition_sizes,
++            input_size=input_size,
++            output_size=output_size,
++            params_dtype=params_dtype,
++            **extra_weight_attrs,
++        )
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        return self.scheme.process_weights_after_loading(layer)
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        return self.scheme.apply_weights(layer, x, bias)
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/__init__.py b/vllm/model_executor/layers/quantization/inc/schemes/__init__.py
+new file mode 100644
+index 000000000000..ea6c0a00d86d
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/schemes/__init__.py
+@@ -0,0 +1,13 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from .factory import resolve_scheme
++from .inc_scheme import INCLinearScheme, INCScheme
++from .inc_wna16_scheme import INCWna16Scheme
++
++__all__ = [
++    "INCScheme",
++    "INCLinearScheme",
++    "INCWna16Scheme",
++    "resolve_scheme",
++]
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/factory.py b/vllm/model_executor/layers/quantization/inc/schemes/factory.py
+new file mode 100644
+index 000000000000..4ae85ed9a831
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/schemes/factory.py
+@@ -0,0 +1,22 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from ..config_parser import INCLayerConfig
++    from .inc_scheme import INCScheme
++
++
++def resolve_scheme(layer_config: "INCLayerConfig") -> "INCScheme":
++    from .inc_wna16_scheme import INCWna16Scheme
++
++    scheme_list: list[type[INCScheme]] = [
++        INCWna16Scheme,
++    ]
++
++    for scheme_cls in scheme_list:
++        if scheme_cls.can_handle(layer_config):
++            return scheme_cls()
++
++    raise NotImplementedError(f"No INC scheme found for layer config: {layer_config}")
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/inc_scheme.py b/vllm/model_executor/layers/quantization/inc/schemes/inc_scheme.py
+new file mode 100644
+index 000000000000..b8bb263de056
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_scheme.py
+@@ -0,0 +1,104 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from abc import ABC, abstractmethod
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    import torch
++
++    from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
++    from vllm.model_executor.layers.linear import LinearMethodBase
++    from vllm.model_executor.layers.quantization import QuantizationMethods
++
++    from ..config_parser import INCLayerConfig
++    from ..inc import INCConfig
++
++
++class INCScheme(ABC):
++    """One class per quant type. Single registration point for the factory.
++
++    Each subclass defines:
++      - can_handle(): when does this scheme apply?
++      - get_linear_method(): required — how to quantize Linear layers
++      - get_moe_method(): optional — how to quantize MoE layers
++      - get_kvcache_method(): optional — how to quantize KV cache
++
++    Schemes that don't support MoE/KVCache inherit the default raise.
++    """
++
++    @staticmethod
++    @abstractmethod
++    def can_handle(layer_config: "INCLayerConfig") -> bool:
++        raise NotImplementedError
++
++    @abstractmethod
++    def get_linear_method(
++        self,
++        config: "INCConfig",
++        layer: "torch.nn.Module",
++        prefix: str,
++        layer_config: "INCLayerConfig",
++    ) -> "LinearMethodBase":
++        raise NotImplementedError
++
++    def get_moe_method(
++        self,
++        config: "INCConfig",
++        layer: "torch.nn.Module",
++        prefix: str,
++        layer_config: "INCLayerConfig",
++    ) -> "FusedMoEMethodBase | None":
++        """Optional. Override if this scheme supports MoE.
++        Default raises NotImplementedError."""
++        raise NotImplementedError(
++            f"{type(self).__name__} does not support MoE layers. "
++            f"Layer config: {layer_config}"
++        )
++
++    def get_kvcache_method(
++        self,
++        config: "INCConfig",
++        layer: "torch.nn.Module",
++        prefix: str,
++        layer_config: "INCLayerConfig",
++    ) -> "QuantizationMethods":
++        """Optional. Override if this scheme supports KV cache quantization.
++        Default raises NotImplementedError."""
++        raise NotImplementedError(
++            f"{type(self).__name__} does not support KV cache quantization. "
++            f"Layer config: {layer_config}"
++        )
++
++
++class INCLinearScheme(ABC):
++    @classmethod
++    @abstractmethod
++    def get_min_capability(cls) -> int:
++        raise NotImplementedError
++
++    @abstractmethod
++    def create_weights(
++        self,
++        layer: "torch.nn.Module",
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: "torch.dtype",
++        **extra_weight_attrs,
++    ) -> None:
++        raise NotImplementedError
++
++    @abstractmethod
++    def process_weights_after_loading(self, layer: "torch.nn.Module") -> None:
++        raise NotImplementedError
++
++    @abstractmethod
++    def apply_weights(
++        self,
++        layer: "torch.nn.Module",
++        x: "torch.Tensor",
++        bias: "torch.Tensor | None" = None,
++    ) -> "torch.Tensor":
++        raise NotImplementedError
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
+new file mode 100644
+index 000000000000..e0ffc6ac287f
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
+@@ -0,0 +1,399 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from functools import lru_cache
++from typing import TYPE_CHECKING, Any
++
++import torch
++from torch.nn.parameter import Parameter
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
++from vllm.model_executor.layers.quantization.awq import AWQConfig
++from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
++from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++    check_marlin_supported,
++)
++from vllm.model_executor.parameter import (
++    GroupQuantScaleParameter,
++    PackedvLLMParameter,
++    RowvLLMParameter,
++)
++from vllm.scalar_type import scalar_types
++
++from .inc_scheme import INCLinearScheme
++
++logger = init_logger(__name__)
++
++if TYPE_CHECKING:
++    from ..config_parser import INCLayerConfig
++
++
++@lru_cache(maxsize=1)
++def get_ark_state() -> tuple[bool, str | None, Any | None, Any | None]:
++    """Return ARK availability, error details, cached module, and QuantLinear."""
++    try:
++        import auto_round_kernel as ark
++        from auto_round_kernel.qlinear import QuantLinear
++
++        logger.info("Successfully imported auto_round_kernel.")
++    except ImportError as error:
++        return False, str(error), None, None
++
++    if getattr(ark, "cpu_lib", None) is None and getattr(ark, "xpu_lib", None) is None:
++        return (
++            False,
++            "No ARK backend library is available.",
++            None,
++            None,
++        )
++    logger.info("Successfully loaded auto_round_kernel backend library.")
++
++    return True, None, ark, QuantLinear
++
++
++class INCWNA16LinearScheme(INCLinearScheme):
++    def __init__(self, layer_config: "INCLayerConfig") -> None:
++        self.layer_config = layer_config
++        self.inner_method = self._build_inner_method()
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 60
++
++    def _build_inner_method(self):
++        if self.layer_config.is_gptq:
++            return self._build_gptq_method()
++        if self.layer_config.is_awq:
++            return self._build_awq_method()
++        raise NotImplementedError(
++            f"WNA16 linear scheme does not support {self.layer_config}"
++        )
++
++    def _build_gptq_method(self):
++        gptq_type_map = {
++            (4, True): scalar_types.uint4b8,
++            (8, True): scalar_types.uint8b128,
++        }
++        use_marlin = (
++            self.layer_config.backend == "auto" or "marlin" in self.layer_config.backend
++        ) and (self.layer_config.bits, self.layer_config.sym) in gptq_type_map
++        if use_marlin:
++            use_marlin = check_marlin_supported(
++                gptq_type_map[(self.layer_config.bits, self.layer_config.sym)],
++                self.layer_config.group_size,
++                has_zp=not self.layer_config.sym,
++            )
++
++        if use_marlin:
++            from vllm.model_executor.layers.quantization.auto_gptq import (
++                AutoGPTQLinearMethod,
++            )
++
++            return AutoGPTQLinearMethod(
++                AutoGPTQConfig(
++                    weight_bits=self.layer_config.bits,
++                    group_size=self.layer_config.group_size,
++                    desc_act=False,
++                    is_sym=self.layer_config.sym,
++                    lm_head_quantized=False,
++                    dynamic={},
++                    full_config={},
++                )
++            )
++
++        raise NotImplementedError(
++            f"INC quantization with bits={self.layer_config.bits}, "
++            f"sym={self.layer_config.sym} is not supported. "
++            "Only 4-bit and 8-bit symmetric quantization is supported "
++            "with Marlin kernels."
++        )
++
++    def _build_awq_method(self):
++        awq_type_map = {
++            4: scalar_types.uint4,
++            8: scalar_types.uint8,
++        }
++        use_marlin = (
++            self.layer_config.backend == "auto" or "marlin" in self.layer_config.backend
++        ) and self.layer_config.bits in awq_type_map
++        if use_marlin:
++            use_marlin = check_marlin_supported(
++                awq_type_map[self.layer_config.bits],
++                self.layer_config.group_size,
++                not self.layer_config.sym,
++            )
++
++        if use_marlin:
++            from vllm.model_executor.layers.quantization.awq_marlin import (
++                AWQMarlinLinearMethod,
++            )
++
++            return AWQMarlinLinearMethod(
++                AWQMarlinConfig(
++                    weight_bits=self.layer_config.bits,
++                    group_size=self.layer_config.group_size,
++                    zero_point=not self.layer_config.sym,
++                    lm_head_quantized=False,
++                    modules_to_not_convert=[],
++                    full_config={},
++                )
++            )
++
++        from vllm.model_executor.layers.quantization.awq import AWQLinearMethod
++
++        return AWQLinearMethod(
++            AWQConfig(
++                weight_bits=self.layer_config.bits,
++                group_size=self.layer_config.group_size,
++                zero_point=not self.layer_config.sym,
++            )
++        )
++
++    def create_weights(
++        self,
++        layer: "torch.nn.Module",
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: "torch.dtype",
++        **extra_weight_attrs,
++    ) -> None:
++        return self.inner_method.create_weights(
++            layer=layer,
++            input_size_per_partition=input_size_per_partition,
++            output_partition_sizes=output_partition_sizes,
++            input_size=input_size,
++            output_size=output_size,
++            params_dtype=params_dtype,
++            **extra_weight_attrs,
++        )
++
++    def process_weights_after_loading(self, layer: "torch.nn.Module") -> None:
++        return self.inner_method.process_weights_after_loading(layer)
++
++    def apply_weights(
++        self,
++        layer: "torch.nn.Module",
++        x: "torch.Tensor",
++        bias: "torch.Tensor | None" = None,
++    ) -> "torch.Tensor":
++        return self.inner_method.apply(layer, x, bias)
++
++
++class INCXPULinearBase(INCLinearScheme):
++    def __init__(self, layer_config: "INCLayerConfig") -> None:
++        self.weight_bits = layer_config.bits
++        self.group_size = layer_config.group_size
++        self.sym = layer_config.sym
++        self.pack_factor = 32 // self.weight_bits
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 0
++
++    def _create_inc_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        params_dtype: torch.dtype,
++        weight_loader: Any,
++    ) -> None:
++        output_size_per_partition = sum(output_partition_sizes)
++        scales_and_zp_size = input_size_per_partition // self.group_size
++
++        qweight = PackedvLLMParameter(
++            data=torch.empty(
++                input_size_per_partition // self.pack_factor,
++                output_size_per_partition,
++                dtype=torch.int32,
++            ),
++            input_dim=0,
++            output_dim=1,
++            packed_dim=0,
++            packed_factor=self.pack_factor,
++            weight_loader=weight_loader,
++        )
++        scales = GroupQuantScaleParameter(
++            data=torch.empty(
++                scales_and_zp_size,
++                output_size_per_partition,
++                dtype=params_dtype,
++            ),
++            input_dim=0,
++            output_dim=1,
++            weight_loader=weight_loader,
++        )
++        qzeros = PackedvLLMParameter(
++            data=torch.empty(
++                scales_and_zp_size,
++                output_size_per_partition // self.pack_factor,
++                dtype=torch.int32,
++            ),
++            input_dim=0,
++            output_dim=1,
++            packed_dim=1,
++            packed_factor=self.pack_factor,
++            weight_loader=weight_loader,
++        )
++
++        layer.register_parameter("qweight", qweight)
++        layer.register_parameter("scales", scales)
++        layer.register_parameter("qzeros", qzeros)
++
++        g_idx = RowvLLMParameter(
++            data=torch.tensor(
++                [i // self.group_size for i in range(input_size_per_partition)],
++                dtype=torch.int32,
++            ),
++            input_dim=0,
++            weight_loader=weight_loader,
++        )
++        layer.register_parameter("g_idx", g_idx)
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        del input_size, output_size
++        self._create_inc_weights(
++            layer=layer,
++            input_size_per_partition=input_size_per_partition,
++            output_partition_sizes=output_partition_sizes,
++            params_dtype=params_dtype,
++            weight_loader=extra_weight_attrs.get("weight_loader"),
++        )
++
++
++class INCXPULinearMethod(INCXPULinearBase):
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        device = layer.qweight.data.device
++
++        qweight_ct = layer.qweight.data.t().contiguous()
++        layer.qweight = Parameter(qweight_ct.t(), requires_grad=False)
++        layer.scales = Parameter(layer.scales.data, requires_grad=False)
++        layer.qzeros = Parameter(
++            torch.tensor([8], dtype=torch.int8, device=device),
++            requires_grad=False,
++        )
++
++    def apply_weights(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        out_shape = x.shape[:-1] + (layer.qweight.shape[1],)
++        reshaped_x = x.reshape(-1, x.shape[-1])
++        out = torch.ops._xpu_C.int4_gemm_w4a16(
++            reshaped_x,
++            layer.qweight,
++            bias,
++            layer.scales,
++            layer.qzeros,
++            self.group_size,
++            None,
++        )
++        return out.reshape(out_shape)
++
++
++class INCARKLinearMethod(INCXPULinearBase):
++    def __init__(self, layer_config: "INCLayerConfig") -> None:
++        super().__init__(layer_config)
++
++        is_available, error_str, _, quant_linear_cls = get_ark_state()
++        if not is_available or quant_linear_cls is None:
++            reason = error_str or "unknown error"
++            raise ImportError(f"Failed to import auto_round_kernel. {reason}")
++
++        self.quant_linear_cls = quant_linear_cls
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        super().create_weights(
++            layer=layer,
++            input_size_per_partition=input_size_per_partition,
++            output_partition_sizes=output_partition_sizes,
++            input_size=input_size,
++            output_size=output_size,
++            params_dtype=params_dtype,
++            **extra_weight_attrs,
++        )
++        layer.in_features = input_size_per_partition
++        layer.out_features = sum(output_partition_sizes)
++        layer.params_dtype = params_dtype
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if hasattr(layer, "input_size_per_partition"):
++            in_features = layer.input_size_per_partition
++        elif hasattr(layer, "input_size"):
++            in_features = layer.input_size
++        else:
++            raise AttributeError("Cannot determine in_features for layer.")
++
++        if hasattr(layer, "output_partition_sizes"):
++            out_features = sum(layer.output_partition_sizes)
++        elif hasattr(layer, "output_size_per_partition"):
++            out_features = layer.output_size_per_partition
++        elif hasattr(layer, "output_size"):
++            out_features = layer.output_size
++        else:
++            out_features = layer.scales.shape[-1]
++
++        ark_linear = self.quant_linear_cls(
++            bits=self.weight_bits,
++            group_size=self.group_size,
++            sym=self.sym,
++            in_features=in_features,
++            out_features=out_features,
++            bias=layer.bias is not None,
++            weight_dtype=layer.params_dtype,
++        )
++        ark_linear.to(layer.qweight.device)
++
++        with torch.no_grad():
++            ark_linear.qweight.copy_(layer.qweight.detach())
++            if hasattr(layer, "qzeros") and layer.qzeros is not None:
++                ark_linear.qzeros.copy_(layer.qzeros.detach())
++            else:
++                ark_linear.qzeros = None
++            ark_linear.scales.copy_(layer.scales.detach())
++            if hasattr(layer, "bias") and layer.bias is not None:
++                ark_linear.bias.copy_(layer.bias.detach())
++
++        ark_linear.post_init()
++        layer.ark_linear = ark_linear
++
++        del layer.qweight
++        if hasattr(layer, "qzeros"):
++            del layer.qzeros
++        del layer.scales
++
++    def apply_weights(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        del bias
++        return layer.ark_linear.forward(x)
++
++
++class INCXPUW4A16LinearScheme(INCXPULinearMethod):
++    pass
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_scheme.py b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_scheme.py
+new file mode 100644
+index 000000000000..7b6c10de2a5f
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_scheme.py
+@@ -0,0 +1,201 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from typing import TYPE_CHECKING
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
++from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
++from vllm.platforms import current_platform
++from vllm.scalar_type import scalar_types
++
++from ..inc_linear import INCLinearMethod
++from .inc_scheme import INCScheme
++
++if TYPE_CHECKING:
++    import torch
++
++    from ..config_parser import INCLayerConfig
++    from ..inc import INCConfig
++
++logger = init_logger(__name__)
++
++
++class INCWna16Scheme(INCScheme):
++    @staticmethod
++    def can_handle(layer_config: "INCLayerConfig") -> bool:
++        return layer_config.is_wna16_int
++
++    def get_linear_method(
++        self,
++        config: "INCConfig",
++        layer: "torch.nn.Module",
++        prefix: str,
++        layer_config: "INCLayerConfig",
++    ):
++        del config, layer
++        if current_platform.is_xpu():
++            if layer_config.bits == 4 and layer_config.sym:
++                from .inc_wna16_linear import (
++                    INCARKLinearMethod,
++                    INCXPULinearMethod,
++                    get_ark_state,
++                )
++
++                is_ark_available, ark_error, _, _ = get_ark_state()
++                if is_ark_available:
++                    return INCLinearMethod(INCARKLinearMethod(layer_config))
++
++                logger.debug(
++                    "ARK backend is unavailable for layer %s; "
++                    "falling back to the default XPU INC path. Error: %s",
++                    prefix,
++                    ark_error or "unknown error",
++                )
++                return INCLinearMethod(INCXPULinearMethod(layer_config))
++            raise NotImplementedError(f"INC on XPU: unsupported config {layer_config}")
++
++        if current_platform.is_cpu() and layer_config.is_gptq:
++            if layer_config.bits == 4 and layer_config.sym:
++                from .inc_wna16_linear import (
++                    INCARKLinearMethod,
++                    INCWNA16LinearScheme,
++                    get_ark_state,
++                )
++
++                is_ark_available, ark_error, _, _ = get_ark_state()
++                if is_ark_available:
++                    return INCLinearMethod(INCARKLinearMethod(layer_config))
++
++                logger.debug(
++                    "ARK backend is unavailable for layer %s; "
++                    "falling back to the default CPU INC path. Error: %s",
++                    prefix,
++                    ark_error or "unknown error",
++                )
++                return INCLinearMethod(INCWNA16LinearScheme(layer_config))
++            raise NotImplementedError(f"INC on CPU: unsupported config {layer_config}")
++
++        from .inc_wna16_linear import INCWNA16LinearScheme
++
++        return INCLinearMethod(INCWNA16LinearScheme(layer_config))
++
++    def get_moe_method(
++        self,
++        config: "INCConfig",
++        layer: "torch.nn.Module",
++        prefix: str,
++        layer_config: "INCLayerConfig",
++    ):
++        del config, prefix
++        # XPU and CPU do not support MoE quantization yet
++        if current_platform.is_xpu() or current_platform.is_cpu():
++            from vllm.model_executor.layers.fused_moe import (
++                UnquantizedFusedMoEMethod,
++            )
++
++            return UnquantizedFusedMoEMethod(layer.moe_config)
++        if layer_config.is_gptq:
++            return _resolve_gptq_moe(layer, layer_config)
++        if layer_config.is_awq:
++            return _resolve_awq_moe(layer, layer_config)
++        raise NotImplementedError(f"WNA16 MoE does not support config {layer_config}")
++
++
++def _resolve_gptq_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
++    from vllm.model_executor.layers.quantization.auto_gptq import (
++        AutoGPTQMoEMethod,
++    )
++    from vllm.model_executor.layers.quantization.moe_wna16 import (
++        MoeWNA16Config,
++        MoeWNA16Method,
++    )
++    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++        check_marlin_supported,
++        check_moe_marlin_supports_layer,
++    )
++
++    gptq_type_map = {
++        (4, True): scalar_types.uint4b8,
++        (8, True): scalar_types.uint8b128,
++    }
++    use_marlin = (layer_config.bits, layer_config.sym) in gptq_type_map
++    if use_marlin:
++        use_marlin = check_marlin_supported(
++            gptq_type_map[(layer_config.bits, layer_config.sym)],
++            layer_config.group_size,
++            has_zp=not layer_config.sym,
++        ) and check_moe_marlin_supports_layer(layer, layer_config.group_size)
++
++    if use_marlin:
++        return AutoGPTQMoEMethod(
++            AutoGPTQConfig(
++                weight_bits=layer_config.bits,
++                group_size=layer_config.group_size,
++                desc_act=False,
++                is_sym=layer_config.sym,
++                lm_head_quantized=False,
++                dynamic={},
++                full_config={},
++            ),
++            layer.moe_config,
++        )
++
++    moe_config = MoeWNA16Config.from_config(
++        {
++            "quant_method": "gptq",
++            "bits": layer_config.bits,
++            "group_size": layer_config.group_size,
++            "sym": layer_config.sym,
++            "lm_head": False,
++        }
++    )
++    return MoeWNA16Method(moe_config, layer.moe_config)
++
++
++def _resolve_awq_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
++    from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinMoEMethod
++    from vllm.model_executor.layers.quantization.moe_wna16 import (
++        MoeWNA16Config,
++        MoeWNA16Method,
++    )
++    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++        check_marlin_supported,
++        check_moe_marlin_supports_layer,
++    )
++
++    awq_type_map = {
++        4: scalar_types.uint4,
++        8: scalar_types.uint8,
++    }
++    use_marlin = layer_config.bits in awq_type_map
++    if use_marlin:
++        use_marlin = check_marlin_supported(
++            awq_type_map[layer_config.bits],
++            layer_config.group_size,
++            not layer_config.sym,
++        ) and check_moe_marlin_supports_layer(layer, layer_config.group_size)
++
++    if use_marlin:
++        return AWQMarlinMoEMethod(
++            AWQMarlinConfig(
++                weight_bits=layer_config.bits,
++                group_size=layer_config.group_size,
++                zero_point=not layer_config.sym,
++                lm_head_quantized=False,
++                modules_to_not_convert=[],
++                full_config={},
++            ),
++            layer.moe_config,
++        )
++
++    moe_config = MoeWNA16Config.from_config(
++        {
++            "quant_method": "awq",
++            "bits": layer_config.bits,
++            "group_size": layer_config.group_size,
++            "zero_point": not layer_config.sym,
++            "lm_head": False,
++        }
++    )
++    return MoeWNA16Method(moe_config, layer.moe_config)

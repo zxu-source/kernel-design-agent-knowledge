@@ -1,0 +1,326 @@
+diff --git a/python/sglang/srt/disaggregation/base/conn.py b/python/sglang/srt/disaggregation/base/conn.py
+index fbd9186b5e07..f1b49b2c8634 100644
+--- a/python/sglang/srt/disaggregation/base/conn.py
++++ b/python/sglang/srt/disaggregation/base/conn.py
+@@ -18,6 +18,9 @@ class StateType(str, enum.Enum):
+     MAMBA = "mamba"
+     SWA = "swa"
+     DSA = "dsa"
++    # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
++    # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
++    SWA_RING = "swa_ring"
+ 
+ 
+ @dataclasses.dataclass
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index 25506ca33859..247ba6673699 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -1023,6 +1023,17 @@ def _dsa_payload():
+                     kv_indices_full.cpu().numpy(), device_page_size
+                 )
+ 
++            def _swa_ring_payload():
++                # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
++                # Same window positions and order -> positional match with prefill.
++                ring_stride = self.token_to_kv_pool.unified_swa_ring_size
++                window_size = self.token_to_kv_pool.unified_swa_window
++                window_start = max(0, seq_len - window_size)
++                positions = np.arange(window_start, seq_len, dtype=np.int64)
++                state_slot = int(decode_req.req.req_pool_idx)
++                ring_rows = state_slot * ring_stride + (positions % ring_stride)
++                return ring_rows.astype(np.int32)
++
+             state_types = self.kv_manager.kv_args.state_types
+             state_indices: Optional[List] = []
+             for st in state_types:
+@@ -1032,6 +1043,8 @@ def _dsa_payload():
+                     state_indices.append(_swa_payload())
+                 elif st == StateType.DSA:
+                     state_indices.append(_dsa_payload())
++                elif st == StateType.SWA_RING:
++                    state_indices.append(_swa_ring_payload())
+                 else:
+                     state_indices.append(None)
+ 
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index ffc6c6cfd37e..f9cb07da8b98 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -996,7 +996,7 @@ def maybe_send_extra(
+                         )
+                         or rc
+                     )
+-            elif st in (StateType.SWA, StateType.DSA):
++            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
+                 if (
+                     target_rank_registration_info is not None
+                     and not self.is_mla_backend
+@@ -1008,16 +1008,22 @@ def maybe_send_extra(
+                     )
+                 src_indices = list(indices)
+                 dst_indices_local = list(dst_indices)
+-                if len(src_indices) > len(dst_indices_local):
+-                    logger.warning(
+-                        f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
+-                    )
+-                    src_indices = src_indices[: len(dst_indices_local)]
+-                elif len(src_indices) < len(dst_indices_local):
++                if len(src_indices) != len(dst_indices_local):
++                    # SWA_RING is positional: truncating silently misaligns rows
++                    # and corrupts KV, so fail loud. Paged SWA/DSA tolerate a
++                    # 1-page drift -> keep the lenient truncation below.
++                    if st == StateType.SWA_RING:
++                        raise RuntimeError(
++                            "SWA_RING state index length mismatch: "
++                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
++                        )
+                     logger.warning(
+                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
+                     )
+-                    dst_indices_local = dst_indices_local[: len(src_indices)]
++                    if len(src_indices) > len(dst_indices_local):
++                        src_indices = src_indices[: len(dst_indices_local)]
++                    else:
++                        dst_indices_local = dst_indices_local[: len(src_indices)]
+                 rc = (
+                     self._send_kvcache_generic(
+                         mooncake_session_id=req.mooncake_session_id,
+diff --git a/python/sglang/srt/disaggregation/mori/conn.py b/python/sglang/srt/disaggregation/mori/conn.py
+index 8aada7c25d2b..7e29f408e4b9 100644
+--- a/python/sglang/srt/disaggregation/mori/conn.py
++++ b/python/sglang/srt/disaggregation/mori/conn.py
+@@ -1092,7 +1092,7 @@ def send_state(
+                         dst_dims,
+                     )
+                 )
+-            elif st in ("swa", "dsa"):
++            elif st in ("swa", "dsa", "swa_ring"):
+                 statuses.extend(
+                     self._send_swa_dsa_state(
+                         peer_info,
+@@ -1226,6 +1226,14 @@ def _send_swa_dsa_state(
+                 f"No overlapping state indices for state_type={state_type}"
+             )
+         if src_state_indices.size != dst_state_indices.size:
++            # SWA_RING is positional: truncating silently misaligns rows and
++            # corrupts KV, so fail loud. Paged swa/dsa tolerate a 1-page drift
++            # -> keep truncation.
++            if state_type == "swa_ring":
++                raise RuntimeError(
++                    "SWA_RING state index length mismatch: "
++                    f"src={src_state_indices.size}, dst={dst_state_indices.size}"
++                )
+             logger.warning(
+                 "State index length mismatch for %s: src=%d dst=%d; truncating to common prefix=%d",
+                 state_type,
+diff --git a/python/sglang/srt/disaggregation/nixl/conn.py b/python/sglang/srt/disaggregation/nixl/conn.py
+index d16be006511c..bf20ab429c78 100644
+--- a/python/sglang/srt/disaggregation/nixl/conn.py
++++ b/python/sglang/srt/disaggregation/nixl/conn.py
+@@ -1612,7 +1612,7 @@ def maybe_send_extra(
+                         dst_gpu_id,
+                         comp_notif,
+                     )
+-            elif st in (StateType.SWA, StateType.DSA):
++            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
+                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
+                     raise RuntimeError(
+                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index 992bc46d60c7..89ee2e2d8e99 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -26,6 +26,7 @@
+ from http import HTTPStatus
+ from typing import TYPE_CHECKING, List, Optional
+ 
++import numpy as np
+ import torch
+ 
+ from sglang.srt.disaggregation.base import KVPoll
+@@ -991,6 +992,19 @@ def _dsa_payload():
+                 ]
+                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+ 
++            def _swa_ring_payload():
++                # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
++                # for the last `window` positions, in ascending position order so
++                # decode (its own req_pool_idx) matches positionally.
++                _pool = self.token_to_kv_pool_allocator.get_kvcache()
++                ring_stride = _pool.unified_swa_ring_size
++                window_size = _pool.unified_swa_window
++                window_start = max(0, seq_len - window_size)
++                positions = np.arange(window_start, seq_len, dtype=np.int64)
++                state_slot = int(req.req_pool_idx)
++                ring_rows = state_slot * ring_stride + (positions % ring_stride)
++                return ring_rows.astype(np.int32)
++
+             state_types = (
+                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+             )
+@@ -1002,6 +1016,8 @@ def _dsa_payload():
+                     state_indices.append(_swa_payload())
+                 elif st == StateType.DSA:
+                     state_indices.append(_dsa_payload())
++                elif st == StateType.SWA_RING:
++                    state_indices.append(_swa_ring_payload())
+                 else:
+                     state_indices.append(None)
+ 
+diff --git a/python/sglang/srt/disaggregation/utils.py b/python/sglang/srt/disaggregation/utils.py
+index e1d7d9c8db32..2cfe1e102c6a 100644
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -638,6 +638,22 @@ def setup_state_kv_args(
+             append_state_component(
+                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+             )
++            # unified_kv: the SWA ring lives in the unified buffers (no separate
++            # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
++            if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
++                token_to_kv_pool, "get_unified_swa_ring_buf_infos"
++            ):
++                ring_ptrs, ring_lens, ring_item_lens = (
++                    token_to_kv_pool.get_unified_swa_ring_buf_infos()
++                )
++                if ring_ptrs:
++                    append_state_component(
++                        kv_args,
++                        StateType.SWA_RING,
++                        ring_ptrs,
++                        ring_lens,
++                        ring_item_lens,
++                    )
+         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+             dim = (
+                 token_to_kv_pool.get_state_dim_per_tensor()
+diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+index 4eddf503bf9f..f914e6142455 100644
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -458,6 +458,7 @@ def __init__(
+         start_layer: Optional[int] = None,
+         end_layer: Optional[int] = None,
+         enable_hisparse: bool = False,
++        num_req_slots: Optional[int] = None,
+     ):
+         super().__init__(
+             swa_size,
+@@ -479,6 +480,12 @@ def __init__(
+         )
+ 
+         self.max_num_reqs = max_num_reqs
++        # SWA ring needs one slot per addressable req_pool_idx. PD decode inflates
++        # req_to_token past max_num_reqs (pre-alloc), so the caller passes the real
++        # capacity; sizing as max_num_reqs+1 overflows ("length out of range").
++        self.num_req_slots = (
++            num_req_slots if num_req_slots is not None else max_num_reqs + 1
++        )
+         self.c4_size = c4_size
+         self.c4_logical_size = c4_logical_size
+         self.c128_size = c128_size
+@@ -535,7 +542,7 @@ def __init__(
+             )
+             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
+                 stage_ratios=stage_ratios,
+-                num_slots=self.max_num_reqs + 1,
++                num_slots=self.num_req_slots,
+                 num_blocks=self.c128_size,
+                 qk_nope_head_dim=qk_nope_head_dim,
+                 qk_rope_head_dim=qk_rope_head_dim,
+@@ -629,16 +636,45 @@ def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+         item_lens: List[int] = []
+ 
+         if self._unified_kv:
+-            buf_groups = [
+-                self.unified_kv_pool.kv_buffer,
+-                self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+-            ]
+-        else:
+-            buf_groups = [
+-                self.c4_kv_pool.kv_buffer,
+-                self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+-                self.c128_kv_pool.kv_buffer,
+-            ]
++            # Unified buffer per layer: [swa_pages + compress_pages, head_dim].
++            # Compressed region [swa_pages:] is page-contiguous (row swa_pages +
++            # loc//ratio), so reuse the page-block PD transfer by offsetting the ptr
++            # past the SWA ring and setting item_len = one page of rows. The SWA ring
++            # ships separately as StateType.SWA_RING. Order [c4, c4_indexer, c128]
++            # mirrors the non-unified kv_data layout (keeps PP ptr-slicing valid).
++            stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
++            swa_pages = self.unified_kv_pool.swa_pages
++
++            def _append_compressed_entry(local_layer_id: int, ratio: int) -> None:
++                buf = self.unified_kv_pool.kv_buffer[local_layer_id]
++                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
++                row_bytes = buf[0].nbytes
++                rows_per_page = self.page_size // ratio
++                compress_rows = buf.shape[0] - swa_pages
++                data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
++                data_lens.append(compress_rows * row_bytes)
++                item_lens.append(rows_per_page * row_bytes)
++
++            c4_locals = [i for i, r in enumerate(stage_ratios) if r == 4]
++            c128_locals = [i for i, r in enumerate(stage_ratios) if r == 128]
++
++            for i in c4_locals:
++                _append_compressed_entry(i, 4)
++            for buf in self.c4_indexer_kv_pool.index_k_with_scale_buffer:
++                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
++                data_ptrs.append(buf.data_ptr())
++                data_lens.append(buf.nbytes)
++                item_lens.append(buf[0].nbytes)
++            for i in c128_locals:
++                _append_compressed_entry(i, 128)
++
++            return data_ptrs, data_lens, item_lens
++
++        buf_groups = [
++            self.c4_kv_pool.kv_buffer,
++            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
++            self.c128_kv_pool.kv_buffer,
++        ]
+ 
+         for bufs in buf_groups:
+             for buf in bufs:
+@@ -649,6 +685,24 @@ def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+ 
+         return data_ptrs, data_lens, item_lens
+ 
++    def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
++        """SWA-ring region [0, swa_pages) of every unified_kv layer, addressed
++        per-row by ring slot. Shipped as the StateType.SWA_RING PD component."""
++        # TODO(billishyahao): validate PP layer-slicing for SWA_RING.
++        data_ptrs: List[int] = []
++        data_lens: List[int] = []
++        item_lens: List[int] = []
++        if not self._unified_kv:
++            return data_ptrs, data_lens, item_lens
++        swa_pages = self.unified_kv_pool.swa_pages
++        for buf in self.unified_kv_pool.kv_buffer:
++            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
++            row_bytes = buf[0].nbytes
++            data_ptrs.append(buf.data_ptr())
++            data_lens.append(swa_pages * row_bytes)
++            item_lens.append(row_bytes)
++        return data_ptrs, data_lens, item_lens
++
+     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+         data_ptrs: List[int] = []
+         data_lens: List[int] = []
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index 0b308a25713d..d35144d94f32 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -406,6 +406,9 @@ def _init_pools(self: ModelRunner):
+                 compression_ratios = self.model_config.compress_ratios
+             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+                 max_num_reqs=self.max_running_requests,
++                # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
++                # past max_running_requests (pre-alloc), so size to the real capacity.
++                num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
+                 swa_size=self.swa_max_total_num_tokens,
+                 c4_size=self.c4_max_total_num_tokens,
+                 c128_size=self.c128_max_total_num_tokens,

@@ -1,0 +1,271 @@
+diff --git a/tests/engine/test_arg_utils.py b/tests/engine/test_arg_utils.py
+index 9b21f3eebc10..9d34975032e1 100644
+--- a/tests/engine/test_arg_utils.py
++++ b/tests/engine/test_arg_utils.py
+@@ -206,6 +206,14 @@ def test_get_kwargs():
+     assert kwargs["nested_config"]["type"]('{"field": 2}') == NestedConfig(2)  # type: ignore[call-arg]
+ 
+ 
++def test_jit_monitor_verbose_arg():
++    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
++    args = parser.parse_args(["--jit-monitor-verbose"])
++
++    assert args.jit_monitor_verbose
++    assert EngineArgs(model="test", jit_monitor_verbose=True).jit_monitor_verbose
++
++
+ def test_hf_token_get_kwargs():
+     kwargs = get_kwargs(ModelConfig)["hf_token"]
+ 
+diff --git a/tests/test_jit_monitor.py b/tests/test_jit_monitor.py
+index a463f4b5faa1..8dd778d52fd2 100644
+--- a/tests/test_jit_monitor.py
++++ b/tests/test_jit_monitor.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import os
+ import sys
++from contextlib import contextmanager
+ from types import SimpleNamespace
+ from unittest import mock
+ 
+@@ -14,8 +15,10 @@
+ def _reset_monitor():
+     """Reset global monitor state between tests."""
+     jit_monitor._active = False
++    jit_monitor._verbose = False
+     yield
+     jit_monitor._active = False
++    jit_monitor._verbose = False
+ 
+ 
+ # ------------------------------------------------------------------
+@@ -30,10 +33,15 @@ def _make_fake_knobs(*, autotuning_print=False, jit_hook=None):
+     return SimpleNamespace(autotuning=autotuning, runtime=runtime)
+ 
+ 
++@contextmanager
+ def _patch_triton_knobs(fake_knobs):
+     """Context manager that makes ``from triton import knobs`` return *fake_knobs*."""
+     fake_triton = SimpleNamespace(knobs=fake_knobs)
+-    return mock.patch.dict(sys.modules, {"triton": fake_triton})
++    with (
++        mock.patch.dict(sys.modules, {"triton": fake_triton}),
++        mock.patch.object(jit_monitor, "HAS_TRITON", True),
++    ):
++        yield
+ 
+ 
+ # ------------------------------------------------------------------
+@@ -108,7 +116,10 @@ def test_hook_logs_warning(self):
+         hook = fake.runtime.jit_post_compile_hook
+         mock_fn = SimpleNamespace(name="test_kernel")
+ 
+-        with mock.patch.object(jit_monitor.logger, "warning") as m:
++        with (
++            mock.patch.object(jit_monitor.logger, "warning_once") as m,
++            mock.patch.object(jit_monitor.logger, "warning") as warning,
++        ):
+             hook(
+                 key="some_key",
+                 repr="some_repr",
+@@ -119,6 +130,7 @@ def test_hook_logs_warning(self):
+             )
+ 
+         m.assert_called_once()
++        warning.assert_not_called()
+         msg = m.call_args[0][0] % m.call_args[0][1:]
+         assert "Triton kernel JIT compilation during inference" in msg
+         assert "test_kernel" in msg
+@@ -206,9 +218,9 @@ def _add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+         tl.store(out_ptr + offs, x + y, mask=mask)
+ 
+ 
+-def _run_add_kernel(n: int, block: int = 256) -> None:
++def _run_add_kernel(n: int, block: int = 256, offset: int = 0) -> None:
+     """Launch ``_add_kernel`` with vectors of length *n*."""
+-    x = torch.randn(n, device="cuda")
++    x = torch.randn(n + offset, device="cuda")[offset:]  # affect alignment
+     y = torch.randn(n, device="cuda")
+     out = torch.empty(n, device="cuda")
+     grid = ((n + block - 1) // block,)
+@@ -224,7 +236,7 @@ def test_no_warning_on_cached_shape(self):
+         _run_add_kernel(1024)
+ 
+         jit_monitor.activate()
+-        with mock.patch.object(jit_monitor.logger, "warning") as w:
++        with mock.patch.object(jit_monitor.logger, "warning_once") as w:
+             _run_add_kernel(1024)
+         w.assert_not_called()
+ 
+@@ -232,9 +244,21 @@ def test_warning_on_new_constexpr(self):
+         _run_add_kernel(1024, block=256)
+ 
+         jit_monitor.activate()
+-        with mock.patch.object(jit_monitor.logger, "warning") as w:
++        with mock.patch.object(jit_monitor.logger, "warning_once") as w:
+             # Different BLOCK (a tl.constexpr) forces recompilation.
+             _run_add_kernel(1024, block=512)
+         w.assert_called()
+         msg = w.call_args[0][0] % w.call_args[0][1:]
+         assert "_add_kernel" in msg
++
++    def test_verbose_warning_on_each_new_pointer_alignment(self):
++        _run_add_kernel(1024)
++
++        jit_monitor.activate(verbose=True)
++        with (
++            mock.patch.object(jit_monitor.logger, "warning") as w,
++            mock.patch.object(jit_monitor.logger, "warning_once") as w_once,
++        ):
++            _run_add_kernel(1024, offset=1)
++        assert w.called
++        w_once.assert_not_called()
+diff --git a/vllm/config/observability.py b/vllm/config/observability.py
+index 84e83c6d4ad2..b35ec6ce74e6 100644
+--- a/vllm/config/observability.py
++++ b/vllm/config/observability.py
+@@ -76,6 +76,10 @@ def show_hidden_metrics(self) -> bool:
+     This includes number of context/generation requests and tokens
+     and the elapsed cpu time for the iteration."""
+ 
++    jit_monitor_verbose: bool = False
++    """Log every Triton JIT compile with its dispatch key. This can emit many
++    logs and add overhead, so it is intended for debugging."""
++
+     @cached_property
+     def collect_model_forward_time(self) -> bool:
+         """Whether to collect model forward time for the request."""
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index b4cc1cf0326e..3ac143e3e74a 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -637,6 +637,7 @@ class EngineArgs:
+     enable_logging_iteration_details: bool = (
+         ObservabilityConfig.enable_logging_iteration_details
+     )
++    jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
+     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
+     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+@@ -1357,6 +1358,10 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+             "--enable-logging-iteration-details",
+             **observability_kwargs["enable_logging_iteration_details"],
+         )
++        observability_group.add_argument(
++            "--jit-monitor-verbose",
++            **observability_kwargs["jit_monitor_verbose"],
++        )
+ 
+         # Scheduler arguments
+         scheduler_kwargs = get_kwargs(SchedulerConfig)
+@@ -2202,6 +2207,7 @@ def create_engine_config(
+             enable_mfu_metrics=self.enable_mfu_metrics,
+             enable_mm_processor_stats=self.enable_mm_processor_stats,
+             enable_logging_iteration_details=self.enable_logging_iteration_details,
++            jit_monitor_verbose=self.jit_monitor_verbose,
+         )
+ 
+         # Compilation config overrides
+diff --git a/vllm/triton_utils/jit_monitor.py b/vllm/triton_utils/jit_monitor.py
+index 5ee33fc51dc4..9a7b1695af79 100644
+--- a/vllm/triton_utils/jit_monitor.py
++++ b/vllm/triton_utils/jit_monitor.py
+@@ -8,6 +8,10 @@
+ latency spike. This module registers hooks in the Triton runtime to
+ detect and log such events so they can be investigated.
+ 
++Set ``--jit-monitor-verbose`` to log every Triton JIT compile with its
++dispatch key. This is intentionally opt-in because it can emit many logs and
++add overhead.
++
+ Currently monitors:
+ - Triton ``@triton.autotune`` cache misses (via ``knobs.autotuning.print``)
+ - Triton ``@triton.jit`` first-time compilations
+@@ -22,6 +26,7 @@
+ logger = init_logger(__name__)
+ 
+ _active: bool = False
++_verbose: bool = False
+ 
+ 
+ def is_active() -> bool:
+@@ -29,7 +34,7 @@ def is_active() -> bool:
+     return _active
+ 
+ 
+-def activate() -> None:
++def activate(*, verbose: bool = False) -> None:
+     """Enable JIT compilation monitoring after warmup.
+ 
+     Call once per worker process at the end of
+@@ -43,10 +48,11 @@ def activate() -> None:
+     their environment, autotuning printing is left disabled; the JIT
+     compilation hook is still registered regardless.
+     """
+-    global _active
++    global _active, _verbose
+     if _active:
+         return
+     _active = True
++    _verbose = verbose
+ 
+     _setup_triton_autotuning_print()
+     _setup_triton_jit_hook()
+@@ -84,6 +90,27 @@ def _setup_triton_autotuning_print() -> None:
+ # ------------------------------------------------------------------
+ 
+ 
++def _log_jit_compile(fn_name: str, kwargs) -> None:
++    if _verbose:
++        compile_info = kwargs.get("compile")
++        if not isinstance(compile_info, dict):
++            compile_info = {}
++        logger.warning(
++            "Triton %sJIT compilation during inference: %s (key=%s).",
++            "autotune/warmup candidate " if kwargs.get("warmup") else "kernel ",
++            fn_name,
++            compile_info.get("key") or kwargs.get("key"),
++        )
++        return
++
++    logger.warning_once(
++        "Triton kernel JIT compilation during inference: %s. "
++        "This causes a latency spike; consider extending warmup "
++        "to cover this shape/config.",
++        fn_name,
++    )
++
++
+ def _setup_triton_jit_hook() -> None:
+     """Register a ``jit_post_compile_hook`` that warns on compilation."""
+     if not HAS_TRITON:
+@@ -100,12 +127,7 @@ def _on_jit_compile(**kwargs):
+         # pre-existing hook unchanged.
+         fn = kwargs.get("fn")
+         fn_name = getattr(fn, "name", "<unknown>")
+-        logger.warning_once(
+-            "Triton kernel JIT compilation during inference: %s. "
+-            "This causes a latency spike; consider extending warmup "
+-            "to cover this shape/config.",
+-            fn_name,
+-        )
++        _log_jit_compile(fn_name, kwargs)
+         if existing_hook is not None:
+             return existing_hook(**kwargs)
+         return None
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 052e1fe76f43..0291faf1afc8 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -737,7 +737,9 @@ def compile_or_warm_up_model(self) -> CompilationTimes:
+             activate as activate_triton_jit_monitor,
+         )
+ 
+-        activate_triton_jit_monitor()
++        activate_triton_jit_monitor(
++            verbose=self.observability_config.jit_monitor_verbose
++        )
+ 
+         # Freeze the worker heap so the GC won't scan static objects
+         # (model weights, KV caches, CUDA graphs) during inference.

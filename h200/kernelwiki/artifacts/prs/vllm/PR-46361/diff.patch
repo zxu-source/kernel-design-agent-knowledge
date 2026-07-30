@@ -1,0 +1,337 @@
+diff --git a/docs/features/quantization/inc.md b/docs/features/quantization/inc.md
+index adb6b3ae8e2f..ffb90cec8c1a 100644
+--- a/docs/features/quantization/inc.md
++++ b/docs/features/quantization/inc.md
+@@ -75,14 +75,11 @@ vllm serve Intel/DeepSeek-R1-0528-Qwen3-8B-int4-AutoRound \
+     --max-model-len 4096
+ ```
+ 
+-!!! note
+-     To deploy `wNa16` models on Intel GPU/CPU, please add `--enforce-eager` for now.
+-
+ ## Evaluating the Quantized Model with vLLM
+ 
+ ```bash
+ lm_eval --model vllm \
+-  --model_args pretrained="Intel/DeepSeek-R1-0528-Qwen3-8B-int4-AutoRound,max_model_len=8192,max_num_batched_tokens=32768,max_num_seqs=128,gpu_memory_utilization=0.8,dtype=bfloat16,max_gen_toks=2048,enforce_eager=True" \
++  --model_args pretrained="Intel/DeepSeek-R1-0528-Qwen3-8B-int4-AutoRound,max_model_len=8192,max_num_batched_tokens=32768,max_num_seqs=128,gpu_memory_utilization=0.8,dtype=bfloat16,max_gen_toks=2048" \
+   --tasks gsm8k \
+   --num_fewshot 5 \
+   --batch_size 128
+diff --git a/requirements/xpu.txt b/requirements/xpu.txt
+index 684d0ef30f0c..f06f033d83e0 100644
+--- a/requirements/xpu.txt
++++ b/requirements/xpu.txt
+@@ -16,5 +16,5 @@ torch==2.12.0
+ torchaudio
+ torchvision
+ 
+-auto_round_lib>=0.13.3
++auto_round_lib>=0.14.0
+ vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.10.1/vllm_xpu_kernels-0.1.10.1-cp38-abi3-manylinux_2_28_x86_64.whl
+diff --git a/tests/quantization/test_auto_round.py b/tests/quantization/test_auto_round.py
+index f5a38ddb51d5..2cd70e4cf0ff 100644
+--- a/tests/quantization/test_auto_round.py
++++ b/tests/quantization/test_auto_round.py
+@@ -61,7 +61,7 @@
+ )
+ @pytest.mark.parametrize("model", MODELS)
+ def test_auto_round_model(vllm_runner, model):
+-    with vllm_runner(model, enforce_eager=True) as llm:
++    with vllm_runner(model) as llm:
+         output = llm.generate_greedy(["The capital of France is"], max_tokens=8)
+ 
+     assert output
+@@ -336,7 +336,7 @@ class DummyQuantLinear:
+     monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+     monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+     monkeypatch.setattr(
+-        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.get_ark_state",
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_ark_ops.get_ark_state",
+         lambda: (True, None, object(), DummyQuantLinear),
+     )
+ 
+@@ -355,7 +355,7 @@ def test_wna16_xpu_falls_back_when_ark_unavailable(monkeypatch) -> None:
+     monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+     monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+     monkeypatch.setattr(
+-        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.get_ark_state",
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_ark_ops.get_ark_state",
+         lambda: (False, "missing", None, None),
+     )
+ 
+@@ -377,7 +377,7 @@ class DummyQuantLinear:
+     monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+     monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+     monkeypatch.setattr(
+-        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.get_ark_state",
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_ark_ops.get_ark_state",
+         lambda: (True, None, object(), DummyQuantLinear),
+     )
+ 
+@@ -398,7 +398,7 @@ def test_wna16_cpu_gptq_raises_when_ark_and_marlin_unavailable(
+     monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+     monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+     monkeypatch.setattr(
+-        "vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_linear.get_ark_state",
++        "vllm.model_executor.layers.quantization.inc.schemes.inc_ark_ops.get_ark_state",
+         lambda: (False, "missing", None, None),
+     )
+     monkeypatch.setattr(
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/inc_ark_ops.py b/vllm/model_executor/layers/quantization/inc/schemes/inc_ark_ops.py
+new file mode 100644
+index 000000000000..cf54d1b531e8
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_ark_ops.py
+@@ -0,0 +1,123 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from functools import lru_cache
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = init_logger(__name__)
++
++_OPS_REGISTERED = False
++
++
++@lru_cache(maxsize=1)
++def get_ark_state() -> tuple[bool, str | None, Any | None, Any | None]:
++    """Return ARK availability, error details, cached module, and QuantLinear."""
++    try:
++        import auto_round_kernel as ark
++        from auto_round_kernel.qlinear import QuantLinear
++
++        logger.info("Successfully imported auto_round_kernel.")
++    except ImportError as error:
++        return False, str(error), None, None
++
++    if getattr(ark, "cpu_lib", None) is None and getattr(ark, "xpu_lib", None) is None:
++        return (
++            False,
++            "No ARK backend library is available.",
++            None,
++            None,
++        )
++
++    logger.info("Successfully loaded auto_round_kernel backend library.")
++    return True, None, ark, QuantLinear
++
++
++def _inc_ark_woq_linear_impl(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    bias: torch.Tensor | None,
++    out_features: int,
++    in_features: int,
++    group_size: int,
++    compute_type: str,
++    weight_type: str,
++    scale_type: str,
++    asym: bool,
++) -> torch.Tensor:
++    ark = get_ark_state()[2]
++    assert ark is not None
++
++    return ark.woqgemm_linear(
++        x,
++        qweight,
++        bias,
++        out_features,
++        in_features,
++        group_size,
++        compute_type,
++        weight_type,
++        scale_type,
++        asym,
++    )
++
++
++def _inc_ark_woq_linear_fake(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    bias: torch.Tensor | None,
++    out_features: int,
++    in_features: int,
++    group_size: int,
++    compute_type: str,
++    weight_type: str,
++    scale_type: str,
++    asym: bool,
++) -> torch.Tensor:
++    del qweight
++    del bias
++    del in_features
++    del group_size
++    del compute_type
++    del weight_type
++    del scale_type
++    del asym
++    return torch.empty(
++        (*x.shape[:-1], out_features),
++        dtype=x.dtype,
++        device=x.device,
++    )
++
++
++class ark_ops:
++    @staticmethod
++    def register_ops_once() -> None:
++        global _OPS_REGISTERED
++        if _OPS_REGISTERED:
++            return
++
++        is_available, error_str, _, _ = get_ark_state()
++        if not is_available:
++            logger.debug(
++                "Skip registering ark op because ARK is unavailable: %s",
++                error_str or "unknown error",
++            )
++            return
++
++        direct_register_custom_op(
++            op_name="inc_ark_woq_linear",
++            op_func=_inc_ark_woq_linear_impl,
++            fake_impl=_inc_ark_woq_linear_fake,
++            dispatch_key=current_platform.dispatch_key,
++        )
++        _OPS_REGISTERED = True
++
++
++ark_ops.register_ops_once()
++
++__all__ = ["get_ark_state"]
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
+index a212e4d30501..dd6c2fa2eaae 100644
+--- a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
++++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
+@@ -1,13 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from functools import lru_cache
+ from typing import TYPE_CHECKING, Any
+ 
+ import torch
+ from torch.nn.parameter import Parameter
+ 
+-from vllm.logger import init_logger
+ from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
+ from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+@@ -22,35 +20,10 @@
+ 
+ from .inc_scheme import INCLinearScheme
+ 
+-logger = init_logger(__name__)
+-
+ if TYPE_CHECKING:
+     from ..config_parser import INCLayerConfig
+ 
+ 
+-@lru_cache(maxsize=1)
+-def get_ark_state() -> tuple[bool, str | None, Any | None, Any | None]:
+-    """Return ARK availability, error details, cached module, and QuantLinear."""
+-    try:
+-        import auto_round_kernel as ark
+-        from auto_round_kernel.qlinear import QuantLinear
+-
+-        logger.info("Successfully imported auto_round_kernel.")
+-    except ImportError as error:
+-        return False, str(error), None, None
+-
+-    if getattr(ark, "cpu_lib", None) is None and getattr(ark, "xpu_lib", None) is None:
+-        return (
+-            False,
+-            "No ARK backend library is available.",
+-            None,
+-            None,
+-        )
+-    logger.info("Successfully loaded auto_round_kernel backend library.")
+-
+-    return True, None, ark, QuantLinear
+-
+-
+ class INCWNA16LinearScheme(INCLinearScheme):
+     def __init__(self, layer_config: "INCLayerConfig") -> None:
+         self.layer_config = layer_config
+@@ -380,6 +353,8 @@ class INCARKLinearMethod(INCXPULinearBase):
+     def __init__(self, layer_config: "INCLayerConfig") -> None:
+         super().__init__(layer_config)
+ 
++        from .inc_ark_ops import get_ark_state
++
+         is_available, error_str, _, quant_linear_cls = get_ark_state()
+         if not is_available or quant_linear_cls is None:
+             reason = error_str or "unknown error"
+@@ -453,9 +428,13 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+                 ark_linear.bias.copy_(layer.bias.detach())
+ 
+         ark_linear.post_init()
+-        layer.ark_linear = ark_linear
+ 
+-        del layer.qweight
++        layer.qweight = Parameter(ark_linear.qweight.detach(), requires_grad=False)
++        layer.ark_bias = ark_linear.bias
++        layer.ark_compute_type = ark_linear.cdt
++        layer.ark_weight_type = ark_linear.wdt
++        layer.ark_scale_type = ark_linear.sdt
++
+         if hasattr(layer, "qzeros"):
+             del layer.qzeros
+         del layer.scales
+@@ -466,8 +445,18 @@ def apply_weights(
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        del bias
+-        return layer.ark_linear.forward(x)
++        return torch.ops.vllm.inc_ark_woq_linear.default(
++            x,
++            layer.qweight,
++            layer.ark_bias,
++            layer.out_features,
++            layer.in_features,
++            self.group_size,
++            layer.ark_compute_type,
++            layer.ark_weight_type,
++            layer.ark_scale_type,
++            not self.sym,
++        )
+ 
+ 
+ class INCXPUW4A16LinearScheme(INCXPULinearMethod):
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_scheme.py b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_scheme.py
+index e994b034944e..803103586199 100644
+--- a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_scheme.py
++++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_scheme.py
+@@ -36,10 +36,10 @@ def get_linear_method(
+         del config, layer
+         if current_platform.is_xpu():
+             if layer_config.bits == 4 and layer_config.sym:
++                from .inc_ark_ops import get_ark_state
+                 from .inc_wna16_linear import (
+                     INCARKLinearMethod,
+                     INCXPULinearMethod,
+-                    get_ark_state,
+                 )
+ 
+                 is_ark_available, ark_error, _, _ = get_ark_state()
+@@ -57,10 +57,10 @@ def get_linear_method(
+ 
+         if current_platform.is_cpu() and layer_config.is_gptq:
+             if layer_config.bits == 4 and layer_config.sym:
++                from .inc_ark_ops import get_ark_state
+                 from .inc_wna16_linear import (
+                     INCARKLinearMethod,
+                     INCWNA16LinearScheme,
+-                    get_ark_state,
+                 )
+ 
+                 is_ark_available, ark_error, _, _ = get_ark_state()

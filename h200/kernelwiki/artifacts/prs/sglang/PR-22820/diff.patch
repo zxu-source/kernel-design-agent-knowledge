@@ -1,0 +1,245 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+index 7a7d9fd0b4b0..73bb93b558e3 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+@@ -14,6 +14,7 @@
+ 
+ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+ from sglang.srt.layers.moe.utils import get_moe_padding_size
++from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     cpu_has_amx_support,
+     get_bool_env_var,
+@@ -45,7 +46,6 @@
+ _is_xpu = is_xpu()
+ _use_sgl_xpu = use_intel_xpu_backend()
+ 
+-from sglang.srt.server_args import get_global_server_args
+ 
+ if _is_cuda:
+     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 6bb195758656..4fd67aef9c6f 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -1009,6 +1009,7 @@ def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+         dispatch_output = self.dispatcher.dispatch(
+             hidden_states=hidden_states, topk_output=topk_output
+         )
++
+         if _use_aiter and self.dispatcher.local_expert_mapping is not None:
+             self.expert_mask_gpu = (
+                 (
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 5297f070b09f..dd67a0d3893b 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3625,8 +3625,9 @@ def dispatch_event_loop(scheduler: Scheduler):
+             scheduler.event_loop_normal_disagg_decode()
+ 
+ 
+-def configure_scheduler(
++def configure_scheduler_process(
+     server_args: ServerArgs,
++    gpu_id: int,
+     tp_rank: int,
+     attn_cp_rank: int,
+     moe_dp_rank: int,
+@@ -3639,6 +3640,8 @@ def configure_scheduler(
+     Returns:
+         dp_rank
+     """
++    kill_itself_when_parent_died()
++
+     # Generate the logger prefix
+     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
+@@ -3666,6 +3669,16 @@ def configure_scheduler(
+     configure_logger(server_args, prefix=prefix)
+     suppress_other_loggers()
+ 
++    # Set cpu affinity to this gpu process
++    if envs.SGLANG_SET_CPU_AFFINITY.get():
++        set_gpu_proc_affinity(
++            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
++        )
++    if not envs.SGLANG_NUMA_BIND_V2.get():
++        numa_node = get_numa_node_if_available(server_args, gpu_id)
++        if numa_node is not None:
++            numa_bind_to_node(numa_node)
++
+     return dp_rank
+ 
+ 
+@@ -3681,22 +3694,18 @@ def run_scheduler_process(
+     dp_rank: Optional[int],
+     pipe_writer,
+ ):
+-    dp_rank = configure_scheduler(
+-        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
++    dp_rank = configure_scheduler_process(
++        server_args,
++        gpu_id,
++        tp_rank,
++        attn_cp_rank,
++        moe_dp_rank,
++        moe_ep_rank,
++        pp_rank,
++        dp_rank,
+     )
+-    kill_itself_when_parent_died()
+     parent_process = psutil.Process().parent()
+ 
+-    # Set cpu affinity to this gpu process
+-    if envs.SGLANG_SET_CPU_AFFINITY.get():
+-        set_gpu_proc_affinity(
+-            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+-        )
+-    if not envs.SGLANG_NUMA_BIND_V2.get():
+-        numa_node = get_numa_node_if_available(server_args, gpu_id)
+-        if numa_node is not None:
+-            numa_bind_to_node(numa_node)
+-
+     # Set up tracing
+     if server_args.enable_trace:
+         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 0a45c1dc6d38..0c289beff984 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -77,7 +77,9 @@
+ 
+ # Define constants
+ DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
++
+ SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
++
+ LOAD_FORMAT_CHOICES = [
+     "auto",
+     "pt",
+@@ -151,37 +153,13 @@
+     "intel_xpu",
+ ]
+ 
+-LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
+-
+-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
+-
+-ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
+-
+-GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
+-
+ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+ 
+ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+ 
+-NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
+-
+-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
+-
+-DEFAULT_LORA_EVICTION_POLICY = "lru"
+-
+-NSA_CHOICES = [
+-    "flashmla_sparse",
+-    "flashmla_kv",
+-    "flashmla_auto",
+-    "fa3",
+-    "tilelang",
+-    "aiter",
+-    "trtllm",
+-]
+-
+-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
++DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
+ 
+-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
++GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
+ 
+ MOE_RUNNER_BACKEND_CHOICES = [
+     "auto",
+@@ -225,11 +203,34 @@
+     "flashinfer_trtllm",
+ ]
+ 
+-MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
++RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
++
++RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
++
++LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
++
++ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
++
++NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
++
++PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
++
++DEFAULT_LORA_EVICTION_POLICY = "lru"
++
++NSA_CHOICES = [
++    "flashmla_sparse",
++    "flashmla_kv",
++    "flashmla_auto",
++    "fa3",
++    "tilelang",
++    "aiter",
++    "trtllm",
++]
+ 
+ MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
+ 
+ MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
++
+ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+ 
+ 
+@@ -246,6 +247,14 @@ def add_attention_backend_choices(choices):
+     ATTENTION_BACKEND_CHOICES.extend(choices)
+ 
+ 
++def add_deterministic_attention_backend_choices(choices):
++    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
++
++
++def add_radix_supported_deterministic_attention_backend_choices(choices):
++    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend(choices)
++
++
+ def add_disagg_transfer_backend_choices(choices):
+     DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
+ 
+@@ -266,14 +275,6 @@ def add_fp4_gemm_runner_backend_choices(choices):
+     FP4_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
+ 
+ 
+-def add_deterministic_attention_backend_choices(choices):
+-    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
+-
+-
+-def add_radix_supported_deterministic_attention_backend_choices(choices):
+-    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend(choices)
+-
+-
+ def add_radix_eviction_policy_choices(choices):
+     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
+ 
+@@ -282,10 +283,6 @@ def add_rl_on_policy_target_choices(choices):
+     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
+ 
+ 
+-def add_mamba_ssm_dtype_choices(choices):
+-    MAMBA_SSM_DTYPE_CHOICES.extend(choices)
+-
+-
+ @dataclasses.dataclass
+ class ServerArgs:
+     """
+@@ -5416,7 +5413,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
+             "--mamba-ssm-dtype",
+             type=str,
+             default=None,
+-            choices=MAMBA_SSM_DTYPE_CHOICES,
++            choices=["float32", "bfloat16", "float16"],
+             help="The data type of the SSM states in mamba cache. "
+             "If not set, will be read from model config (mamba_ssm_dtype).",
+         )

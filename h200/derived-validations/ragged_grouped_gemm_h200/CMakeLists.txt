@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.24)
+project(ragged_grouped_gemm LANGUAGES CXX CUDA)
+set(CMAKE_CUDA_ARCHITECTURES 90)
+add_executable(ragged_grouped_gemm_test src/ragged_grouped_gemm.cu tests/ragged_grouped_gemm_test.cu)
+target_include_directories(ragged_grouped_gemm_test PRIVATE include)
+target_compile_features(ragged_grouped_gemm_test PRIVATE cxx_std_17)

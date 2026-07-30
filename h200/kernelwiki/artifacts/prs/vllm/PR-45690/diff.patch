@@ -1,0 +1,734 @@
+diff --git a/csrc/cpu/cpu_attn.cpp b/csrc/cpu/cpu_attn.cpp
+index 26b881f4f143..2634e649a719 100644
+--- a/csrc/cpu/cpu_attn.cpp
++++ b/csrc/cpu/cpu_attn.cpp
+@@ -15,9 +15,10 @@ torch::Tensor get_scheduler_metadata(
+     const int64_t num_req, const int64_t num_heads_q,
+     const int64_t num_heads_kv, const int64_t head_dim,
+     const torch::Tensor& seq_lens, at::ScalarType dtype,
+-    const torch::Tensor& query_start_loc, const bool casual,
++    const torch::Tensor& query_start_loc, const bool causal,
+     const int64_t window_size, const std::string& isa_hint,
+-    const bool enable_kv_split) {
++    const bool enable_kv_split,
++    const std::optional<torch::Tensor>& dynamic_causal) {
+   cpu_attention::ISA isa;
+   if (isa_hint == "amx") {
+     isa = cpu_attention::ISA::AMX;
+@@ -44,24 +45,13 @@ torch::Tensor get_scheduler_metadata(
+   input.head_dim = head_dim;
+   input.query_start_loc = query_start_loc.data_ptr<int32_t>();
+   input.seq_lens = seq_lens.data_ptr<int32_t>();
+-  if (window_size != -1) {
+-    input.left_sliding_window_size = window_size - 1;
+-    if (casual) {
+-      input.right_sliding_window_size = 0;
+-    } else {
+-      input.right_sliding_window_size = window_size - 1;
+-    }
+-  } else {
+-    input.left_sliding_window_size = -1;
+-    if (casual) {
+-      input.right_sliding_window_size = 0;
+-    } else {
+-      input.right_sliding_window_size = -1;
+-    }
+-  }
+-  input.casual = casual;
++
++  input.sliding_window_size = window_size;
++  input.causal = causal;
+   input.isa = isa;
+   input.enable_kv_split = enable_kv_split;
++  input.dynamic_causal =
++      dynamic_causal.has_value() ? dynamic_causal->data_ptr<bool>() : nullptr;
+ 
+   VLLM_DISPATCH_FLOATING_TYPES(dtype, "get_scheduler_metadata", [&]() {
+     CPU_ATTN_DISPATCH(head_dim, isa, 0, [&]() {
+@@ -175,10 +165,11 @@ void cpu_attention_with_kv_cache(
+     const torch::Tensor& seq_lens,         // [num_tokens]
+     const double scale, const bool causal,
+     const std::optional<torch::Tensor>& alibi_slopes,  // [num_heads]
+-    const int64_t sliding_window_left, const int64_t sliding_window_right,
++    const int64_t sliding_window,
+     const torch::Tensor& block_table,  // [num_tokens, max_block_num]
+     const double softcap, const torch::Tensor& scheduler_metadata,
+-    const std::optional<torch::Tensor>& s_aux,  // [num_heads]
++    const std::optional<torch::Tensor>& s_aux,           // [num_heads]
++    const std::optional<torch::Tensor>& dynamic_causal,  // [num_reqs]
+     const double k_scale = 1.0, const double v_scale = 1.0,
+     const std::string& kv_cache_dtype = "auto") {
+   TORCH_CHECK_EQ(query.dim(), 3);
+@@ -220,13 +211,11 @@ void cpu_attention_with_kv_cache(
+   input.alibi_slopes =
+       alibi_slopes.has_value() ? alibi_slopes->data_ptr<float>() : nullptr;
+   input.s_aux = s_aux.has_value() ? s_aux->data_ptr<c10::BFloat16>() : nullptr;
++  input.dynamic_causal =
++      dynamic_causal.has_value() ? dynamic_causal->data_ptr<bool>() : nullptr;
+   input.scale = scale;
+   input.causal = causal;
+-  input.sliding_window_left = sliding_window_left;
+-  input.sliding_window_right = sliding_window_right;
+-  if (input.causal) {
+-    input.sliding_window_right = 0;
+-  }
++  input.sliding_window_size = sliding_window;
+   input.softcap = static_cast<float>(softcap);
+ 
+   if (is_fp8) {
+diff --git a/csrc/cpu/cpu_attn_impl.hpp b/csrc/cpu/cpu_attn_impl.hpp
+index be7915303ab3..d1b6c71c1829 100644
+--- a/csrc/cpu/cpu_attn_impl.hpp
++++ b/csrc/cpu/cpu_attn_impl.hpp
+@@ -388,13 +388,13 @@ class AttentionScheduler {
+     int32_t head_dim;
+     int32_t* query_start_loc;
+     int32_t* seq_lens;
+-    int32_t left_sliding_window_size;
+-    int32_t right_sliding_window_size;
+-    bool casual;
++    int32_t sliding_window_size;
++    bool causal;
+     cpu_attention::ISA isa;
+     int32_t max_num_q_per_iter;  // max Q head num can be hold in registers
+     int32_t kv_block_alignment;  // context length alignment requirement
+     bool enable_kv_split;
++    bool* dynamic_causal;
+   };
+ 
+   static constexpr int32_t MaxQTileIterNum = 128;
+@@ -403,7 +403,8 @@ class AttentionScheduler {
+       : available_cache_size_(cpu_utils::get_available_l2_size()) {}
+ 
+   torch::Tensor schedule(const ScheduleInput& input) const {
+-    const bool casual = input.casual;
++    const bool causal = input.causal;
++    const bool is_dynamic_causal = input.dynamic_causal != nullptr;
+     const int32_t thread_num = omp_get_max_threads();
+     const int64_t cache_size = cpu_utils::get_available_l2_size();
+     const int32_t max_num_q_per_iter = input.max_num_q_per_iter;
+@@ -434,8 +435,7 @@ class AttentionScheduler {
+     const int32_t default_tile_token_num = default_tile_size / q_head_per_kv;
+     const int32_t split_kv_q_token_num_threshold =
+         input.enable_kv_split ? 1 : 0;
+-    const int32_t left_sliding_window_size = input.left_sliding_window_size;
+-    const int32_t right_sliding_window_size = input.right_sliding_window_size;
++    const int32_t sliding_window_size = input.sliding_window_size;
+     TORCH_CHECK_LE(split_kv_q_token_num_threshold * q_head_per_kv, 16);
+ 
+     // get total kv len
+@@ -444,7 +444,9 @@ class AttentionScheduler {
+       const int32_t seq_len = input.seq_lens[req_id];
+       const int32_t q_token_num =
+           input.query_start_loc[req_id + 1] - input.query_start_loc[req_id];
+-      const int32_t q_start_pos = (casual ? (seq_len - q_token_num) : 0);
++      const bool req_causal =
++          is_dynamic_causal ? input.dynamic_causal[req_id] : causal;
++      const int32_t q_start_pos = seq_len - q_token_num;
+       const int32_t kv_start_pos = 0;
+       const int32_t kv_end_pos = seq_len;
+ 
+@@ -456,7 +458,7 @@ class AttentionScheduler {
+         const int32_t q_tile_pos_right = q_tile_pos_left + q_tile_token_num;
+         const auto [kv_tile_pos_left, kv_tile_pos_right] = calcu_kv_tile_pos(
+             kv_start_pos, kv_end_pos, q_tile_pos_left, q_tile_pos_right,
+-            left_sliding_window_size, right_sliding_window_size);
++            sliding_window_size, req_causal);
+         const auto [aligned_kv_tile_pos_left, aligned_kv_tile_pos_right] =
+             align_kv_tile_pos(kv_tile_pos_left, kv_tile_pos_right,
+                               kv_len_alignment);
+@@ -484,7 +486,9 @@ class AttentionScheduler {
+       const int32_t seq_len = input.seq_lens[req_id];
+       const int32_t q_token_num =
+           input.query_start_loc[req_id + 1] - input.query_start_loc[req_id];
+-      const int32_t q_start_pos = (casual ? (seq_len - q_token_num) : 0);
++      const bool req_causal =
++          is_dynamic_causal ? input.dynamic_causal[req_id] : causal;
++      const int32_t q_start_pos = seq_len - q_token_num;
+       const int32_t kv_start_pos = 0;
+       const int32_t kv_end_pos = seq_len;
+       int32_t local_split_id = 0;
+@@ -498,7 +502,7 @@ class AttentionScheduler {
+         const int32_t q_tile_pos_right = q_tile_pos_left + q_tile_token_num;
+         const auto [kv_tile_pos_left, kv_tile_pos_right] = calcu_kv_tile_pos(
+             kv_start_pos, kv_end_pos, q_tile_pos_left, q_tile_pos_right,
+-            left_sliding_window_size, right_sliding_window_size);
++            sliding_window_size, req_causal);
+         const auto [aligned_kv_tile_pos_left, aligned_kv_tile_pos_right] =
+             align_kv_tile_pos(kv_tile_pos_left, kv_tile_pos_right,
+                               kv_len_alignment);
+@@ -708,15 +712,41 @@ class AttentionScheduler {
+     return metadata_tensor;
+   }
+ 
++  FORCE_INLINE static std::pair<int32_t, int32_t> calcu_sliding_window_size(
++      int32_t window_size, bool causal) {
++    int32_t left_sliding_window_size, right_sliding_window_size;
++    if (window_size != -1) {
++      left_sliding_window_size = window_size - 1;
++      if (causal) {
++        right_sliding_window_size = 0;
++      } else {
++        right_sliding_window_size = window_size - 1;
++      }
++    } else {
++      left_sliding_window_size = -1;
++      if (causal) {
++        right_sliding_window_size = 0;
++      } else {
++        right_sliding_window_size = -1;
++      }
++    }
++
++    return {left_sliding_window_size, right_sliding_window_size};
++  }
++
+   FORCE_INLINE static std::pair<int32_t, int32_t> calcu_kv_tile_pos(
+       int32_t kv_left_pos, int32_t kv_right_pos, int32_t q_left_pos,
+-      int32_t q_right_pos, int32_t sliding_window_left,
+-      int32_t sliding_window_right) {
+-    if (sliding_window_left != -1) {
+-      kv_left_pos = std::max(kv_left_pos, q_left_pos - sliding_window_left);
++      int32_t q_right_pos, int32_t window_size, bool causal) {
++    auto [left_sliding_window_size, right_sliding_window_size] =
++        calcu_sliding_window_size(window_size, causal);
++
++    if (left_sliding_window_size != -1) {
++      kv_left_pos =
++          std::max(kv_left_pos, q_left_pos - left_sliding_window_size);
+     }
+-    if (sliding_window_right != -1) {
+-      kv_right_pos = std::min(kv_right_pos, q_right_pos + sliding_window_right);
++    if (right_sliding_window_size != -1) {
++      kv_right_pos =
++          std::min(kv_right_pos, q_right_pos + right_sliding_window_size);
+     }
+     return {kv_left_pos, kv_right_pos};
+   }
+@@ -805,10 +835,10 @@ struct AttentionInput {
+   int32_t* block_table;
+   float* alibi_slopes;
+   c10::BFloat16* s_aux;
++  bool* dynamic_causal;
+   float scale;
+   bool causal;
+-  int32_t sliding_window_left;
+-  int32_t sliding_window_right;
++  int32_t sliding_window_size;
+   float softcap;
+   // FP8 KV cache scales (used by FP8 attention implementations)
+   float k_scale_fp8 = 1.0f;
+@@ -1442,15 +1472,16 @@ class AttentionMainLoop {
+       const int64_t q_head_num_stride = input->query_num_heads_stride;
+       const int64_t kv_cache_head_num_stride = input->cache_num_kv_heads_stride;
+       const int64_t kv_cache_block_num_stride = input->cache_num_blocks_stride;
+-      const int32_t sliding_window_left = input->sliding_window_left;
+-      const int32_t sliding_window_right = input->sliding_window_right;
++      const int32_t sliding_window_size = input->sliding_window_size;
+       const int32_t block_size = input->block_size;
+       const float scale = input->scale;
+       const float softcap_scale = input->softcap;
+       const float* alibi_slopes = input->alibi_slopes;
+       const c10::BFloat16* s_aux = input->s_aux;
++      const bool* dynamic_causal = input->dynamic_causal;
++      const bool is_dynamic_causal = dynamic_causal != nullptr;
+ 
+-      const bool casual = input->causal;
++      const bool causal = input->causal;
+       int32_t* const block_table = input->block_table;
+       const int64_t block_table_stride = input->blt_num_tokens_stride;
+ 
+@@ -1533,6 +1564,11 @@ class AttentionMainLoop {
+                 &curr_workitem_groups[workitem_group_idx];
+ 
+             const int32_t current_group_idx = current_workitem_group->req_id;
++            const int32_t current_group_causal =
++                is_dynamic_causal ? dynamic_causal[current_group_idx] : causal;
++            auto [sliding_window_left, sliding_window_right] =
++                AttentionScheduler::calcu_sliding_window_size(
++                    sliding_window_size, current_group_causal);
+             const int32_t kv_start_pos =
+                 current_workitem_group->kv_split_pos_start;
+             const int32_t kv_end_pos = current_workitem_group->kv_split_pos_end;
+@@ -1560,8 +1596,7 @@ class AttentionMainLoop {
+             const int32_t q_end = input->query_start_loc[current_group_idx + 1];
+             const int32_t q_start = input->query_start_loc[current_group_idx];
+             const int32_t seq_len = input->seq_lens[current_group_idx];
+-            const int32_t q_start_pos =
+-                (casual ? seq_len - (q_end - q_start) : 0);
++            const int32_t q_start_pos = seq_len - (q_end - q_start);
+             const int32_t block_num = (seq_len + block_size - 1) / block_size;
+             // Only apply sink for the first KV split
+             bool use_sink = (s_aux != nullptr &&
+@@ -1611,8 +1646,8 @@ class AttentionMainLoop {
+               const auto [kv_tile_start_pos, kv_tile_end_pos] =
+                   AttentionScheduler::calcu_kv_tile_pos(
+                       kv_start_pos, kv_end_pos, q_tile_start_pos,
+-                      q_tile_end_pos, sliding_window_left,
+-                      sliding_window_right);
++                      q_tile_end_pos, sliding_window_size,
++                      current_group_causal);
+               const auto [rounded_kv_tile_start_pos, rounded_kv_tile_end_pos] =
+                   AttentionScheduler::align_kv_tile_pos(
+                       kv_tile_start_pos, kv_tile_end_pos, blocksize_alignment);
+@@ -1725,8 +1760,8 @@ class AttentionMainLoop {
+                               actual_kv_tile_pos_right] =
+                       AttentionScheduler::calcu_kv_tile_pos(
+                           kv_tile_pos_left, kv_tile_pos_right, q_tile_pos_left,
+-                          q_tile_pos_right, sliding_window_left,
+-                          sliding_window_right);
++                          q_tile_pos_right, sliding_window_size,
++                          current_group_causal);
+                   const int32_t q_iter_idx =
+                       q_head_tile_token_offset / curr_max_q_token_num_per_iter;
+ 
+diff --git a/csrc/cpu/cpu_fused_moe.cpp b/csrc/cpu/cpu_fused_moe.cpp
+index 5839d6c2aaf3..c0d92bde77bb 100644
+--- a/csrc/cpu/cpu_fused_moe.cpp
++++ b/csrc/cpu/cpu_fused_moe.cpp
+@@ -1,3 +1,5 @@
++#include <sleef.h>
++
+ #include "cpu/cpu_types.hpp"
+ #include "cpu/utils.hpp"
+ #include "cpu/micro_gemm/cpu_micro_gemm_vec.hpp"
+@@ -163,7 +165,6 @@ void gelu_tanh_and_mul(float* __restrict__ input, scalar_t* __restrict__ output,
+   vec_op::FP32Vec16 w1_vec(0.7978845608028654);
+   vec_op::FP32Vec16 w2_vec(0.5);
+   vec_op::FP32Vec16 w3_vec(0.044715);
+-  alignas(64) float temp[16];
+ 
+   for (int32_t m = 0; m < m_size; ++m) {
+     for (int32_t n = 0; n < dim; n += 16) {
+@@ -171,12 +172,9 @@ void gelu_tanh_and_mul(float* __restrict__ input, scalar_t* __restrict__ output,
+       vec_op::FP32Vec16 up_vec(up + n);
+       auto gate_pow3_vec = gate_vec * gate_vec * gate_vec;
+       auto inner_vec = w1_vec * (gate_vec + w3_vec * gate_pow3_vec);
+-
+-      inner_vec.save(temp);
+-      for (int32_t i = 0; i < 16; ++i) {
+-        temp[i] = std::tanh(temp[i]);
+-      }
+-      vec_op::FP32Vec16 tanh_vec(temp);
++      // Note: can't use fast_exp form because diffusiongemma will generate
++      // wrong results
++      vec_op::FP32Vec16 tanh_vec(Sleef_tanhf16_u10(inner_vec.reg));
+       auto gelu_tanh = gate_vec * w2_vec * (one_vec + tanh_vec);
+       auto gated_output_fp32 = up_vec * gelu_tanh;
+       scalar_vec_t gated_output = scalar_vec_t(gated_output_fp32);
+diff --git a/csrc/cpu/torch_bindings.cpp b/csrc/cpu/torch_bindings.cpp
+index 495185769ba6..b1a9342deeca 100644
+--- a/csrc/cpu/torch_bindings.cpp
++++ b/csrc/cpu/torch_bindings.cpp
+@@ -152,7 +152,8 @@ torch::Tensor get_scheduler_metadata(
+     const torch::Tensor& seq_lens, at::ScalarType dtype,
+     const torch::Tensor& query_start_loc, const bool casual,
+     const int64_t window_size, const std::string& isa_hint,
+-    const bool enable_kv_split);
++    const bool enable_kv_split,
++    const std::optional<torch::Tensor>& dynamic_causal);
+ 
+ void cpu_attn_reshape_and_cache(const torch::Tensor& key,
+                                 const torch::Tensor& value,
+@@ -169,10 +170,10 @@ void cpu_attention_with_kv_cache(
+     const torch::Tensor& query_start_loc, const torch::Tensor& seq_lens,
+     const double scale, const bool causal,
+     const std::optional<torch::Tensor>& alibi_slopes,
+-    const int64_t sliding_window_left, const int64_t sliding_window_right,
+-    const torch::Tensor& block_table, const double softcap,
+-    const torch::Tensor& scheduler_metadata,
+-    const std::optional<torch::Tensor>& s_aux, const double k_scale,
++    const int64_t sliding_window_left, const torch::Tensor& block_table,
++    const double softcap, const torch::Tensor& scheduler_metadata,
++    const std::optional<torch::Tensor>& s_aux,
++    const std::optional<torch::Tensor>& dynamic_causal, const double k_scale,
+     const double v_scale, const std::string& kv_cache_dtype);
+ 
+ // Note: just for avoiding importing errors
+@@ -500,7 +501,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "get_scheduler_metadata(int num_req, int num_heads_q, int num_heads_kv, "
+       "int head_dim, Tensor seq_lens, ScalarType dtype, Tensor "
+       "query_start_loc, bool casual, int window_size, str isa_hint, bool "
+-      "enable_kv_split) -> Tensor",
++      "enable_kv_split, Tensor? dynamic_causal) -> Tensor",
+       &get_scheduler_metadata);
+   ops.def(
+       "cpu_attn_reshape_and_cache(Tensor key, Tensor value, Tensor(a2!) "
+@@ -512,8 +513,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "cpu_attention_with_kv_cache(Tensor query, Tensor key_cache, Tensor "
+       "value_cache, Tensor(a3!) output, Tensor query_start_loc, Tensor "
+       "seq_lens, float scale, bool causal, Tensor? alibi_slopes, SymInt "
+-      "sliding_window_left, SymInt sliding_window_right, Tensor block_table, "
+-      "float softcap, Tensor scheduler_metadata, Tensor? s_aux, "
++      "sliding_window_size, Tensor block_table, "
++      "float softcap, Tensor scheduler_metadata, Tensor? s_aux, Tensor? "
++      "dynamic_causal, "
+       "float k_scale=1.0, float v_scale=1.0, str kv_cache_dtype=\"auto\") -> "
+       "()",
+       &cpu_attention_with_kv_cache);
+diff --git a/tests/kernels/attention/test_cpu_attn.py b/tests/kernels/attention/test_cpu_attn.py
+index b79621075fb3..e296c226d709 100644
+--- a/tests/kernels/attention/test_cpu_attn.py
++++ b/tests/kernels/attention/test_cpu_attn.py
+@@ -107,6 +107,7 @@ def ref_paged_attn(
+     soft_cap: float | None = None,
+     alibi_slopes: torch.Tensor | None = None,
+     s_aux: torch.Tensor | None = None,
++    dynamic_causal: list[bool] | None = None,
+ ) -> torch.Tensor:
+     num_seqs = len(query_lens)
+     block_tables = block_tables.cpu().numpy()
+@@ -142,17 +143,30 @@ def ref_paged_attn(
+             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+         attn = torch.einsum("qhd,khd->hqk", q, k).float()
+         empty_mask = torch.ones(query_len, kv_len)
+-        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+ 
+-        if sliding_window is not None:
+-            sliding_window_mask = (
+-                torch.triu(
+-                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
++        if dynamic_causal is None or dynamic_causal[i]:
++            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
++            if sliding_window is not None:
++                sliding_window_mask = (
++                    torch.triu(
++                        empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
++                    )
++                    .bool()
++                    .logical_not()
+                 )
+-                .bool()
+-                .logical_not()
+-            )
+-            mask |= sliding_window_mask
++                mask |= sliding_window_mask
++        else:
++            if sliding_window is not None:
++                mask = (
++                    torch.triu(
++                        empty_mask, diagonal=1 - sliding_window + kv_len - query_len
++                    ).bool()
++                    ^ torch.triu(
++                        empty_mask, diagonal=sliding_window + kv_len - query_len
++                    ).bool()
++                ).logical_not()
++            else:
++                mask = empty_mask.logical_not()
+ 
+         if soft_cap is not None:
+             attn = soft_cap * torch.tanh(attn / soft_cap)
+@@ -243,11 +257,6 @@ def varlen_encoder_attention(
+     num_query_heads = num_heads[0]
+     num_kv_heads = num_heads[1]
+     assert num_query_heads % num_kv_heads == 0
+-    window_size = (
+-        (sliding_window - 1, sliding_window - 1)
+-        if sliding_window is not None
+-        else (-1, -1)
+-    )
+     scale = head_size**-0.5
+     token_num = sum(seq_lens)
+ 
+@@ -343,7 +352,7 @@ def varlen_encoder_attention(
+         scale=scale,
+         causal=False,
+         alibi_slopes=None,
+-        sliding_window=window_size,
++        sliding_window=sliding_window if sliding_window is not None else -1,
+         block_table=encoder_block_table,
+         softcap=0,
+         scheduler_metadata=metadata,
+@@ -375,7 +384,7 @@ def varlen_encoder_attention(
+         scale=scale,
+         causal=False,
+         alibi_slopes=None,
+-        sliding_window=window_size,
++        sliding_window=sliding_window if sliding_window is not None else -1,
+         block_table=encoder_block_table,
+         softcap=0,
+         scheduler_metadata=metadata,
+@@ -418,6 +427,7 @@ def varlen_with_paged_kv(
+     kv_cache_dtype: str = "auto",
+     k_scale: float = 1.0,
+     v_scale: float = 1.0,
++    dynamic_causal: list[bool] | None = None,
+ ) -> None:
+     set_random_seed(0)
+     num_seqs = len(seq_lens)
+@@ -427,9 +437,13 @@ def varlen_with_paged_kv(
+     num_kv_heads = num_heads[1]
+     assert num_query_heads % num_kv_heads == 0
+     max_kv_len = max(kv_lens)
+-    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+     scale = head_size**-0.5
+     token_num = sum(query_lens)
++    dynamic_causal_tensor = (
++        torch.tensor(dynamic_causal, dtype=torch.bool)
++        if dynamic_causal is not None
++        else None
++    )
+ 
+     # for n heads the set of slopes is the geometric sequence that starts
+     # 2^(-8/n)
+@@ -515,10 +529,11 @@ def varlen_with_paged_kv(
+         seq_lens=kv_lens_tensor,
+         dtype=dtype,
+         query_start_loc=cu_query_lens,
+-        causal=True,
++        causal=dynamic_causal is None,
+         sliding_window_size=sliding_window if sliding_window is not None else -1,
+         isa=isa,
+         enable_kv_split=False,
++        dynamic_causal=dynamic_causal_tensor,
+     )
+ 
+     out_without_split = torch.empty_like(query)
+@@ -530,13 +545,14 @@ def varlen_with_paged_kv(
+         query_start_loc=cu_query_lens,
+         seq_lens=kv_lens_tensor,
+         scale=scale,
+-        causal=True,
++        causal=dynamic_causal is None,
+         alibi_slopes=alibi_slopes,
+-        sliding_window=window_size,
++        sliding_window=sliding_window if sliding_window is not None else -1,
+         block_table=block_tables,
+         softcap=soft_cap if soft_cap is not None else 0,
+         scheduler_metadata=metadata,
+         s_aux=s_aux,
++        dynamic_causal=dynamic_causal_tensor,
+         **fp8_kwargs,
+     )
+ 
+@@ -548,10 +564,11 @@ def varlen_with_paged_kv(
+         seq_lens=kv_lens_tensor,
+         dtype=dtype,
+         query_start_loc=cu_query_lens,
+-        causal=True,
++        causal=dynamic_causal is None,
+         sliding_window_size=sliding_window if sliding_window is not None else -1,
+         isa=isa,
+         enable_kv_split=True,
++        dynamic_causal=dynamic_causal_tensor,
+     )
+ 
+     out_with_split = torch.empty_like(query)
+@@ -563,13 +580,14 @@ def varlen_with_paged_kv(
+         query_start_loc=cu_query_lens,
+         seq_lens=kv_lens_tensor,
+         scale=scale,
+-        causal=True,
++        causal=dynamic_causal is None,
+         alibi_slopes=alibi_slopes,
+-        sliding_window=window_size,
++        sliding_window=sliding_window if sliding_window is not None else -1,
+         block_table=block_tables,
+         softcap=soft_cap if soft_cap is not None else 0,
+         scheduler_metadata=metadata,
+         s_aux=s_aux,
++        dynamic_causal=dynamic_causal_tensor,
+         **fp8_kwargs,
+     )
+ 
+@@ -597,13 +615,14 @@ def varlen_with_paged_kv(
+             query_start_loc=cu_query_lens,
+             seq_lens=kv_lens_tensor,
+             scale=scale,
+-            causal=True,
++            causal=dynamic_causal is None,
+             alibi_slopes=alibi_slopes,
+-            sliding_window=window_size,
++            sliding_window=sliding_window if sliding_window is not None else -1,
+             block_table=block_tables,
+             softcap=soft_cap if soft_cap is not None else 0,
+             scheduler_metadata=metadata,
+             s_aux=s_aux,
++            dynamic_causal=dynamic_causal_tensor,
+         )
+         atol = _FP8_ATOL[kv_cache_dtype]
+         rtol = _FP8_RTOL
+@@ -620,6 +639,7 @@ def varlen_with_paged_kv(
+             soft_cap=soft_cap,
+             alibi_slopes=alibi_slopes,
+             s_aux=s_aux,
++            dynamic_causal=dynamic_causal,
+         )
+         atol, rtol = 1.5e-2, 1e-2
+ 
+@@ -1035,3 +1055,58 @@ def test_varlen_with_paged_kv_sink(
+         isa=isa,
+         kv_cache_dtype=kv_cache_dtype,
+     )
++
++
++@pytest.mark.parametrize(
++    "kv_cache_dtype",
++    [
++        "auto",
++    ],
++)
++@pytest.mark.parametrize("seq_lens", SEQ_LENS)
++@pytest.mark.parametrize("num_heads", NUM_HEADS)
++@pytest.mark.parametrize(
++    "head_size",
++    [
++        128,
++    ],
++)
++@pytest.mark.parametrize("block_size", [96, 128])
++@pytest.mark.parametrize("sliding_window", SLIDING_WINDOWS)
++@pytest.mark.parametrize("dtype", [torch.bfloat16])
++@pytest.mark.parametrize("soft_cap", [None])
++@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
++@pytest.mark.parametrize("use_alibi", [False])
++@pytest.mark.parametrize("use_sink", [False])
++@pytest.mark.parametrize("isa", ["amx"])
++@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
++def test_varlen_with_paged_kv_dynamic_causal(
++    seq_lens: list[tuple[int, int]],
++    num_heads: tuple[int, int],
++    head_size: int,
++    sliding_window: int | None,
++    dtype: torch.dtype,
++    block_size: int,
++    soft_cap: float | None,
++    num_blocks: int,
++    use_alibi: bool,
++    use_sink: bool,
++    isa: str,
++    kv_cache_dtype: str,
++) -> None:
++    dynamic_causal = [bool(i % 2) for i in range(len(seq_lens))]
++    varlen_with_paged_kv(
++        seq_lens=seq_lens,
++        num_heads=num_heads,
++        head_size=head_size,
++        sliding_window=sliding_window,
++        dtype=dtype,
++        block_size=block_size,
++        soft_cap=soft_cap,
++        num_blocks=num_blocks,
++        use_alibi=use_alibi,
++        use_sink=use_sink,
++        isa=isa,
++        kv_cache_dtype=kv_cache_dtype,
++        dynamic_causal=dynamic_causal,
++    )
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 3878f3038bd2..6f72a8a51563 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -3619,6 +3619,7 @@ def cpu_attn_get_scheduler_metadata(
+     sliding_window_size: int,
+     isa: str,
+     enable_kv_split: bool,
++    dynamic_causal: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     scheduler_metadata = torch.ops._C.get_scheduler_metadata(
+         num_reqs,
+@@ -3632,6 +3633,7 @@ def cpu_attn_get_scheduler_metadata(
+         sliding_window_size,
+         isa,
+         enable_kv_split,
++        dynamic_causal,
+     )
+     return scheduler_metadata
+ 
+@@ -3670,11 +3672,12 @@ def cpu_attention_with_kv_cache(
+     scale: float,
+     causal: bool,
+     alibi_slopes: torch.Tensor | None,
+-    sliding_window: tuple[int, int],
++    sliding_window: int,
+     block_table: torch.Tensor,
+     softcap: float,
+     scheduler_metadata: torch.Tensor,
+     s_aux: torch.Tensor | None,
++    dynamic_causal: torch.Tensor | None = None,
+     k_scale: float = 1.0,
+     v_scale: float = 1.0,
+     kv_cache_dtype: str = "auto",
+@@ -3689,12 +3692,12 @@ def cpu_attention_with_kv_cache(
+         scale,
+         causal,
+         alibi_slopes,
+-        sliding_window[0],
+-        sliding_window[1],
++        sliding_window,
+         block_table,
+         softcap,
+         scheduler_metadata,
+         s_aux,
++        dynamic_causal,
+         k_scale,
+         v_scale,
+         kv_cache_dtype,
+diff --git a/vllm/v1/attention/backends/cpu_attn.py b/vllm/v1/attention/backends/cpu_attn.py
+index ebaab1b30d31..e0670769adb4 100644
+--- a/vllm/v1/attention/backends/cpu_attn.py
++++ b/vllm/v1/attention/backends/cpu_attn.py
+@@ -112,6 +112,7 @@ class CPUAttentionMetadata:
+     slot_mapping: torch.Tensor
+     scheduler_metadata: torch.Tensor | None
+     causal: bool = True
++    dynamic_causal: torch.Tensor | None = None
+ 
+     # can be removed after deprecate sdpa
+     use_sdpa_prefill: bool = False
+@@ -172,7 +173,16 @@ def build(
+         seq_lens = common_attn_metadata.seq_lens
+         block_table_tensor = common_attn_metadata.block_table_tensor
+         slot_mapping = common_attn_metadata.slot_mapping
+-        causal = False if self.is_cross_attention else common_attn_metadata.causal
++        is_dynamic_casual = isinstance(common_attn_metadata.causal, torch.Tensor)
++        dynamic_casual = None
++        if is_dynamic_casual:
++            dynamic_casual = common_attn_metadata.causal
++
++        causal = (
++            False
++            if self.is_cross_attention or is_dynamic_casual
++            else common_attn_metadata.causal
++        )
+ 
+         encoder_cache_tensor = None
+         if self.is_encoder_only_attention:
+@@ -215,6 +225,7 @@ def build(
+             sliding_window_size=self.window_size,
+             isa=self.isa,
+             enable_kv_split=envs.VLLM_CPU_ATTN_SPLIT_KV,
++            dynamic_causal=dynamic_casual,
+         )
+ 
+         attn_metadata = CPUAttentionMetadata(
+@@ -228,6 +239,7 @@ def build(
+             scheduler_metadata=scheduler_metadata,
+             causal=causal,
+             encoder_cache=encoder_cache_tensor,
++            dynamic_causal=dynamic_casual,
+         )
+ 
+         return attn_metadata
+@@ -269,11 +281,9 @@ def __init__(
+             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
+         self.alibi_slopes = alibi_slopes
+         if sliding_window is None:
+-            self.sliding_window = (-1, -1)
+-        elif attn_type == AttentionType.ENCODER_ONLY:
+-            self.sliding_window = (sliding_window - 1, sliding_window - 1)
++            self.sliding_window = -1
+         else:
+-            self.sliding_window = (sliding_window - 1, 0)
++            self.sliding_window = sliding_window
+         self.kv_cache_dtype = kv_cache_dtype
+         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+ 
+@@ -378,6 +388,7 @@ def forward(
+             softcap=self.logits_soft_cap,
+             scheduler_metadata=attn_metadata.scheduler_metadata,
+             s_aux=self.sinks,
++            dynamic_causal=attn_metadata.dynamic_causal,
+             k_scale=layer._k_scale_float,
+             v_scale=layer._v_scale_float,
+             kv_cache_dtype=self.kv_cache_dtype,

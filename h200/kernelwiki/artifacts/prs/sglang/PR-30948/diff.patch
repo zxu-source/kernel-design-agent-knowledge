@@ -1,0 +1,614 @@
+diff --git a/python/sglang/kernels/ops/__init__.py b/python/sglang/kernels/ops/__init__.py
+index 5f7979d3c5e3..207a186f8f05 100644
+--- a/python/sglang/kernels/ops/__init__.py
++++ b/python/sglang/kernels/ops/__init__.py
+@@ -19,6 +19,7 @@
+     "attention",
+     "communication",
+     "diffusion",
++    "embeddings",
+     "gemm",
+     "grammar",
+     "kvcache",
+diff --git a/python/sglang/kernels/ops/embeddings/__init__.py b/python/sglang/kernels/ops/embeddings/__init__.py
+new file mode 100644
+index 000000000000..103d8a705b10
+--- /dev/null
++++ b/python/sglang/kernels/ops/embeddings/__init__.py
+@@ -0,0 +1,17 @@
++"""Embedding kernels."""
++
++from sglang.kernels.registry import register_kernel
++from sglang.kernels.spec import KernelBackend, KernelSpec
++
++register_kernel(
++    KernelSpec(
++        op="embeddings.vocab_parallel_embedding",
++        backend=KernelBackend.TRITON,
++        target=(
++            "sglang.kernels.ops.embeddings.vocab_parallel_embedding:"
++            "vocab_parallel_embedding"
++        ),
++    )
++)
++
++__all__ = []
+diff --git a/python/sglang/kernels/ops/embeddings/vocab_parallel_embedding.py b/python/sglang/kernels/ops/embeddings/vocab_parallel_embedding.py
+new file mode 100644
+index 000000000000..4f6dee592d12
+--- /dev/null
++++ b/python/sglang/kernels/ops/embeddings/vocab_parallel_embedding.py
+@@ -0,0 +1,96 @@
++"""Fused Triton vocabulary-parallel embedding lookup."""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _vocab_parallel_embedding_kernel(
++    input_ptr,
++    weight_ptr,
++    out_ptr,
++    # The scalar params are tl.constexpr on purpose: it lets the compiler fold
++    # the vocab-window comparisons into a single range check (measured ~5%
++    # faster at large token counts), and each embedding layer has one fixed
++    # (hidden_dim, stride, shard-window) tuple, so the specialization costs one
++    # compile per layer at warmup.
++    hidden_dim: tl.constexpr,
++    weight_stride0: tl.constexpr,
++    org_vocab_start_index: tl.constexpr,
++    org_vocab_end_index: tl.constexpr,
++    num_org_vocab_padding: tl.constexpr,
++    added_vocab_start_index: tl.constexpr,
++    added_vocab_end_index: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    col_block = tl.program_id(1)
++    cols = col_block * BLOCK_H + tl.arange(0, BLOCK_H)
++    col_mask = cols < hidden_dim
++
++    token = tl.load(input_ptr + row).to(tl.int64)
++    org_vocab_mask = (token >= org_vocab_start_index) & (token < org_vocab_end_index)
++    added_vocab_mask = (token >= added_vocab_start_index) & (
++        token < added_vocab_end_index
++    )
++    valid = org_vocab_mask | added_vocab_mask
++
++    added_offset = (
++        added_vocab_start_index
++        - (org_vocab_end_index - org_vocab_start_index)
++        - num_org_vocab_padding
++    )
++    local_id = tl.where(
++        org_vocab_mask, token - org_vocab_start_index, token - added_offset
++    )
++    local_id = tl.where(valid, local_id, 0)
++    vals = tl.load(
++        weight_ptr + local_id * weight_stride0 + cols,
++        mask=col_mask & valid,
++        other=0.0,
++    )
++    tl.store(out_ptr + row * hidden_dim + cols, vals, mask=col_mask)
++
++
++def vocab_parallel_embedding(
++    input_: torch.Tensor,
++    weight: torch.Tensor,
++    org_vocab_start_index: int,
++    org_vocab_end_index: int,
++    num_org_vocab_padding: int,
++    added_vocab_start_index: int,
++    added_vocab_end_index: int,
++) -> torch.Tensor:
++    assert input_.is_cuda
++    assert input_.is_contiguous()
++    assert input_.dtype in (torch.int32, torch.int64)
++    assert weight.is_cuda
++    assert weight.ndim == 2
++    assert weight.stride(1) == 1
++
++    hidden_dim = weight.shape[1]
++    output = torch.empty(
++        (*input_.shape, hidden_dim), dtype=weight.dtype, device=weight.device
++    )
++    n_tokens = input_.numel()
++    if n_tokens == 0:
++        return output
++
++    block_h = min(1024, triton.next_power_of_2(hidden_dim))
++    grid = (n_tokens, triton.cdiv(hidden_dim, block_h))
++    _vocab_parallel_embedding_kernel[grid](
++        input_,
++        weight,
++        output,
++        hidden_dim,
++        weight.stride(0),
++        org_vocab_start_index,
++        org_vocab_end_index,
++        num_org_vocab_padding,
++        added_vocab_start_index,
++        added_vocab_end_index,
++        BLOCK_H=block_h,
++        num_warps=8,
++    )
++    return output
+diff --git a/python/sglang/srt/layers/vocab_parallel_embedding.py b/python/sglang/srt/layers/vocab_parallel_embedding.py
+index 259254195c4a..adc7a3d5377f 100644
+--- a/python/sglang/srt/layers/vocab_parallel_embedding.py
++++ b/python/sglang/srt/layers/vocab_parallel_embedding.py
+@@ -9,6 +9,9 @@
+ import torch
+ from torch.nn.parameter import Parameter, UninitializedParameter
+ 
++from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
++    vocab_parallel_embedding as fused_vocab_parallel_embedding,
++)
+ from sglang.srt.distributed import (
+     divide,
+     get_tp_group,
+@@ -498,40 +501,75 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
+         param[loaded_weight.shape[0] :].data.fill_(0)
+ 
++    def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
++        """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
++        if self.tp_size == 1:
++            return False
++        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
++            return False
++        if not input_.is_cuda or not input_.is_contiguous():
++            return False
++        if input_.dtype not in (torch.int32, torch.int64):
++            return False
++        return (
++            self.weight.is_cuda
++            and self.weight.ndim == 2
++            and self.weight.stride(1) == 1
++            and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
++        )
++
++    def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
++        """Embed against the local vocab shard; out-of-shard rows are zero
++        (identity when tp_size == 1).
++
++        The output must be allocated inside the symmetric-memory context so
++        the caller's all-reduce can use it; the mask temporaries and the
++        in-place fill deliberately stay outside the pool.
++        """
++        symm_alloc = use_symmetric_memory(
++            get_tp_group(), disabled=not is_allocation_symmetric()
++        )
++        if self.tp_size == 1:
++            with symm_alloc:
++                return self.quant_method.embedding(self, input_.long())
++        if self._use_triton_embedding(input_):
++            with symm_alloc:
++                return fused_vocab_parallel_embedding(
++                    input_,
++                    self.weight,
++                    self.shard_indices.org_vocab_start_index,
++                    self.shard_indices.org_vocab_end_index,
++                    self.shard_indices.num_org_vocab_padding,
++                    self.shard_indices.added_vocab_start_index,
++                    self.shard_indices.added_vocab_end_index,
++                )
++        # Map out-of-shard ids to index 0, gather, then zero those rows.
++        masked_input, input_mask = get_masked_input_and_mask(
++            input_,
++            self.shard_indices.org_vocab_start_index,
++            self.shard_indices.org_vocab_end_index,
++            self.shard_indices.num_org_vocab_padding,
++            self.shard_indices.added_vocab_start_index,
++            self.shard_indices.added_vocab_end_index,
++        )
++        with symm_alloc:
++            output_parallel = self.quant_method.embedding(self, masked_input.long())
++        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
++        return output_parallel
++
+     def forward(self, input_):
+         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
+         # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
+         maybe_detect_oob(
+             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+         )
+-        if self.tp_size > 1:
+-            # Build the mask.
+-            masked_input, input_mask = get_masked_input_and_mask(
+-                input_,
+-                self.shard_indices.org_vocab_start_index,
+-                self.shard_indices.org_vocab_end_index,
+-                self.shard_indices.num_org_vocab_padding,
+-                self.shard_indices.added_vocab_start_index,
+-                self.shard_indices.added_vocab_end_index,
+-            )
+-        else:
+-            masked_input = input_
+-
+-        # Get the embeddings.
+-        with use_symmetric_memory(
+-            get_tp_group(), disabled=not is_allocation_symmetric()
+-        ):
+-            output_parallel = self.quant_method.embedding(self, masked_input.long())
+-
+-        if self.tp_size > 1:
+-            # Mask the output embedding.
+-            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+-            if not get_attn_tp_context().input_scattered:
+-                if self.use_attn_tp_group:
+-                    output_parallel = attn_tp_all_reduce(output_parallel)
+-                else:
+-                    # Reduce across all the model parallel GPUs.
+-                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
++        output_parallel = self._embed_local_shard(input_)
++        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
++            if self.use_attn_tp_group:
++                output_parallel = attn_tp_all_reduce(output_parallel)
++            else:
++                # Reduce across all the model parallel GPUs.
++                output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+         return output_parallel
+ 
+     def extra_repr(self) -> str:
+diff --git a/test/registered/jit/benchmark/bench_vocab_parallel_embedding.py b/test/registered/jit/benchmark/bench_vocab_parallel_embedding.py
+new file mode 100644
+index 000000000000..4c5b872396de
+--- /dev/null
++++ b/test/registered/jit/benchmark/bench_vocab_parallel_embedding.py
+@@ -0,0 +1,185 @@
++import torch
++import torch.nn.functional as F
++import triton
++import triton.testing
++
++from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
++from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
++    vocab_parallel_embedding,
++)
++from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(
++    est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
++)
++
++# Key order must match the perf_report x_names.
++DEFAULTS = dict(
++    batch_size=120,
++    hidden_size=6144,
++    vocab_size=128256,
++    tp_size=8,
++    token_pattern="uniform",
++    dtype="bf16",
++)
++
++# One-at-a-time star sweep around DEFAULTS (the full product would be 1170
++# configs). Each entry overrides one field (or one coupled field group).
++SWEEPS = [
++    (
++        "batch_size",
++        get_benchmark_range(
++            [1, 2, 4, 8, 16, 32, 64, 120, 256, 512, 1024, 2048, 4096],
++            ci_range=[1, 120],
++        ),
++    ),
++    ("hidden_size", get_benchmark_range([4096, 6144, 7168], ci_range=[])),
++    (
++        ("vocab_size", "tp_size"),
++        get_benchmark_range(
++            [(32000, 4), (32000, 8), (128256, 4), (128256, 8), (154880, 8)],
++            ci_range=[],
++        ),
++    ),
++    (
++        "token_pattern",
++        get_benchmark_range(["uniform", "all_local", "all_remote"], ci_range=[]),
++    ),
++    ("dtype", get_benchmark_range(["bf16", "fp16"], ci_range=[])),
++]
++
++
++def _make_benchmark_configs():
++    # Dict keying dedupes the all-defaults config each sweep re-produces.
++    configs = {}
++    for keys, values in SWEEPS:
++        for value in values:
++            override = (
++                dict(zip(keys, value)) if isinstance(keys, tuple) else {keys: value}
++            )
++            config = {**DEFAULTS, **override}
++            configs[tuple(config.values())] = None
++    return list(configs)
++
++
++BENCHMARK_CONFIGS = _make_benchmark_configs()
++
++
++def _dtype_from_name(dtype: str) -> torch.dtype:
++    if dtype == "bf16":
++        return torch.bfloat16
++    if dtype == "fp16":
++        return torch.float16
++    raise ValueError(f"Unknown dtype: {dtype}")
++
++
++def _make_input_ids(
++    batch_size: int, vocab_size: int, tp_size: int, token_pattern: str
++) -> torch.Tensor:
++    assert vocab_size % tp_size == 0
++    per_partition = vocab_size // tp_size
++    if token_pattern == "uniform":
++        return torch.randint(
++            0, vocab_size, (batch_size,), dtype=torch.int64, device="cuda"
++        )
++    if token_pattern == "all_local":
++        return torch.randint(
++            0,
++            per_partition,
++            (batch_size,),
++            dtype=torch.int64,
++            device="cuda",
++        )
++    if token_pattern == "all_remote":
++        return torch.randint(
++            per_partition,
++            vocab_size,
++            (batch_size,),
++            dtype=torch.int64,
++            device="cuda",
++        )
++    raise ValueError(f"Unknown token_pattern: {token_pattern}")
++
++
++def _torch_vocab_parallel_embedding(
++    input_ids: torch.Tensor, weight: torch.Tensor, vocab_size: int
++):
++    masked_input, input_mask = get_masked_input_and_mask(
++        input_ids,
++        0,
++        weight.shape[0],
++        0,
++        vocab_size,
++        vocab_size,
++    )
++    output = F.embedding(masked_input.long(), weight)
++    output.masked_fill_(input_mask.unsqueeze(-1), 0)
++    return output
++
++
++def _triton_vocab_parallel_embedding(
++    input_ids: torch.Tensor, weight: torch.Tensor, vocab_size: int
++):
++    return vocab_parallel_embedding(
++        input_ids,
++        weight,
++        0,
++        weight.shape[0],
++        0,
++        vocab_size,
++        vocab_size,
++    )
++
++
++@triton.testing.perf_report(
++    triton.testing.Benchmark(
++        x_names=[
++            "batch_size",
++            "hidden_size",
++            "vocab_size",
++            "tp_size",
++            "token_pattern",
++            "dtype",
++        ],
++        x_vals=BENCHMARK_CONFIGS,
++        line_arg="provider",
++        line_vals=["triton", "torch"],
++        line_names=["Fused Triton", "Compiled mask + embedding + masked_fill"],
++        styles=[("blue", "-"), ("red", "--")],
++        ylabel="us",
++        plot_name="vocab-parallel-embedding-performance",
++        args={},
++    )
++)
++def benchmark(
++    batch_size: int,
++    hidden_size: int,
++    vocab_size: int,
++    tp_size: int,
++    token_pattern: str,
++    dtype: str,
++    provider: str,
++):
++    assert vocab_size % tp_size == 0
++    torch_dtype = _dtype_from_name(dtype)
++    per_partition = vocab_size // tp_size
++    input_ids = _make_input_ids(batch_size, vocab_size, tp_size, token_pattern)
++    weight = torch.randn((per_partition, hidden_size), dtype=torch_dtype, device="cuda")
++
++    expected = _torch_vocab_parallel_embedding(input_ids, weight, vocab_size)
++    actual = _triton_vocab_parallel_embedding(input_ids, weight, vocab_size)
++    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++
++    if provider == "triton":
++        fn = lambda: _triton_vocab_parallel_embedding(input_ids, weight, vocab_size)
++    elif provider == "torch":
++        fn = lambda: _torch_vocab_parallel_embedding(input_ids, weight, vocab_size)
++    else:
++        raise ValueError(f"Unknown provider: {provider}")
++
++    return run_benchmark(fn)
++
++
++if __name__ == "__main__":
++    benchmark.run(print_data=True)
+diff --git a/test/registered/kernels/test_kernels_namespace.py b/test/registered/kernels/test_kernels_namespace.py
+index 1837db8e2432..e91663c23419 100644
+--- a/test/registered/kernels/test_kernels_namespace.py
++++ b/test/registered/kernels/test_kernels_namespace.py
+@@ -68,6 +68,7 @@
+     "grammar.apply_token_bitmask_inplace_triton": {"triton"},
+     "memory.alloc_extend_kernel": {"triton"},
+     "attention.decode_attention_fwd": {"triton"},
++    "embeddings.vocab_parallel_embedding": {"triton"},
+     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
+     "speculative.gather_spec_extras": {"triton"},
+ }
+@@ -117,6 +118,7 @@
+     "attention",
+     "communication",
+     "diffusion",
++    "embeddings",
+     "gemm",
+     "grammar",
+     "kvcache",
+diff --git a/test/registered/kernels/test_vocab_parallel_embedding.py b/test/registered/kernels/test_vocab_parallel_embedding.py
+new file mode 100644
+index 000000000000..ab0f2c96f107
+--- /dev/null
++++ b/test/registered/kernels/test_vocab_parallel_embedding.py
+@@ -0,0 +1,142 @@
++import types
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
++    vocab_parallel_embedding,
++)
++from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
++from sglang.srt.layers.vocab_parallel_embedding import (
++    VocabParallelEmbedding,
++    get_masked_input_and_mask,
++)
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="CUDA is required for this test."
++)
++
++
++def _reference_embedding(input_ids, weight, cfg):
++    # The kernel's contract is bit-parity with the eager production path it
++    # replaces, so use that exact path as the oracle.
++    masked_input, input_mask = get_masked_input_and_mask(input_ids, **cfg)
++    output = F.embedding(masked_input.long(), weight)
++    output.masked_fill_(input_mask.unsqueeze(-1), 0)
++    return output
++
++
++def _run_case(input_ids, weight, cfg):
++    expected = _reference_embedding(input_ids, weight, cfg)
++    actual = vocab_parallel_embedding(input_ids, weight, **cfg)
++    assert actual.dtype == expected.dtype
++    assert actual.shape == expected.shape
++    assert actual.is_contiguous()
++    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
++@pytest.mark.parametrize("input_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("hidden_dim", [7, 128, 6144])
++def test_vocab_parallel_embedding_no_added_vocab(dtype, input_dtype, hidden_dim):
++    cfg = dict(
++        org_vocab_start_index=16,
++        org_vocab_end_index=32,
++        num_org_vocab_padding=0,
++        added_vocab_start_index=64,
++        added_vocab_end_index=64,
++    )
++    weight = torch.randn((16, hidden_dim), dtype=dtype, device="cuda")
++    # Include negative and garbage ids: the mask is the only defense against
++    # them when the OOB probe is disabled, so they must produce zero rows.
++    token_ids = [-100, -1, 0, 16, 17, 31, 32, 63, 2**30]
++    if input_dtype == torch.int64:
++        token_ids += [torch.iinfo(torch.int64).min, torch.iinfo(torch.int64).max]
++    input_ids = torch.tensor(token_ids, dtype=input_dtype, device="cuda")
++    _run_case(input_ids, weight, cfg)
++
++
++def test_vocab_parallel_embedding_added_vocab_with_padding():
++    cfg = dict(
++        org_vocab_start_index=10,
++        org_vocab_end_index=18,
++        num_org_vocab_padding=4,
++        added_vocab_start_index=100,
++        added_vocab_end_index=103,
++    )
++    weight = torch.randn((16, 257), dtype=torch.bfloat16, device="cuda")
++    input_ids = torch.tensor(
++        [[9, 10, 17], [18, 100, 102]], dtype=torch.int64, device="cuda"
++    )
++    _run_case(input_ids, weight, cfg)
++
++
++def test_vocab_parallel_embedding_strided_weight():
++    cfg = dict(
++        org_vocab_start_index=10,
++        org_vocab_end_index=18,
++        num_org_vocab_padding=4,
++        added_vocab_start_index=100,
++        added_vocab_end_index=103,
++    )
++    # Column slice of a wider buffer: stride(0) != hidden_dim, stride(1) == 1.
++    weight = torch.randn((16, 300), dtype=torch.bfloat16, device="cuda")[:, :257]
++    assert weight.stride(0) == 300 and weight.stride(1) == 1
++    input_ids = torch.tensor(
++        [[9, 10, 17], [18, 100, 102]], dtype=torch.int64, device="cuda"
++    )
++    _run_case(input_ids, weight, cfg)
++
++
++def test_vocab_parallel_embedding_empty_input():
++    cfg = dict(
++        org_vocab_start_index=0,
++        org_vocab_end_index=8,
++        num_org_vocab_padding=0,
++        added_vocab_start_index=8,
++        added_vocab_end_index=8,
++    )
++    weight = torch.randn((8, 64), dtype=torch.bfloat16, device="cuda")
++    input_ids = torch.empty((0,), dtype=torch.int64, device="cuda")
++    _run_case(input_ids, weight, cfg)
++
++
++def _stub_layer(**overrides):
++    # The gate reads only tp_size, quant_method, and weight, so a stub avoids
++    # needing distributed init for tp_size > 1.
++    layer = types.SimpleNamespace(
++        tp_size=2,
++        quant_method=UnquantizedEmbeddingMethod(),
++        weight=torch.empty((16, 32), dtype=torch.bfloat16, device="cuda"),
++    )
++    for name, value in overrides.items():
++        setattr(layer, name, value)
++    return layer
++
++
++def test_use_triton_embedding_gate():
++    # The gate's failure direction is silent (the eager fallback is
++    # numerically correct), so pin eligibility and the exclusions that define
++    # the fused kernel's scope.
++    gate = VocabParallelEmbedding._use_triton_embedding
++    input_ids = torch.zeros((4,), dtype=torch.int64, device="cuda")
++    assert gate(_stub_layer(), input_ids)
++    assert not gate(_stub_layer(tp_size=1), input_ids)
++    assert not gate(_stub_layer(quant_method=object()), input_ids)
++    unsupported_weights = (
++        torch.empty((16, 32), dtype=torch.bfloat16, device="cpu"),
++        torch.empty((16,), dtype=torch.bfloat16, device="cuda"),
++        torch.empty((16, 64), dtype=torch.bfloat16, device="cuda")[:, ::2],
++    )
++    for weight in unsupported_weights:
++        assert not gate(_stub_layer(weight=weight), input_ids)
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))

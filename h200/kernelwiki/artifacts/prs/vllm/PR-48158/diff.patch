@@ -1,0 +1,265 @@
+diff --git a/tests/kernels/attention/test_rocm_triton_attn_dsv4.py b/tests/kernels/attention/test_rocm_triton_attn_dsv4.py
+index e00726f64d80..41863c916318 100644
+--- a/tests/kernels/attention/test_rocm_triton_attn_dsv4.py
++++ b/tests/kernels/attention/test_rocm_triton_attn_dsv4.py
+@@ -197,46 +197,6 @@ def _ragged_from_rows(
+     )
+ 
+ 
+-def _ref_combine_topk_swa_ragged(
+-    device: torch.device,
+-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-    expected_ragged = torch.tensor(
+-        [
+-            100,
+-            101,
+-            7,
+-            8,
+-            9,
+-            110,
+-            111,
+-            8,
+-            9,
+-            10,
+-            120,
+-            121,
+-            122,
+-            9,
+-            10,
+-            11,
+-            150,
+-            27,
+-            28,
+-            29,
+-            160,
+-            161,
+-            28,
+-            29,
+-            30,
+-        ],
+-        dtype=torch.int32,
+-        device=device,
+-    )
+-    expected_lens = torch.tensor([5, 5, 6, 4, 5], dtype=torch.int32, device=device)
+-    expected_indptr = torch.zeros(6, dtype=torch.int32, device=device)
+-    torch.cumsum(expected_lens, dim=0, out=expected_indptr[1:])
+-    return expected_ragged, expected_indptr, expected_lens
+-
+-
+ @torch.inference_mode()
+ def test_compute_global_topk_ragged_indices_and_indptr() -> None:
+     from vllm.models.deepseek_v4.amd.rocm import (
+@@ -369,55 +329,6 @@ def test_sparse_attn_decode_ragged_kernel() -> None:
+     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+ 
+ 
+-@torch.inference_mode()
+-def test_combine_topk_swa_indices_ragged() -> None:
+-    from vllm.models.deepseek_v4.amd.rocm import (
+-        combine_topk_swa_indices_ragged,
+-    )
+-
+-    device = torch.device("cuda")
+-    topk_indices = torch.tensor(
+-        [
+-            [100, 101, 102, 103],
+-            [110, 111, 112, 113],
+-            [120, 121, 122, 123],
+-            [130, 131, 132, 133],
+-            [140, 141, 142, 143],
+-        ],
+-        dtype=torch.int32,
+-        device=device,
+-    )
+-    query_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32, device=device)
+-    seq_lens = torch.tensor([6, 4], dtype=torch.int32, device=device)
+-    gather_lens = torch.tensor([4, 3], dtype=torch.int32, device=device)
+-    window_size = 3
+-    compress_ratio = 2
+-    topk = 4
+-    M = 20
+-    N = 8
+-
+-    actual_ragged, actual_indptr, actual_lens = combine_topk_swa_indices_ragged(
+-        topk_indices,
+-        query_start_loc,
+-        seq_lens,
+-        gather_lens,
+-        window_size,
+-        compress_ratio,
+-        topk,
+-        M,
+-        N,
+-    )
+-    expected_ragged, expected_indptr, expected_lens = _ref_combine_topk_swa_ragged(
+-        device
+-    )
+-
+-    torch.testing.assert_close(
+-        actual_ragged[: expected_ragged.numel()], expected_ragged
+-    )
+-    torch.testing.assert_close(actual_indptr, expected_indptr)
+-    torch.testing.assert_close(actual_lens, expected_lens)
+-
+-
+ @requires_gfx950
+ @torch.inference_mode()
+ def test_decode_num_splits_heuristic(monkeypatch) -> None:
+diff --git a/vllm/models/deepseek_v4/amd/rocm.py b/vllm/models/deepseek_v4/amd/rocm.py
+index 641b3da68bdf..b3456ba785c7 100644
+--- a/vllm/models/deepseek_v4/amd/rocm.py
++++ b/vllm/models/deepseek_v4/amd/rocm.py
+@@ -272,153 +272,6 @@ def compute_global_topk_ragged_indices_and_indptr(
+     return global_topk_ragged, topk_indptr, topk_lens
+ 
+ 
+-@triton.jit
+-def _compute_combined_lens_kernel(
+-    combined_lens_ptr,
+-    query_start_loc_ptr,
+-    seq_lens_ptr,
+-    TOP_K: tl.constexpr,
+-    COMPRESS_RATIO: tl.constexpr,
+-    WINDOW_SIZE: tl.constexpr,
+-):
+-    batch_idx = tl.program_id(0)
+-    worker_id = tl.program_id(1)
+-    num_workers = tl.num_programs(1)
+-
+-    base = tl.load(query_start_loc_ptr)
+-    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
+-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
+-    query_len = query_end - query_start
+-    seq_len = tl.load(seq_lens_ptr + batch_idx)
+-    start_pos = seq_len - query_len
+-
+-    for token_idx in range(query_start + worker_id, query_end, num_workers):
+-        token_idx_in_query = token_idx - query_start
+-        pos = start_pos + token_idx_in_query
+-        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+-        tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
+-
+-
+-@triton.jit
+-def _combine_topk_swa_indices_ragged_kernel(
+-    combined_ragged_ptr,
+-    combined_indptr_ptr,
+-    topk_indices_ptr,
+-    topk_indices_stride,
+-    query_start_loc_ptr,
+-    seq_lens_ptr,
+-    gather_lens_ptr,
+-    M,
+-    N,
+-    topk_width,
+-    TOP_K: tl.constexpr,
+-    COMPRESS_RATIO: tl.constexpr,
+-    WINDOW_SIZE: tl.constexpr,
+-    BLOCK_SIZE: tl.constexpr,
+-):
+-    batch_idx = tl.program_id(0)
+-    worker_id = tl.program_id(1)
+-    block_idx = tl.program_id(2)
+-    num_workers = tl.num_programs(1)
+-
+-    base = tl.load(query_start_loc_ptr)
+-    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
+-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
+-    query_len = query_end - query_start
+-    seq_len = tl.load(seq_lens_ptr + batch_idx)
+-    gather_len = tl.load(gather_lens_ptr + batch_idx)
+-    start_pos = seq_len - query_len
+-    gather_start = seq_len - gather_len
+-
+-    for token_idx in range(query_start + worker_id, query_end, num_workers):
+-        token_idx_in_query = token_idx - query_start
+-        pos = start_pos + token_idx_in_query
+-        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+-        combined_len = topk_len + swa_len
+-
+-        offset = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+-        if block_idx * BLOCK_SIZE < combined_len:
+-            out_start = tl.load(combined_indptr_ptr + token_idx)
+-            topk_mask = (offset < topk_len) & (offset < topk_width)
+-            topk_vals = tl.load(
+-                topk_indices_ptr + token_idx * topk_indices_stride + offset,
+-                mask=topk_mask,
+-                other=-1,
+-            )
+-            tl.store(
+-                combined_ragged_ptr + out_start + offset,
+-                topk_vals + M * batch_idx,
+-                mask=topk_mask,
+-            )
+-
+-            swa_offset = offset - topk_len
+-            swa_mask = (offset >= topk_len) & (swa_offset < swa_len)
+-            tl.store(
+-                combined_ragged_ptr + out_start + offset,
+-                M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start,
+-                mask=swa_mask,
+-            )
+-
+-
+-def combine_topk_swa_indices_ragged(
+-    topk_indices: torch.Tensor,
+-    query_start_loc: torch.Tensor,
+-    seq_lens: torch.Tensor,
+-    gather_lens: torch.Tensor,
+-    window_size: int,
+-    compress_ratio: int,
+-    topk: int,
+-    M: int,
+-    N: int,
+-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-    topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
+-    num_tokens = topk_indices.shape[0]
+-    num_reqs = seq_lens.shape[0]
+-    combined_lens = torch.empty(
+-        num_tokens, dtype=torch.int32, device=topk_indices.device
+-    )
+-
+-    num_workers = 128
+-    _compute_combined_lens_kernel[(num_reqs, num_workers)](
+-        combined_lens,
+-        query_start_loc,
+-        seq_lens,
+-        TOP_K=topk,
+-        COMPRESS_RATIO=compress_ratio,
+-        WINDOW_SIZE=window_size,
+-    )
+-
+-    combined_indptr = _build_indptr_from_lengths(combined_lens)
+-    combined_ragged = torch.empty(
+-        num_tokens * (topk + window_size),
+-        dtype=torch.int32,
+-        device=topk_indices.device,
+-    )
+-    if combined_ragged.numel() > 0:
+-        block = 128
+-        _combine_topk_swa_indices_ragged_kernel[
+-            (num_reqs, num_workers, triton.cdiv(topk + window_size, block))
+-        ](
+-            combined_ragged,
+-            combined_indptr,
+-            topk_indices,
+-            topk_indices.stride(0),
+-            query_start_loc,
+-            seq_lens,
+-            gather_lens,
+-            M,
+-            N,
+-            topk_indices.shape[-1],
+-            TOP_K=topk,
+-            COMPRESS_RATIO=compress_ratio,
+-            WINDOW_SIZE=window_size,
+-            BLOCK_SIZE=block,
+-        )
+-    return combined_ragged, combined_indptr, combined_lens
+-
+-
+ def _copy_ragged_to_graph_buffers(
+     ragged_indices: torch.Tensor,
+     ragged_indptr: torch.Tensor,

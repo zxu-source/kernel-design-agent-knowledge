@@ -1,0 +1,495 @@
+diff --git a/python/sglang/srt/eplb/eplb_manager.py b/python/sglang/srt/eplb/eplb_manager.py
+index 38f8b07d29da..27e7e1bc651e 100644
+--- a/python/sglang/srt/eplb/eplb_manager.py
++++ b/python/sglang/srt/eplb/eplb_manager.py
+@@ -4,8 +4,14 @@
+ 
+ import torch.cuda
+ 
++from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+-from sglang.srt.eplb.expert_location import ExpertLocationMetadata
++from sglang.srt.eplb.expert_location import (
++    ExpertLocationMetadata,
++    format_expert_location_layout,
++    format_expert_location_layout_diff,
++    get_global_expert_location_metadata,
++)
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.model_executor.model_runner import ModelRunner
+@@ -78,14 +84,23 @@ def rebalance(self):
+         )
+ 
+         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
+-        for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
++        all_update_layer_ids = [
++            layer_id for chunk in update_layer_ids_chunks for layer_id in chunk
++        ]
++        self._log_rebalance_layout_before_update(
++            expert_location_metadata,
++            update_layer_ids=all_update_layer_ids,
++        )
++        for chunk_layer_ids in update_layer_ids_chunks:
+             if len(update_layer_ids_chunks) > 1:
+                 yield
+             self._model_runner.update_expert_location(
+                 expert_location_metadata,
+-                update_layer_ids=update_layer_ids,
++                update_layer_ids=chunk_layer_ids,
+             )
+ 
++        self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
++
+         msg = f"[EPLBManager] rebalance end"
+         if enable_timing:
+             torch.get_device_module().synchronize()
+@@ -115,6 +130,56 @@ def _compute_update_layer_ids_chunks(self) -> List[List[int]]:
+         chunk_size = self._rebalance_layers_per_chunk or 1000000
+         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
+ 
++    def _should_log_expert_location_metadata(self) -> bool:
++        return (
++            self._model_runner.tp_rank == 0
++            and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get()
++        )
++
++    def _log_rebalance_layout_before_update(
++        self,
++        new_expert_location_metadata: ExpertLocationMetadata,
++        update_layer_ids: List[int],
++    ):
++        if not self._should_log_expert_location_metadata():
++            return
++
++        old_expert_location_metadata = get_global_expert_location_metadata()
++        logger.info(
++            "[EPLBManager] rebalance layout before:\n%s",
++            format_expert_location_layout(
++                old_expert_location_metadata,
++                layer_ids=update_layer_ids,
++            ),
++        )
++        logger.info(
++            "[EPLBManager] rebalance layout target:\n%s",
++            format_expert_location_layout(
++                new_expert_location_metadata,
++                layer_ids=update_layer_ids,
++            ),
++        )
++        logger.info(
++            "[EPLBManager] rebalance layout diff:\n%s",
++            format_expert_location_layout_diff(
++                old_expert_location_metadata,
++                new_expert_location_metadata,
++                layer_ids=update_layer_ids,
++            ),
++        )
++
++    def _log_rebalance_layout_after_update(self, update_layer_ids: List[int]):
++        if not self._should_log_expert_location_metadata():
++            return
++
++        logger.info(
++            "[EPLBManager] rebalance layout after:\n%s",
++            format_expert_location_layout(
++                get_global_expert_location_metadata(),
++                layer_ids=update_layer_ids,
++            ),
++        )
++
+ 
+ def _chunk_list(items: List, chunk_size):
+     for start_index in range(0, len(items), chunk_size):
+diff --git a/python/sglang/srt/eplb/expert_distribution.py b/python/sglang/srt/eplb/expert_distribution.py
+index 16fafcd11a52..faed8e44cabe 100644
+--- a/python/sglang/srt/eplb/expert_distribution.py
++++ b/python/sglang/srt/eplb/expert_distribution.py
+@@ -326,7 +326,7 @@ def init_new(
+             else:
+                 raise NotImplementedError
+ 
+-        if server_args.moe_a2a_backend != "none":
++        if server_args.moe_a2a_backend == "deepep":
+             if server_args.deepep_mode == "normal":
+                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+             elif server_args.deepep_mode == "low_latency":
+@@ -336,6 +336,8 @@ def init_new(
+             else:
+                 raise NotImplementedError
+ 
++        # Non-DeepEP a2a backends (flashinfer / nixl / mooncake / megamoe) and
++        # no-a2a path dispatch through the standard topk select_experts.
+         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+ 
+     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
+@@ -736,11 +738,15 @@ def _append_utilization_rate(
+             utilization_rate_gpu = torch.mean(
+                 compute_utilization_rate(gpu_physical_count)
+             )
++            should_track_history = not math.isclose(
++                self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
++            )
+             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
+-                print(f"hi {self._rank=} {utilization_rate_gpu=}")
+                 outputs["metrics"] = ExpertDistributionMetrics(
+                     eplb_balancedness=utilization_rate_gpu,
+                 )
++                if should_track_history:
++                    self._history.append(utilization_rate_gpu.item())
+             else:
+                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
+                 utilization_rate_cpu = utilization_rate_gpu.item()
+@@ -794,7 +800,7 @@ def clear(self):
+             d.clear()
+ 
+     def mean(self) -> Dict[int, float]:
+-        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
++        return {d.maxlen: sum(d) / len(d) for d in self._dequeues if len(d) > 0}
+ 
+ 
+ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
+diff --git a/python/sglang/srt/eplb/expert_location.py b/python/sglang/srt/eplb/expert_location.py
+index d45e6cb09458..6f21898feb8e 100644
+--- a/python/sglang/srt/eplb/expert_location.py
++++ b/python/sglang/srt/eplb/expert_location.py
+@@ -19,7 +19,7 @@
+ import random
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import TYPE_CHECKING, List, Optional
++from typing import TYPE_CHECKING, Iterable, List, Optional
+ 
+ import torch
+ import torch.distributed
+@@ -305,6 +305,109 @@ def logical_to_all_physical(
+         ]
+ 
+ 
++def format_expert_location_layout(
++    metadata: Optional[ExpertLocationMetadata],
++    layer_ids: Optional[Iterable[int]] = None,
++) -> str:
++    if metadata is None:
++        return "<none>"
++
++    return format_physical_to_logical_map(
++        metadata.physical_to_logical_map_cpu,
++        ep_size=metadata.ep_size,
++        layer_ids=layer_ids,
++    )
++
++
++def format_expert_location_layout_diff(
++    old_metadata: Optional[ExpertLocationMetadata],
++    new_metadata: Optional[ExpertLocationMetadata],
++    layer_ids: Optional[Iterable[int]] = None,
++) -> str:
++    if old_metadata is None or new_metadata is None:
++        return "<none>"
++
++    old_map = old_metadata.physical_to_logical_map_cpu
++    new_map = new_metadata.physical_to_logical_map_cpu
++    if old_map.shape != new_map.shape:
++        return f"shape_changed old_shape={tuple(old_map.shape)} new_shape={tuple(new_map.shape)}"
++
++    layer_ids = _normalize_layer_ids(layer_ids, num_layers=old_map.shape[0])
++    num_physical_experts = old_map.shape[1]
++
++    changed_by_layer = []
++    for layer_id in layer_ids:
++        num_changed = torch.count_nonzero(old_map[layer_id] != new_map[layer_id]).item()
++        if num_changed > 0:
++            changed_by_layer.append((layer_id, num_changed))
++
++    total_changed = sum(num_changed for _, num_changed in changed_by_layer)
++    total_slots = len(layer_ids) * num_physical_experts
++    lines = [f"changed_physical_slots={total_changed}/{total_slots}"]
++    if not changed_by_layer:
++        lines.append("changed_layers=[]")
++        return "\n".join(lines)
++
++    for layer_id, num_changed in changed_by_layer:
++        lines.append(f"layer={layer_id}: changed={num_changed}/{num_physical_experts}")
++    return "\n".join(lines)
++
++
++def format_physical_to_logical_map(
++    physical_to_logical_map: torch.Tensor,
++    ep_size: int,
++    layer_ids: Optional[Iterable[int]] = None,
++) -> str:
++    physical_to_logical_map = physical_to_logical_map.cpu()
++    if physical_to_logical_map.numel() == 0:
++        return "<empty>"
++
++    layer_ids = _normalize_layer_ids(
++        layer_ids, num_layers=physical_to_logical_map.shape[0]
++    )
++    num_physical_experts = physical_to_logical_map.shape[1]
++    num_local_physical_experts, remainder = divmod(num_physical_experts, ep_size)
++
++    lines = [
++        "physical_to_logical_map "
++        f"num_layers={physical_to_logical_map.shape[0]} "
++        f"num_physical_experts={num_physical_experts} "
++        f"ep_size={ep_size}"
++    ]
++    for layer_id in layer_ids:
++        row = physical_to_logical_map[layer_id].tolist()
++        if remainder != 0:
++            lines.append(
++                f"layer={layer_id}: "
++                f"physical={json.dumps(row, separators=(',', ':'))}"
++            )
++            continue
++
++        rank_chunks = []
++        for ep_rank in range(ep_size):
++            start = ep_rank * num_local_physical_experts
++            end = start + num_local_physical_experts
++            rank_chunks.append(
++                f"ep{ep_rank}={json.dumps(row[start:end], separators=(',', ':'))}"
++            )
++        lines.append(f"layer={layer_id}: " + " ".join(rank_chunks))
++
++    return "\n".join(lines)
++
++
++def _normalize_layer_ids(
++    layer_ids: Optional[Iterable[int]],
++    num_layers: int,
++) -> List[int]:
++    if layer_ids is None:
++        return list(range(num_layers))
++
++    normalized_layer_ids = [int(layer_id) for layer_id in layer_ids]
++    for layer_id in normalized_layer_ids:
++        assert 0 <= layer_id < num_layers, f"{layer_id=} {num_layers=}"
++    return normalized_layer_ids
++
++
+ def get_global_expert_location_metadata():
+     from sglang.srt.runtime_context import get_resources
+ 
+diff --git a/python/sglang/srt/eplb/expert_location_dispatch.py b/python/sglang/srt/eplb/expert_location_dispatch.py
+index 6484089bcd3b..bf1890a5a1a6 100644
+--- a/python/sglang/srt/eplb/expert_location_dispatch.py
++++ b/python/sglang/srt/eplb/expert_location_dispatch.py
+@@ -19,9 +19,6 @@
+ 
+ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+ from sglang.srt.runtime_context import get_server_args
+-from sglang.srt.utils import is_hip
+-
+-_is_hip = is_hip()
+ 
+ 
+ @dataclass
+@@ -102,7 +99,7 @@ def _topk_ids_logical_to_physical_static(
+     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+ ) -> torch.Tensor:
+     physical_topk_ids = info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
+-    if _is_hip:
++    if physical_topk_ids.dtype != topk_ids.dtype:
+         physical_topk_ids = physical_topk_ids.to(topk_ids.dtype)
+     return physical_topk_ids
+ 
+@@ -120,7 +117,7 @@ def _topk_ids_logical_to_physical_dynamic(
+         % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
+     )
+     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+-    if _is_hip:
++    if topk_ids.dtype != original_dtype:
+         topk_ids = topk_ids.to(original_dtype)
+ 
+     topk_ids = topk_ids.view(topk_ids_original_shape)
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 7a3c98b5a25d..144f2b707608 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -2116,7 +2116,6 @@ def select_experts(
+         assert (
+             num_token_non_padded is None
+         ), "num_token_non_padded is not yet supported in custom_routing_function"
+-        assert expert_location_dispatch_info is None
+         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+         topk_weights, topk_ids = custom_routing_function(
+             hidden_states=hidden_states,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 4cd22513e6a1..d49c444f73d1 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -101,6 +101,7 @@
+     ExpertLocationMetadata,
+     broadcast_global_expert_location_metadata,
+     compute_initial_expert_location_metadata,
++    format_expert_location_layout,
+     get_global_expert_location_metadata,
+     set_global_expert_location_metadata,
+ )
+@@ -670,7 +671,10 @@ def initialize(self):
+             )
+             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
+                 logger.info(
+-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
++                    "Initial expert_location_metadata:\n%s",
++                    format_expert_location_layout(
++                        get_global_expert_location_metadata()
++                    ),
+                 )
+ 
+             set_global_expert_distribution_recorder(
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index a99f280af78d..ada984296183 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -1870,7 +1870,27 @@ def suppress_other_loggers():
+     logging.getLogger("vllm.config").setLevel(logging.ERROR)
+ 
+ 
++_KERNEL_VERSION_CHECK_PACKAGES = frozenset(
++    {
++        "flashinfer-python",
++        "flashinfer_python",
++        "sglang-kernel",
++        "sglang_kernel",
++    }
++)
++
++
++def _should_skip_kernel_pkg_version_check(pkg: str) -> bool:
++    return (
++        pkg in _KERNEL_VERSION_CHECK_PACKAGES
++        and envs.SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK.get()
++    )
++
++
+ def assert_pkg_version(pkg: str, min_version: str, message: str):
++    if _should_skip_kernel_pkg_version_check(pkg):
++        return
++
+     try:
+         installed_version = version(pkg)
+         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
+@@ -1896,6 +1916,9 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
+     Returns:
+         True if package is installed and version >= min_version, False otherwise
+     """
++    if _should_skip_kernel_pkg_version_check(pkg):
++        return True
++
+     try:
+         installed_version = version(pkg)
+         return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)
+diff --git a/test/registered/unit/eplb/test_dispatch_dtype_preservation.py b/test/registered/unit/eplb/test_dispatch_dtype_preservation.py
+index eb030a40ec99..f747dcadf2e8 100644
+--- a/test/registered/unit/eplb/test_dispatch_dtype_preservation.py
++++ b/test/registered/unit/eplb/test_dispatch_dtype_preservation.py
+@@ -12,7 +12,6 @@
+ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+ 
+ import unittest
+-from unittest.mock import patch
+ 
+ import torch
+ 
+@@ -58,28 +57,25 @@ def _make_permuted_info():
+ class TestStaticDispatchDtype(CustomTestCase):
+     """Tests for _topk_ids_logical_to_physical_static dtype preservation."""
+ 
+-    def test_preserves_int32_dtype_on_hip(self):
++    def test_preserves_int32_dtype(self):
+         """int32 input must produce int32 output when dispatch map is int64."""
+         info = _make_identity_info()
+         topk_ids = torch.tensor([5, 103, 206], dtype=torch.int32)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_static(topk_ids, info)
++        result = _topk_ids_logical_to_physical_static(topk_ids, info)
+         self.assertEqual(result.dtype, torch.int32)
+ 
+     def test_preserves_int64_dtype(self):
+         """int64 input with int64 map should stay int64."""
+         info = _make_identity_info()
+         topk_ids = torch.tensor([5, 103, 206], dtype=torch.int64)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_static(topk_ids, info)
++        result = _topk_ids_logical_to_physical_static(topk_ids, info)
+         self.assertEqual(result.dtype, torch.int64)
+ 
+     def test_values_correct_after_cast(self):
+         """Remapped values are correct, not corrupted by the dtype cast."""
+         info = _make_permuted_info()
+         topk_ids = torch.tensor([0, 1, 2, 127, 255], dtype=torch.int32)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_static(topk_ids, info)
++        result = _topk_ids_logical_to_physical_static(topk_ids, info)
+         expected = info.partial_logical_to_rank_dispatch_physical_map[topk_ids.long()]
+         self.assertTrue(torch.equal(result, expected.to(torch.int32)))
+ 
+@@ -87,8 +83,7 @@ def test_batch_shape_preserved(self):
+         """2-D input shape is preserved through the remap."""
+         info = _make_identity_info()
+         topk_ids = torch.randint(0, NUM_LOGICAL, (32, 8), dtype=torch.int32)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_static(topk_ids, info)
++        result = _topk_ids_logical_to_physical_static(topk_ids, info)
+         self.assertEqual(result.shape, (32, 8))
+         self.assertEqual(result.dtype, torch.int32)
+ 
+@@ -96,13 +91,12 @@ def test_batch_shape_preserved(self):
+ class TestDynamicDispatchDtype(CustomTestCase):
+     """Tests for _topk_ids_logical_to_physical_dynamic dtype preservation."""
+ 
+-    def test_preserves_int32_dtype_on_hip(self):
++    def test_preserves_int32_dtype(self):
+         """int32 input must produce int32 output when dispatch map is int64."""
+         info = _make_permuted_info()
+         info.ep_dispatch_algorithm = "dynamic"
+         topk_ids = torch.tensor([5, 103, 206], dtype=torch.int32)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
++        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+         self.assertEqual(result.dtype, torch.int32)
+ 
+     def test_preserves_int64_dtype(self):
+@@ -110,8 +104,7 @@ def test_preserves_int64_dtype(self):
+         info = _make_permuted_info()
+         info.ep_dispatch_algorithm = "dynamic"
+         topk_ids = torch.tensor([5, 103, 206], dtype=torch.int64)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
++        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+         self.assertEqual(result.dtype, torch.int64)
+ 
+     def test_values_correct_single_candidate(self):
+@@ -119,8 +112,7 @@ def test_values_correct_single_candidate(self):
+         info = _make_permuted_info()
+         info.ep_dispatch_algorithm = "dynamic"
+         topk_ids = torch.tensor([0, 1, 2, 127, 255], dtype=torch.int32)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
++        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+         expected = info.partial_logical_to_all_physical_map[topk_ids.long(), 0]
+         self.assertTrue(torch.equal(result, expected.to(torch.int32)))
+ 
+@@ -129,8 +121,7 @@ def test_batch_shape_preserved(self):
+         info = _make_permuted_info()
+         info.ep_dispatch_algorithm = "dynamic"
+         topk_ids = torch.randint(0, NUM_LOGICAL, (32, 8), dtype=torch.int32)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
++        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+         self.assertEqual(result.shape, (32, 8))
+         self.assertEqual(result.dtype, torch.int32)
+ 
+@@ -141,8 +132,7 @@ def test_no_op_dtype_bug_regression(self):
+         info = _make_permuted_info()
+         info.ep_dispatch_algorithm = "dynamic"
+         topk_ids = torch.randint(0, NUM_LOGICAL, (64, 8), dtype=torch.int32)
+-        with patch("sglang.srt.eplb.expert_location_dispatch._is_hip", True):
+-            result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
++        result = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+         self.assertEqual(
+             result.dtype,
+             torch.int32,

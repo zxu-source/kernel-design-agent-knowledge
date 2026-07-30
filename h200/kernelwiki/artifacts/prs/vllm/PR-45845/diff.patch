@@ -1,0 +1,164 @@
+diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
+index 0871a15d08d3..3e05a253e249 100644
+--- a/tests/v1/core/test_prefix_caching.py
++++ b/tests/v1/core/test_prefix_caching.py
+@@ -3905,3 +3905,41 @@ def test_pure_swa_retention_dense_default_caches_all(monkeypatch):
+         is not None
+     }
+     assert cached == set(range(16))
++
++
++def test_mamba_reachable_block_mask_sparsifies_retention():
++    """Mamba state-snapshot retention: with VLLM_PREFIX_CACHE_RETENTION_INTERVAL
++    the manager keeps one cached state per interval-sized segment (plus the
++    latest replay boundary) instead of a snapshot per block, which is what
++    lets a small attention block_size avoid Mamba dominating the KV pool."""
++    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
++
++    block_size = 16
++    spec = MambaSpec(
++        block_size=block_size,
++        shapes=(1, 1),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++    )
++
++    def retained(retention_interval, num_prompt_tokens=256, end_block=16):
++        m = MambaManager.reachable_block_mask(
++            start_block=0,
++            end_block=end_block,
++            alignment_tokens=block_size,
++            kv_cache_spec=spec,
++            use_eagle=False,
++            retention_interval=retention_interval,
++            num_prompt_tokens=num_prompt_tokens,
++        )
++        return None if m is None else {i for i, v in enumerate(m) if v}
++
++    # Dense default (None) -> no mask, every block cached (unchanged behavior).
++    assert retained(None) is None
++    # interval == block_size -> every block is a boundary -> stays dense.
++    assert retained(block_size) is None
++    # interval 64 = 4 blocks: segment tails at i%4==3 -> {3,7,11,15}; latest
++    # replay boundary 240//16 - 1 = 14. Sparse subset of the 16 blocks.
++    assert retained(64) == {3, 7, 11, 14, 15}
++    # interval 0 -> only the latest replay boundary (block 14).
++    assert retained(0) == {14}
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 376f65f6697a..48f597e1f249 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -22,6 +22,7 @@
+     FullAttentionSpec,
+     KVCacheConfig,
+     KVCacheSpec,
++    MambaSpec,
+     SlidingWindowSpec,
+ )
+ from vllm.v1.request import Request
+@@ -35,18 +36,18 @@ def _validate_prefix_cache_retention_interval(
+     if retention_interval is None:
+         return
+ 
+-    # Retention only sparsifies sliding-window checkpoints for now; every other
+-    # manager (full attention, Mamba, chunked-local) caches densely and
+-    # ignores it to be conservative.
+-    # TODO: Support Mamba/linear attention.
++    # Retention sparsifies sliding-window and Mamba (linear-attention)
++    # checkpoints; full-attention and chunked-local groups cache densely and
++    # ignore it (their hit granularity must stay fine).
+     if not any(
+-        isinstance(g.kv_cache_spec, SlidingWindowSpec)
++        isinstance(g.kv_cache_spec, (SlidingWindowSpec, MambaSpec))
+         for g in kv_cache_config.kv_cache_groups
+     ):
+         raise ValueError(
+             "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is set but this model has "
+-            "no sliding-window KV cache group, so retention has no effect. "
+-            "Unset it (the feature only applies to sliding-window attention)."
++            "no sliding-window or Mamba KV cache group, so retention has no "
++            "effect. Unset it (it only applies to sliding-window and Mamba "
++            "attention)."
+         )
+ 
+     if retention_interval < 0 or retention_interval % scheduler_block_size != 0:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index c98c59017c52..e21c20a22819 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1018,6 +1018,60 @@ def find_longest_cache_hit(
+ 
+         return computed_blocks
+ 
++    @classmethod
++    def reachable_block_mask(
++        cls,
++        start_block: int,
++        end_block: int,
++        alignment_tokens: int | None,
++        kv_cache_spec: KVCacheSpec,
++        use_eagle: bool,
++        retention_interval: int | None = None,
++        num_prompt_tokens: int | None = None,
++    ) -> list[bool] | None:
++        """Sparse Mamba state-snapshot retention.
++
++        ``retention_interval``:
++
++          ``None`` -> dense (cache every block; default, unchanged behavior)
++          ``0``    -> keep only the latest replay boundary
++          ``> 0``  -> keep one state per ``retention_interval``-sized segment
++        """
++        if retention_interval is None or alignment_tokens is None:
++            # Dense caching (default) or no alignment constraint imposed.
++            return None
++        assert isinstance(kv_cache_spec, MambaSpec)
++        block_size = kv_cache_spec.block_size
++        mask = [False] * (end_block - start_block)
++
++        # (1) Segment-boundary states. A Mamba hit needs exactly the single
++        # state block ending on the boundary (no window, and draft models have
++        # no mamba layers, so no eagle shift). Block ``i`` ends at token
++        # ``(i + 1) * block_size``.
++        segment_tokens = None if retention_interval == 0 else retention_interval
++        if segment_tokens is not None:
++            per_segment = segment_tokens // block_size
++            if per_segment <= 1:
++                # Interval at/below the block size: every block is a boundary.
++                return None
++            first_boundary = (
++                start_block + per_segment
++            ) // per_segment * per_segment - 1
++            for i in range(first_boundary - start_block, len(mask), per_segment):
++                mask[i] = True
++
++        # (2) Replay boundary. ``get_computed_blocks`` caps hits at
++        # ``num_prompt - 1``, so an exact prompt replay lands on the latest
++        # fine-aligned boundary. Sparse retention would otherwise skip its
++        # state, so keep it explicitly.
++        if num_prompt_tokens is not None:
++            latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
++            boundary_block = latest // block_size - 1
++            if start_block <= boundary_block < end_block:
++                mask[boundary_block - start_block] = True
++
++        return mask
++
+     def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+         assert isinstance(self.kv_cache_spec, MambaSpec)
+ 
+@@ -1224,9 +1278,12 @@ def cache_blocks(
+             for block in self.req_to_blocks[request.request_id][
+                 num_cached_blocks_before:num_cached_blocks_after
+             ]:
+-                if block.is_null:
++                # Skip null blocks (align-mode skipped states) and blocks that
++                # were not cached this step — with sparse retention
++                # (reachable_block_mask) the intermediate state snapshots carry
++                # no hash and must not be recorded as cached-this-step.
++                if block.is_null or block.block_hash is None:
+                     continue
+-                assert block.block_hash is not None
+                 self.cached_blocks_this_step.add(block.block_hash)
+ 
+     def new_step_starts(self) -> None:

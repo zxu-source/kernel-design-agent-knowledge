@@ -1,0 +1,914 @@
+diff --git a/benchmark/kernels/fused_moe_triton/common_utils.py b/benchmark/kernels/fused_moe_triton/common_utils.py
+index a1fe4e0a36e1..adac313a11b1 100644
+--- a/benchmark/kernels/fused_moe_triton/common_utils.py
++++ b/benchmark/kernels/fused_moe_triton/common_utils.py
+@@ -38,6 +38,10 @@ def get_model_config(
+ ) -> Dict:
+     config = get_config(model_name, trust_remote_code=True)
+ 
++    # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
++    if hasattr(config, "text_config"):
++        config = config.get_text_config()
++
+     block_shape = None
+     if (
+         hasattr(config, "quantization_config")
+@@ -46,11 +50,19 @@ def get_model_config(
+         block_shape = config.quantization_config["weight_block_size"]
+         assert len(block_shape) == 2
+ 
+-    architecture = config.architectures[0]
++    if (
++        hasattr(config, "quantization_config")
++        and "config_groups" in config.quantization_config
++    ):
++        config_groups = config.quantization_config["config_groups"]
++        # Get group_size from the first group's weights config
++        first_group = next(iter(config_groups.values()), {})
++        weights_config = first_group.get("weights", {})
++        group_size = weights_config.get("group_size")
++        block_shape = [0, group_size]
++        assert len(block_shape) == 2
+ 
+-    # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
+-    if hasattr(config, "text_config"):
+-        config = config.get_text_config()
++    architecture = config.architectures[0]
+ 
+     hidden_size = config.hidden_size
+     if architecture == "DbrxForCausalLM":
+@@ -223,6 +235,7 @@ def get_config_filename(
+     use_fp8_w8a8: bool,
+     use_int8_w8a8: bool,
+     use_int8_w8a16: bool,
++    use_int4_w4a16: bool,
+     per_channel_quant: bool,
+     block_shape: List[int],
+ ) -> str:
+@@ -231,13 +244,18 @@ def get_config_filename(
+         use_int8_w8a16=use_int8_w8a16,
+         use_fp8_w8a8=use_fp8_w8a8,
+         use_int8_w8a8=use_int8_w8a8,
++        use_int4_w4a16=use_int4_w4a16,
+     )
+ 
+     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
+     # is the intermediate size after silu_and_mul.
++    N = shard_intermediate_size // 2
++    if use_int4_w4a16:
++        N = N // 2
++
+     filename = get_config_file_name(
+         num_experts,
+-        shard_intermediate_size // 2,
++        N,
+         dtype_str,
+         block_shape,
+         per_channel_quant,
+diff --git a/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py b/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py
+index aef7ed8f6ca7..34aa83b38fd2 100644
+--- a/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py
++++ b/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py
+@@ -28,6 +28,10 @@
+ )
+ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
++from sglang.srt.server_args import (
++    ServerArgs,
++    set_global_server_args_for_scheduler,
++)
+ from sglang.srt.utils import is_hip
+ 
+ _is_hip = is_hip()
+@@ -44,6 +48,7 @@ def benchmark_config(
+     use_fp8_w8a8: bool,
+     use_int8_w8a8: bool,
+     use_int8_w8a16: bool,
++    use_int4_w4a16: bool,
+     per_channel_quant: bool,
+     block_shape: List[int] = None,
+     num_iters: int = 100,
+@@ -71,6 +76,27 @@ def benchmark_config(
+             ),
+             dtype=torch.int8,
+         )
++    elif use_int4_w4a16:
++        w1 = torch.randint(
++            0,
++            255,
++            (
++                num_experts,
++                shard_intermediate_size,
++                hidden_size // 2,
++            ),
++            dtype=torch.uint8,
++        )
++        w2 = torch.randint(
++            0,
++            255,
++            (
++                num_experts,
++                hidden_size,
++                shard_intermediate_size // 4,
++            ),
++            dtype=torch.uint8,
++        )
+     else:
+         w1 = torch.randn(
+             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
+@@ -89,6 +115,19 @@ def benchmark_config(
+             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
+         )
+         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
++    if use_int4_w4a16:
++        block_n = 1 if (block_shape[0] == 0) else block_shape[0]
++        block_k = block_shape[1]
++        n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
++        n_tiles_w2 = (hidden_size + block_n - 1) // block_n
++        k_tiles_w1 = (hidden_size + block_k - 1) // block_k
++        k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
++        w1_scale = torch.randn(
++            (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.bfloat16
++        )
++        w2_scale = torch.randn(
++            (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.bfloat16
++        )
+     if use_fp8_w8a8 or use_int8_w8a8:
+         if use_int8_w8a8 and block_shape is None:
+             w1_scale = torch.randn(
+@@ -146,6 +185,7 @@ def run():
+                 use_fp8_w8a8=use_fp8_w8a8,
+                 use_int8_w8a8=use_int8_w8a8,
+                 use_int8_w8a16=use_int8_w8a16,
++                use_int4_w4a16=use_int4_w4a16,
+                 w1_scale=w1_scale,
+                 w2_scale=w2_scale,
+                 a1_scale=a1_scale,
+@@ -195,13 +235,14 @@ def run():
+ @ray.remote(num_gpus=1)
+ class BenchmarkWorker:
+ 
+-    def __init__(self, seed: int) -> None:
++    def __init__(self, seed: int, server_args: ServerArgs) -> None:
+         torch.set_default_device("cuda")
+         torch.cuda.manual_seed_all(0)
+         self.seed = seed
+         # Get the device ID to allocate tensors and kernels
+         # on the respective GPU.
+         self.device_id = int(ray.get_gpu_ids()[0])
++        set_global_server_args_for_scheduler(server_args)
+ 
+     def benchmark(
+         self,
+@@ -214,20 +255,27 @@ def benchmark(
+         use_fp8_w8a8: bool,
+         use_int8_w8a8: bool,
+         use_int8_w8a16: bool,
++        use_int4_w4a16: bool,
+         per_channel_quant: bool,
+         block_shape: List[int],
+     ) -> Tuple[Dict[str, int], float]:
+         torch.cuda.manual_seed_all(0)
+         dtype_str = get_config_dtype_str(
+-            dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
++            dtype,
++            use_int8_w8a16=use_int8_w8a16,
++            use_fp8_w8a8=use_fp8_w8a8,
++            use_int4_w4a16=use_int4_w4a16,
+         )
+         # NOTE(woosuk): The current naming convention uses w2.shape[2], which
+         # is the intermediate size after silu_and_mul.
+         block_n = block_shape[0] if block_shape else 0
+         block_k = block_shape[1] if block_shape else 0
++        N = shard_intermediate_size // 2
++        if use_int4_w4a16:
++            N = N // 2
+         op_config = get_moe_configs(
+             num_experts,
+-            shard_intermediate_size // 2,
++            N,
+             dtype_str,
+             block_n,
+             block_k,
+@@ -258,6 +306,7 @@ def benchmark(
+                 use_fp8_w8a8,
+                 use_int8_w8a8,
+                 use_int8_w8a16,
++                use_int4_w4a16,
+                 per_channel_quant,
+                 block_shape,
+             )
+@@ -274,6 +323,7 @@ def tune(
+         use_fp8_w8a8: bool,
+         use_int8_w8a8: bool,
+         use_int8_w8a16: bool,
++        use_int4_w4a16: bool,
+         per_channel_quant: bool,
+         block_shape: List[int],
+         search_space: List[Dict[str, int]],
+@@ -294,6 +344,7 @@ def tune(
+                         use_fp8_w8a8,
+                         use_int8_w8a8,
+                         use_int8_w8a16,
++                        use_int4_w4a16,
+                         per_channel_quant,
+                         block_shape,
+                         num_iters=10,
+@@ -312,7 +363,9 @@ def tune(
+ 
+ 
+ def main(args: argparse.Namespace):
+-    print(args)
++    server_args = ServerArgs(
++        model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
++    )
+ 
+     model_config = get_model_config(
+         args.model, args.tp_size, args.ep_size, args.disable_shared_experts_fusion
+@@ -328,6 +381,7 @@ def main(args: argparse.Namespace):
+     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
+     use_int8_w8a8 = args.dtype == "int8_w8a8"
+     use_int8_w8a16 = args.dtype == "int8_w8a16"
++    use_int4_w4a16 = args.dtype == "int4_w4a16"
+     per_channel_quant = args.per_channel_quant
+ 
+     if args.batch_size is None:
+@@ -337,7 +391,7 @@ def main(args: argparse.Namespace):
+ 
+     ray.init()
+     num_gpus = int(ray.available_resources()["GPU"])
+-    workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
++    workers = [BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)]
+ 
+     def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+         outputs = []
+@@ -369,6 +423,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+             use_fp8_w8a8,
+             use_int8_w8a8,
+             use_int8_w8a16,
++            use_int4_w4a16,
+             per_channel_quant,
+             block_shape,
+         )
+@@ -390,6 +445,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+                     use_fp8_w8a8,
+                     use_int8_w8a8,
+                     use_int8_w8a16,
++                    use_int4_w4a16,
+                     per_channel_quant,
+                     block_shape,
+                     search_space,
+@@ -420,6 +476,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+                     use_fp8_w8a8,
+                     use_int8_w8a8,
+                     use_int8_w8a16,
++                    use_int4_w4a16,
+                     per_channel_quant,
+                     block_shape,
+                 )
+@@ -442,7 +499,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+     parser.add_argument(
+         "--dtype",
+         type=str,
+-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8"],
++        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int4_w4a16"],
+         default="auto",
+     )
+     parser.add_argument(
+diff --git a/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py b/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py
+index a903a15a9ec0..8d4afbe84d52 100644
+--- a/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py
++++ b/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py
+@@ -32,6 +32,10 @@
+ )
+ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
++from sglang.srt.server_args import (
++    ServerArgs,
++    set_global_server_args_for_scheduler,
++)
+ from sglang.srt.utils import is_hip
+ 
+ _is_hip = is_hip()
+@@ -132,6 +136,7 @@ def benchmark_config(
+     use_fp8_w8a8: bool,
+     use_int8_w8a8: bool,
+     use_int8_w8a16: bool,
++    use_int4_w4a16: bool,
+     topk_ids_list,
+     block_shape: List[int] = None,
+     ep_size: int = 1,
+@@ -163,6 +168,27 @@ def benchmark_config(
+             ),
+             dtype=torch.int8,
+         )
++    elif use_int4_w4a16:
++        w1 = torch.randint(
++            0,
++            255,
++            (
++                num_experts,
++                shard_intermediate_size,
++                hidden_size // 2,
++            ),
++            dtype=torch.uint8,
++        )
++        w2 = torch.randint(
++            0,
++            255,
++            (
++                num_experts,
++                hidden_size,
++                shard_intermediate_size // 4,
++            ),
++            dtype=torch.uint8,
++        )
+     else:
+         w1 = torch.randn(
+             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
+@@ -180,6 +206,19 @@ def benchmark_config(
+             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
+         )
+         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
++    if use_int4_w4a16:
++        block_n = 1 if (block_shape[0] == 0) else block_shape[0]
++        block_k = block_shape[1]
++        n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
++        n_tiles_w2 = (hidden_size + block_n - 1) // block_n
++        k_tiles_w1 = (hidden_size + block_k - 1) // block_k
++        k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
++        w1_scale = torch.randn(
++            (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.bfloat16
++        )
++        w2_scale = torch.randn(
++            (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.bfloat16
++        )
+     if use_fp8_w8a8 or use_int8_w8a8:
+         if use_int8_w8a8 and block_shape is None:
+             w1_scale = torch.randn(
+@@ -284,7 +323,7 @@ def get_kernel_wrapper(moe_use_tma, inner_iter, use_cuda_graph):
+             B=w1,
+             bias=None,
+             C=intermediate_cache1,
+-            A_scale=None,
++            A_scale=a1_scale,
+             B_scale=w1_scale,
+             B_zp=None,
+             topk_weights=topk_output_.topk_weights,
+@@ -294,9 +333,9 @@ def get_kernel_wrapper(moe_use_tma, inner_iter, use_cuda_graph):
+             config=config,
+             compute_type=compute_type,
+             use_fp8_w8a8=use_fp8_w8a8,
+-            use_int8_w8a8=False,
+-            use_int8_w8a16=False,
+-            use_int4_w4a16=False,
++            use_int8_w8a8=use_int8_w8a8,
++            use_int8_w8a16=use_int8_w8a16,
++            use_int4_w4a16=use_int4_w4a16,
+             per_channel_quant=False,
+             block_shape=block_shape,
+             b_use_tma=moe_use_tma,
+@@ -320,9 +359,9 @@ def get_kernel_wrapper(moe_use_tma, inner_iter, use_cuda_graph):
+             config=config,
+             compute_type=compute_type,
+             use_fp8_w8a8=use_fp8_w8a8,
+-            use_int8_w8a8=False,
+-            use_int8_w8a16=False,
+-            use_int4_w4a16=False,
++            use_int8_w8a8=use_int8_w8a8,
++            use_int8_w8a16=use_int8_w8a16,
++            use_int4_w4a16=use_int4_w4a16,
+             per_channel_quant=False,
+             block_shape=block_shape,
+             a_use_tma=moe_use_tma,
+@@ -405,13 +444,14 @@ def config_dict(self, block_m):
+ 
+ class BenchmarkWorker:
+ 
+-    def __init__(self, seed: int) -> None:
++    def __init__(self, seed: int, server_args: ServerArgs) -> None:
+         torch.set_default_device("cuda")
+         torch.cuda.manual_seed_all(0)
+         self.seed = seed
+         # Get the device ID to allocate tensors and kernels
+         # on the respective GPU.
+         self.device_id = 0  # int(ray.get_gpu_ids()[0])
++        set_global_server_args_for_scheduler(server_args)
+ 
+     def benchmark(
+         self,
+@@ -424,6 +464,7 @@ def benchmark(
+         use_fp8_w8a8: bool,
+         use_int8_w8a8: bool,
+         use_int8_w8a16: bool,
++        use_int4_w4a16: bool,
+         block_shape: List[int],
+         cfg: Dict[str, int],
+         topk_ids_dir: str,
+@@ -443,6 +484,7 @@ def benchmark(
+                 use_fp8_w8a8,
+                 use_int8_w8a8,
+                 use_int8_w8a16,
++                use_int4_w4a16,
+                 topk_ids_list,
+                 block_shape,
+                 ep_size=ep_size,
+@@ -460,6 +502,7 @@ def tune(
+         use_fp8_w8a8: bool,
+         use_int8_w8a8: bool,
+         use_int8_w8a16: bool,
++        use_int4_w4a16: bool,
+         block_shape: List[int],
+         search_space: List[Dict[str, int]],
+         topk_ids_dir: str,
+@@ -483,6 +526,7 @@ def tune(
+                         use_fp8_w8a8,
+                         use_int8_w8a8,
+                         use_int8_w8a16,
++                        use_int4_w4a16,
+                         topk_ids_list,
+                         block_shape,
+                         ep_size=ep_size,
+@@ -527,6 +571,7 @@ def cmp_configs(
+         use_fp8_w8a8: bool,
+         use_int8_w8a8: bool,
+         use_int8_w8a16: bool,
++        use_int4_w4a16: bool,
+         block_shape: List[int],
+         cmp_config_files: List[str],
+         topk_ids_dir: str,
+@@ -562,6 +607,7 @@ def cmp_configs(
+                         use_fp8_w8a8,
+                         use_int8_w8a8,
+                         use_int8_w8a16,
++                        use_int4_w4a16,
+                         topk_ids_list,
+                         block_shape,
+                         ep_size=ep_size,
+@@ -582,6 +628,7 @@ def save_configs_sep(
+     use_fp8_w8a8: bool,
+     use_int8_w8a8: bool,
+     use_int8_w8a16: bool,
++    use_int4_w4a16: bool,
+     block_shape: List[int],
+     down_moe: bool = False,
+ ) -> None:
+@@ -590,6 +637,7 @@ def save_configs_sep(
+         use_int8_w8a16=use_int8_w8a16,
+         use_fp8_w8a8=use_fp8_w8a8,
+         use_int8_w8a8=use_int8_w8a8,
++        use_int4_w4a16=use_int4_w4a16,
+     )
+ 
+     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
+@@ -611,6 +659,10 @@ def save_configs_sep(
+ def main(args: argparse.Namespace):
+     print(args)
+ 
++    server_args = ServerArgs(
++        model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
++    )
++
+     model_config = get_model_config(
+         args.model,
+         args.tp_size,
+@@ -629,6 +681,7 @@ def main(args: argparse.Namespace):
+     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
+     use_int8_w8a8 = args.dtype == "int8_w8a8"
+     use_int8_w8a16 = args.dtype == "int8_w8a16"
++    use_int4_w4a16 = args.dtype == "int4_w4a16"
+ 
+     topk_ids_dir = args.topk_ids_dir
+     if args.batch_size is None:
+@@ -638,7 +691,7 @@ def main(args: argparse.Namespace):
+         batch_sizes = [args.batch_size]
+ 
+     if args.cmp_configs is not None:
+-        worker = BenchmarkWorker(args.seed)
++        worker = BenchmarkWorker(args.seed, server_args)
+         worker.cmp_configs(
+             batch_sizes,
+             E,
+@@ -649,6 +702,7 @@ def main(args: argparse.Namespace):
+             use_fp8_w8a8,
+             use_int8_w8a8,
+             use_int8_w8a16,
++            use_int4_w4a16,
+             block_shape,
+             args.cmp_configs,
+             topk_ids_dir,
+@@ -657,7 +711,7 @@ def main(args: argparse.Namespace):
+         return
+ 
+     if len(batch_sizes) == 1:
+-        worker = BenchmarkWorker(args.seed)
++        worker = BenchmarkWorker(args.seed, server_args)
+         if args.tune:
+             search_space = get_configs_compute_bound()
+             worker.tune(
+@@ -670,6 +724,7 @@ def main(args: argparse.Namespace):
+                 use_fp8_w8a8,
+                 use_int8_w8a8,
+                 use_int8_w8a16,
++                use_int4_w4a16,
+                 block_shape,
+                 search_space,
+                 topk_ids_dir,
+@@ -695,6 +750,7 @@ def main(args: argparse.Namespace):
+                 use_fp8_w8a8,
+                 use_int8_w8a8,
+                 use_int8_w8a16,
++                use_int4_w4a16,
+                 block_shape,
+                 cfg,
+                 topk_ids_dir,
+@@ -708,7 +764,7 @@ def main(args: argparse.Namespace):
+     ray.init()
+     num_gpus = int(ray.available_resources()["GPU"])
+     workers = [
+-        ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed)
++        ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed, server_args)
+         for _ in range(num_gpus)
+     ]
+ 
+@@ -738,6 +794,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+         use_fp8_w8a8,
+         use_int8_w8a8,
+         use_int8_w8a16,
++        use_int4_w4a16,
+         False,
+         block_shape,
+     )
+@@ -759,6 +816,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+                 use_fp8_w8a8,
+                 use_int8_w8a8,
+                 use_int8_w8a16,
++                use_int4_w4a16,
+                 block_shape,
+                 search_space,
+                 topk_ids_dir,
+@@ -787,6 +845,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+         use_fp8_w8a8,
+         use_int8_w8a8,
+         use_int8_w8a16,
++        use_int4_w4a16,
+         block_shape,
+     )
+ 
+@@ -801,6 +860,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+         use_fp8_w8a8,
+         use_int8_w8a8,
+         use_int8_w8a16,
++        use_int4_w4a16,
+         block_shape,
+         down_moe=True,
+     )
+@@ -818,7 +878,7 @@ def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+     parser.add_argument(
+         "--dtype",
+         type=str,
+-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8"],
++        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int8_w4a16"],
+         default="auto",
+     )
+     parser.add_argument("--seed", type=int, default=0)
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_4_0/E=384,N=128,device_name=,dtype=int4_w4a16.json b/python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_4_0/E=384,N=128,device_name=,dtype=int4_w4a16.json
+new file mode 100644
+index 000000000000..66313c12af23
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_4_0/E=384,N=128,device_name=,dtype=int4_w4a16.json
+@@ -0,0 +1,164 @@
++{
++    "1": {
++        "BLOCK_SIZE_M": 32,
++        "BLOCK_SIZE_N": 16,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "2": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 16,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 1,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "4": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 1,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "8": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "16": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "24": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 1,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "32": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 8,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "48": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 8,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "64": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "96": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 8,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "128": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 8,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "256": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "512": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "1024": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "1536": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "2048": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "3072": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "4096": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    }
++}
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_4_0/E=384,N=128,device_name=,dtype=int4_w4a16_down.json b/python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_4_0/E=384,N=128,device_name=,dtype=int4_w4a16_down.json
+new file mode 100644
+index 000000000000..66313c12af23
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_4_0/E=384,N=128,device_name=,dtype=int4_w4a16_down.json
+@@ -0,0 +1,164 @@
++{
++    "1": {
++        "BLOCK_SIZE_M": 32,
++        "BLOCK_SIZE_N": 16,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "2": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 16,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 1,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "4": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 1,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "8": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "16": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "24": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 1,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "32": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 8,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "48": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 8,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "64": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "96": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 8,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "128": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 8,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "256": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "512": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "1024": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "1536": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "2048": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "3072": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    },
++    "4096": {
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 32,
++        "GROUP_SIZE_M": 4,
++        "num_warps": 2,
++        "num_stages": 2,
++        "waves_per_eu": 0
++    }
++}

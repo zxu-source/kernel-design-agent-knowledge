@@ -1,0 +1,1483 @@
+diff --git a/python/sglang/kernels/README.md b/python/sglang/kernels/README.md
+index e90f7822861d..30602f0326d2 100644
+--- a/python/sglang/kernels/README.md
++++ b/python/sglang/kernels/README.md
+@@ -53,7 +53,7 @@ explicitly, e.g.:
+ 
+ ```python
+ from sglang.kernels import select_kernel, KernelBackend
+-jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.CUDA_JIT).load()
++jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()
+ ```
+ 
+ ## `BaseFusedOp` — the per-operator implementation contract
+@@ -67,7 +67,7 @@ single `forward()`:
+   every other backend is checked against.
+ - `forward_torch_compile` — inherited for free as
+   `torch.compile(forward_native)`.
+-- `forward_triton` / `forward_cuda_jit` / `forward_cuda_aot` /
++- `forward_triton` / `forward_jit` / `forward_aot` /
+   `forward_cute_dsl` / `forward_flashinfer` / `forward_deepgemm` — opt-in
+   overrides. A backend is *available* iff its method is overridden.
+ 
+diff --git a/python/sglang/kernels/__init__.py b/python/sglang/kernels/__init__.py
+index 8bc34fccf78f..aaaffc4e2972 100644
+--- a/python/sglang/kernels/__init__.py
++++ b/python/sglang/kernels/__init__.py
+@@ -38,10 +38,12 @@
+ from sglang.kernels.selector import get_kernel, select_kernel
+ from sglang.kernels.spec import (
+     CapabilityRequirement,
++    DeviceType,
+     FormatSignature,
+     KernelBackend,
+     KernelSpec,
+     PlatformInfo,
++    capabilities_satisfied,
+ )
+ 
+ # Importing the operator groups populates the registry (metadata only). Kept
+@@ -53,6 +55,8 @@
+     "ops",
+     "BaseFusedOp",
+     "CapabilityRequirement",
++    "DeviceType",
++    "capabilities_satisfied",
+     "FormatSignature",
+     "FusedOpTraceRecord",
+     "KernelBackend",
+diff --git a/python/sglang/kernels/fused_op.py b/python/sglang/kernels/fused_op.py
+index e54d7f18d2e4..34ffe0aab681 100644
+--- a/python/sglang/kernels/fused_op.py
++++ b/python/sglang/kernels/fused_op.py
+@@ -12,7 +12,7 @@
+   every other backend is checked against.
+ - ``forward_torch_compile`` — provided by the base class as
+   ``torch.compile(forward_native)``.
+-- ``forward_triton`` / ``forward_cuda_jit`` / ``forward_cuda_aot`` /
++- ``forward_triton`` / ``forward_jit`` / ``forward_aot`` /
+   ``forward_cute_dsl`` / ``forward_flashinfer`` / ``forward_deepgemm`` —
+   opt-in overrides.
+ 
+@@ -36,7 +36,16 @@
+ 
+ import functools
+ from abc import ABC, abstractmethod
+-from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple
++from typing import (
++    AbstractSet,
++    Any,
++    ClassVar,
++    Dict,
++    List,
++    Mapping,
++    Optional,
++    Tuple,
++)
+ 
+ import msgspec
+ 
+@@ -47,29 +56,32 @@
+     KernelBackend,
+     KernelSpec,
+     PlatformInfo,
++    capabilities_satisfied,
+ )
+ 
+-# backend -> forward_<backend> method name.
++# backend (provenance) -> forward_<backend> method name.
+ BACKEND_METHODS: Dict[KernelBackend, str] = {
+     KernelBackend.TORCH: "forward_native",
+     KernelBackend.TORCH_COMPILE: "forward_torch_compile",
+     KernelBackend.TRITON: "forward_triton",
+-    KernelBackend.CUDA_JIT: "forward_cuda_jit",
+-    KernelBackend.CUDA_AOT: "forward_cuda_aot",
++    KernelBackend.JIT: "forward_jit",
++    KernelBackend.AOT: "forward_aot",
+     KernelBackend.CUTE_DSL: "forward_cute_dsl",
+     KernelBackend.FLASHINFER: "forward_flashinfer",
+     KernelBackend.DEEPGEMM: "forward_deepgemm",
++    KernelBackend.AITER: "forward_aiter",
+ }
+ 
+ # best -> fallback. ``torch_compile`` is deliberately absent: auto-selection
+ # must never trigger a surprise compilation in a serving process; force it
+-# explicitly when wanted.
++# explicitly when wanted. Per-op priority overrides this (see BaseFusedOp).
+ DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
+-    KernelBackend.CUDA_AOT,
+-    KernelBackend.CUDA_JIT,
++    KernelBackend.AOT,
++    KernelBackend.JIT,
+     KernelBackend.FLASHINFER,
+     KernelBackend.DEEPGEMM,
+     KernelBackend.CUTE_DSL,
++    KernelBackend.AITER,
+     KernelBackend.TRITON,
+     KernelBackend.TORCH,
+ )
+@@ -181,8 +193,11 @@ class BaseFusedOp(ABC):
+         Backend preference for auto-selection, best first. Defaults to
+         :data:`DEFAULT_PRIORITY`.
+     capabilities:
+-        Per-backend :class:`CapabilityRequirement`, consulted by
+-        :meth:`backend_eligible` (and exported into the registry specs).
++        Per-backend set of :class:`CapabilityRequirement` (OR semantics;
++        omitted / empty = runs on any device), consulted by
++        :meth:`backend_eligible` (and exported into the registry specs). Use the
++        ``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.NPU`` shortcuts, e.g.
++        ``{KernelBackend.AOT: {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}}``.
+     format_signature:
+         Data-contract description shared by all backends of this op.
+     descriptions:
+@@ -191,7 +206,9 @@ class BaseFusedOp(ABC):
+ 
+     op: ClassVar[str]
+     priority: ClassVar[Tuple[KernelBackend, ...]] = DEFAULT_PRIORITY
+-    capabilities: ClassVar[Mapping[KernelBackend, CapabilityRequirement]] = {}
++    capabilities: ClassVar[
++        Mapping[KernelBackend, AbstractSet[CapabilityRequirement]]
++    ] = {}
+     format_signature: ClassVar[FormatSignature] = FormatSignature()
+     descriptions: ClassVar[Mapping[KernelBackend, str]] = {}
+ 
+@@ -234,11 +251,11 @@ def forward_torch_compile(self, *args, **kwargs):
+     def forward_triton(self, *args, **kwargs):
+         raise NotImplementedError(f"{self.op}: no triton backend")
+ 
+-    def forward_cuda_jit(self, *args, **kwargs):
+-        raise NotImplementedError(f"{self.op}: no cuda_jit backend")
++    def forward_jit(self, *args, **kwargs):
++        raise NotImplementedError(f"{self.op}: no jit backend")
+ 
+-    def forward_cuda_aot(self, *args, **kwargs):
+-        raise NotImplementedError(f"{self.op}: no cuda_aot backend")
++    def forward_aot(self, *args, **kwargs):
++        raise NotImplementedError(f"{self.op}: no aot backend")
+ 
+     def forward_cute_dsl(self, *args, **kwargs):
+         raise NotImplementedError(f"{self.op}: no cute_dsl backend")
+@@ -249,6 +266,9 @@ def forward_flashinfer(self, *args, **kwargs):
+     def forward_deepgemm(self, *args, **kwargs):
+         raise NotImplementedError(f"{self.op}: no deepgemm backend")
+ 
++    def forward_aiter(self, *args, **kwargs):
++        raise NotImplementedError(f"{self.op}: no aiter backend")
++
+     # --- selection ---
+ 
+     def available_backends(self) -> List[KernelBackend]:
+@@ -259,12 +279,13 @@ def backend_eligible(self, backend: KernelBackend, *args, **kwargs) -> bool:
+         """Whether ``backend`` may run *this* call.
+ 
+         The base implementation checks the backend's
+-        :class:`CapabilityRequirement` against the detected platform.
+-        Subclasses may extend it with per-call shape/dtype gates so
++        :class:`CapabilityRequirement` set (OR semantics) against the detected
++        platform. Subclasses may extend it with per-call shape/dtype gates so
+         auto-selection bounces to the next backend instead of raising.
+         """
+-        capability = self.capabilities.get(backend)
+-        return capability is None or capability.is_satisfied_by(_platform())
++        return capabilities_satisfied(
++            self.capabilities.get(backend, frozenset()), _platform()
++        )
+ 
+     def _resolve_backend(self, *args, **kwargs) -> KernelBackend:
+         forced = get_fused_op_backend()
+@@ -300,7 +321,7 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
+ 
+     ``module``/``attr`` locate the module-level instance so that
+     ``KernelSpec.load()`` can lazily resolve e.g.
+-    ``"<module>:<attr>.forward_cuda_aot"`` to the bound backend method. Returns
++    ``"<module>:<attr>.forward_aot"`` to the bound backend method. Returns
+     ``instance`` so group packages can write
+     ``_RMSNORM = register_fused_op(_RMSNormOp(), __name__, "_RMSNORM")``.
+     """
+@@ -310,7 +331,7 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
+                 op=instance.op,
+                 backend=backend,
+                 target=f"{module}:{attr}.{BACKEND_METHODS[backend]}",
+-                capability=instance.capabilities.get(backend, CapabilityRequirement()),
++                capabilities=frozenset(instance.capabilities.get(backend, ())),
+                 format_signature=instance.format_signature,
+                 description=instance.descriptions.get(backend, ""),
+             )
+diff --git a/python/sglang/kernels/ops/activation/__init__.py b/python/sglang/kernels/ops/activation/__init__.py
+index 3bd204a5d9f0..0a493f251229 100644
+--- a/python/sglang/kernels/ops/activation/__init__.py
++++ b/python/sglang/kernels/ops/activation/__init__.py
+@@ -4,7 +4,7 @@
+ pure-``torch`` reference (``forward_native``) plus AOT (``sgl_kernel``) and
+ JIT CUDA backends behind one ``(input, out)`` signature. The JIT backend
+ additionally accepts ``expert_ids`` / ``expert_step`` — call
+-``forward_cuda_jit`` directly when those are needed.
++``forward_jit`` directly when those are needed.
+ """
+ 
+ from __future__ import annotations
+@@ -24,10 +24,17 @@
+     import torch
+ 
+ _ACT_DTYPES = ("float16", "bfloat16")
+-_CUDA = CapabilityRequirement(requires_cuda=True)
++_CUDA = frozenset({CapabilityRequirement.CUDA})
++_HIP = frozenset({CapabilityRequirement.HIP})
++# sgl_kernel's gated-activation ops build for CUDA *and* ROCm (production
++# imports them from sgl_kernel on both), so the AOT backend spans both devices
++# — the canonical OR-semantics case that a device-baked backend name couldn't.
++_CUDA_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
++# JIT before AOT to match the production path (srt/layers/activation.py imports
++# from sglang.jit_kernel.activation on CUDA); auto-selection must not invert it.
+ _ACT_PRIORITY = (
+-    KernelBackend.CUDA_AOT,
+-    KernelBackend.CUDA_JIT,
++    KernelBackend.JIT,
++    KernelBackend.AOT,
+     KernelBackend.TORCH,
+ )
+ 
+@@ -40,8 +47,8 @@ class _GatedActivationOp(BaseFusedOp):
+ 
+     priority = _ACT_PRIORITY
+     capabilities = {
+-        KernelBackend.CUDA_AOT: _CUDA,
+-        KernelBackend.CUDA_JIT: _CUDA,
++        KernelBackend.AOT: _CUDA_HIP,
++        KernelBackend.JIT: _CUDA,
+     }
+     format_signature = FormatSignature(
+         supported_dtypes=_ACT_DTYPES,
+@@ -61,14 +68,14 @@ def forward_native(
+         out.copy_(result)
+         return out
+ 
+-    def forward_cuda_aot(
++    def forward_aot(
+         self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+     ) -> torch.Tensor:
+         import sgl_kernel
+ 
+         return getattr(sgl_kernel, self.kernel_attr)(input, out)
+ 
+-    def forward_cuda_jit(
++    def forward_jit(
+         self,
+         input: torch.Tensor,
+         out: Optional[torch.Tensor] = None,
+@@ -83,13 +90,37 @@ def forward_cuda_jit(
+ 
+ 
+ class SiluAndMulOp(_GatedActivationOp):
+-    """``out = silu(input[..., :d]) * input[..., d:]`` with ``d = input.shape[-1] // 2``."""
++    """``out = silu(input[..., :d]) * input[..., d:]`` with ``d = input.shape[-1] // 2``.
++
++    Adds an ``AITER`` backend on ``device=HIP``: on ROCm this op has a native
++    ``aiter`` kernel (``srt/layers/activation.py`` uses it in production). Note
++    the sibling gelu ops below deliberately do *not* register AITER — ROCm/aiter
++    coverage is a per-``(op, backend)`` subset, which the decoupled backend/device
++    model expresses directly (a device-agnostic ``KernelBackend`` name plus a
++    per-backend ``CapabilityRequirement``).
++    """
+ 
+     op = "activation.silu_and_mul"
+     kernel_attr = "silu_and_mul"
++    # AOT spans CUDA+HIP; JIT is CUDA; AITER is an opt-in HIP path. By priority,
++    # CUDA resolves to JIT and HIP resolves to AOT (matching production
++    # defaults); AITER is registered and HIP-eligible but sits below AOT, so it
++    # is available for explicit/forced selection without changing the default.
++    priority = (
++        KernelBackend.JIT,
++        KernelBackend.AOT,
++        KernelBackend.AITER,
++        KernelBackend.TORCH,
++    )
++    capabilities = {
++        KernelBackend.AOT: _CUDA_HIP,
++        KernelBackend.JIT: _CUDA,
++        KernelBackend.AITER: _HIP,
++    }
+     descriptions = {
+-        KernelBackend.CUDA_AOT: "silu_and_mul (sgl_kernel wheel).",
+-        KernelBackend.CUDA_JIT: "silu_and_mul (sglang.jit_kernel).",
++        KernelBackend.AOT: "silu_and_mul (sgl_kernel wheel).",
++        KernelBackend.JIT: "silu_and_mul (sglang.jit_kernel).",
++        KernelBackend.AITER: "silu_and_mul (aiter, ROCm).",
+         KernelBackend.TORCH: "silu_and_mul (pure-torch reference).",
+     }
+ 
+@@ -98,6 +129,22 @@ def _act(self, gate: torch.Tensor) -> torch.Tensor:
+ 
+         return F.silu(gate)
+ 
++    def forward_aiter(
++        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
++    ) -> torch.Tensor:
++        import torch
++        from aiter import silu_and_mul as _aiter_silu_and_mul
++
++        d = input.shape[-1] // 2
++        if out is None:
++            out = torch.empty(
++                (*input.shape[:-1], d), dtype=input.dtype, device=input.device
++            )
++        # aiter's ROCm silu_and_mul: (out, input, limit); limit=0.0 = no clamp,
++        # matching the standard (unclamped) gated-SiLU used elsewhere.
++        _aiter_silu_and_mul(out, input, 0.0)
++        return out
++
+ 
+ class GeluAndMulOp(_GatedActivationOp):
+     """``out = gelu(input[..., :d]) * input[..., d:]`` (erf-based GELU)."""
+@@ -105,8 +152,8 @@ class GeluAndMulOp(_GatedActivationOp):
+     op = "activation.gelu_and_mul"
+     kernel_attr = "gelu_and_mul"
+     descriptions = {
+-        KernelBackend.CUDA_AOT: "gelu_and_mul (sgl_kernel wheel).",
+-        KernelBackend.CUDA_JIT: "gelu_and_mul (sglang.jit_kernel).",
++        KernelBackend.AOT: "gelu_and_mul (sgl_kernel wheel).",
++        KernelBackend.JIT: "gelu_and_mul (sglang.jit_kernel).",
+         KernelBackend.TORCH: "gelu_and_mul (pure-torch reference).",
+     }
+ 
+@@ -122,8 +169,8 @@ class GeluTanhAndMulOp(_GatedActivationOp):
+     op = "activation.gelu_tanh_and_mul"
+     kernel_attr = "gelu_tanh_and_mul"
+     descriptions = {
+-        KernelBackend.CUDA_AOT: "gelu_tanh_and_mul (sgl_kernel wheel).",
+-        KernelBackend.CUDA_JIT: "gelu_tanh_and_mul (sglang.jit_kernel).",
++        KernelBackend.AOT: "gelu_tanh_and_mul (sgl_kernel wheel).",
++        KernelBackend.JIT: "gelu_tanh_and_mul (sglang.jit_kernel).",
+         KernelBackend.TORCH: "gelu_tanh_and_mul (pure-torch reference).",
+     }
+ 
+diff --git a/python/sglang/kernels/ops/diffusion/__init__.py b/python/sglang/kernels/ops/diffusion/__init__.py
+index 2ae0c0ee02d1..ede2683ff069 100644
+--- a/python/sglang/kernels/ops/diffusion/__init__.py
++++ b/python/sglang/kernels/ops/diffusion/__init__.py
+@@ -20,14 +20,14 @@
+     import torch
+     from torch import nn
+ 
+-_CUDA = CapabilityRequirement(requires_cuda=True)
++_CUDA = frozenset({CapabilityRequirement.CUDA})
+ 
+ register_kernel(
+     KernelSpec(
+         op="diffusion.apply_group_norm_silu",
+-        backend=KernelBackend.CUDA_JIT,
++        backend=KernelBackend.JIT,
+         target="sglang.jit_kernel.diffusion.group_norm_silu:apply_group_norm_silu",
+-        capability=_CUDA,
++        capabilities=_CUDA,
+         format_signature=FormatSignature(description="fused GroupNorm + SiLU"),
+         description="Fused group-norm + SiLU (sglang.jit_kernel).",
+     )
+@@ -35,9 +35,9 @@
+ register_kernel(
+     KernelSpec(
+         op="diffusion.residual_gate_add",
+-        backend=KernelBackend.CUDA_JIT,
++        backend=KernelBackend.JIT,
+         target="sglang.jit_kernel.diffusion.residual_gate_add:residual_gate_add_cuda",
+-        capability=_CUDA,
++        capabilities=_CUDA,
+         format_signature=FormatSignature(description="residual + gate * update"),
+         description="Fused residual gate-add (sglang.jit_kernel).",
+     )
+@@ -45,9 +45,9 @@
+ register_kernel(
+     KernelSpec(
+         op="diffusion.fused_inplace_qknorm_rope",
+-        backend=KernelBackend.CUDA_JIT,
++        backend=KernelBackend.JIT,
+         target="sglang.jit_kernel.diffusion.qknorm_rope:fused_inplace_qknorm_rope",
+-        capability=_CUDA,
++        capabilities=_CUDA,
+         format_signature=FormatSignature(
+             in_place=True, description="fused in-place QK-norm + RoPE"
+         ),
+@@ -60,7 +60,7 @@ def apply_group_norm_silu(
+     x: torch.Tensor, norm: nn.Module, activation: nn.Module
+ ) -> torch.Tensor:
+     """Fused GroupNorm + SiLU (falls back to eager when unsupported)."""
+-    return get_kernel("diffusion.apply_group_norm_silu", KernelBackend.CUDA_JIT)(
++    return get_kernel("diffusion.apply_group_norm_silu", KernelBackend.JIT)(
+         x, norm, activation
+     )
+ 
+@@ -69,7 +69,7 @@ def residual_gate_add(
+     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+ ) -> torch.Tensor:
+     """Fused ``residual + gate * update``."""
+-    return get_kernel("diffusion.residual_gate_add", KernelBackend.CUDA_JIT)(
++    return get_kernel("diffusion.residual_gate_add", KernelBackend.JIT)(
+         residual, update, gate
+     )
+ 
+@@ -88,7 +88,7 @@ def fused_inplace_qknorm_rope(
+     rope_dim: int = 0,
+ ) -> None:
+     """Fused in-place QK RMS-norm + RoPE."""
+-    return get_kernel("diffusion.fused_inplace_qknorm_rope", KernelBackend.CUDA_JIT)(
++    return get_kernel("diffusion.fused_inplace_qknorm_rope", KernelBackend.JIT)(
+         q,
+         k,
+         q_weight,
+diff --git a/python/sglang/kernels/ops/gemm/__init__.py b/python/sglang/kernels/ops/gemm/__init__.py
+index d11f7ed0d40b..600203826fe4 100644
+--- a/python/sglang/kernels/ops/gemm/__init__.py
++++ b/python/sglang/kernels/ops/gemm/__init__.py
+@@ -16,12 +16,12 @@
+ if TYPE_CHECKING:
+     import torch
+ 
+-_CUDA = CapabilityRequirement(requires_cuda=True)
++_CUDA = frozenset({CapabilityRequirement.CUDA})
+ 
+ register_kernel(
+     KernelSpec(
+         op="gemm.fp8_scaled_mm",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel:fp8_scaled_mm",
+         format_signature=FormatSignature(
+             supported_dtypes=("float8_e4m3fn",),
+@@ -33,7 +33,7 @@
+ register_kernel(
+     KernelSpec(
+         op="gemm.dsv3_fused_a_gemm",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel:dsv3_fused_a_gemm",
+         format_signature=FormatSignature(
+             supported_dtypes=("bfloat16",),
+@@ -45,9 +45,9 @@
+ register_kernel(
+     KernelSpec(
+         op="gemm.dsv3_fused_a_gemm",
+-        backend=KernelBackend.CUDA_JIT,
++        backend=KernelBackend.JIT,
+         target="sglang.jit_kernel.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
+-        capability=_CUDA,
++        capabilities=_CUDA,
+         format_signature=FormatSignature(
+             supported_dtypes=("bfloat16",),
+             description="DeepSeek-V3 fused QKV-A GEMM (drop-in with AOT signature)",
+@@ -58,9 +58,9 @@
+ register_kernel(
+     KernelSpec(
+         op="gemm.dsv3_router_gemm",
+-        backend=KernelBackend.CUDA_JIT,
++        backend=KernelBackend.JIT,
+         target="sglang.jit_kernel.dsv3_router_gemm:dsv3_router_gemm",
+-        capability=_CUDA,
++        capabilities=_CUDA,
+         format_signature=FormatSignature(
+             supported_dtypes=("bfloat16",),
+             description="DeepSeek-V3 router GEMM; num_tokens in [1, 16]",
+@@ -79,7 +79,7 @@ def fp8_scaled_mm(
+     bias: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """FP8 scaled matmul: ``(mat_a @ mat_b) * scales_a * scales_b (+ bias)``."""
+-    return get_kernel("gemm.fp8_scaled_mm", KernelBackend.CUDA_AOT)(
++    return get_kernel("gemm.fp8_scaled_mm", KernelBackend.AOT)(
+         mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+     )
+ 
+@@ -90,9 +90,7 @@ def dsv3_fused_a_gemm(
+     output: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """DeepSeek-V3 fused QKV-A GEMM."""
+-    return get_kernel("gemm.dsv3_fused_a_gemm", KernelBackend.CUDA_AOT)(
+-        mat_a, mat_b, output
+-    )
++    return get_kernel("gemm.dsv3_fused_a_gemm", KernelBackend.AOT)(mat_a, mat_b, output)
+ 
+ 
+ def dsv3_router_gemm(
+@@ -102,7 +100,7 @@ def dsv3_router_gemm(
+     output: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """DeepSeek-V3 router GEMM (JIT-backed). ``out_dtype`` defaults to bfloat16."""
+-    impl = get_kernel("gemm.dsv3_router_gemm", KernelBackend.CUDA_JIT)
++    impl = get_kernel("gemm.dsv3_router_gemm", KernelBackend.JIT)
+     if out_dtype is None:
+         return impl(hidden_states, router_weights, output=output)
+     return impl(hidden_states, router_weights, out_dtype, output)
+diff --git a/python/sglang/kernels/ops/layernorm/__init__.py b/python/sglang/kernels/ops/layernorm/__init__.py
+index a6e0fab43a18..8de0679d6763 100644
+--- a/python/sglang/kernels/ops/layernorm/__init__.py
++++ b/python/sglang/kernels/ops/layernorm/__init__.py
+@@ -6,7 +6,7 @@
+ over module-level instances; auto-selection prefers the AOT ``sgl_kernel``
+ implementation on CUDA and falls back to the native reference elsewhere.
+ Pick a specific backend with e.g.
+-``_RMSNORM.forward(x, w, backend=KernelBackend.CUDA_JIT)`` or globally via
++``_RMSNORM.forward(x, w, backend=KernelBackend.JIT)`` or globally via
+ ``SGLANG_FORCE_FUSED_OP_BACKEND``.
+ """
+ 
+@@ -25,10 +25,10 @@
+     import torch
+ 
+ _NORM_DTYPES = ("float16", "bfloat16")
+-_CUDA = CapabilityRequirement(requires_cuda=True)
++_CUDA = frozenset({CapabilityRequirement.CUDA})
+ _NORM_PRIORITY = (
+-    KernelBackend.CUDA_AOT,
+-    KernelBackend.CUDA_JIT,
++    KernelBackend.AOT,
++    KernelBackend.JIT,
+     KernelBackend.TORCH,
+ )
+ 
+@@ -42,16 +42,16 @@ class RMSNormOp(BaseFusedOp):
+     op = "layernorm.rmsnorm"
+     priority = _NORM_PRIORITY
+     capabilities = {
+-        KernelBackend.CUDA_AOT: _CUDA,
+-        KernelBackend.CUDA_JIT: _CUDA,
++        KernelBackend.AOT: _CUDA,
++        KernelBackend.JIT: _CUDA,
+     }
+     format_signature = FormatSignature(
+         supported_dtypes=_NORM_DTYPES,
+         description="out = (x / RMS(x)) * weight; returns tensor",
+     )
+     descriptions = {
+-        KernelBackend.CUDA_AOT: "RMS normalization (sgl_kernel wheel).",
+-        KernelBackend.CUDA_JIT: "RMS normalization (sglang.jit_kernel).",
++        KernelBackend.AOT: "RMS normalization (sgl_kernel wheel).",
++        KernelBackend.JIT: "RMS normalization (sglang.jit_kernel).",
+         KernelBackend.TORCH: "RMS normalization (pure-torch reference).",
+     }
+ 
+@@ -74,7 +74,7 @@ def forward_native(
+         out.copy_(result)
+         return out
+ 
+-    def forward_cuda_aot(
++    def forward_aot(
+         self,
+         input: torch.Tensor,
+         weight: torch.Tensor,
+@@ -86,7 +86,7 @@ def forward_cuda_aot(
+ 
+         return sgl_kernel.rmsnorm(input, weight, eps, out, enable_pdl)
+ 
+-    def forward_cuda_jit(
++    def forward_jit(
+         self,
+         input: torch.Tensor,
+         weight: torch.Tensor,
+@@ -114,8 +114,8 @@ class FusedAddRMSNormOp(BaseFusedOp):
+     op = "layernorm.fused_add_rmsnorm"
+     priority = _NORM_PRIORITY
+     capabilities = {
+-        KernelBackend.CUDA_AOT: _CUDA,
+-        KernelBackend.CUDA_JIT: _CUDA,
++        KernelBackend.AOT: _CUDA,
++        KernelBackend.JIT: _CUDA,
+     }
+     format_signature = FormatSignature(
+         supported_dtypes=_NORM_DTYPES,
+@@ -123,10 +123,10 @@ class FusedAddRMSNormOp(BaseFusedOp):
+         description="residual += x; x = RMSNorm(residual) * weight",
+     )
+     descriptions = {
+-        KernelBackend.CUDA_AOT: (
++        KernelBackend.AOT: (
+             "Fused residual-add + RMS normalization (sgl_kernel wheel)."
+         ),
+-        KernelBackend.CUDA_JIT: (
++        KernelBackend.JIT: (
+             "Fused residual-add + RMS normalization (sglang.jit_kernel)."
+         ),
+         KernelBackend.TORCH: (
+@@ -150,7 +150,7 @@ def forward_native(
+         normed = acc * torch.rsqrt(variance + eps)
+         input.copy_((normed * weight).to(input.dtype))
+ 
+-    def forward_cuda_aot(
++    def forward_aot(
+         self,
+         input: torch.Tensor,
+         residual: torch.Tensor,
+@@ -162,7 +162,7 @@ def forward_cuda_aot(
+ 
+         return sgl_kernel.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+ 
+-    def forward_cuda_jit(
++    def forward_jit(
+         self,
+         input: torch.Tensor,
+         residual: torch.Tensor,
+@@ -180,13 +180,13 @@ class GemmaRMSNormOp(BaseFusedOp):
+ 
+     op = "layernorm.gemma_rmsnorm"
+     priority = _NORM_PRIORITY
+-    capabilities = {KernelBackend.CUDA_AOT: _CUDA}
++    capabilities = {KernelBackend.AOT: _CUDA}
+     format_signature = FormatSignature(
+         supported_dtypes=_NORM_DTYPES,
+         description="out = (x / RMS(x)) * (weight + 1); returns tensor",
+     )
+     descriptions = {
+-        KernelBackend.CUDA_AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
++        KernelBackend.AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
+         KernelBackend.TORCH: "Gemma-style RMS normalization (pure-torch reference).",
+     }
+ 
+@@ -209,7 +209,7 @@ def forward_native(
+         out.copy_(result)
+         return out
+ 
+-    def forward_cuda_aot(
++    def forward_aot(
+         self,
+         input: torch.Tensor,
+         weight: torch.Tensor,
+@@ -227,14 +227,14 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
+ 
+     op = "layernorm.gemma_fused_add_rmsnorm"
+     priority = _NORM_PRIORITY
+-    capabilities = {KernelBackend.CUDA_AOT: _CUDA}
++    capabilities = {KernelBackend.AOT: _CUDA}
+     format_signature = FormatSignature(
+         supported_dtypes=_NORM_DTYPES,
+         in_place=True,
+         description="residual += x; x = GemmaRMSNorm(residual) * (weight + 1)",
+     )
+     descriptions = {
+-        KernelBackend.CUDA_AOT: ("Gemma-style fused residual-add + RMS normalization."),
++        KernelBackend.AOT: ("Gemma-style fused residual-add + RMS normalization."),
+         KernelBackend.TORCH: (
+             "Gemma-style fused residual-add + RMS normalization "
+             "(pure-torch reference)."
+@@ -257,7 +257,7 @@ def forward_native(
+         normed = acc * torch.rsqrt(variance + eps)
+         input.copy_((normed * (1.0 + weight.to(torch.float32))).to(input.dtype))
+ 
+-    def forward_cuda_aot(
++    def forward_aot(
+         self,
+         input: torch.Tensor,
+         residual: torch.Tensor,
+diff --git a/python/sglang/kernels/ops/mamba/__init__.py b/python/sglang/kernels/ops/mamba/__init__.py
+index 5b3252df200d..bde9532a7383 100644
+--- a/python/sglang/kernels/ops/mamba/__init__.py
++++ b/python/sglang/kernels/ops/mamba/__init__.py
+@@ -14,7 +14,7 @@
+ register_kernel(
+     KernelSpec(
+         op="mamba.causal_conv1d_fwd",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel.mamba:causal_conv1d_fwd",
+         format_signature=FormatSignature(
+             in_place=True, description="causal depthwise conv1d forward (prefill)"
+@@ -25,7 +25,7 @@
+ register_kernel(
+     KernelSpec(
+         op="mamba.causal_conv1d_update",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel.mamba:causal_conv1d_update",
+         format_signature=FormatSignature(
+             in_place=True, description="causal depthwise conv1d update (decode)"
+@@ -47,7 +47,7 @@ def causal_conv1d_fwd(
+     pad_slot_id: int,
+ ):
+     """Causal depthwise conv1d forward (prefill)."""
+-    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.CUDA_AOT)(
++    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.AOT)(
+         x,
+         weight,
+         bias_,
+@@ -71,7 +71,7 @@ def causal_conv1d_update(
+     pad_slot_id: int,
+ ):
+     """Causal depthwise conv1d update (decode)."""
+-    return get_kernel("mamba.causal_conv1d_update", KernelBackend.CUDA_AOT)(
++    return get_kernel("mamba.causal_conv1d_update", KernelBackend.AOT)(
+         x,
+         conv_state,
+         weight,
+diff --git a/python/sglang/kernels/ops/moe/__init__.py b/python/sglang/kernels/ops/moe/__init__.py
+index aacaed80bb86..b4efb1219637 100644
+--- a/python/sglang/kernels/ops/moe/__init__.py
++++ b/python/sglang/kernels/ops/moe/__init__.py
+@@ -16,12 +16,12 @@
+ if TYPE_CHECKING:
+     import torch
+ 
+-_CUDA = CapabilityRequirement(requires_cuda=True)
++_CUDA = frozenset({CapabilityRequirement.CUDA})
+ 
+ register_kernel(
+     KernelSpec(
+         op="moe.moe_align_block_size",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel:moe_align_block_size",
+         format_signature=FormatSignature(
+             in_place=True,
+@@ -33,9 +33,9 @@
+ register_kernel(
+     KernelSpec(
+         op="moe.moe_align_block_size",
+-        backend=KernelBackend.CUDA_JIT,
++        backend=KernelBackend.JIT,
+         target="sglang.jit_kernel.moe_align:moe_align_block_size",
+-        capability=_CUDA,
++        capabilities=_CUDA,
+         format_signature=FormatSignature(
+             in_place=True,
+             description="MoE align-block-size (JIT variant, AOT signature)",
+@@ -46,7 +46,7 @@
+ register_kernel(
+     KernelSpec(
+         op="moe.topk_softmax",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel:topk_softmax",
+         format_signature=FormatSignature(
+             in_place=True,
+@@ -69,7 +69,7 @@ def moe_align_block_size(
+     ignore_invalid_expert: bool = False,
+ ) -> None:
+     """Align and sort expert token ids into block-padded output buffers."""
+-    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.CUDA_AOT)
++    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.AOT)
+     if ignore_invalid_expert:
+         return kernel(
+             topk_ids,
+@@ -103,7 +103,7 @@ def topk_softmax(
+     correction_bias: Optional[torch.Tensor] = None,
+ ) -> None:
+     """Compute top-k softmax routing weights/ids for MoE."""
+-    return get_kernel("moe.topk_softmax", KernelBackend.CUDA_AOT)(
++    return get_kernel("moe.topk_softmax", KernelBackend.AOT)(
+         topk_weights,
+         topk_ids,
+         gating_output,
+diff --git a/python/sglang/kernels/ops/quantization/__init__.py b/python/sglang/kernels/ops/quantization/__init__.py
+index def98d2732ea..9d48b4fa3764 100644
+--- a/python/sglang/kernels/ops/quantization/__init__.py
++++ b/python/sglang/kernels/ops/quantization/__init__.py
+@@ -16,12 +16,12 @@
+ if TYPE_CHECKING:
+     import torch
+ 
+-_CUDA = CapabilityRequirement(requires_cuda=True)
++_CUDA = frozenset({CapabilityRequirement.CUDA})
+ 
+ register_kernel(
+     KernelSpec(
+         op="quantization.sgl_per_token_quant_fp8",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel:sgl_per_token_quant_fp8",
+         format_signature=FormatSignature(
+             supported_dtypes=("float8_e4m3fn",),
+@@ -41,7 +41,7 @@
+     register_kernel(
+         KernelSpec(
+             op=f"quantization.{_name}",
+-            backend=KernelBackend.CUDA_AOT,
++            backend=KernelBackend.AOT,
+             target=f"sgl_kernel:{_name}",
+             format_signature=FormatSignature(
+                 in_place=True,
+@@ -55,9 +55,9 @@
+ register_kernel(
+     KernelSpec(
+         op="quantization.sgl_per_token_group_quant_8bit",
+-        backend=KernelBackend.CUDA_JIT,
++        backend=KernelBackend.JIT,
+         target="sglang.jit_kernel.per_token_group_quant_8bit:per_token_group_quant_8bit",
+-        capability=_CUDA,
++        capabilities=_CUDA,
+         format_signature=FormatSignature(
+             in_place=True,
+             description="per-token-group 8-bit quantization (JIT variant)",
+@@ -73,7 +73,7 @@ def sgl_per_token_quant_fp8(
+     output_s: torch.Tensor,
+ ) -> None:
+     """Per-token FP8 quantization, writing into ``output_q`` / ``output_s``."""
+-    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.CUDA_AOT)(
++    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.AOT)(
+         input, output_q, output_s
+     )
+ 
+@@ -92,9 +92,7 @@ def sgl_per_token_group_quant_8bit(
+     enable_v2: Optional[bool] = None,
+ ) -> None:
+     """Per-token-group 8-bit quantization, writing into ``output_q`` / ``output_s``."""
+-    return get_kernel(
+-        "quantization.sgl_per_token_group_quant_8bit", KernelBackend.CUDA_AOT
+-    )(
++    return get_kernel("quantization.sgl_per_token_group_quant_8bit", KernelBackend.AOT)(
+         input,
+         output_q,
+         output_s,
+@@ -163,7 +161,7 @@ def sgl_per_token_group_quant_8bit(
+             "sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant"
+             ":nvfp4_gemm_swiglu_nvfp4_quant"
+         ),
+-        capability=CapabilityRequirement(requires_cuda=True, min_cuda_arch=(10, 0)),
++        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+         description="Fused NVFP4 GEMM + SwiGLU + NVFP4 quant (CuTe DSL, SM100).",
+     )
+ )
+diff --git a/python/sglang/kernels/ops/sampling/__init__.py b/python/sglang/kernels/ops/sampling/__init__.py
+index 00694f554281..3e42c16ce6ce 100644
+--- a/python/sglang/kernels/ops/sampling/__init__.py
++++ b/python/sglang/kernels/ops/sampling/__init__.py
+@@ -14,7 +14,7 @@
+ register_kernel(
+     KernelSpec(
+         op="sampling.top_k_renorm_probs",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel.sampling:top_k_renorm_probs",
+         format_signature=FormatSignature(
+             description="renormalize probs by top-k thresholding; returns tensor"
+@@ -25,7 +25,7 @@
+ register_kernel(
+     KernelSpec(
+         op="sampling.top_p_renorm_probs",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel.sampling:top_p_renorm_probs",
+         format_signature=FormatSignature(
+             description="renormalize probs by top-p thresholding; returns tensor"
+@@ -39,18 +39,14 @@ def top_k_renorm_probs(
+     probs: torch.Tensor, top_k: Union[torch.Tensor, int]
+ ) -> torch.Tensor:
+     """Renormalize ``probs`` by top-k thresholding."""
+-    return get_kernel("sampling.top_k_renorm_probs", KernelBackend.CUDA_AOT)(
+-        probs, top_k
+-    )
++    return get_kernel("sampling.top_k_renorm_probs", KernelBackend.AOT)(probs, top_k)
+ 
+ 
+ def top_p_renorm_probs(
+     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
+ ) -> torch.Tensor:
+     """Renormalize ``probs`` by top-p thresholding."""
+-    return get_kernel("sampling.top_p_renorm_probs", KernelBackend.CUDA_AOT)(
+-        probs, top_p
+-    )
++    return get_kernel("sampling.top_p_renorm_probs", KernelBackend.AOT)(probs, top_p)
+ 
+ 
+ __all__ = ["top_k_renorm_probs", "top_p_renorm_probs"]
+diff --git a/python/sglang/kernels/ops/spatial/__init__.py b/python/sglang/kernels/ops/spatial/__init__.py
+index 9542f244a7a7..7c8836334593 100644
+--- a/python/sglang/kernels/ops/spatial/__init__.py
++++ b/python/sglang/kernels/ops/spatial/__init__.py
+@@ -11,7 +11,7 @@
+ register_kernel(
+     KernelSpec(
+         op="spatial.get_sm_available",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel.spatial:get_sm_available",
+         format_signature=FormatSignature(
+             description="number of SMs available on device"
+@@ -22,7 +22,7 @@
+ register_kernel(
+     KernelSpec(
+         op="spatial.create_greenctx_stream_by_value",
+-        backend=KernelBackend.CUDA_AOT,
++        backend=KernelBackend.AOT,
+         target="sgl_kernel.spatial:create_greenctx_stream_by_value",
+         format_signature=FormatSignature(
+             description="create two green-context streams partitioned by SM count"
+@@ -34,16 +34,16 @@
+ 
+ def get_sm_available(device_id: Optional[int] = None) -> int:
+     """Return the number of SMs available on ``device_id``."""
+-    return get_kernel("spatial.get_sm_available", KernelBackend.CUDA_AOT)(device_id)
++    return get_kernel("spatial.get_sm_available", KernelBackend.AOT)(device_id)
+ 
+ 
+ def create_greenctx_stream_by_value(
+     SM_a: int, SM_b: int, device_id: Optional[int] = None
+ ):
+     """Create two green-context streams partitioned by ``SM_a`` / ``SM_b``."""
+-    return get_kernel(
+-        "spatial.create_greenctx_stream_by_value", KernelBackend.CUDA_AOT
+-    )(SM_a, SM_b, device_id)
++    return get_kernel("spatial.create_greenctx_stream_by_value", KernelBackend.AOT)(
++        SM_a, SM_b, device_id
++    )
+ 
+ 
+ __all__ = ["get_sm_available", "create_greenctx_stream_by_value"]
+diff --git a/python/sglang/kernels/selector.py b/python/sglang/kernels/selector.py
+index 472d84232e89..8f649fc6a798 100644
+--- a/python/sglang/kernels/selector.py
++++ b/python/sglang/kernels/selector.py
+@@ -1,16 +1,24 @@
+-"""Fixed-path kernel resolution over the :data:`registry`.
++"""Device-aware fixed-path kernel resolution over the :data:`registry`.
+ 
+-There is no priority ranking or heuristic backend selection. Each operator has
+-a fixed call path — its :attr:`KernelSpec.target`:
++There is no priority *ranking* or preference heuristic. Resolution of an op's
++call path is deterministic:
+ 
+ - an op with a single registered backend resolves to it directly;
+-- an op with several registered backends must be resolved by naming the backend
+-  explicitly (``backend=...``). The extra backends exist only as inventory, and
+-  are never silently auto-picked.
++- an op with several registered backends is filtered by the detected platform
++  (a hard :class:`~sglang.kernels.spec.CapabilityRequirement` check, not a
++  preference). If exactly one backend is usable on this device, it is the fixed
++  call path; if several remain usable, the caller must name the backend
++  explicitly (``backend=...``).
++
++Because ``KernelBackend`` is now device-agnostic provenance, the *same* backend
++(e.g. ``AOT``) may be registered for an op on more than one device; the
++availability filter is what makes ``select_kernel`` pick the right one per
++platform. Filtering by device is a hard eligibility gate, not the ranked
++auto-selection that ``BaseFusedOp`` performs.
+ 
+ :func:`get_kernel` is the fast path used by the public ``ops.*`` wrappers: it
+ resolves the spec to its callable and caches the result so repeated calls do
+-not re-run resolution or re-import.
++not re-run resolution or re-import (the platform is constant per process).
+ """
+ 
+ from __future__ import annotations
+@@ -19,7 +27,12 @@
+ from typing import Callable, Optional
+ 
+ from sglang.kernels.registry import registry
+-from sglang.kernels.spec import KernelBackend, KernelSpec
++from sglang.kernels.spec import KernelBackend, KernelSpec, PlatformInfo
++
++
++@lru_cache(maxsize=1)
++def _platform() -> PlatformInfo:
++    return PlatformInfo.detect()
+ 
+ 
+ def select_kernel(op: str, backend: Optional[KernelBackend] = None) -> KernelSpec:
+@@ -30,15 +43,16 @@ def select_kernel(op: str, backend: Optional[KernelBackend] = None) -> KernelSpe
+     op:
+         Operator id, ``"<group>.<name>"``.
+     backend:
+-        Required only when ``op`` has more than one registered backend; selects
+-        which one. For single-backend ops it is optional.
++        Required only when ``op`` has more than one backend *usable on the
++        current device*; selects which one. Otherwise optional.
+ 
+     Raises
+     ------
+     KeyError
+         If ``op`` is unknown, or if ``backend`` is requested but not registered.
+     ValueError
+-        If ``op`` has multiple backends and ``backend`` is not given.
++        If ``op`` has multiple device-eligible backends and ``backend`` is not
++        given, or if none are eligible on this platform.
+     """
+     specs = registry.get(op)
+     if not specs:
+@@ -53,9 +67,20 @@ def select_kernel(op: str, backend: Optional[KernelBackend] = None) -> KernelSpe
+     if len(specs) == 1:
+         return specs[0]
+ 
++    # Multiple backends: hard-filter by device eligibility.
++    platform = _platform()
++    eligible = [s for s in specs if s.is_available(platform)]
++    if len(eligible) == 1:
++        return eligible[0]
++    if not eligible:
++        raise ValueError(
++            f"op {op!r} has no backend usable on device {platform.device.value!r} "
++            f"(registered: {[s.backend.value for s in specs]})"
++        )
+     raise ValueError(
+-        f"op {op!r} has multiple registered backends "
+-        f"({[s.backend.value for s in specs]}); pass backend=... to choose one"
++        f"op {op!r} has multiple backends usable on device "
++        f"{platform.device.value!r} ({[s.backend.value for s in eligible]}); "
++        f"pass backend=... to choose one"
+     )
+ 
+ 
+diff --git a/python/sglang/kernels/spec.py b/python/sglang/kernels/spec.py
+index c854824a2585..0ca15ab155b9 100644
+--- a/python/sglang/kernels/spec.py
++++ b/python/sglang/kernels/spec.py
+@@ -8,34 +8,53 @@
+ 
+ The concrete callable behind a :class:`KernelSpec` is resolved lazily through
+ ``KernelSpec.load()``; nothing is imported until a kernel is actually called.
++
++Backend vs. device (RFC #29630 follow-up): :class:`KernelBackend` names only the
++*provenance* of an implementation (how it is built / where it comes from), not
++the hardware it runs on. Both JIT and AOT sources already build for CUDA *and*
++ROCm, and a wheel may ship only a per-op subset, so platform support is
++per-``(op, backend)`` metadata carried by :class:`CapabilityRequirement`, not
++derivable from the backend name.
+ """
+ 
+ from __future__ import annotations
+ 
+ import importlib
+ from enum import Enum
+-from typing import Callable, Optional, Tuple
++from typing import Callable, ClassVar, FrozenSet, Optional, Tuple, Union
+ 
+ import msgspec
+ 
+ 
+ class KernelBackend(str, Enum):
+-    """Implementation backend for a kernel.
++    """Provenance of a kernel implementation (how it is built), not its device.
+ 
+-    Values mirror the backends called out in RFC #29630: JIT CUDA, AOT
+-    CUDA/C++ (the ``sgl_kernel`` wheel), Triton, CuTe DSL, FlashInfer, DeepGEMM,
+-    and the pure-``torch`` fallback path.
++    ``JIT`` (``sglang.jit_kernel``, compiles under nvcc *and* hipcc) and ``AOT``
++    (the ``sgl_kernel`` wheel, built for CUDA *and* ROCm) are both cross-device;
++    which devices a given op supports is expressed by its
++    :class:`CapabilityRequirement` list. Platform-specific libraries (e.g.
++    ``aiter`` on AMD) are just additional provenance values.
+     """
+ 
+     TORCH = "torch"  # pure-torch reference (forward_native)
+     TORCH_COMPILE = "torch_compile"  # torch.compile(forward_native)
+     TRITON = "triton"
+-    CUDA_JIT = "cuda_jit"  # sglang.jit_kernel
+-    CUDA_AOT = "cuda_aot"  # sgl_kernel wheel
++    JIT = "jit"  # sglang.jit_kernel (nvcc / hipcc)
++    AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
+     CUTE_DSL = "cute_dsl"
+     FLASHINFER = "flashinfer"
+     DEEPGEMM = "deepgemm"
+-    # TODO(RFC #29630): backends for other hardware (hip_c / npu / cpu-avx, ...)
++    AITER = "aiter"  # AMD aiter library (device=HIP)
++    # TODO(RFC #29630): more provenance as needed (npu / cpu-avx, ...)
++
++
++class DeviceType(str, Enum):
++    """Accelerator device family a kernel can run on."""
++
++    CUDA = "cuda"
++    HIP = "hip"
++    CPU = "cpu"
++    # TODO(RFC #29630): NPU / XPU / ... as backends land.
+ 
+ 
+ class PlatformInfo(msgspec.Struct, frozen=True):
+@@ -49,6 +68,13 @@ class PlatformInfo(msgspec.Struct, frozen=True):
+     cuda_arch_major: Optional[int] = None
+     cuda_arch_minor: Optional[int] = None
+ 
++    @property
++    def device(self) -> DeviceType:
++        try:
++            return DeviceType(self.device_type)
++        except (ValueError, TypeError):
++            return DeviceType.CPU
++
+     @property
+     def is_cuda(self) -> bool:
+         return self.device_type == "cuda"
+@@ -85,23 +111,45 @@ def detect(cls) -> PlatformInfo:
+ 
+ 
+ class CapabilityRequirement(msgspec.Struct, frozen=True):
+-    """Coarse hardware requirement used to filter out unusable backends.
+-
+-    ``min_cuda_arch`` / ``max_cuda_arch`` are ``(major, minor)`` tuples, e.g.
+-    ``(9, 0)`` for SM90. They only apply when the kernel requires CUDA.
++    """One device (plus an optional CUDA-arch window) a backend can run on.
++
++    A :class:`KernelSpec` / :class:`~sglang.kernels.fused_op.BaseFusedOp` backend
++    carries a *set* of these with **OR** semantics — any matching entry makes the
++    backend eligible, and an empty set means unrestricted (runs anywhere). A set
++    (not a tuple) because order and duplicates are meaningless here: ``{CUDA,
++    HIP}`` and ``{HIP, CUDA}`` describe the same thing. This replaces the old
++    ``requires_cuda`` / ``requires_hip`` booleans (whose AND semantics could not
++    express "CUDA or HIP"); arch bounds now attach to the device they describe
++    (``min_cuda_arch`` / ``max_cuda_arch`` apply only when ``device == CUDA``).
++
++    The device-only cases are so common that they are exposed as class constants
++    (``CapabilityRequirement.CUDA`` / ``.HIP``); use :meth:`cuda` for an
++    arch-bounded CUDA requirement (e.g. ``CapabilityRequirement.cuda(
++    min_sm=(10, 0))`` for SM100+).
+     """
+ 
+-    requires_cuda: bool = False
+-    requires_hip: bool = False
++    device: DeviceType
+     min_cuda_arch: Optional[Tuple[int, int]] = None
+     max_cuda_arch: Optional[Tuple[int, int]] = None
+ 
++    # Common device-only shortcuts, assigned after the class body (they are
++    # instances of the class itself). ClassVar keeps them out of msgspec fields.
++    CUDA: ClassVar[CapabilityRequirement]
++    HIP: ClassVar[CapabilityRequirement]
++
++    @classmethod
++    def cuda(
++        cls,
++        min_sm: Optional[Tuple[int, int]] = None,
++        max_sm: Optional[Tuple[int, int]] = None,
++    ) -> CapabilityRequirement:
++        """A CUDA requirement bounded to an SM-arch window (inclusive)."""
++        return cls(device=DeviceType.CUDA, min_cuda_arch=min_sm, max_cuda_arch=max_sm)
++
+     def is_satisfied_by(self, platform: PlatformInfo) -> bool:
+-        if self.requires_hip and not platform.is_hip:
+-            return False
+-        if self.requires_cuda and not platform.is_cuda:
++        if self.device != platform.device:
+             return False
+-        if platform.is_cuda and platform.cuda_arch_major is not None:
++        if self.device == DeviceType.CUDA and platform.cuda_arch_major is not None:
+             arch = (platform.cuda_arch_major, platform.cuda_arch_minor or 0)
+             if self.min_cuda_arch is not None and arch < self.min_cuda_arch:
+                 return False
+@@ -110,6 +158,28 @@ def is_satisfied_by(self, platform: PlatformInfo) -> bool:
+         return True
+ 
+ 
++CapabilityRequirement.CUDA = CapabilityRequirement(device=DeviceType.CUDA)
++CapabilityRequirement.HIP = CapabilityRequirement(device=DeviceType.HIP)
++
++
++def capabilities_satisfied(
++    capabilities: Union[
++        FrozenSet[CapabilityRequirement],
++        Tuple[CapabilityRequirement, ...],
++        CapabilityRequirement,
++    ],
++    platform: PlatformInfo,
++) -> bool:
++    """OR over ``capabilities`` (empty = unrestricted).
++
++    Accepts a set/tuple of requirements, or tolerates a single
++    :class:`CapabilityRequirement` (the pre-decouple API used one) by wrapping it.
++    """
++    if isinstance(capabilities, CapabilityRequirement):
++        capabilities = (capabilities,)
++    return (not capabilities) or any(c.is_satisfied_by(platform) for c in capabilities)
++
++
+ class FormatSignature(msgspec.Struct, frozen=True):
+     """A light description of a kernel's data contract.
+ 
+@@ -131,15 +201,17 @@ class KernelSpec(msgspec.Struct, frozen=True):
+         Fully-qualified operator id, ``"<group>.<name>"`` (e.g.
+         ``"layernorm.rmsnorm"``). This is the public lookup key.
+     backend:
+-        Which :class:`KernelBackend` provides this implementation.
++        Which :class:`KernelBackend` (provenance) provides this implementation.
+     target:
+         Import path of the callable in ``"module:attr"`` form, resolved lazily
+         by :meth:`load` (e.g. ``"sgl_kernel:rmsnorm"``). ``attr`` may be a
+         dotted path into a module-level object, e.g.
+-        ``"sglang.kernels.ops.layernorm:_RMSNORM.forward_cuda_aot"`` for a
+-        bound :class:`~sglang.kernels.fused_op.BaseFusedOp` backend method.
+-    capability:
+-        Hardware requirement used by the selector to skip unusable backends.
++        ``"sglang.kernels.ops.layernorm:_RMSNORM.forward_aot"`` for a bound
++        :class:`~sglang.kernels.fused_op.BaseFusedOp` backend method.
++    capabilities:
++        Set of :class:`CapabilityRequirement` (OR semantics; empty = runs on
++        any device) used by the selector to skip backends unusable on the
++        detected platform.
+     format_signature:
+         Optional data-contract description for inventory/documentation.
+     description:
+@@ -149,9 +221,7 @@ class KernelSpec(msgspec.Struct, frozen=True):
+     op: str
+     backend: KernelBackend
+     target: str
+-    capability: CapabilityRequirement = msgspec.field(
+-        default_factory=CapabilityRequirement
+-    )
++    capabilities: FrozenSet[CapabilityRequirement] = frozenset()
+     format_signature: FormatSignature = msgspec.field(default_factory=FormatSignature)
+     description: str = ""
+ 
+@@ -165,7 +235,7 @@ def name(self) -> str:
+ 
+     def is_available(self, platform: PlatformInfo) -> bool:
+         """Whether this backend can run on ``platform`` (metadata-only check)."""
+-        return self.capability.is_satisfied_by(platform)
++        return capabilities_satisfied(self.capabilities, platform)
+ 
+     def load(self) -> Callable:
+         """Import and return the backing callable.
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 6ff55e01de0b..07b3adcb09eb 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -701,7 +701,7 @@ class Envs:
+ 
+     # Kernels
+     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
+-    # value, e.g. "torch" / "torch_compile" / "triton" / "cuda_aot"); unset =
++    # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
+     # auto-select by priority. "torch" flips all fused ops to their pure-torch
+     # reference implementations for numerical-bug bisection.
+     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+diff --git a/test/registered/kernels/test_fused_op.py b/test/registered/kernels/test_fused_op.py
+index 93e0748b15f8..3f47735d7bf5 100644
+--- a/test/registered/kernels/test_fused_op.py
++++ b/test/registered/kernels/test_fused_op.py
+@@ -43,13 +43,13 @@ class _CudaOnlyToyOp(BaseFusedOp):
+     """Toy op whose optimized backend requires CUDA (never eligible on CPU)."""
+ 
+     op = "test.toy_cuda_only"
+-    priority = (KernelBackend.CUDA_AOT, KernelBackend.TORCH)
+-    capabilities = {KernelBackend.CUDA_AOT: CapabilityRequirement(requires_cuda=True)}
++    priority = (KernelBackend.AOT, KernelBackend.TORCH)
++    capabilities = {KernelBackend.AOT: {CapabilityRequirement.CUDA}}
+ 
+     def forward_native(self, a):
+         return a * 2
+ 
+-    def forward_cuda_aot(self, a):
++    def forward_aot(self, a):
+         raise AssertionError("must not be selected on a CPU-only box")
+ 
+ 
+@@ -117,7 +117,7 @@ def test_unimplemented_backend_raises(self):
+             op.forward(
+                 torch.tensor([1.0]),
+                 torch.tensor([2.0]),
+-                backend=KernelBackend.CUDA_AOT,
++                backend=KernelBackend.AOT,
+             )
+ 
+     def test_torch_compile_backend(self):
+@@ -150,8 +150,8 @@ def test_register_fused_op_specs(self):
+             {
+                 KernelBackend.TORCH,
+                 KernelBackend.TORCH_COMPILE,
+-                KernelBackend.CUDA_JIT,
+-                KernelBackend.CUDA_AOT,
++                KernelBackend.JIT,
++                KernelBackend.AOT,
+             },
+         )
+         # Dotted targets resolve to the bound backend methods.
+diff --git a/test/registered/kernels/test_kernels_namespace.py b/test/registered/kernels/test_kernels_namespace.py
+index 1837db8e2432..33402cf97a5b 100644
+--- a/test/registered/kernels/test_kernels_namespace.py
++++ b/test/registered/kernels/test_kernels_namespace.py
+@@ -20,50 +20,50 @@
+ EXPECTED_OPS = {
+     # BaseFusedOp-backed ops: native + torch_compile always available,
+     # plus the overridden CUDA backends.
+-    "activation.silu_and_mul": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
+-    "activation.gelu_and_mul": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
++    "activation.silu_and_mul": {"aot", "jit", "aiter", "torch", "torch_compile"},
++    "activation.gelu_and_mul": {"aot", "jit", "torch", "torch_compile"},
+     "activation.gelu_tanh_and_mul": {
+-        "cuda_aot",
+-        "cuda_jit",
++        "aot",
++        "jit",
+         "torch",
+         "torch_compile",
+     },
+-    "layernorm.rmsnorm": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
++    "layernorm.rmsnorm": {"aot", "jit", "torch", "torch_compile"},
+     "layernorm.fused_add_rmsnorm": {
+-        "cuda_aot",
+-        "cuda_jit",
++        "aot",
++        "jit",
+         "torch",
+         "torch_compile",
+     },
+-    "layernorm.gemma_rmsnorm": {"cuda_aot", "torch", "torch_compile"},
+-    "layernorm.gemma_fused_add_rmsnorm": {"cuda_aot", "torch", "torch_compile"},
++    "layernorm.gemma_rmsnorm": {"aot", "torch", "torch_compile"},
++    "layernorm.gemma_fused_add_rmsnorm": {"aot", "torch", "torch_compile"},
+     # curated dual/single-backend wrapper ops
+-    "gemm.fp8_scaled_mm": {"cuda_aot"},
+-    "gemm.dsv3_fused_a_gemm": {"cuda_aot", "cuda_jit"},
+-    "gemm.dsv3_router_gemm": {"cuda_jit"},
++    "gemm.fp8_scaled_mm": {"aot"},
++    "gemm.dsv3_fused_a_gemm": {"aot", "jit"},
++    "gemm.dsv3_router_gemm": {"jit"},
+     "kvcache.reshape_and_cache_flash": {"triton"},
+-    "moe.moe_align_block_size": {"cuda_aot", "cuda_jit"},
+-    "moe.topk_softmax": {"cuda_aot"},
+-    "quantization.sgl_per_token_quant_fp8": {"cuda_aot"},
++    "moe.moe_align_block_size": {"aot", "jit"},
++    "moe.topk_softmax": {"aot"},
++    "quantization.sgl_per_token_quant_fp8": {"aot"},
+     # migrated from srt/layers/quantization (Phase 2.5)
+     "quantization.w8a8_block_fp8_matmul": {"triton"},
+     "quantization.per_token_quant_int8": {"triton"},
+     "quantization.awq_dequantize_triton": {"triton"},
+     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
+     "moe.pack_topk_ids": {"triton"},
+-    "quantization.sgl_per_token_group_quant_8bit": {"cuda_aot", "cuda_jit"},
+-    "quantization.sgl_per_token_group_quant_fp8": {"cuda_aot"},
+-    "quantization.sgl_per_token_group_quant_int8": {"cuda_aot"},
++    "quantization.sgl_per_token_group_quant_8bit": {"aot", "jit"},
++    "quantization.sgl_per_token_group_quant_fp8": {"aot"},
++    "quantization.sgl_per_token_group_quant_int8": {"aot"},
+     # deferred-group wrappers, now populated
+-    "sampling.top_k_renorm_probs": {"cuda_aot"},
+-    "sampling.top_p_renorm_probs": {"cuda_aot"},
+-    "spatial.get_sm_available": {"cuda_aot"},
+-    "spatial.create_greenctx_stream_by_value": {"cuda_aot"},
+-    "mamba.causal_conv1d_fwd": {"cuda_aot"},
+-    "mamba.causal_conv1d_update": {"cuda_aot"},
+-    "diffusion.apply_group_norm_silu": {"cuda_jit"},
+-    "diffusion.residual_gate_add": {"cuda_jit"},
+-    "diffusion.fused_inplace_qknorm_rope": {"cuda_jit"},
++    "sampling.top_k_renorm_probs": {"aot"},
++    "sampling.top_p_renorm_probs": {"aot"},
++    "spatial.get_sm_available": {"aot"},
++    "spatial.create_greenctx_stream_by_value": {"aot"},
++    "mamba.causal_conv1d_fwd": {"aot"},
++    "mamba.causal_conv1d_update": {"aot"},
++    "diffusion.apply_group_norm_silu": {"jit"},
++    "diffusion.residual_gate_add": {"jit"},
++    "diffusion.fused_inplace_qknorm_rope": {"jit"},
+     # representative migrated Triton kernels (inventory)
+     "grammar.apply_token_bitmask_inplace_triton": {"triton"},
+     "memory.alloc_extend_kernel": {"triton"},
+@@ -194,19 +194,64 @@ def test_single_backend_op_resolves_without_backend(self):
+                 self.assertEqual(spec.backend.value, next(iter(backends)), op)
+ 
+     def test_multi_backend_op_requires_explicit_backend(self):
+-        # No hidden ranking: a multi-backend op must be resolved explicitly.
+-        multi = [op for op, b in EXPECTED_OPS.items() if len(b) > 1]
+-        self.assertTrue(multi)  # sanity: we do have multi-backend ops
+-        for op in multi:
++        # Device is a HARD eligibility filter, not a preference ranking: when
++        # more than one backend is usable on the current device, selection must
++        # be explicit (no hidden auto-ranking). Force a CUDA platform so the
++        # result is deterministic regardless of the test host.
++        import sglang.kernels.selector as sel
++
++        saved = sel._platform
++        try:
++            sel._platform = lambda: self.K.PlatformInfo(
++                device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0
++            )
++            # rmsnorm exposes torch/torch_compile/jit/aot, all eligible on CUDA.
+             with self.assertRaises(ValueError):
+-                self.K.select_kernel(op)
++                self.K.select_kernel("layernorm.rmsnorm")
++            # An explicit backend is always the fixed call path.
++            spec = self.K.select_kernel(
++                "layernorm.rmsnorm", backend=self.K.KernelBackend.JIT
++            )
++            self.assertEqual(spec.backend, self.K.KernelBackend.JIT)
++        finally:
++            sel._platform = saved
++
++    def test_decoupled_backend_device_selection(self):
++        # Proves the decoupled backend/device model against production reality:
++        #  - AOT (sgl_kernel) spans CUDA *and* HIP (OR-semantics capability);
++        #  - JIT is CUDA-only; AITER is an opt-in HIP-only path on silu_and_mul;
++        #  - gelu_and_mul has no AITER kernel (per-(op, backend) subset).
++        # Auto-selection matches production defaults: JIT on CUDA, AOT on HIP.
++        import sglang.kernels.fused_op as fo
++        from sglang.kernels.ops.activation import _GELU_AND_MUL, _SILU_AND_MUL
++
++        B = self.K.KernelBackend
++        hip = self.K.PlatformInfo(device_type="hip")
++        cuda = self.K.PlatformInfo(device_type="cuda", cuda_arch_major=9)
++        saved = fo._platform
++        try:
++            fo._platform = lambda: hip
++            # silu implements AITER (a HIP kernel); gelu does not (per-op subset).
++            self.assertIn(B.AITER, _SILU_AND_MUL.available_backends())
++            self.assertNotIn(B.AITER, _GELU_AND_MUL.available_backends())
++            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AOT))  # (cuda, hip)
++            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AITER))  # hip-only
++            self.assertFalse(_SILU_AND_MUL.backend_eligible(B.JIT))  # cuda-only
++            # HIP default = AOT (production default); AITER is opt-in below it.
++            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.AOT)
++            # gelu has no AITER but AOT spans HIP -> resolves to AOT, not torch.
++            self.assertEqual(_GELU_AND_MUL._resolve_backend(), B.AOT)
++            fo._platform = lambda: cuda
++            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.JIT)  # CUDA default
++        finally:
++            fo._platform = saved
+ 
+     def test_selector_explicit_backend(self):
+         spec = self.K.select_kernel(
+-            "layernorm.rmsnorm", backend=self.K.KernelBackend.CUDA_JIT
++            "layernorm.rmsnorm", backend=self.K.KernelBackend.JIT
+         )
+         self.assertEqual(
+-            spec.target, "sglang.kernels.ops.layernorm:_RMSNORM.forward_cuda_jit"
++            spec.target, "sglang.kernels.ops.layernorm:_RMSNORM.forward_jit"
+         )
+ 
+     def test_selector_unknown_op_raises(self):
+@@ -219,22 +264,49 @@ def test_selector_unknown_op_raises(self):
+ 
+     def test_capability_requirement_logic(self):
+         cap = self.K.CapabilityRequirement
++        dev = self.K.DeviceType
+         plat = self.K.PlatformInfo
+         cpu = plat(device_type="cpu")
+         sm90 = plat(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
+         sm100 = plat(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
++        hip = plat(device_type="hip")
+ 
+-        self.assertFalse(cap(requires_cuda=True).is_satisfied_by(cpu))
+-        self.assertTrue(cap(requires_cuda=True).is_satisfied_by(sm90))
++        self.assertFalse(cap(device=dev.CUDA).is_satisfied_by(cpu))
++        self.assertTrue(cap(device=dev.CUDA).is_satisfied_by(sm90))
++        self.assertFalse(cap(device=dev.CUDA).is_satisfied_by(hip))
++        self.assertTrue(cap(device=dev.HIP).is_satisfied_by(hip))
+         self.assertFalse(
+-            cap(requires_cuda=True, min_cuda_arch=(10, 0)).is_satisfied_by(sm90)
++            cap(device=dev.CUDA, min_cuda_arch=(10, 0)).is_satisfied_by(sm90)
+         )
+         self.assertTrue(
+-            cap(requires_cuda=True, min_cuda_arch=(10, 0)).is_satisfied_by(sm100)
++            cap(device=dev.CUDA, min_cuda_arch=(10, 0)).is_satisfied_by(sm100)
+         )
+         self.assertFalse(
+-            cap(requires_cuda=True, max_cuda_arch=(9, 0)).is_satisfied_by(sm100)
++            cap(device=dev.CUDA, max_cuda_arch=(9, 0)).is_satisfied_by(sm100)
++        )
++
++        # OR semantics: a {cuda, hip} set is satisfied by either device.
++        cuda_or_hip = {cap.CUDA, cap.HIP}
++        self.assertTrue(self.K.capabilities_satisfied(cuda_or_hip, sm90))
++        self.assertTrue(self.K.capabilities_satisfied(cuda_or_hip, hip))
++        self.assertFalse(self.K.capabilities_satisfied(cuda_or_hip, cpu))
++        self.assertTrue(self.K.capabilities_satisfied((), cpu))  # empty = unrestricted
++        # single requirement is tolerated (pre-decouple API used one).
++        self.assertTrue(self.K.capabilities_satisfied(cap.CUDA, sm90))
++
++        # Class-constant shortcuts equal their explicit form; sets are unordered
++        # and dedup, so {CUDA, HIP} == {HIP, CUDA}.
++        self.assertEqual(cap.CUDA, cap(device=dev.CUDA))
++        self.assertEqual(cap.HIP, cap(device=dev.HIP))
++        self.assertEqual({cap.CUDA, cap.HIP}, {cap.HIP, cap.CUDA})
++        self.assertEqual(len({cap.CUDA, cap(device=dev.CUDA)}), 1)
++        # cuda(min_sm=...) factory: an SM100+ CUDA requirement.
++        self.assertEqual(
++            cap.cuda(min_sm=(10, 0)),
++            cap(device=dev.CUDA, min_cuda_arch=(10, 0)),
+         )
++        self.assertTrue(cap.cuda(min_sm=(10, 0)).is_satisfied_by(sm100))
++        self.assertFalse(cap.cuda(min_sm=(10, 0)).is_satisfied_by(sm90))
+ 
+     def test_platform_detect_does_not_raise(self):
+         plat = self.K.PlatformInfo.detect()

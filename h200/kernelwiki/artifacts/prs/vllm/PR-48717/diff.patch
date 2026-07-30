@@ -1,0 +1,244 @@
+diff --git a/tests/v1/kv_connector/unit/test_nixl_connector_hma.py b/tests/v1/kv_connector/unit/test_nixl_connector_hma.py
+index 16c47962aefb..178eb42b93f8 100644
+--- a/tests/v1/kv_connector/unit/test_nixl_connector_hma.py
++++ b/tests/v1/kv_connector/unit/test_nixl_connector_hma.py
+@@ -86,7 +86,9 @@ def test_logical_to_kernel_block_ids_with_hma():
+ 
+     # Test conversion: FA + SW group
+     logical_block_ids = [[0, 1, 2], [3, 4]]
+-    kernel_block_ids = worker._logical_to_kernel_block_ids(logical_block_ids)
++    kernel_block_ids = worker._logical_to_kernel_block_ids(
++        logical_block_ids, worker._physical_blocks_per_logical_kv_block
++    )
+ 
+     expected_kernel_block_ids = [[0, 1, 2, 3, 4, 5], [6, 7, 8, 9]]
+     assert kernel_block_ids == expected_kernel_block_ids, (
+@@ -179,7 +181,7 @@ def test_read_blocks_for_req_expands_remote_ids(
+     """_read_blocks_for_req must expand remote logical block IDs to kernel
+     block IDs when kernel block size != logical block size.
+ 
+-    The hot path always calls _logical_to_remote_kernel_block_ids with
++    The hot path always calls _logical_to_kernel_block_ids with
+     remote_info.remote_physical_blocks_per_logical (model-agnostic).
+     """
+     from unittest.mock import MagicMock
+@@ -1140,7 +1142,7 @@ def test_derive_mamba_conv_split(
+         ),
+     ],
+ )
+-def test_logical_to_remote_kernel_block_ids(
++def test_logical_to_kernel_block_ids_with_remote_ratio(
+     mamba_enabled,
+     swa_enabled,
+     local_physical_per_logical,
+@@ -1148,7 +1150,7 @@ def test_logical_to_remote_kernel_block_ids(
+     logical_block_ids,
+     expected_kernel_block_ids,
+ ):
+-    """Verify _logical_to_remote_kernel_block_ids uses the remote
++    """Verify _logical_to_kernel_block_ids uses the remote
+     physical_per_logical for FA expansion, not the local one.
+ 
+     This was the root cause of silent accuracy corruption in Qwen3.5
+@@ -1169,7 +1171,7 @@ def test_logical_to_remote_kernel_block_ids(
+         swa_enabled=swa_enabled,
+     )
+ 
+-    result = worker._logical_to_remote_kernel_block_ids(
++    result = worker._logical_to_kernel_block_ids(
+         logical_block_ids,
+         remote_physical_per_logical,
+     )
+diff --git a/tests/v1/kv_connector/unit/test_nixl_push_connector.py b/tests/v1/kv_connector/unit/test_nixl_push_connector.py
+index 3c9cce1bd686..ad5ccbbbe86c 100644
+--- a/tests/v1/kv_connector/unit/test_nixl_push_connector.py
++++ b/tests/v1/kv_connector/unit/test_nixl_push_connector.py
+@@ -487,7 +487,7 @@ def test_start_load_kv_enqueues_to_writer(self):
+         # path here.
+         w._send_heartbeats = lambda metadata: None
+         # Stub logical-to-kernel mapping used by reqs_to_recv.
+-        w._logical_to_kernel_block_ids = lambda x: x
++        w._logical_to_kernel_block_ids = lambda x, ratio: x
+ 
+         meta = NixlConnectorMetadata()
+         meta.push_registrations = {
+@@ -775,7 +775,7 @@ def test_start_load_kv_with_empty_metadata_is_noop(self):
+         """Empty metadata must not wake the writer or enqueue anything."""
+         w = _StubWriterWorker.fresh()
+         w._send_heartbeats = lambda metadata: None
+-        w._logical_to_kernel_block_ids = lambda x: x
++        w._logical_to_kernel_block_ids = lambda x, ratio: x
+ 
+         meta = NixlConnectorMetadata()
+         w.start_load_kv(meta)
+@@ -944,7 +944,7 @@ def _mla_worker_writing_to(d_ranks):
+                 rank_offset_factor=0,
+             )
+         }
+-        w._logical_to_remote_kernel_block_ids = lambda block_ids, ratio: block_ids
++        w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
+         w.dst_xfer_side_handles = {engine_id: {r: 1000 + r for r in d_ranks}}
+         w.src_xfer_handles_by_block_size = {16: 2000}
+         w._remote_agents = {engine_id: {(0, r): f"agent-{r}" for r in d_ranks}}
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index 47243968936a..7cbe7da8b85c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -1850,7 +1850,7 @@ def save_kv_to_host(self, metadata: NixlConnectorMetadata):
+ 
+         for req_id, meta in metadata.reqs_to_save.items():
+             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
+-                meta.local_block_ids
++                meta.local_block_ids, self._physical_blocks_per_logical_kv_block
+             )
+             if logger.isEnabledFor(logging.DEBUG):
+                 logger.debug(
+@@ -2205,30 +2205,36 @@ def get_mapped_blocks(
+ 
+         return mapped_2d.flatten().astype(np.int64)
+ 
+-    def _logical_to_kernel_block_ids(self, block_ids: BlockIds) -> BlockIds:
++    def _logical_to_kernel_block_ids(self, block_ids: BlockIds, ratio: int) -> BlockIds:
+         """
+-        Convert logical block ids to kernel physical block ids.
++        Convert block ids to kernel physical block ids.
+         This is required when the logical block size (the one set by the user)
+         does not match the one required by the attn backend.
++        `ratio` is the number of physical blocks per logical block.
++        We always receive logical blocks from the engine, so we expand them here eg:
++        logical block ids: [(SW-clipped) [1], (FA) [2, 3]], ratio=2
++        physical block ids: [(SW-clipped) [2, 3], (FA) [4, 5, 6, 7]]
+         """
+-        if self._physical_blocks_per_logical_kv_block == 1:
++        if ratio == 1:
+             # Noop when physical and logical block sizes are the same
+             return block_ids
+-        block_arange = np.arange(0, self._physical_blocks_per_logical_kv_block).reshape(
+-            1, -1
+-        )
+-        # Mamba blocks have no logical<>physical discrepancy
++        block_arange = np.arange(0, ratio).reshape(1, -1)
++        # Mamba blocks have no logical<>physical discrepancy (block-size=1)
+         group_specs = self.kv_cache_config.kv_cache_groups
+-        return [
+-            BlockTable.map_to_kernel_blocks(
+-                np.array(group),
+-                self._physical_blocks_per_logical_kv_block,
+-                block_arange,
+-            ).tolist()
+-            if not isinstance(group_specs[i].kv_cache_spec, MambaSpec)
+-            else group
+-            for i, group in enumerate(block_ids)
+-        ]
++        physical_block_ids = []
++        for i, group in enumerate(block_ids):
++            spec = group_specs[i].kv_cache_spec
++            if isinstance(spec, MambaSpec):
++                physical_block_ids.append(group)
++            else:
++                physical_block_ids.append(
++                    BlockTable.map_to_kernel_blocks(
++                        np.array(group),
++                        ratio,
++                        block_arange,
++                    ).tolist()
++                )
++        return physical_block_ids
+ 
+     def _apply_prefix_caching(
+         self,
+@@ -2306,39 +2312,6 @@ def _apply_prefix_caching(
+                     remote_block_ids[i] = remote_group[:num_blocks]
+         return local_block_ids, remote_block_ids
+ 
+-    def _logical_to_remote_kernel_block_ids(
+-        self, block_ids: BlockIds, remote_physical_per_logical: int
+-    ) -> BlockIds:
+-        """Map logical block IDs to physical kernel block IDs on the remote.
+-
+-        Args:
+-            block_ids: per-group lists of logical block IDs.
+-            remote_physical_per_logical: remote engine's physical blocks
+-                per logical block.
+-
+-        Returns:
+-            Same structure with FA groups expanded (each logical block L
+-            becomes kernel blocks [L*remote_physical_per_logical, ..
+-            L*remote_physical_per_logical +
+-            remote_physical_per_logical - 1]).
+-            Mamba groups are passed through unchanged.
+-        """
+-        if remote_physical_per_logical == 1:
+-            return block_ids
+-        remote_arange = np.arange(remote_physical_per_logical).reshape(1, -1)
+-        group_specs = self.kv_cache_config.kv_cache_groups
+-        result = [
+-            BlockTable.map_to_kernel_blocks(
+-                np.array(group),
+-                remote_physical_per_logical,
+-                remote_arange,
+-            ).tolist()
+-            if not isinstance(group_specs[i].kv_cache_spec, MambaSpec)
+-            else group
+-            for i, group in enumerate(block_ids)
+-        ]
+-        return result
+-
+     def get_backend_aware_kv_block_len(
+         self, layer_idx: int, first_split: bool = True, mamba_view: bool = False
+     ) -> int:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
+index 4414bf60704f..63969382dff8 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
+@@ -48,7 +48,7 @@ def start_load_kv(self, metadata: NixlConnectorMetadata):
+         """
+         for req_id, meta in metadata.reqs_to_recv.items():
+             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
+-                meta.local_block_ids
++                meta.local_block_ids, self._physical_blocks_per_logical_kv_block
+             )
+             assert meta.remote is not None
+             # Remote block IDs are kept logical here; expanded in
+@@ -134,7 +134,7 @@ def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
+         remote_info = self.transfer_topo.get_engine_info(engine_id)
+         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
+ 
+-        meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
++        meta.remote.block_ids = self._logical_to_kernel_block_ids(
+             meta.remote.block_ids,
+             remote_info.remote_physical_blocks_per_logical,
+         )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+index 090c2074ddd3..859dbae00b6f 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+@@ -152,7 +152,7 @@ def start_load_kv(self, metadata: NixlConnectorMetadata):
+         # D-side: track reqs waiting for P to push.
+         for req_id, meta in metadata.reqs_to_recv.items():
+             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
+-                meta.local_block_ids
++                meta.local_block_ids, self._physical_blocks_per_logical_kv_block
+             )
+             assert meta.remote is not None
+             remote_engine_id = meta.remote.engine_id
+@@ -414,7 +414,9 @@ def _do_start_push_kv(
+         # expands each side using the appropriate ratio.
+         logical_local = self._as_grouped_block_ids(local_block_ids)
+         logical_remote = self._as_grouped_block_ids(remote_block_ids)
+-        physical_local = self._logical_to_kernel_block_ids(logical_local)
++        physical_local = self._logical_to_kernel_block_ids(
++            logical_local, self._physical_blocks_per_logical_kv_block
++        )
+ 
+         push_meta = ReqMeta(
+             local_block_ids=logical_local,
+@@ -501,7 +503,7 @@ def _xfer_blocks_for_req(self, req_id: str, meta: ReqMeta):
+         # Expand D's logical IDs using the ratio learned during the
+         # NIXL handshake. ``meta`` is freshly built by
+         # ``_do_start_push_kv`` so mutating it here is safe.
+-        meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
++        meta.remote.block_ids = self._logical_to_kernel_block_ids(
+             meta.remote.block_ids,
+             remote_info.remote_physical_blocks_per_logical,
+         )

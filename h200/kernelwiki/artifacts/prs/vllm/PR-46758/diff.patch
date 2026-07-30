@@ -1,0 +1,212 @@
+diff --git a/tests/kernels/moe/test_deepep_moe.py b/tests/kernels/moe/test_deepep_moe.py
+index 4080ca184597..8d12e2888d0d 100644
+--- a/tests/kernels/moe/test_deepep_moe.py
++++ b/tests/kernels/moe/test_deepep_moe.py
+@@ -11,7 +11,7 @@
+ from torch.distributed import ProcessGroup
+ 
+ import vllm.envs as envs
+-from tests.kernels.moe.utils import make_dummy_moe_config
++from tests.kernels.moe.utils import check_accuracy, make_dummy_moe_config
+ from vllm import _custom_ops as ops
+ from vllm.config import VllmConfig, set_current_vllm_config
+ from vllm.model_executor.layers.activation import SiluAndMul
+@@ -227,39 +227,44 @@ def build_expert_map():
+     out_hidden_states = torch.empty_like(test_tensors.rank_tokens)
+     total_num_tokens = test_tensors.rank_tokens.size(0)
+ 
++    quant_config = FusedMoEQuantConfig.make(
++        q_dtype,
++        w1_scale=w1_scale,
++        w2_scale=w2_scale,
++        per_act_token_quant=per_act_token_quant,
++        a1_scale=test_tensors.rank_token_scales,
++    )
++
++    # Build the kernel (and its DeepEP buffer) once and reuse it across chunks.
++    # Re-creating it per chunk re-inits rocSHMEM, which only allows one
++    # allocation per process on ROCm. The buffer is sized by max_tokens_per_rank
++    # so it is valid for every chunk (mirrors production's cached all2all handle).
++    mk: FusedMoEKernel = make_modular_kernel(
++        pg,
++        pgi,
++        low_latency_mode,
++        hidden_size,
++        dp_size,
++        num_experts,
++        num_local_experts,
++        q_dtype,
++        use_fp8_dispatch,
++        quant_config,
++    )
++
+     def process_chunk(chunk_start, chunk_end, skip_result_store=False):
+         rank_tokens_chunk = test_tensors.rank_tokens[chunk_start:chunk_end]
+         topk_weights_chunk = test_tensors.topk_weights[chunk_start:chunk_end]
+         topk_chunk = test_tensors.topk[chunk_start:chunk_end]
+-        rank_token_scales_chunk = test_tensors.rank_token_scales
+-        if (
+-            rank_token_scales_chunk is not None
+-            and rank_token_scales_chunk.size(0) == total_num_tokens
+-        ):
+-            # per act token
+-            rank_token_scales_chunk = rank_token_scales_chunk[chunk_start:chunk_end]
+-
+-        quant_config = FusedMoEQuantConfig.make(
+-            q_dtype,
+-            w1_scale=w1_scale,
+-            w2_scale=w2_scale,
+-            per_act_token_quant=per_act_token_quant,
+-            a1_scale=rank_token_scales_chunk,
+-        )
+ 
+-        # Make modular kernel
+-        mk: FusedMoEKernel = make_modular_kernel(
+-            pg,
+-            pgi,
+-            low_latency_mode,
+-            hidden_size,
+-            dp_size,
+-            num_experts,
+-            num_local_experts,
+-            q_dtype,
+-            use_fp8_dispatch,
+-            quant_config,
+-        )
++        if low_latency_mode:
++            # Reusing one buffer leaves it dirty; the low-latency kernels need
++            # the zero-initialized regions reset before each dispatch.
++            mk.prepare_finalize.buffer.clean_low_latency_buffer(
++                MAX_TOKENS_PER_RANK,
++                hidden_size,
++                num_experts,
++            )
+ 
+         out = mk.apply(
+             hidden_states=rank_tokens_chunk,
+@@ -350,6 +355,28 @@ def torch_moe_impl(
+     return out
+ 
+ 
++def assert_deepep_close(
++    expected: torch.Tensor,
++    actual: torch.Tensor,
++    k: int,
++    use_fp8_dispatch: bool,
++) -> None:
++    if use_fp8_dispatch and current_platform.is_fp8_fnuz():
++        # ROCm e4m3fnuz rounds differently than the reference quant,
++        # so DeepEP's fp8 dispatch can yield a few outliers even with
++        # a correct kernel; allow a small fraction of mismatches here.
++        atol = rtol = 1.5e-1
++        check_accuracy(expected, actual, atol=atol, rtol=rtol, percent=0.95)
++        return
++
++    torch.testing.assert_close(
++        expected,
++        actual,
++        atol=6e-2,
++        rtol=6e-2,
++    )
++
++
+ def _deep_ep_moe(
+     pgi: ProcessGroupInfo,
+     low_latency_mode: bool,
+@@ -362,6 +389,9 @@ def _deep_ep_moe(
+     use_fp8_dispatch: bool,
+     per_act_token_quant: bool,
+ ):
++    # Set seed in worker process for deterministic tensor generation.
++    set_random_seed(7)
++
+     device = torch.device(f"cuda:{pgi.local_rank}")
+     init_workspace_manager(device)
+ 
+@@ -426,12 +456,7 @@ def _deep_ep_moe(
+             per_act_token_quant,
+         )
+ 
+-    torch.testing.assert_close(
+-        torch_combined,
+-        deepep_combined,
+-        atol=6e-2,
+-        rtol=6e-2,
+-    )
++    assert_deepep_close(torch_combined, deepep_combined, config.k, use_fp8_dispatch)
+ 
+ 
+ MNKs = [
+diff --git a/tests/kernels/moe/test_ocp_mx_moe.py b/tests/kernels/moe/test_ocp_mx_moe.py
+index e768947b2699..a96e47fe4392 100644
+--- a/tests/kernels/moe/test_ocp_mx_moe.py
++++ b/tests/kernels/moe/test_ocp_mx_moe.py
+@@ -9,6 +9,7 @@
+ import torch
+ from packaging import version
+ 
++from tests.kernels.moe.utils import check_accuracy
+ from vllm._aiter_ops import is_aiter_found
+ from vllm.platforms import current_platform
+ from vllm.utils.flashinfer import has_flashinfer
+@@ -515,29 +516,6 @@ def tg_mxfp4_moe(
+     return tg_result
+ 
+ 
+-def check_accuracy(a, b, atol, rtol, percent):
+-    """Allow a mismatch percentage of 1 - percent."""
+-    if torch.any(torch.isnan(a)):
+-        raise Exception("NaN in reference output")
+-    if torch.any(torch.isnan(b)):
+-        raise Exception("NaN in actual output")
+-    if torch.any(torch.isinf(a)):
+-        raise Exception("Inf in reference output")
+-    if torch.any(torch.isinf(b)):
+-        raise Exception("Inf in actual output")
+-    assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
+-
+-    left = torch.abs(a - b)
+-    right = atol + rtol * torch.abs(b)
+-    count = torch.sum(left > right)
+-    mismatch_percent = count / a.numel()
+-    if mismatch_percent > 1 - percent:
+-        raise Exception(
+-            f"Mismatch percentage is {mismatch_percent:.4f} for rtol {rtol} "
+-            f"(threshold: {1 - percent:.4f})"
+-        )
+-
+-
+ @pytest.mark.parametrize("topk", [1, 4])
+ @pytest.mark.parametrize("num_experts", [32, 128])
+ @pytest.mark.parametrize("num_tokens", [1, 128, 1024])
+diff --git a/tests/kernels/moe/utils.py b/tests/kernels/moe/utils.py
+index 4899de44a815..3f3bcebd11e9 100644
+--- a/tests/kernels/moe/utils.py
++++ b/tests/kernels/moe/utils.py
+@@ -653,3 +653,26 @@ def make_shared_experts(
+     return make_shared_experts_with_weights(
+         N, K, in_dtype, w1, w2, w1_s=w1_s, w2_s=w2_s, quant_dtype=quant_dtype
+     )
++
++
++def check_accuracy(a, b, atol, rtol, percent):
++    """Allow a mismatch percentage of 1 - percent."""
++    if torch.any(torch.isnan(a)):
++        raise Exception("NaN in reference output")
++    if torch.any(torch.isnan(b)):
++        raise Exception("NaN in actual output")
++    if torch.any(torch.isinf(a)):
++        raise Exception("Inf in reference output")
++    if torch.any(torch.isinf(b)):
++        raise Exception("Inf in actual output")
++    assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
++
++    left = torch.abs(a - b)
++    right = atol + rtol * torch.abs(b)
++    count = torch.sum(left > right)
++    mismatch_percent = count / a.numel()
++    if mismatch_percent > 1 - percent:
++        raise Exception(
++            f"Mismatch percentage is {mismatch_percent:.4f} for rtol {rtol} "
++            f"(threshold: {1 - percent:.4f})"
++        )

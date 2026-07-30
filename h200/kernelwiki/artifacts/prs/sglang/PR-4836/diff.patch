@@ -1,0 +1,117 @@
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index e50f74dfa5be..2b5cd1b62c30 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -78,6 +78,7 @@
+     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
+     "disable_radix_cache": ServerArgs.disable_radix_cache,
+     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
++    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
+     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
+     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+     "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 7fa9c05c76df..4c1a6d93af25 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -158,6 +158,7 @@ def __init__(
+                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
+                 "disable_radix_cache": server_args.disable_radix_cache,
+                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
++                "moe_dense_tp_size": server_args.moe_dense_tp_size,
+                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
+                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
+                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index ad9262d2cbd6..26073bd67695 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -1066,12 +1066,18 @@ def __init__(
+                 prefix=add_prefix("mlp", prefix),
+             )
+         else:
++            if self._enable_moe_dense_fully_dp():
++                mlp_tp_rank, mlp_tp_size = 0, 1
++            else:
++                mlp_tp_rank, mlp_tp_size = None, None
+             self.mlp = DeepseekV2MLP(
+                 hidden_size=config.hidden_size,
+                 intermediate_size=config.intermediate_size,
+                 hidden_act=config.hidden_act,
+                 quant_config=quant_config,
+                 prefix=add_prefix("mlp", prefix),
++                tp_rank=mlp_tp_rank,
++                tp_size=mlp_tp_size,
+             )
+ 
+         self.input_is_scattered = (
+@@ -1084,6 +1090,10 @@ def __init__(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
+ 
++    @staticmethod
++    def _enable_moe_dense_fully_dp():
++        return global_server_args_dict["moe_dense_tp_size"] == 1
++
+     @staticmethod
+     def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
+         is_sparse = is_nextn or (
+@@ -1094,6 +1104,7 @@ def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
+         ffn_input_mode = (
+             _FFNInputMode.SCATTERED
+             if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
++            or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
+             else _FFNInputMode.FULL
+         )
+         return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
+@@ -1240,7 +1251,12 @@ def forward_ffn_with_scattered_input(
+                     hidden_states, residual
+                 )
+ 
+-        hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
++        if not (
++            self._enable_moe_dense_fully_dp()
++            and (not self.info.is_sparse)
++            and hidden_states.shape[0] == 0
++        ):
++            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+ 
+         if self.is_last_layer and self.attn_tp_size != 1:
+             hidden_states += residual
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 436c0f306aae..41bb651179b6 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -181,6 +181,7 @@ class ServerArgs:
+     hicache_ratio: float = 2.0
+     flashinfer_mla_disable_ragged: bool = False
+     warmups: Optional[str] = None
++    moe_dense_tp_size: Optional[int] = None
+     n_share_experts_fusion: int = 0
+     disable_shared_experts_fusion: bool = False
+     disable_chunked_prefix_cache: bool = False
+@@ -252,6 +253,11 @@ def __post_init__(self):
+ 
+         assert self.chunked_prefill_size % self.page_size == 0
+ 
++        assert self.moe_dense_tp_size in {
++            1,
++            None,
++        }, f"moe_dense_tp_size only support 1 and None currently"
++
+         if self.attention_backend == "flashmla":
+             logger.warning(
+                 "FlashMLA only supports a page_size of 64, change page_size to 64."
+@@ -1101,6 +1107,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
+             action="store_true",
+             help="Enabling DeepEP MoE implementation for EP MoE.",
+         )
++        parser.add_argument(
++            "--moe-dense-tp-size",
++            type=int,
++            default=ServerArgs.moe_dense_tp_size,
++            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
++        )
+         parser.add_argument(
+             "--deepep-mode",
+             type=str,

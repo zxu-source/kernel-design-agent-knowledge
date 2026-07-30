@@ -1,0 +1,671 @@
+diff --git a/python/sglang/kernels/ops/speculative/__init__.py b/python/sglang/kernels/ops/speculative/__init__.py
+index e873cd2792ff..2f48798ae1d9 100644
+--- a/python/sglang/kernels/ops/speculative/__init__.py
++++ b/python/sglang/kernels/ops/speculative/__init__.py
+@@ -18,6 +18,7 @@
+     ("multi_layer_eagle", "rotate_input_ids_triton"),
+     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
+     ("spec_tree", "verify_tree_greedy_kernel_triton"),
++    ("topk1", "draft_topk1_postprocess"),
+ ]
+ for _mod, _fn in _TRITON_KERNELS:
+     register_kernel(
+diff --git a/python/sglang/kernels/ops/speculative/topk1.py b/python/sglang/kernels/ops/speculative/topk1.py
+new file mode 100644
+index 000000000000..a63a2561783e
+--- /dev/null
++++ b/python/sglang/kernels/ops/speculative/topk1.py
+@@ -0,0 +1,148 @@
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++_DRAFT_TOPK1_BLOCK = 8192
++
++
++@triton.jit
++def _draft_topk1_partial_argmax_kernel(
++    logits,
++    partial_vals,
++    partial_indices,
++    logits_row_stride,
++    vocab_size: tl.constexpr,
++    num_splits: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    # int64 row base: row * stride overflows int32 once bs * vocab reaches 2^31.
++    row = tl.program_id(0).to(tl.int64)
++    split = tl.program_id(1)
++    offsets = split * BLOCK + tl.arange(0, BLOCK)
++    mask = offsets < vocab_size
++    vals = tl.load(
++        logits + row * logits_row_stride + offsets,
++        mask=mask,
++        other=-float("inf"),
++    ).to(tl.float32)
++
++    max_val = tl.max(vals, axis=0)
++    local_index = tl.argmax(vals, axis=0)
++    out_offset = row * num_splits + split
++    tl.store(partial_vals + out_offset, max_val)
++    tl.store(partial_indices + out_offset, split * BLOCK + local_index)
++
++
++@triton.jit
++def _draft_topk1_finalize_kernel(
++    partial_vals,
++    partial_indices,
++    topk_p,
++    topk_index,
++    positions,
++    draft_tokens,
++    draft_tokens_stride,
++    draft_token_column,
++    num_splits: tl.constexpr,
++    WRITE_DRAFT_TOKEN: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    offsets = tl.arange(0, BLOCK)
++    mask = offsets < num_splits
++    vals = tl.load(
++        partial_vals + row * num_splits + offsets,
++        mask=mask,
++        other=-float("inf"),
++    )
++
++    split = tl.argmax(vals, axis=0)
++    index = tl.load(partial_indices + row * num_splits + split).to(tl.int64)
++    tl.store(topk_index + row, index)
++    tl.store(topk_p + row, 1.0)
++    if WRITE_DRAFT_TOKEN:
++        tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
++
++    position = tl.load(positions + row)
++    tl.store(positions + row, position + 1)
++
++
++def draft_topk1_postprocess(
++    next_token_logits: torch.Tensor,
++    positions: torch.Tensor,
++    draft_tokens: torch.Tensor | None = None,
++    draft_token_column: int = 0,
++):
++    """Argmax draft logits for topk=1 and advance positions.
++
++    PyTorch eager argmax reduces each row with too little parallelism for the
++    GLM/DSV4 vocab widths in CUDA graph replay. This split reduction exposes
++    the vocab dimension across CTAs, then finalizes one token per row.
++
++    If ``draft_tokens`` is given, the finalize kernel also stores the argmax
++    into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
++    buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
++    is greedy and the chain probabilities are unused downstream.
++    """
++    assert next_token_logits.ndim == 2
++    assert next_token_logits.stride(1) == 1
++    assert positions.ndim == 1
++    assert positions.is_contiguous()
++    assert positions.shape[0] == next_token_logits.shape[0]
++    assert positions.device == next_token_logits.device
++    write_draft_token = draft_tokens is not None
++    if write_draft_token:
++        assert draft_tokens.ndim == 2
++        assert draft_tokens.dtype == torch.long
++        assert draft_tokens.device == next_token_logits.device
++        assert draft_tokens.shape[0] == next_token_logits.shape[0]
++        assert draft_tokens.stride(1) == 1
++        assert 0 <= draft_token_column < draft_tokens.shape[1]
++
++    bs, vocab_size = next_token_logits.shape
++    topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
++    topk_index = torch.empty(
++        (bs, 1), dtype=torch.int64, device=next_token_logits.device
++    )
++    if bs == 0:
++        return topk_p, topk_index
++
++    block = _DRAFT_TOPK1_BLOCK
++    num_splits = triton.cdiv(vocab_size, block)
++    partial_vals = torch.empty(
++        (bs, num_splits), dtype=torch.float32, device=next_token_logits.device
++    )
++    partial_indices = torch.empty(
++        (bs, num_splits), dtype=torch.int32, device=next_token_logits.device
++    )
++
++    _draft_topk1_partial_argmax_kernel[(bs, num_splits)](
++        next_token_logits,
++        partial_vals,
++        partial_indices,
++        next_token_logits.stride(0),
++        vocab_size,
++        num_splits,
++        BLOCK=block,
++        num_warps=8,
++    )
++    # Dummy operand for the disabled draft-token slot: the pointer must be
++    # valid even though the kernel never dereferences it (gated off by
++    # WRITE_DRAFT_TOKEN).
++    _draft_topk1_finalize_kernel[(bs,)](
++        partial_vals,
++        partial_indices,
++        topk_p,
++        topk_index,
++        positions,
++        draft_tokens if write_draft_token else topk_index,
++        draft_tokens.stride(0) if write_draft_token else 0,
++        draft_token_column,
++        num_splits,
++        WRITE_DRAFT_TOKEN=write_draft_token,
++        BLOCK=triton.next_power_of_2(num_splits),
++        num_warps=1,
++    )
++    return topk_p, topk_index
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 539046d180ab..1de74ecfb0ac 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -6,6 +6,7 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+ from sglang.srt.environ import envs
+ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
+@@ -582,6 +583,27 @@ def draft_forward(self, forward_batch: ForwardBatch):
+         if self.server_args.speculative_use_rejection_sampling:
+             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+ 
++        topk1_chain_fits = (
++            self.topk == 1
++            and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
++        )
++        # Materialize the chain directly only when the CUDA kernel can write
++        # every subsequent column. Other topk=1 paths retain the token list and
++        # assemble it with one final cat instead of launching a copy per step.
++        draft_tokens_topk1 = None
++        if (
++            topk1_chain_fits
++            and _is_cuda
++            and self.hot_token_id is None
++            and not self.server_args.speculative_use_rejection_sampling
++        ):
++            draft_tokens_topk1 = torch.empty(
++                (topk_index.shape[0], self.speculative_num_steps),
++                dtype=topk_index.dtype,
++                device=topk_index.device,
++            )
++            draft_tokens_topk1[:, :1].copy_(topk_index)
++
+         # Forward multiple steps
+         scores = None
+         if self.index_share_for_mtp_iteration:
+@@ -593,12 +615,15 @@ def draft_forward(self, forward_batch: ForwardBatch):
+             ):
+                 spec_info.dsa_topk_indices = None
+         for i in range(self.speculative_num_steps):
+-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+-                i, topk_p, topk_index, hidden_states, scores, self.topk
+-            )
+-            score_list.append(tree_info[0])
+-            token_list.append(tree_info[1])
+-            parents_list.append(tree_info[2])
++            if draft_tokens_topk1 is not None:
++                input_ids = topk_index.flatten()
++            else:
++                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
++                    i, topk_p, topk_index, hidden_states, scores, self.topk
++                )
++                score_list.append(tree_info[0])
++                token_list.append(tree_info[1])
++                parents_list.append(tree_info[2])
+ 
+             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+             if i == self.speculative_num_steps - 1:
+@@ -641,11 +666,22 @@ def draft_forward(self, forward_batch: ForwardBatch):
+                     forward_batch.sampling_info.temperatures,
+                 )
+                 draft_probs_list.append(probs)
++                forward_batch.positions.add_(1)
+             elif self.topk == 1 and not _is_hip:
+-                topk_index = torch.argmax(
+-                    logits_output.next_token_logits, dim=-1, keepdim=True
+-                )
+-                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
++                if _is_cuda:
++                    # The positions advance is fused into the kernel.
++                    topk_p, topk_index = draft_topk1_postprocess(
++                        logits_output.next_token_logits,
++                        forward_batch.positions,
++                        draft_tokens_topk1,
++                        i + 1,
++                    )
++                else:
++                    topk_index = torch.argmax(
++                        logits_output.next_token_logits, dim=-1, keepdim=True
++                    )
++                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
++                    forward_batch.positions.add_(1)
+             else:
+                 probs = renorm_draft_probs(
+                     logits_output.next_token_logits,
+@@ -653,6 +689,7 @@ def draft_forward(self, forward_batch: ForwardBatch):
+                     self.server_args.speculative_use_rejection_sampling,
+                 )
+                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
++                forward_batch.positions.add_(1)
+             maybe_detect_oob(
+                 topk_index,
+                 0,
+@@ -662,42 +699,35 @@ def draft_forward(self, forward_batch: ForwardBatch):
+             if self.hot_token_id is not None:
+                 topk_index = self.hot_token_id[topk_index]
+             hidden_states = logits_output.hidden_states
+-            forward_batch.positions.add_(1)
+ 
+         if self.index_share_for_mtp_iteration:
+             spec_info.dsa_topk_indices = None
+             forward_batch.reuse_dsa_topk_indices = False
+ 
++        draft_probs = (
++            torch.stack(draft_probs_list, dim=1)
++            if self.server_args.speculative_use_rejection_sampling
++            else None
++        )
++
+         # Organize the results
+-        if (
+-            self.topk == 1
+-            and token_list[0].shape[0] <= self._topk1_parents_prealloc.shape[0]
+-        ):
+-            # Chain topology: draft_tokens = concat of per-step tokens; the
+-            # full-length topk/sort/gather over score_list collapses to an
+-            # identity. parent_list and top_scores_index are runtime-invariant
+-            # constants pre-allocated on the worker. Oversized batches (rare,
+-            # would silently truncate the slice) fall through to the slow path.
++        if draft_tokens_topk1 is not None:
++            bs = draft_tokens_topk1.shape[0]
++            top_scores_index = self._topk1_score_indices_prealloc[:bs]
++            parent_list = self._topk1_parents_prealloc[:bs]
++            return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
++
++        if topk1_chain_fits:
+             bs = token_list[0].shape[0]
+             draft_tokens = torch.cat(token_list, dim=1)
+             top_scores_index = self._topk1_score_indices_prealloc[:bs]
+             parent_list = self._topk1_parents_prealloc[:bs]
+-            draft_probs = (
+-                torch.stack(draft_probs_list, dim=1)
+-                if self.server_args.speculative_use_rejection_sampling
+-                else None
+-            )
+             return parent_list, top_scores_index, draft_tokens, draft_probs
+ 
+         parent_list, top_scores_index, draft_tokens = organize_draft_results(
+             score_list, token_list, parents_list, self.speculative_num_draft_tokens
+         )
+ 
+-        draft_probs = (
+-            torch.stack(draft_probs_list, dim=1)
+-            if self.server_args.speculative_use_rejection_sampling
+-            else None
+-        )
+         return parent_list, top_scores_index, draft_tokens, draft_probs
+ 
+     def draft_extend(self):
+diff --git a/test/registered/jit/benchmark/bench_spec_topk1.py b/test/registered/jit/benchmark/bench_spec_topk1.py
+new file mode 100644
+index 000000000000..1635a1046d2c
+--- /dev/null
++++ b/test/registered/jit/benchmark/bench_spec_topk1.py
+@@ -0,0 +1,165 @@
++"""Benchmark CUDA topk=1 speculative decoding helpers."""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.testing
++
++from sglang.jit_kernel.benchmark.utils import (
++    DEFAULT_DEVICE,
++    get_benchmark_range,
++    run_benchmark,
++)
++from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(
++    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
++)
++
++
++BATCH_SIZE_RANGE = get_benchmark_range(
++    full_range=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
++    ci_range=[1, 16, 256, 2048],
++)
++VOCAB_SIZES = {
++    "dsv4": 129280,
++    "glm5_2": 151552,
++}
++VOCAB_SIZE_RANGE = get_benchmark_range(
++    full_range=list(VOCAB_SIZES.values()),
++    ci_range=list(VOCAB_SIZES.values()),
++)
++NUM_STEPS = 3
++
++
++def make_logits(batch_size: int, vocab_size: int) -> torch.Tensor:
++    logits = torch.zeros(
++        (batch_size, vocab_size), dtype=torch.float32, device=DEFAULT_DEVICE
++    )
++    max_index = (
++        torch.arange(batch_size, dtype=torch.long, device=DEFAULT_DEVICE) * 9973 + 17
++    ) % vocab_size
++    logits.scatter_(1, max_index[:, None], 1000.0)
++    return logits
++
++
++def make_draft_case(batch_size: int, vocab_size: int):
++    logits = make_logits(batch_size, vocab_size)
++    positions = torch.zeros(batch_size, dtype=torch.long, device=DEFAULT_DEVICE)
++    return logits, positions
++
++
++def make_chain_case(batch_size: int, vocab_size: int):
++    seed_topk_index = torch.randint(
++        0, vocab_size, (batch_size, 1), dtype=torch.long, device=DEFAULT_DEVICE
++    )
++    logits = [make_logits(batch_size, vocab_size) for _ in range(NUM_STEPS - 1)]
++    positions = torch.zeros(batch_size, dtype=torch.long, device=DEFAULT_DEVICE)
++    return seed_topk_index, logits, positions
++
++
++def eager_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor):
++    topk_index = torch.argmax(logits, dim=-1, keepdim=True)
++    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
++    positions.add_(1)
++    return topk_p, topk_index
++
++
++def fused_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor):
++    return draft_topk1_postprocess(logits, positions)
++
++
++def eager_chain_materialize(
++    seed_topk_index: torch.Tensor,
++    logits: list[torch.Tensor],
++    positions: torch.Tensor,
++):
++    token_list = [seed_topk_index]
++    for step_logits in logits:
++        _, topk_index = eager_draft_topk1_postprocess(step_logits, positions)
++        token_list.append(topk_index)
++    return torch.cat(token_list, dim=1)
++
++
++def fused_chain_materialize(
++    seed_topk_index: torch.Tensor,
++    logits: list[torch.Tensor],
++    positions: torch.Tensor,
++):
++    draft_tokens = torch.empty(
++        (seed_topk_index.shape[0], NUM_STEPS),
++        dtype=torch.long,
++        device=DEFAULT_DEVICE,
++    )
++    draft_tokens[:, :1].copy_(seed_topk_index)
++    for i, step_logits in enumerate(logits, start=1):
++        draft_topk1_postprocess(
++            step_logits,
++            positions,
++            draft_tokens,
++            draft_token_column=i,
++        )
++    return draft_tokens
++
++
++@triton.testing.perf_report(
++    triton.testing.Benchmark(
++        x_names=["batch_size", "vocab_size"],
++        x_vals=[(bs, vocab) for bs in BATCH_SIZE_RANGE for vocab in VOCAB_SIZE_RANGE],
++        line_arg="provider",
++        line_vals=["fused", "eager"],
++        line_names=["Fused Triton", "Eager torch"],
++        styles=[("blue", "-"), ("orange", "--")],
++        ylabel="us",
++        plot_name="spec-topk1-draft-postprocess",
++        args={},
++    )
++)
++def benchmark_draft_postprocess(
++    batch_size: int, vocab_size: int, provider: str
++) -> tuple[float, float, float]:
++    logits, positions = make_draft_case(batch_size, vocab_size)
++    if provider == "fused":
++        fn = lambda: fused_draft_topk1_postprocess(logits, positions)
++    elif provider == "eager":
++        fn = lambda: eager_draft_topk1_postprocess(logits, positions)
++    else:
++        raise ValueError(f"Unknown provider: {provider}")
++    fn()
++    torch.cuda.synchronize()
++    return run_benchmark(fn)
++
++
++@triton.testing.perf_report(
++    triton.testing.Benchmark(
++        x_names=["batch_size", "vocab_size"],
++        x_vals=[(bs, vocab) for bs in BATCH_SIZE_RANGE for vocab in VOCAB_SIZE_RANGE],
++        line_arg="provider",
++        line_vals=["fused", "eager"],
++        line_names=["Fused Triton", "Eager argmax + cat"],
++        styles=[("blue", "-"), ("orange", "--")],
++        ylabel="us",
++        plot_name="spec-topk1-chain-materialize",
++        args={},
++    )
++)
++def benchmark_chain_materialize(
++    batch_size: int, vocab_size: int, provider: str
++) -> tuple[float, float, float]:
++    seed_topk_index, logits, positions = make_chain_case(batch_size, vocab_size)
++    if provider == "fused":
++        fn = lambda: fused_chain_materialize(seed_topk_index, logits, positions)
++    elif provider == "eager":
++        fn = lambda: eager_chain_materialize(seed_topk_index, logits, positions)
++    else:
++        raise ValueError(f"Unknown provider: {provider}")
++    fn()
++    torch.cuda.synchronize()
++    return run_benchmark(fn)
++
++
++if __name__ == "__main__":
++    benchmark_draft_postprocess.run(print_data=True)
++    benchmark_chain_materialize.run(print_data=True)
+diff --git a/test/registered/kernels/test_kernels_namespace.py b/test/registered/kernels/test_kernels_namespace.py
+index 1837db8e2432..1573d16d42bf 100644
+--- a/test/registered/kernels/test_kernels_namespace.py
++++ b/test/registered/kernels/test_kernels_namespace.py
+@@ -69,6 +69,7 @@
+     "memory.alloc_extend_kernel": {"triton"},
+     "attention.decode_attention_fwd": {"triton"},
+     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
++    "speculative.draft_topk1_postprocess": {"triton"},
+     "speculative.gather_spec_extras": {"triton"},
+ }
+ 
+diff --git a/test/registered/kernels/test_spec_topk1.py b/test/registered/kernels/test_spec_topk1.py
+new file mode 100644
+index 000000000000..c0396cf8389d
+--- /dev/null
++++ b/test/registered/kernels/test_spec_topk1.py
+@@ -0,0 +1,163 @@
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
++
++import unittest
++
++import torch
++
++from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
++from sglang.test.test_utils import CustomTestCase
++
++
++def _make_logits_with_unique_argmax(
++    batch_size: int,
++    vocab_size: int,
++    *,
++    dtype: torch.dtype,
++    device: torch.device,
++    seed: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    g = torch.Generator(device=device).manual_seed(seed)
++    logits = torch.randn(
++        (batch_size, vocab_size), dtype=dtype, device=device, generator=g
++    )
++    expected_index = (
++        torch.arange(batch_size, dtype=torch.long, device=device) * 9973 + 17
++    ) % vocab_size
++    logits.scatter_(1, expected_index[:, None], 1000.0)
++    return logits, expected_index[:, None]
++
++
++@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
++class TestSpecTopk1Triton(CustomTestCase):
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        cls.device = torch.device("cuda")
++
++    def test_draft_topk1_postprocess_matches_argmax_and_position_add(self):
++        configs = [
++            (1, 127, torch.float32),
++            (4, 8192, torch.float16),
++            (7, 8193, torch.bfloat16),
++            (3, 50000, torch.float32),
++        ]
++        for batch_size, vocab_size, dtype in configs:
++            with self.subTest(
++                batch_size=batch_size, vocab_size=vocab_size, dtype=dtype
++            ):
++                logits, expected_index = _make_logits_with_unique_argmax(
++                    batch_size,
++                    vocab_size,
++                    dtype=dtype,
++                    device=self.device,
++                    seed=vocab_size,
++                )
++                positions = torch.arange(
++                    batch_size, dtype=torch.long, device=self.device
++                )
++                expected_positions = positions + 1
++
++                topk_p, topk_index = draft_topk1_postprocess(logits, positions)
++
++                torch.testing.assert_close(topk_index, expected_index, rtol=0, atol=0)
++                torch.testing.assert_close(
++                    topk_p,
++                    torch.ones(
++                        (batch_size, 1), dtype=torch.float32, device=self.device
++                    ),
++                    rtol=0,
++                    atol=0,
++                )
++                torch.testing.assert_close(
++                    positions, expected_positions, rtol=0, atol=0
++                )
++
++    def test_draft_topk1_postprocess_can_write_draft_token_column(self):
++        batch_size = 17
++        # Multi-split vocab so the fused write composes with the split reduction.
++        vocab_size = 50000
++        logits, expected_index = _make_logits_with_unique_argmax(
++            batch_size,
++            vocab_size,
++            dtype=torch.float32,
++            device=self.device,
++            seed=0,
++        )
++        positions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
++        backing = torch.full((batch_size, 5), -1, dtype=torch.long, device=self.device)
++        draft_tokens = backing[:, 1:4]
++
++        topk_p, topk_index = draft_topk1_postprocess(
++            logits, positions, draft_tokens, draft_token_column=2
++        )
++
++        torch.testing.assert_close(topk_index, expected_index, rtol=0, atol=0)
++        torch.testing.assert_close(topk_p, torch.ones_like(topk_p), rtol=0, atol=0)
++        # Exactly one backing column is written; both neighbors stay untouched.
++        expected_backing = torch.full_like(backing, -1)
++        expected_backing[:, 3] = expected_index[:, 0]
++        torch.testing.assert_close(backing, expected_backing, rtol=0, atol=0)
++        torch.testing.assert_close(
++            positions, torch.ones_like(positions), rtol=0, atol=0
++        )
++
++    def test_row_strided_logits_view_matches_argmax(self):
++        batch_size = 5
++        vocab_size = 8193
++        # Poison the padding columns: if the kernel used the dense vocab width
++        # as the row stride it would read them and pick the wrong index.
++        backing = torch.full(
++            (batch_size, vocab_size + 64),
++            2000.0,
++            dtype=torch.float32,
++            device=self.device,
++        )
++        logits, expected_index = _make_logits_with_unique_argmax(
++            batch_size,
++            vocab_size,
++            dtype=torch.float32,
++            device=self.device,
++            seed=1,
++        )
++        backing[:, :vocab_size] = logits
++        strided_logits = backing[:, :vocab_size]
++        self.assertFalse(strided_logits.is_contiguous())
++        positions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
++
++        topk_p, topk_index = draft_topk1_postprocess(strided_logits, positions)
++
++        torch.testing.assert_close(topk_index, expected_index, rtol=0, atol=0)
++        torch.testing.assert_close(topk_p, torch.ones_like(topk_p), rtol=0, atol=0)
++        torch.testing.assert_close(
++            positions, torch.ones_like(positions), rtol=0, atol=0
++        )
++
++    def test_empty_batch(self):
++        logits = torch.empty((0, 1024), dtype=torch.float32, device=self.device)
++        positions = torch.empty((0,), dtype=torch.long, device=self.device)
++        draft_tokens = torch.empty((0, 3), dtype=torch.long, device=self.device)
++
++        topk_p, topk_index = draft_topk1_postprocess(
++            logits, positions, draft_tokens, draft_token_column=1
++        )
++
++        self.assertEqual(topk_p.shape, (0, 1))
++        self.assertEqual(topk_index.shape, (0, 1))
++        self.assertEqual(draft_tokens.numel(), 0)
++
++    def test_non_contiguous_inputs_raise(self):
++        logits = torch.empty((16, 4), dtype=torch.float32, device=self.device).t()
++        positions = torch.arange(8, dtype=torch.long, device=self.device)[::2]
++
++        with self.assertRaises(AssertionError):
++            draft_topk1_postprocess(
++                logits, torch.empty(4, dtype=torch.long, device=self.device)
++            )
++        with self.assertRaises(AssertionError):
++            draft_topk1_postprocess(torch.empty((4, 16), device=self.device), positions)
++
++
++if __name__ == "__main__":
++    unittest.main()

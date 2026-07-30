@@ -1,0 +1,247 @@
+diff --git a/tests/test_force_first_config.py b/tests/test_force_first_config.py
+new file mode 100644
+index 000000000000..9db7805e1523
+--- /dev/null
++++ b/tests/test_force_first_config.py
+@@ -0,0 +1,93 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Targeted unit tests for VLLM_TRITON_FORCE_FIRST_CONFIG.
++
++These tests exercise only the patched `Autotuner.run` logic installed by
++`vllm.triton_utils.force_first_config.install`. The wrapped kernel is a
++plain callable so the tests run on CPU-only hosts (no GPU, no actual
++kernel launch) as long as the `triton` package is importable.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.triton_utils import HAS_TRITON, triton
++
++if not HAS_TRITON:
++    pytest.skip("triton not available", allow_module_level=True)
++
++from vllm.triton_utils import force_first_config  # noqa: E402
++
++OutOfResources = triton.runtime.errors.OutOfResources
++
++
++@pytest.fixture
++def patched_autotuner(monkeypatch: pytest.MonkeyPatch):
++    """Install the first-valid-config patch and restore after.
++
++    The env-var gate lives in vllm.env_override; install() itself does not
++    read the environment, so the test calls it directly.
++    """
++    Autotuner = triton.runtime.autotuner.Autotuner
++    original_run = Autotuner.run
++    # Reset the once-only guard so install() re-runs for each test.
++    monkeypatch.setattr(force_first_config, "_installed", False)
++    force_first_config.install()
++    yield Autotuner
++    Autotuner.run = original_run
++
++
++def _make_fake_self(configs, fn):
++    """Minimal stand-in for an Autotuner instance."""
++    return SimpleNamespace(
++        configs=configs,
++        keys=[],
++        arg_names=[],
++        base_fn=fn,
++        fn=fn,
++        best_config=None,
++    )
++
++
++def test_skips_invalid_first_config_and_caches_second(patched_autotuner):
++    bad = triton.Config({"BLOCK": 1024})
++    good = triton.Config({"BLOCK": 64})
++    calls = []
++
++    def fake_fn(*args, **kwargs):
++        calls.append(kwargs["BLOCK"])
++        if kwargs["BLOCK"] == 1024:
++            raise OutOfResources(required=99999, limit=1, name="shared memory")
++        return "ok"
++
++    fake_self = _make_fake_self([bad, good], fake_fn)
++
++    # First call: walks past the invalid config, picks the second.
++    assert patched_autotuner.run(fake_self) == "ok"
++    assert calls == [1024, 64]
++    assert fake_self.best_config is good
++
++    # Second call: cached index is reused, invalid config is NOT retried.
++    calls.clear()
++    assert patched_autotuner.run(fake_self) == "ok"
++    assert calls == [64]
++
++
++def test_empty_configs_falls_back_to_direct_call(patched_autotuner):
++    def fake_fn(*args, **kwargs):
++        return "direct"
++
++    fake_self = _make_fake_self([], fake_fn)
++    assert patched_autotuner.run(fake_self) == "direct"
++
++
++def test_all_configs_invalid_raises_runtime_error(patched_autotuner):
++    cfgs = [triton.Config({"BLOCK": 1024}), triton.Config({"BLOCK": 2048})]
++
++    def always_oor(*args, **kwargs):
++        raise OutOfResources(required=99999, limit=1, name="shared memory")
++
++    fake_self = _make_fake_self(cfgs, always_oor)
++    with pytest.raises(RuntimeError, match="[Nn]o valid config"):
++        patched_autotuner.run(fake_self)
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index fe084ce5149a..a931b2305fa8 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -856,3 +856,18 @@ def _patch_inductor_fallback_allow_list() -> None:
+ 
+ 
+ _patch_inductor_fallback_allow_list()
++
++# ============================================================
++# Triton Autotuner determinism
++# ============================================================
++# Replace the Autotuner.run so it always pick the first running configuration.
++# Useful to eliminate autotune variability leading to non determinism.
++if os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower() in (
++    "1",
++    "true",
++):
++    from vllm.triton_utils.force_first_config import (
++        install as _install_force_first_config,
++    )
++
++    _install_force_first_config()
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 10f8fef4a793..a94e084ab628 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -108,6 +108,7 @@
+     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
+     VLLM_USE_TRITON_AWQ: bool = False
+     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
++    VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
+     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
+     VLLM_SKIP_P2P_CHECK: bool = False
+     VLLM_DISABLED_KERNELS: list[str] = []
+@@ -1072,6 +1073,14 @@ def _resolve_rust_frontend_path() -> str | None:
+     ),
+     # If set, vLLM will use Triton implementations of AWQ.
+     "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
++    # If set, monkey-patch triton.runtime.autotuner.Autotuner.run to skip
++    # benchmarking and select the first valid config (walking past invalid
++    # ones). Used to eliminate autotuning variability when measuring kernel
++    # performance and applied before running any kernel.
++    "VLLM_TRITON_FORCE_FIRST_CONFIG": lambda: (
++        os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower()
++        in ("1", "true")
++    ),
+     # If set, allow loading or unloading lora adapters in runtime,
+     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
+         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()
+diff --git a/vllm/triton_utils/force_first_config.py b/vllm/triton_utils/force_first_config.py
+new file mode 100644
+index 000000000000..67f566d8ae04
+--- /dev/null
++++ b/vllm/triton_utils/force_first_config.py
+@@ -0,0 +1,92 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Skip Triton autotuning under VLLM_TRITON_FORCE_FIRST_CONFIG."""
++
++from vllm.logger import init_logger
++from vllm.triton_utils.importing import HAS_TRITON
++
++logger = init_logger(__name__)
++
++_installed: bool = False
++
++
++def is_installed() -> bool:
++    """Return whether the first-valid-config patch is currently installed."""
++    return _installed
++
++
++def install() -> None:
++    """Install the Autotuner.run replacement."""
++    global _installed
++    if _installed:
++        return
++    if not HAS_TRITON:
++        return
++
++    import importlib
++
++    autotuner_mod = importlib.import_module("triton.runtime.autotuner")
++    Autotuner = autotuner_mod.Autotuner
++    from triton.compiler.errors import CompileTimeAssertionFailure
++    from triton.runtime.errors import OutOfResources, PTXASError
++
++    _invalid_config_errors = (OutOfResources, CompileTimeAssertionFailure, PTXASError)
++    _picked_cache: dict[tuple, int] = {}
++    seen_kernels: set[str] = set()
++
++    def _run_first_valid_config(self, *args, **kwargs):
++        if not self.configs:
++            return self.fn(*args, **kwargs)
++
++        key_vals = tuple(kwargs[name] for name in self.keys if name in kwargs)
++        cache_key = (id(self), key_vals)
++        kernel_name = getattr(self.base_fn, "__name__", repr(self.fn))
++
++        cached_idx = _picked_cache.get(cache_key)
++        candidate_indices = (
++            [cached_idx] if cached_idx is not None else list(range(len(self.configs)))
++        )
++
++        last_exc: Exception | None = None
++        for idx in candidate_indices:
++            config = self.configs[idx]
++            if config.pre_hook is not None:
++                full_nargs = {
++                    **dict(zip(self.arg_names, args)),
++                    **kwargs,
++                    **config.all_kwargs(),
++                }
++                config.pre_hook(full_nargs)
++            # Prefer self.fn.run(...) — the kernel-launch entrypoint for both
++            # JITFunction and Heuristics. Calling JITFunction(...) directly
++            # raises "Cannot call @triton.jit'd outside of the scope of a
++            # kernel". Fall back to plain call only if .run is missing.
++            launch = getattr(self.fn, "run", self.fn)
++            try:
++                result = launch(*args, **kwargs, **config.all_kwargs())
++            except _invalid_config_errors as e:
++                last_exc = e
++                continue
++
++            if cached_idx is None:
++                _picked_cache[cache_key] = idx
++                self.best_config = config
++                if kernel_name not in seen_kernels:
++                    seen_kernels.add(kernel_name)
++                    logger.info(
++                        "[triton-autotune-disabled] kernel=%s configs=%d "
++                        "picked_index=%d picked=%s",
++                        kernel_name,
++                        len(self.configs),
++                        idx,
++                        config,
++                    )
++            return result
++
++        raise RuntimeError(
++            f"No valid config for kernel "
++            f"{kernel_name} key={key_vals} (tried {len(self.configs)} configs)"
++        ) from last_exc
++
++    Autotuner.run = _run_first_valid_config
++    _installed = True

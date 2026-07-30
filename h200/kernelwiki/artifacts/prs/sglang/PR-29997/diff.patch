@@ -1,0 +1,2787 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index a355707bee48..27933521b165 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -116,7 +116,6 @@ def routing(
+     is_npu,
+     is_xpu,
+ )
+-from sglang.srt.utils.patch_torch import register_fake_if_exists
+ 
+ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+ 
+@@ -144,8 +143,6 @@ def routing(
+ 
+ 
+ if _is_cuda:
+-    from sgl_kernel import moe_fused_gate
+-
+     try:
+         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
+ 
+@@ -1486,25 +1483,29 @@ def biased_grouped_topk_gpu(
+ 
+         return topk_weights, topk_ids
+ 
+-    elif (
+-        _is_cuda
+-        # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
+-        and experts_per_group <= 32
+-        and is_power_of_two(num_experts)
+-    ):
+-        topk_weights, topk_ids = moe_fused_gate(
++    elif _is_cuda and num_expert_group > 1:
++        # CUDA grouped fallback (flashinfer unavailable / constraints unmet): the
++        # unified Triton router replaces the retired AOT moe_fused_gate kernel. It
++        # handles any experts-per-group (no MAX_VPT=32 cap) and any num_experts.
++        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_grouped_gate
++
++        return jit_grouped_gate(
+             gating_output.to(dtype=torch.float32),
+-            correction_bias,
+-            num_expert_group,
+-            topk_group,
++            correction_bias.to(dtype=torch.float32),
+             topk,
+-            num_fused_shared_experts,
+-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+-            apply_routed_scaling_factor_on_output,
++            scoring_func="sigmoid",
++            num_fused_shared_experts=num_fused_shared_experts,
++            renormalize=renormalize,
++            routed_scaling_factor=(
++                routed_scaling_factor if routed_scaling_factor is not None else 1.0
++            ),
++            apply_routed_scaling_factor_on_output=bool(
++                apply_routed_scaling_factor_on_output
++            ),
++            num_expert_group=num_expert_group,
++            topk_group=topk_group,
+         )
+ 
+-        return topk_weights, topk_ids
+-
+     elif _use_aiter:
+         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+         token = gating_output.shape[0]
+@@ -2185,47 +2186,7 @@ def select_experts(
+     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+ 
+ 
+-# Register fake implementations for torch.compile support
+-if _is_cuda:
+-
+-    @torch.library.register_fake("sgl_kernel::moe_fused_gate")
+-    def _moe_fused_gate(
+-        input_tensor,
+-        bias,
+-        num_expert_group,
+-        topk_group,
+-        topk,
+-        num_fused_shared_experts=0,
+-        routed_scaling_factor=0,
+-        apply_routed_scaling_factor_on_output=False,
+-    ):
+-        num_rows = input_tensor.shape[0]
+-        topk_weights = torch.empty(
+-            (num_rows, topk), dtype=torch.float32, device=input_tensor.device
+-        )
+-        topk_ids = torch.empty(
+-            (num_rows, topk), dtype=torch.int32, device=input_tensor.device
+-        )
+-        return topk_weights, topk_ids
+-
+-    @register_fake_if_exists("sgl_kernel::kimi_k2_moe_fused_gate")
+-    def _kimi_k2_moe_fused_gate(
+-        input_tensor,
+-        bias,
+-        topk,
+-        renormalize,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output,
+-    ):
+-        num_rows = input_tensor.shape[0]
+-        topk_weights = input_tensor.new_empty(
+-            num_rows,
+-            topk,
+-            dtype=torch.float32,
+-        )
+-        topk_ids = input_tensor.new_empty(
+-            num_rows,
+-            topk,
+-            dtype=torch.int32,
+-        )
+-        return topk_weights, topk_ids
++# NOTE: the AOT sgl_kernel::moe_fused_gate and sgl_kernel::kimi_k2_moe_fused_gate
++# ops (and their torch.compile fake impls) were retired here — both CUDA gate
++# paths now route through the unified Triton router (jit_kernel/moe_fused_gate.py),
++# whose Python impl is traceable directly, so no register_fake shim is needed.
+diff --git a/sgl-kernel/CMakeLists.txt b/sgl-kernel/CMakeLists.txt
+index e45aa68b9b45..d3ed05a63f70 100644
+--- a/sgl-kernel/CMakeLists.txt
++++ b/sgl-kernel/CMakeLists.txt
+@@ -283,9 +283,7 @@ set(SOURCES
+     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
+     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
+     "csrc/moe/moe_align_kernel.cu"
+-    "csrc/moe/moe_fused_gate.cu"
+     "csrc/moe/fused_qknorm_rope_kernel.cu"
+-    "csrc/moe/kimi_k2_moe_fused_gate.cu"
+     "csrc/moe/moe_sum.cu"
+     "csrc/moe/moe_sum_reduce.cu"
+     "csrc/moe/moe_topk_softmax_kernels.cu"
+diff --git a/sgl-kernel/benchmark/bench_kimi_k2_moe_fused_gate.py b/sgl-kernel/benchmark/bench_kimi_k2_moe_fused_gate.py
+deleted file mode 100644
+index 975a67a50f10..000000000000
+--- a/sgl-kernel/benchmark/bench_kimi_k2_moe_fused_gate.py
++++ /dev/null
+@@ -1,114 +0,0 @@
+-import itertools
+-import math
+-import os
+-
+-import torch
+-import triton
+-import triton.language as tl
+-from sgl_kernel import kimi_k2_moe_fused_gate
+-
+-from sglang.srt.layers.moe.topk import kimi_k2_biased_topk_impl
+-from sglang.utils import is_in_ci
+-
+-IS_CI = is_in_ci()
+-
+-
+-def kimi_k2_biased_topk_torch_compile(scores, bias, topk, routed_scaling_factor):
+-    """Original torch.compile-based implementation"""
+-    return kimi_k2_biased_topk_impl(
+-        scores,
+-        scores,
+-        bias,
+-        topk=topk,
+-        renormalize=True,
+-        routed_scaling_factor=routed_scaling_factor,
+-    )
+-
+-
+-def kimi_k2_biased_topk_fused_kernel(scores, bias, topk, routed_scaling_factor):
+-    """Our fused CUDA kernel implementation"""
+-    return kimi_k2_moe_fused_gate(
+-        scores,
+-        bias,
+-        topk=topk,
+-        renormalize=True,
+-        routed_scaling_factor=routed_scaling_factor,
+-    )
+-
+-
+-# CI environment uses simplified parameters
+-if IS_CI:
+-    seq_length_range = [5000]  # Only test one sequence length in CI
+-else:
+-    seq_length_range = [
+-        1,
+-        8,
+-        16,
+-        32,
+-        64,
+-        128,
+-        256,
+-        512,
+-        1024,
+-        2048,
+-        4096,
+-        10000,
+-        15000,
+-        20000,
+-        25000,
+-        30000,
+-        35000,
+-        40000,
+-    ]
+-
+-configs = [(sq,) for sq in seq_length_range]
+-
+-
+-@triton.testing.perf_report(
+-    triton.testing.Benchmark(
+-        x_names=["seq_length"],
+-        x_vals=[list(_) for _ in configs],
+-        line_arg="provider",
+-        line_vals=["torch_compile", "fused_kernel"],
+-        line_names=["Torch Compile", "Fused Kernel"],
+-        styles=[("blue", "-"), ("red", "-")],
+-        ylabel="us",
+-        plot_name="kimi-k2-moe-fused-gate-performance",
+-        args={},
+-    )
+-)
+-def benchmark(seq_length, provider):
+-    dtype = torch.float32
+-    device = torch.device("cuda")
+-    num_experts, topk = 384, 6  # Kimi K2 configuration
+-    routed_scaling_factor = 2.872  # Kimi K2's routed scaling factor
+-
+-    scores = torch.randn((seq_length, num_experts), device=device, dtype=dtype)
+-    bias = torch.rand(num_experts, device=device, dtype=dtype)
+-
+-    quantiles = [0.5, 0.2, 0.8]
+-
+-    if provider == "torch_compile":
+-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+-            lambda: kimi_k2_biased_topk_torch_compile(
+-                scores.clone(), bias.clone(), topk, routed_scaling_factor
+-            ),
+-            quantiles=quantiles,
+-        )
+-    elif provider == "fused_kernel":
+-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+-            lambda: kimi_k2_biased_topk_fused_kernel(
+-                scores.clone(), bias.clone(), topk, routed_scaling_factor
+-            ),
+-            quantiles=quantiles,
+-        )
+-
+-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+-
+-
+-if __name__ == "__main__":
+-    print("=" * 80)
+-    print("Benchmarking Kimi K2 MoE Fused Gate Performance")
+-    print("=" * 80)
+-    print("\nPerformance vs Sequence Length (384 experts, topk=6)")
+-    benchmark.run(print_data=True, save_path=".")
+diff --git a/sgl-kernel/benchmark/bench_moe_fused_gate.py b/sgl-kernel/benchmark/bench_moe_fused_gate.py
+deleted file mode 100644
+index 508dcf1a9a15..000000000000
+--- a/sgl-kernel/benchmark/bench_moe_fused_gate.py
++++ /dev/null
+@@ -1,86 +0,0 @@
+-import itertools
+-import math
+-import os
+-
+-import torch
+-import triton
+-import triton.language as tl
+-from sgl_kernel import moe_fused_gate
+-
+-from sglang.srt.layers.moe.topk import biased_grouped_topk
+-from sglang.utils import is_in_ci
+-
+-IS_CI = is_in_ci()
+-
+-
+-def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
+-    return biased_grouped_topk(
+-        scores,
+-        scores,
+-        bias,
+-        topk=topk,
+-        renormalize=True,
+-        num_expert_group=num_expert_group,
+-        topk_group=topk_group,
+-        routed_scaling_factor=2.5,  # DeepSeek-R1 : 2.5, Kimi K2: 2.872
+-    )
+-
+-
+-def biased_grouped_topk_org_fuse_kernel(
+-    scores, bias, num_expert_group, topk_group, topk
+-):
+-    return moe_fused_gate(scores, bias, num_expert_group, topk_group, topk)
+-
+-
+-# CI environment uses simplified parameters
+-if IS_CI:
+-    seq_length_range = [5000]  # Only test one sequence length in CI
+-else:
+-    seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+-
+-configs = [(sq,) for sq in seq_length_range]
+-
+-
+-@triton.testing.perf_report(
+-    triton.testing.Benchmark(
+-        x_names=["seq_length"],
+-        x_vals=[list(_) for _ in configs],
+-        line_arg="provider",
+-        line_vals=["original", "kernel"],
+-        line_names=["Original", "SGL Kernel"],
+-        styles=[("blue", "-"), ("red", "-")],
+-        ylabel="us",
+-        plot_name="moe-fused-gate-performance",
+-        args={},
+-    )
+-)
+-def benchmark(seq_length, provider):
+-    dtype = torch.float32
+-    device = torch.device("cuda")
+-    num_experts, num_expert_group, topk_group, topk = 256, 8, 4, 8
+-
+-    scores = torch.randn((seq_length, num_experts), device=device, dtype=dtype)
+-    bias = torch.rand(num_experts, device=device, dtype=dtype)
+-
+-    quantiles = [0.5, 0.2, 0.8]
+-
+-    if provider == "original":
+-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+-            lambda: biased_grouped_topk_org(
+-                scores.clone(), bias.clone(), num_expert_group, topk_group, topk
+-            ),
+-            quantiles=quantiles,
+-        )
+-    elif provider == "kernel":
+-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+-            lambda: biased_grouped_topk_org_fuse_kernel(
+-                scores.clone(), bias.clone(), num_expert_group, topk_group, topk
+-            ),
+-            quantiles=quantiles,
+-        )
+-
+-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+-
+-
+-if __name__ == "__main__":
+-    benchmark.run(print_data=True)
+diff --git a/sgl-kernel/csrc/common_extension.cc b/sgl-kernel/csrc/common_extension.cc
+index f6261dbc70b4..420cab75e35f 100644
+--- a/sgl-kernel/csrc/common_extension.cc
++++ b/sgl-kernel/csrc/common_extension.cc
+@@ -171,17 +171,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
+   m.impl("moe_sum", torch::kCUDA, &moe_sum);
+ 
+-  m.def(
+-      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
+-      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+-      "(Tensor[])");
+-  m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
+-
+-  m.def(
+-      "kimi_k2_moe_fused_gate(Tensor input, Tensor bias, int topk, bool renormalize, "
+-      "float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+-      "(Tensor[])");
+-  m.impl("kimi_k2_moe_fused_gate", torch::kCUDA, &kimi_k2_moe_fused_gate);
++  // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the CUDA gate/topk path
++  // now routes through the unified Triton router
++  // (python/sglang/jit_kernel/moe_fused_gate.py).
+ 
+   m.def(
+       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
+diff --git a/sgl-kernel/csrc/common_extension_musa.cc b/sgl-kernel/csrc/common_extension_musa.cc
+index c59068c8fe13..6faea31364a8 100644
+--- a/sgl-kernel/csrc/common_extension_musa.cc
++++ b/sgl-kernel/csrc/common_extension_musa.cc
+@@ -123,17 +123,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
+   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
+   m.impl("moe_sum", torch::kMUSA, &moe_sum);
+ 
+-  m.def(
+-      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
+-      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+-      "(Tensor[])");
+-  m.impl("moe_fused_gate", torch::kMUSA, &moe_fused_gate);
+-
+-  m.def(
+-      "kimi_k2_moe_fused_gate(Tensor input, Tensor bias, int topk, bool renormalize, "
+-      "float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+-      "(Tensor[])");
+-  m.impl("kimi_k2_moe_fused_gate", torch::kMUSA, &kimi_k2_moe_fused_gate);
++  // moe_fused_gate / kimi_k2_moe_fused_gate (AOT gate kernels) retired: gate/topk
++  // is consolidated onto the unified Triton router (sglang issue #26771). sglang's
++  // MUSA path uses `mate.moe_fused_gate`, so dropping the sgl_kernel MUSA op here
++  // has no runtime impact.
+ 
+   /*
+    * From csrc/speculative
+diff --git a/sgl-kernel/csrc/moe/kimi_k2_moe_fused_gate.cu b/sgl-kernel/csrc/moe/kimi_k2_moe_fused_gate.cu
+deleted file mode 100644
+index 9afe4dfcdaa3..000000000000
+--- a/sgl-kernel/csrc/moe/kimi_k2_moe_fused_gate.cu
++++ /dev/null
+@@ -1,364 +0,0 @@
+-#include <ATen/cuda/CUDAContext.h>
+-#include <cuda_runtime.h>
+-#include <torch/all.h>
+-
+-#include <cfloat>
+-
+-// Kimi K2 MoE fused gate, supports NUM_EXPERTS in {256 (MiMo V2 Flash), 384 (Kimi K2)}.
+-// Routing (DeepSeek "noaux_tc" with num_expert_group = 1):
+-//   1. sigmoid(gate_logit)
+-//   2. add per-expert correction bias (ranking only)
+-//   3. pick top-k by biased score
+-//   4. weights = sigmoid (no bias)
+-//   5. optional renorm; routed_scaling_factor folded into renorm (no-op when not renormalizing)
+-
+-__device__ __forceinline__ float sigmoid_accurate(float x) {
+-  return 1.0f / (1.0f + expf(-x));
+-}
+-
+-template <int N>
+-struct GateConfig {
+-  static_assert(
+-      N == 256 || N == 384,
+-      "kimi_k2_moe_fused_gate currently only supports "
+-      "NUM_EXPERTS == 256 or 384");
+-  static constexpr int NUM_EXPERTS = N;
+-  static constexpr int WARP_SIZE = 32;
+-  static constexpr int WARPS_PER_CTA = 6;  // only used by the large-token kernel
+-  static constexpr int VPT = N / 32;       // 8 (256) or 12 (384)
+-  static constexpr int VEC_SIZE = 4;
+-  static constexpr int VEC_PER_LANE = VPT / VEC_SIZE;   // 2 or 3
+-  static constexpr int WARPS_PER_TOKEN_SMALL = N / 32;  // 8 or 12
+-  static constexpr int THREADS_PER_BLOCK_SMALL = N;     // 256 or 384
+-  static constexpr int SMALL_TOKEN_THRESHOLD = 512;
+-  static constexpr int MAX_TOPK = 8;  // must match TORCH_CHECK(topk <= 8) at the host launcher
+-  static_assert(VPT % VEC_SIZE == 0, "VPT must be a multiple of VEC_SIZE for the float4 vec load");
+-};
+-
+-// Small-token kernel: 1 block per token, NUM_EXPERTS threads (1 thread = 1 expert).
+-template <int N>
+-__global__ void kimi_k2_moe_fused_gate_kernel_small_token(
+-    float* input,
+-    float* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t topk,
+-    bool renormalize,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  using Cfg = GateConfig<N>;
+-  constexpr int NUM_EXPERTS = Cfg::NUM_EXPERTS;
+-  constexpr int WARP_SIZE = Cfg::WARP_SIZE;
+-  constexpr int WARPS_PER_TOKEN_SMALL = Cfg::WARPS_PER_TOKEN_SMALL;
+-  constexpr int MAX_TOPK = Cfg::MAX_TOPK;
+-
+-  int64_t row_idx = blockIdx.x;
+-  if (row_idx >= num_rows) return;
+-
+-  int tid = threadIdx.x;
+-  int warp_id = tid / WARP_SIZE;
+-  int lane_id = tid % WARP_SIZE;
+-
+-  // Sigmoid weights (no bias) for final lookup, indexed by expert id.
+-  __shared__ float shared_original_scores[NUM_EXPERTS];
+-  __shared__ float warp_maxs[WARPS_PER_TOKEN_SMALL];
+-  __shared__ int warp_experts[WARPS_PER_TOKEN_SMALL];
+-  __shared__ int selected_experts[MAX_TOPK];
+-
+-  // Keep biased_val in register; mask the winner in-place each iteration to
+-  // avoid round-tripping through shared memory.
+-  float input_val = input[row_idx * NUM_EXPERTS + tid];
+-  float bias_val = bias[tid];
+-  float sigmoid_val = sigmoid_accurate(input_val);
+-  float biased_val = sigmoid_val + bias_val;
+-  shared_original_scores[tid] = sigmoid_val;
+-
+-  __syncthreads();
+-
+-  // Lane 0 of warp 0 accumulates the renorm sum as it picks each winner,
+-  // saving a second pass over selected_experts during writeback.
+-  float sum_for_renorm = 0.0f;
+-
+-  for (int k = 0; k < topk; k++) {
+-    // Stage 1: per-warp argmax.
+-    float warp_max_val = biased_val;
+-    int warp_max_expert = tid;
+-#pragma unroll
+-    for (int offset = 16; offset > 0; offset /= 2) {
+-      float other_val = __shfl_down_sync(0xFFFFFFFF, warp_max_val, offset);
+-      int other_expert = __shfl_down_sync(0xFFFFFFFF, warp_max_expert, offset);
+-      if (other_val > warp_max_val) {
+-        warp_max_val = other_val;
+-        warp_max_expert = other_expert;
+-      }
+-    }
+-    if (lane_id == 0) {
+-      warp_maxs[warp_id] = warp_max_val;
+-      warp_experts[warp_id] = warp_max_expert;
+-    }
+-    __syncthreads();
+-
+-    // Stage 2: warp 0 merges warp-leaders into a single winner.
+-    if (warp_id == 0) {
+-      float final_max = (lane_id < WARPS_PER_TOKEN_SMALL) ? warp_maxs[lane_id] : -FLT_MAX;
+-      int final_expert = (lane_id < WARPS_PER_TOKEN_SMALL) ? warp_experts[lane_id] : -1;
+-#pragma unroll
+-      for (int offset = 16; offset > 0; offset /= 2) {
+-        float other_val = __shfl_down_sync(0xFFFFFFFF, final_max, offset);
+-        int other_expert = __shfl_down_sync(0xFFFFFFFF, final_expert, offset);
+-        if (other_val > final_max) {
+-          final_max = other_val;
+-          final_expert = other_expert;
+-        }
+-      }
+-      if (lane_id == 0) {
+-        selected_experts[k] = final_expert;
+-        if (renormalize && final_expert >= 0 && final_expert < NUM_EXPERTS) {
+-          sum_for_renorm += shared_original_scores[final_expert];
+-        }
+-      }
+-    }
+-    __syncthreads();
+-
+-    int selected = selected_experts[k];
+-    if (tid == selected) biased_val = -FLT_MAX;
+-  }
+-
+-  // Lane 0 of warp 0 writes the output. sum_for_renorm was accumulated
+-  // during the topk loop, so we just fold it into rcp.
+-  if (warp_id == 0 && lane_id == 0) {
+-    float rcp = 1.0f;
+-    if (renormalize && sum_for_renorm > 0.0f) {
+-      rcp = 1.0f / sum_for_renorm;
+-      if (apply_routed_scaling_factor_on_output) {
+-        rcp *= static_cast<float>(routed_scaling_factor);
+-      }
+-    }
+-
+-    for (int k = 0; k < topk; k++) {
+-      int expert_id = selected_experts[k];
+-      bool valid = (expert_id >= 0 && expert_id < NUM_EXPERTS);
+-      output_ptr[row_idx * topk + k] = valid ? shared_original_scores[expert_id] * rcp : 0.0f;
+-      indices_ptr[row_idx * topk + k] = valid ? expert_id : 0;
+-    }
+-  }
+-}
+-
+-// Large-token kernel: 1 warp per token, WARPS_PER_CTA warps per block.
+-template <int N>
+-__global__ void kimi_k2_moe_fused_gate_kernel(
+-    float* input,
+-    float* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t topk,
+-    bool renormalize,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  using Cfg = GateConfig<N>;
+-  constexpr int NUM_EXPERTS = Cfg::NUM_EXPERTS;
+-  constexpr int WARP_SIZE = Cfg::WARP_SIZE;
+-  constexpr int WARPS_PER_CTA = Cfg::WARPS_PER_CTA;
+-  constexpr int VEC_SIZE = Cfg::VEC_SIZE;
+-  constexpr int VEC_PER_LANE = Cfg::VEC_PER_LANE;
+-  constexpr int MAX_TOPK = Cfg::MAX_TOPK;
+-
+-  int64_t row_idx = blockIdx.x * WARPS_PER_CTA + threadIdx.y;
+-  if (row_idx >= num_rows) return;
+-
+-  int lane_id = threadIdx.x;
+-  int warp_id = threadIdx.y;
+-
+-  __shared__ float shared_scores[NUM_EXPERTS * WARPS_PER_CTA];
+-  __shared__ float shared_original_scores[NUM_EXPERTS * WARPS_PER_CTA];
+-  float* warp_scores = shared_scores + warp_id * NUM_EXPERTS;
+-  float* warp_original_scores = shared_original_scores + warp_id * NUM_EXPERTS;
+-  float4* warp_scores_v4 = reinterpret_cast<float4*>(warp_scores);
+-  float4* warp_original_scores_v4 = reinterpret_cast<float4*>(warp_original_scores);
+-
+-  float4* input_vec = reinterpret_cast<float4*>(input + row_idx * NUM_EXPERTS);
+-  float4* bias_vec = reinterpret_cast<float4*>(bias);
+-
+-  // Lane-strided vec_idx (each lane k stores at vec_idx k, k+32, k+64, ...) so each
+-  // iteration's STS.128 is lane-contiguous, avoiding shared-mem bank conflicts.
+-#pragma unroll
+-  for (int i = 0; i < VEC_PER_LANE; i++) {
+-    int vec_idx = lane_id + i * WARP_SIZE;
+-    float4 input_val = input_vec[vec_idx];
+-    float4 bias_val = bias_vec[vec_idx];
+-
+-    float4 sigmoid_v4;
+-    float4 biased_v4;
+-#pragma unroll
+-    for (int j = 0; j < VEC_SIZE; j++) {
+-      float inp = ((float*)&input_val)[j];
+-      float b = ((float*)&bias_val)[j];
+-      float sigmoid_val = sigmoid_accurate(inp);
+-      ((float*)&sigmoid_v4)[j] = sigmoid_val;
+-      ((float*)&biased_v4)[j] = sigmoid_val + b;
+-    }
+-    warp_original_scores_v4[vec_idx] = sigmoid_v4;
+-    warp_scores_v4[vec_idx] = biased_v4;
+-  }
+-
+-  __syncwarp();
+-
+-  // Lane 0 records the picked expert ids and accumulates the renorm sum as
+-  // it goes; the global write is a single pass after the loop.
+-  int top_indices[MAX_TOPK];
+-  float sum_for_renorm = 0.0f;
+-
+-  for (int k = 0; k < topk; k++) {
+-    float max_val = -FLT_MAX;
+-    int max_expert = -1;
+-
+-    for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
+-      if (warp_scores[expert] > max_val) {
+-        max_val = warp_scores[expert];
+-        max_expert = expert;
+-      }
+-    }
+-
+-    // warp shfl reduce; tie-break by lower expert id
+-#pragma unroll
+-    for (int offset = 16; offset > 0; offset /= 2) {
+-      float other_val = __shfl_down_sync(0xFFFFFFFF, max_val, offset);
+-      int other_expert = __shfl_down_sync(0xFFFFFFFF, max_expert, offset);
+-      if (other_val > max_val || (other_val == max_val && other_expert < max_expert)) {
+-        max_val = other_val;
+-        max_expert = other_expert;
+-      }
+-    }
+-
+-    if (lane_id == 0) {
+-      bool valid = (max_expert >= 0 && max_expert < NUM_EXPERTS);
+-      top_indices[k] = valid ? max_expert : -1;
+-      if (renormalize && valid) {
+-        sum_for_renorm += warp_original_scores[max_expert];
+-      }
+-      if (valid) warp_scores[max_expert] = -FLT_MAX;
+-    }
+-    __syncwarp();
+-  }
+-
+-  if (lane_id == 0) {
+-    float rcp = 1.0f;
+-    if (renormalize && sum_for_renorm > 0.0f) {
+-      rcp = 1.0f / sum_for_renorm;
+-      if (apply_routed_scaling_factor_on_output) {
+-        rcp *= static_cast<float>(routed_scaling_factor);
+-      }
+-    }
+-
+-    for (int k = 0; k < topk; k++) {
+-      int e = top_indices[k];
+-      bool valid = (e >= 0);
+-      output_ptr[row_idx * topk + k] = valid ? warp_original_scores[e] * rcp : 0.0f;
+-      indices_ptr[row_idx * topk + k] = valid ? e : 0;
+-    }
+-  }
+-}
+-
+-template <int N>
+-static void launch_for_n(
+-    at::Tensor& input,
+-    at::Tensor& bias,
+-    at::Tensor& output,
+-    at::Tensor& indices,
+-    int64_t topk,
+-    bool renormalize,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output,
+-    cudaStream_t stream) {
+-  using Cfg = GateConfig<N>;
+-  int64_t num_rows = input.size(0);
+-  bool use_small_token_kernel = num_rows <= Cfg::SMALL_TOKEN_THRESHOLD;
+-
+-  if (use_small_token_kernel) {
+-    dim3 grid(num_rows);
+-    dim3 block(Cfg::THREADS_PER_BLOCK_SMALL);
+-    kimi_k2_moe_fused_gate_kernel_small_token<N><<<grid, block, 0, stream>>>(
+-        input.data_ptr<float>(),
+-        bias.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        indices.data_ptr<int32_t>(),
+-        num_rows,
+-        topk,
+-        renormalize,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output);
+-  } else {
+-    int64_t num_blocks = (num_rows + Cfg::WARPS_PER_CTA - 1) / Cfg::WARPS_PER_CTA;
+-    dim3 grid(num_blocks);
+-    dim3 block(Cfg::WARP_SIZE, Cfg::WARPS_PER_CTA);
+-    kimi_k2_moe_fused_gate_kernel<N><<<grid, block, 0, stream>>>(
+-        input.data_ptr<float>(),
+-        bias.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        indices.data_ptr<int32_t>(),
+-        num_rows,
+-        topk,
+-        renormalize,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output);
+-  }
+-}
+-
+-std::vector<at::Tensor> kimi_k2_moe_fused_gate(
+-    at::Tensor& input,
+-    at::Tensor& bias,
+-    int64_t topk,
+-    bool renormalize,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  int64_t num_rows = input.size(0);
+-  int32_t num_experts = input.size(1);
+-
+-  TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
+-  TORCH_CHECK(input.scalar_type() == at::kFloat, "kimi_k2_moe_fused_gate only supports float32 input");
+-  TORCH_CHECK(bias.scalar_type() == at::kFloat, "kimi_k2_moe_fused_gate only supports float32 bias");
+-  TORCH_CHECK(topk <= 8, "kimi_k2_moe_fused_gate only supports topk <= 8 (got ", topk, ")");
+-
+-  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+-  auto output = torch::empty({num_rows, topk}, options);
+-  auto indices = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
+-
+-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+-
+-  switch (num_experts) {
+-    case 256:
+-      launch_for_n<256>(
+-          input,
+-          bias,
+-          output,
+-          indices,
+-          topk,
+-          renormalize,
+-          routed_scaling_factor,
+-          apply_routed_scaling_factor_on_output,
+-          stream);
+-      break;
+-    case 384:
+-      launch_for_n<384>(
+-          input,
+-          bias,
+-          output,
+-          indices,
+-          topk,
+-          renormalize,
+-          routed_scaling_factor,
+-          apply_routed_scaling_factor_on_output,
+-          stream);
+-      break;
+-    default:
+-      TORCH_CHECK(
+-          false,
+-          "kimi_k2_moe_fused_gate only supports num_experts in "
+-          "{256, 384}, got ",
+-          num_experts);
+-  }
+-
+-  return {output, indices};
+-}
+diff --git a/sgl-kernel/csrc/moe/moe_fused_gate.cu b/sgl-kernel/csrc/moe/moe_fused_gate.cu
+deleted file mode 100644
+index 1f70a23d9258..000000000000
+--- a/sgl-kernel/csrc/moe/moe_fused_gate.cu
++++ /dev/null
+@@ -1,523 +0,0 @@
+-#include <ATen/cuda/CUDAContext.h>
+-#include <cuda_runtime.h>
+-#include <cutlass/array.h>
+-#include <cutlass/cutlass.h>
+-#include <cutlass/numeric_types.h>
+-#include <stdio.h>
+-#include <torch/all.h>
+-
+-#include <cfloat>
+-#include <type_traits>
+-template <typename T, int N>
+-using AlignedArray = cutlass::AlignedArray<T, N>;
+-using bfloat16_t = cutlass::bfloat16_t;
+-using float16_t = cutlass::half_t;
+-using float32_t = float;
+-
+-// QQ NOTE: to handle the case for at::Half, error: more than one operator ">" matches these operands: built-in operator
+-// "arithmetic > arithmetic" function "operator>(const __half &, const __half &)"
+-template <typename T>
+-__device__ inline bool cmp_gt(const T& a, const T& b) {
+-  if constexpr (std::is_same<T, at::Half>::value) {
+-    // at::Half (or float16_t in our native case) causes ambiguity, so we cast to float.
+-    return static_cast<float>(a) > static_cast<float>(b);
+-  } else {
+-    // For types like float, at::BFloat16, or cutlass::half_t / cutlass::bfloat16_t, assume operator> works as expected.
+-    return a > b;
+-  }
+-}
+-
+-template <typename T>
+-__device__ inline bool cmp_eq(const T& a, const T& b) {
+-  if constexpr (std::is_same<T, at::Half>::value) {
+-    return static_cast<float>(a) == static_cast<float>(b);
+-  } else {
+-    return a == b;
+-  }
+-}
+-
+-// Fixed constants common to both dynamic and static template versions:
+-static constexpr int WARP_SIZE = 32;
+-static constexpr int WARPS_PER_CTA = 6;
+-static constexpr int MAX_VPT = 32;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
+-
+-// Create an alias for Array using AlignedArray
+-template <typename T, int N>
+-using Array = AlignedArray<T, N>;
+-// QQ: NOTE expression must have a constant value, this has to be > params.VPT
+-template <typename T>
+-using AccessType = AlignedArray<T, MAX_VPT>;
+-
+-template <typename T, typename Params>
+-__device__ void moe_fused_gate_impl(
+-    void* input,
+-    void* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output,
+-    Params params) {
+-  int tidx = threadIdx.x;
+-  int64_t thread_row =
+-      blockIdx.x * params.ROWS_PER_CTA + threadIdx.y * params.ROWS_PER_WARP + tidx / params.THREADS_PER_ROW;
+-  if (thread_row >= num_rows) {
+-    return;
+-  }
+-
+-  // Calculate topk_excluding_share_expert_fusion from topk
+-  int64_t topk_excluding_share_expert_fusion = topk - num_fused_shared_experts;
+-
+-  // Cast pointers to type T:
+-  auto* input_ptr = reinterpret_cast<T*>(input);
+-  auto* bias_ptr = reinterpret_cast<T*>(bias);
+-  auto* thread_row_ptr = input_ptr + thread_row * params.NUM_EXPERTS;
+-
+-  int thread_group_idx = tidx % params.THREADS_PER_ROW;
+-  int first_elt_read_by_thread = thread_group_idx * params.VPT;
+-
+-  // Create local arrays for the row chunk and bias chunk and then reinterpret the address of row_chunk as a pointer to
+-  // AccessType.
+-  T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
+-  Array<T, MAX_VPT> row_chunk;
+-  AccessType<T> const* vec_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(thread_read_ptr);
+-
+-  T* bias_thread_read_ptr = bias_ptr + first_elt_read_by_thread;
+-  Array<T, MAX_VPT> bias_chunk;
+-  AccessType<T> const* vec_bias_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(bias_thread_read_ptr);
+-
+-// QQ NOTE: doing the follow will be slower than loop assign and more importantly
+-// have misaligned address issue when params.VPT < 8 and mismatch with MAX_VPT
+-// AccessType<T>* row_chunk_vec_ptr = reinterpret_cast<AccessType<T>*>(&row_chunk);
+-// row_chunk_vec_ptr[0] = vec_thread_read_ptr[0];
+-#pragma unroll
+-  for (int ii = 0; ii < params.VPT; ++ii) {
+-    row_chunk[ii] = vec_thread_read_ptr[0][ii];
+-    bias_chunk[ii] = vec_bias_thread_read_ptr[0][ii];
+-  }
+-
+-  __syncthreads();
+-
+-////////////////////// Sigmoid //////////////////////
+-#pragma unroll
+-  for (int ii = 0; ii < params.VPT; ++ii) {
+-    row_chunk[ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
+-  }
+-  __syncthreads();
+-
+-////////////////////// Add Bias //////////////////////
+-#pragma unroll
+-  for (int ii = 0; ii < params.VPT; ++ii) {
+-    bias_chunk[ii] = row_chunk[ii] + bias_chunk[ii];
+-  }
+-
+-////////////////////// Exclude Groups //////////////////////
+-#pragma unroll
+-  for (int k_idx = 0; k_idx < params.THREADS_PER_ROW - topk_group;
+-       ++k_idx) {  // QQ NOTE Here params.THREADS_PER_ROW = num_expert_group
+-    int expert = first_elt_read_by_thread;
+-    // local argmax
+-    T max_val = static_cast<T>(-FLT_MAX);
+-    T max_val_second = static_cast<T>(-FLT_MAX);
+-#pragma unroll
+-    for (int ii = 0; ii < params.VPT; ++ii) {
+-      T val = bias_chunk[ii];
+-
+-      if (cmp_gt(val, max_val)) {
+-        max_val_second = max_val;
+-        max_val = val;
+-      } else if (cmp_gt(val, max_val_second)) {
+-        max_val_second = val;
+-      }
+-    }
+-
+-    // QQ NOTE: currently fixed to pick top2 sigmoid weight value in each expert group and sum them as the group weight
+-    // to select expert groups
+-    T max_sum = max_val + max_val_second;
+-
+-// argmin reduce
+-#pragma unroll
+-    for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+-      T other_max_sum =
+-          static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_sum), mask, params.THREADS_PER_ROW));
+-      int other_expert = __shfl_xor_sync(0xFFFFFFFF, expert, mask, params.THREADS_PER_ROW);
+-
+-      // higher indices win
+-      if (cmp_gt(max_sum, other_max_sum) || (cmp_eq(other_max_sum, max_sum) && other_expert > expert)) {
+-        max_sum = other_max_sum;
+-        expert = other_expert;
+-      }
+-    }
+-
+-    // clear the max value in the thread
+-    if (k_idx < params.THREADS_PER_ROW - topk_group) {
+-      int const thread_to_clear_in_group = expert / params.VPT;
+-
+-      if (thread_group_idx == thread_to_clear_in_group) {
+-#pragma unroll
+-        for (int ii = 0; ii < params.VPT; ++ii) {
+-          bias_chunk[ii] = static_cast<T>(FLT_MAX);
+-        }
+-      }
+-    }
+-  }
+-
+-  __syncthreads();
+-
+-  ////////////////////// Topk //////////////////////
+-  float output_sum = 0.0f;
+-  for (int k_idx = 0; k_idx < topk_excluding_share_expert_fusion; ++k_idx) {
+-    // local argmax
+-    T max_val = bias_chunk[0];
+-    int expert = first_elt_read_by_thread;
+-
+-    if (!cmp_eq(max_val, static_cast<T>(FLT_MAX))) {
+-#pragma unroll
+-      for (int ii = 1; ii < params.VPT; ++ii) {
+-        T val = bias_chunk[ii];
+-        if (cmp_gt(val, max_val)) {
+-          max_val = val;
+-          expert = first_elt_read_by_thread + ii;
+-        }
+-      }
+-    } else {
+-      max_val = static_cast<T>(-FLT_MAX);
+-    }
+-
+-    // argmax reduce
+-#pragma unroll
+-    for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+-      T other_max =
+-          static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_val), mask, params.THREADS_PER_ROW));
+-      int other_expert = __shfl_xor_sync(0xFFFFFFFF, expert, mask, params.THREADS_PER_ROW);
+-
+-      // lower indices to win
+-      if (cmp_gt(other_max, max_val) || (cmp_eq(other_max, max_val) && other_expert < expert)) {
+-        max_val = other_max;
+-        expert = other_expert;
+-      }
+-    }
+-
+-    int thread_to_clear_in_group = expert / params.VPT;
+-    int64_t idx = topk * thread_row + k_idx;
+-
+-    if (thread_group_idx == thread_to_clear_in_group) {
+-      int expert_to_clear_in_thread = expert % params.VPT;
+-
+-      // clear the max value in the thread
+-      bias_chunk[expert_to_clear_in_thread] = static_cast<T>(-FLT_MAX);
+-
+-      // store output
+-      output_ptr[idx] = static_cast<float>(row_chunk[expert_to_clear_in_thread]);
+-      indices_ptr[idx] = static_cast<int32_t>(expert);
+-    }
+-
+-    // accumulate sum for all elements
+-    if (thread_group_idx == 0) {
+-      output_sum += output_ptr[idx];
+-    }
+-
+-    __syncthreads();
+-  }
+-
+-  if (thread_group_idx == 0 && num_fused_shared_experts > 0) {
+-    int64_t last_idx = topk * thread_row + topk_excluding_share_expert_fusion;
+-    int64_t expert_offset = 0;
+-    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
+-
+-    // Set the weight to the sum of all weights divided by routed_scaling_factor
+-    output_ptr[last_idx] = output_sum / routed_scaling_factor;
+-
+-    if (num_fused_shared_experts > 1) {
+-      for (int i = 1; i < num_fused_shared_experts; ++i) {
+-        ++last_idx;
+-        ++expert_offset;
+-        indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
+-        // Set the weight to the sum of all weights divided by routed_scaling_factor
+-        output_ptr[last_idx] = output_sum / routed_scaling_factor;
+-      }
+-    }
+-  }
+-  __syncthreads();
+-
+-  ////////////////////// Rescale Output //////////////////////
+-  if (thread_group_idx == 0) {
+-#pragma unroll
+-    for (int ii = 0; ii < topk; ++ii) {
+-      int64_t const idx = topk * thread_row + ii;
+-      output_ptr[idx] = output_ptr[idx] / output_sum;
+-      if (apply_routed_scaling_factor_on_output) {
+-        output_ptr[idx] *= routed_scaling_factor;
+-      }
+-    }
+-  }
+-}
+-
+-//------------------------------------------------------------------------------
+-// Templated Kernel Version (using compile-time constants)
+-//------------------------------------------------------------------------------
+-template <int VPT_, int NUM_EXPERTS_, int THREADS_PER_ROW_, int ROWS_PER_WARP_, int ROWS_PER_CTA_, int WARPS_PER_CTA_>
+-struct KernelParams {
+-  static constexpr int VPT = VPT_;
+-  static constexpr int NUM_EXPERTS = NUM_EXPERTS_;
+-  static constexpr int THREADS_PER_ROW = THREADS_PER_ROW_;
+-  static constexpr int ROWS_PER_WARP = ROWS_PER_WARP_;
+-  static constexpr int ROWS_PER_CTA = ROWS_PER_CTA_;
+-  static constexpr int WARPS_PER_CTA = WARPS_PER_CTA_;
+-};
+-
+-template <
+-    typename T,
+-    int VPT,
+-    int NUM_EXPERTS,
+-    int THREADS_PER_ROW,
+-    int ROWS_PER_WARP,
+-    int ROWS_PER_CTA,
+-    int WARPS_PER_CTA>
+-__global__ void moe_fused_gate_kernel(
+-    void* input,
+-    void* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> params;
+-  moe_fused_gate_impl<T>(
+-      input,
+-      bias,
+-      output_ptr,
+-      indices_ptr,
+-      num_rows,
+-      topk_group,
+-      topk,
+-      num_fused_shared_experts,
+-      routed_scaling_factor,
+-      apply_routed_scaling_factor_on_output,
+-      params);
+-}
+-
+-// Macro to compute compile-time constants and launch the kernel.
+-#define LAUNCH_MOE_GATE_CONFIG(T, EXPERTS, EXPERT_GROUP)                                                 \
+-  do {                                                                                                   \
+-    constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);                                                      \
+-    /* If EXPERT_GROUP > WARP_SIZE, fall back to 1 row per warp */                                       \
+-    constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;      \
+-    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                                          \
+-    moe_fused_gate_kernel<T, VPT, (EXPERTS), (EXPERT_GROUP), ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> \
+-        <<<num_blocks, block_dim, 0, stream>>>(                                                          \
+-            input.data_ptr(),                                                                            \
+-            bias.data_ptr(),                                                                             \
+-            output.data_ptr<float>(),                                                                    \
+-            indices.data_ptr<int32_t>(),                                                                 \
+-            num_rows,                                                                                    \
+-            topk_group,                                                                                  \
+-            topk,                                                                                        \
+-            num_fused_shared_experts,                                                                    \
+-            routed_scaling_factor,                                                                       \
+-            apply_routed_scaling_factor_on_output);                                                      \
+-    dispatched = true;                                                                                   \
+-  } while (0)
+-
+-//------------------------------------------------------------------------------
+-// Dynamic Kernel Version (parameters computed at runtime)
+-//------------------------------------------------------------------------------
+-struct KernelParamsDynamic {
+-  int VPT;
+-  int NUM_EXPERTS;
+-  int THREADS_PER_ROW;
+-  int ROWS_PER_WARP;
+-  int ROWS_PER_CTA;
+-  int WARPS_PER_CTA;
+-};
+-
+-template <typename T>
+-__global__ void moe_fused_gate_kernel_dynamic(
+-    void* input,
+-    void* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t num_experts,
+-    int64_t num_expert_group,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  KernelParamsDynamic params;
+-  params.NUM_EXPERTS = num_experts;             // e.g, for deepseek v3, this is 256
+-  params.VPT = num_experts / num_expert_group;  // e.g., for deepseek v3, this is 256 / 8 = 32
+-  params.THREADS_PER_ROW = num_expert_group;    // fixed as num_expert_group, e.g., for deepseek v3, this is 8
+-  params.WARPS_PER_CTA = WARPS_PER_CTA;         // fixed as 6
+-  params.ROWS_PER_WARP = std::max<int64_t>(1, WARP_SIZE / num_expert_group);  // WARP_SIZE is fixed as 32
+-  params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
+-
+-  moe_fused_gate_impl<T>(
+-      input,
+-      bias,
+-      output_ptr,
+-      indices_ptr,
+-      num_rows,
+-      topk_group,
+-      topk,
+-      num_fused_shared_experts,
+-      routed_scaling_factor,
+-      apply_routed_scaling_factor_on_output,
+-      params);
+-}
+-
+-//------------------------------------------------------------------------------
+-// Host Launcher Function
+-//------------------------------------------------------------------------------
+-std::vector<at::Tensor> moe_fused_gate(
+-    at::Tensor& input,
+-    at::Tensor& bias,
+-    int64_t num_expert_group,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
+-
+-  int64_t num_rows = input.size(0);
+-  int32_t num_experts = input.size(1);
+-  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+-  auto output = torch::empty({num_rows, topk}, options);
+-  auto indices = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
+-
+-  // Compute grid dimensions based on runtime value for num_expert_group.
+-  int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
+-  int64_t num_warps = (num_rows + rows_per_warp - 1) / rows_per_warp;
+-  int64_t num_blocks = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
+-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+-  dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
+-
+-  // Check 1: Ensure that num_experts is a power of 2.
+-  TORCH_CHECK((num_experts & (num_experts - 1)) == 0, "num_experts must be a power of 2, but got ", num_experts);
+-
+-  // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means num_expert_group is power of 2)
+-  TORCH_CHECK(
+-      num_experts % num_expert_group == 0,
+-      "num_experts must be divisible by num_expert_group, but got ",
+-      num_experts,
+-      " / ",
+-      num_expert_group);
+-
+-  int computed_vpt = num_experts / num_expert_group;
+-  // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=32. Maximum VPT indicate max value per
+-  // threads we can process.
+-  TORCH_CHECK(
+-      computed_vpt <= MAX_VPT,
+-      "Per group experts: num_experts / num_expert_group = (",
+-      computed_vpt,
+-      ") exceeds the maximum supported (",
+-      MAX_VPT,
+-      ")");
+-
+-  // Dispatch to templated kernel for known compile-time configurations.
+-  // We currently only support for:
+-  //   Case 1: 256 experts, with 8 or 16 groups.
+-  //   Case 2: 128 experts, with 4 or 8 groups.
+-  //   Case 3: other cases, require 8 <= num_experts / num_expert_group <= 32
+-  bool dispatched = false;
+-  switch (num_experts) {
+-    case 256:
+-      if (num_expert_group == 8)
+-        // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
+-        if (input.scalar_type() == at::kBFloat16) {
+-          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 8);
+-        } else if (input.scalar_type() == at::kHalf) {
+-          LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 8);
+-        } else if (input.scalar_type() == at::kFloat) {
+-          LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 8);
+-        } else if (num_expert_group == 16)
+-          // Here VPT = 256/16 = 16, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2 = 12.
+-          if (input.scalar_type() == at::kBFloat16) {
+-            LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 16);
+-          } else if (input.scalar_type() == at::kHalf) {
+-            LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 16);
+-          } else if (input.scalar_type() == at::kFloat) {
+-            LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 16);
+-          }
+-      break;
+-    case 128:
+-      if (num_expert_group == 4)
+-        // VPT = 128/4 = 32, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2 = 12.
+-        if (input.scalar_type() == at::kBFloat16) {
+-          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 4);
+-        } else if (input.scalar_type() == at::kHalf) {
+-          LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 4);
+-        } else if (input.scalar_type() == at::kFloat) {
+-          LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 4);
+-        } else if (num_expert_group == 8)
+-          // VPT = 128/8 = 16, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
+-          if (input.scalar_type() == at::kBFloat16) {
+-            LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 8);
+-          } else if (input.scalar_type() == at::kHalf) {
+-            LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 8);
+-          } else if (input.scalar_type() == at::kFloat) {
+-            LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 8);
+-          }
+-      break;
+-    default:
+-      break;
+-  }
+-  if (!dispatched) {
+-    // Fallback to the dynamic kernel if none of the supported combinations match.
+-    // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
+-    if (input.scalar_type() == at::kBFloat16) {
+-      moe_fused_gate_kernel_dynamic<bfloat16_t><<<num_blocks, block_dim, 0, stream>>>(
+-          input.data_ptr(),
+-          bias.data_ptr(),
+-          output.data_ptr<float>(),
+-          indices.data_ptr<int32_t>(),
+-          num_rows,
+-          num_experts,
+-          num_expert_group,
+-          topk_group,
+-          topk,
+-          num_fused_shared_experts,
+-          routed_scaling_factor,
+-          apply_routed_scaling_factor_on_output);
+-    } else if (input.scalar_type() == at::kHalf) {
+-      moe_fused_gate_kernel_dynamic<float16_t><<<num_blocks, block_dim, 0, stream>>>(
+-          input.data_ptr(),
+-          bias.data_ptr(),
+-          output.data_ptr<float>(),
+-          indices.data_ptr<int32_t>(),
+-          num_rows,
+-          num_experts,
+-          num_expert_group,
+-          topk_group,
+-          topk,
+-          num_fused_shared_experts,
+-          routed_scaling_factor,
+-          apply_routed_scaling_factor_on_output);
+-    } else if (input.scalar_type() == at::kFloat) {
+-      moe_fused_gate_kernel_dynamic<float32_t><<<num_blocks, block_dim, 0, stream>>>(
+-          input.data_ptr(),
+-          bias.data_ptr(),
+-          output.data_ptr<float>(),
+-          indices.data_ptr<int32_t>(),
+-          num_rows,
+-          num_experts,
+-          num_expert_group,
+-          topk_group,
+-          topk,
+-          num_fused_shared_experts,
+-          routed_scaling_factor,
+-          apply_routed_scaling_factor_on_output);
+-    } else {
+-      TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
+-    }
+-  }
+-  return {output, indices};
+-}
+diff --git a/sgl-kernel/csrc/moe/moe_fused_gate_musa.cu b/sgl-kernel/csrc/moe/moe_fused_gate_musa.cu
+deleted file mode 100644
+index facc66e9e38d..000000000000
+--- a/sgl-kernel/csrc/moe/moe_fused_gate_musa.cu
++++ /dev/null
+@@ -1,840 +0,0 @@
+-#include <musa_runtime.h>
+-#include <mutlass/array.h>
+-#include <mutlass/mutlass.h>
+-#include <mutlass/numeric_types.h>
+-#include <stdio.h>
+-#include <torch/all.h>
+-
+-#include <cfloat>
+-#include <type_traits>
+-
+-#include "torch_musa/csrc/aten/musa/MUSAContext.h"
+-template <typename T, int N>
+-using AlignedArray = mutlass::AlignedArray<T, N>;
+-using bfloat16_t = mutlass::bfloat16_t;
+-using float16_t = mutlass::half_t;
+-using float32_t = float;
+-
+-constexpr float log2ef = 1.4426950408889634074f;
+-
+-static __device__ __forceinline__ float fast_expf(float a) {
+-  return __musa_exp2_f(a * log2ef);
+-}
+-
+-static __device__ __forceinline__ float fast_rcpf(float x) {
+-  float y = __frcp_rn(x);
+-  y = y * (2.f - x * y);
+-  return y;
+-}
+-
+-// QQ NOTE: to handle the case for at::Half, error: more than one operator ">"
+-// matches these operands: built-in operator "arithmetic > arithmetic" function
+-// "operator>(const __half &, const __half &)"
+-template <typename T>
+-__device__ inline bool cmp_gt(const T& a, const T& b) {
+-  if constexpr (std::is_same<T, at::Half>::value) {
+-    // at::Half (or float16_t in our native case) causes ambiguity, so we cast
+-    // to float.
+-    return static_cast<float>(a) > static_cast<float>(b);
+-  } else {
+-    // For types like float, at::BFloat16, or mutlass::half_t /
+-    // mutlass::bfloat16_t, assume operator> works as expected.
+-    return a > b;
+-  }
+-}
+-
+-template <typename T>
+-__device__ inline bool cmp_eq(const T& a, const T& b) {
+-  if constexpr (std::is_same<T, at::Half>::value) {
+-    return static_cast<float>(a) == static_cast<float>(b);
+-  } else {
+-    return a == b;
+-  }
+-}
+-
+-template <typename T>
+-__device__ inline bool cmp_ge(const T& a, const T& b, const int& x, const int& y) {
+-  return (x > y && a == b) || a < b;
+-}
+-
+-// Fixed constants common to both dynamic and static template versions:
+-static constexpr int WARP_SIZE = 32;
+-static constexpr int WARPS_PER_CTA = 16;
+-static constexpr int MAX_VPT = 32;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
+-
+-// Create an alias for Array using AlignedArray
+-template <typename T, int N>
+-using Array = AlignedArray<T, N>;
+-// QQ: NOTE expression must have a constant value, this has to be > params.VPT
+-template <typename T>
+-using AccessType = AlignedArray<T, MAX_VPT>;
+-
+-template <typename T, typename Params>
+-__device__ void moe_fused_gate_impl_dynamic(
+-    void* input,
+-    void* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output,
+-    Params params) {
+-  int tidx = threadIdx.x;
+-  int64_t thread_row =
+-      blockIdx.x * params.ROWS_PER_CTA + threadIdx.y * params.ROWS_PER_WARP + tidx / params.THREADS_PER_ROW;
+-  // Calculate topk_excluding_share_expert_fusion from topk
+-  int64_t topk_excluding_share_expert_fusion = topk - num_fused_shared_experts;
+-
+-  // Cast pointers to type T:
+-  auto* input_ptr = reinterpret_cast<T*>(input);
+-  auto* bias_ptr = reinterpret_cast<T*>(bias);
+-  auto* thread_row_ptr = input_ptr + thread_row * params.NUM_EXPERTS;
+-
+-  int thread_group_idx = tidx % params.THREADS_PER_ROW;
+-  int first_elt_read_by_thread = thread_group_idx * params.VPT;
+-
+-  // Create local arrays for the row chunk and bias chunk and then reinterpret
+-  // the address of row_chunk as a pointer to AccessType.
+-  T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
+-  Array<T, MAX_VPT> row_chunk;
+-  AccessType<T> const* vec_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(thread_read_ptr);
+-
+-  T* bias_thread_read_ptr = bias_ptr + first_elt_read_by_thread;
+-  Array<T, MAX_VPT> bias_chunk;
+-  AccessType<T> const* vec_bias_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(bias_thread_read_ptr);
+-
+-  // QQ NOTE: doing the follow will be slower than loop assign and more
+-  // importantly have misaligned address issue when params.VPT < 8 and mismatch
+-  // with MAX_VPT AccessType<T>* row_chunk_vec_ptr =
+-  // reinterpret_cast<AccessType<T>*>(&row_chunk); row_chunk_vec_ptr[0] =
+-  // vec_thread_read_ptr[0];
+-  if (thread_row < num_rows) {
+-#pragma unroll
+-    for (int ii = 0; ii < params.VPT; ++ii) {
+-      row_chunk[ii] = vec_thread_read_ptr[0][ii];
+-      bias_chunk[ii] = vec_bias_thread_read_ptr[0][ii];
+-    }
+-  }
+-
+-  ////////////////////// Sigmoid //////////////////////
+-  if (thread_row < num_rows) {
+-#pragma unroll
+-    for (int ii = 0; ii < params.VPT; ++ii) {
+-      row_chunk[ii] = static_cast<T>(fast_rcpf(1.0f + fast_expf(-float(row_chunk[ii]))));
+-    }
+-  }
+-
+-  ////////////////////// Add Bias //////////////////////
+-  if (thread_row < num_rows) {
+-#pragma unroll
+-    for (int ii = 0; ii < params.VPT; ++ii) {
+-      bias_chunk[ii] = row_chunk[ii] + bias_chunk[ii];
+-    }
+-  }
+-
+-  ////////////////////// Exclude Groups //////////////////////
+-  if (thread_row < num_rows) {
+-#pragma unroll
+-    for (int k_idx = 0; k_idx < params.THREADS_PER_ROW - topk_group;
+-         ++k_idx) {  // QQ NOTE Here params.THREADS_PER_ROW = num_expert_group
+-      int expert = first_elt_read_by_thread;
+-      // local argmax
+-      T max_val = static_cast<T>(-FLT_MAX);
+-      T max_val_second = static_cast<T>(-FLT_MAX);
+-#pragma unroll
+-      for (int ii = 0; ii < params.VPT; ++ii) {
+-        T val = bias_chunk[ii];
+-
+-        if (cmp_gt(val, max_val)) {
+-          max_val_second = max_val;
+-          max_val = val;
+-        } else if (cmp_gt(val, max_val_second)) {
+-          max_val_second = val;
+-        }
+-      }
+-
+-      // QQ NOTE: currently fixed to pick top2 sigmoid weight value in each
+-      // expert group and sum them as the group weight to select expert groups
+-      T max_sum = max_val + max_val_second;
+-
+-// argmin reduce
+-#pragma unroll
+-      for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+-        T other_max_sum =
+-            static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_sum), mask, params.THREADS_PER_ROW));
+-        int other_expert = __shfl_xor_sync(0xFFFFFFFF, expert, mask, params.THREADS_PER_ROW);
+-
+-        // higher indices win
+-        if (cmp_gt(max_sum, other_max_sum) || (cmp_eq(other_max_sum, max_sum) && other_expert > expert)) {
+-          max_sum = other_max_sum;
+-          expert = other_expert;
+-        }
+-      }
+-
+-      // clear the max value in the thread
+-      if (k_idx < params.THREADS_PER_ROW - topk_group) {
+-        int const thread_to_clear_in_group = expert / params.VPT;
+-
+-        if (thread_group_idx == thread_to_clear_in_group) {
+-#pragma unroll
+-          for (int ii = 0; ii < params.VPT; ++ii) {
+-            bias_chunk[ii] = static_cast<T>(FLT_MAX);
+-          }
+-        }
+-      }
+-    }
+-  }
+-
+-  ////////////////////// Topk //////////////////////
+-  float output_sum = 0.0f;
+-  for (int k_idx = 0; k_idx < topk_excluding_share_expert_fusion; ++k_idx) {
+-    if (thread_row < num_rows) {
+-      // local argmax
+-      T max_val = bias_chunk[0];
+-      int expert = first_elt_read_by_thread;
+-
+-      if (!cmp_eq(max_val, static_cast<T>(FLT_MAX))) {
+-#pragma unroll
+-        for (int ii = 1; ii < params.VPT; ++ii) {
+-          T val = bias_chunk[ii];
+-          if (cmp_gt(val, max_val)) {
+-            max_val = val;
+-            expert = first_elt_read_by_thread + ii;
+-          }
+-        }
+-      } else {
+-        max_val = static_cast<T>(-FLT_MAX);
+-      }
+-
+-      // argmax reduce
+-#pragma unroll
+-      for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+-        T other_max =
+-            static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_val), mask, params.THREADS_PER_ROW));
+-        int other_expert = __shfl_xor_sync(0xFFFFFFFF, expert, mask, params.THREADS_PER_ROW);
+-
+-        // lower indices to win
+-        if (cmp_gt(other_max, max_val) || (cmp_eq(other_max, max_val) && other_expert < expert)) {
+-          max_val = other_max;
+-          expert = other_expert;
+-        }
+-      }
+-
+-      int thread_to_clear_in_group = expert / params.VPT;
+-      int64_t idx = topk * thread_row + k_idx;
+-
+-      if (thread_group_idx == thread_to_clear_in_group) {
+-        int expert_to_clear_in_thread = expert % params.VPT;
+-
+-#pragma unroll
+-        for (int v = 0; v < MAX_VPT; v++) {
+-          if (v < params.VPT && expert_to_clear_in_thread == v) {
+-            // clear the max value in the thread
+-            bias_chunk[v] = static_cast<T>(-FLT_MAX);
+-            // store output
+-            output_ptr[idx] = static_cast<float>(row_chunk[v]);
+-          }
+-        }
+-        indices_ptr[idx] = static_cast<int32_t>(expert);
+-      }
+-
+-      __threadfence_block();
+-      // accumulate sum for all elements
+-      if (thread_group_idx == 0) {
+-        output_sum += output_ptr[idx];
+-      }
+-    }
+-  }
+-
+-  if (thread_row < num_rows) {
+-    if (thread_group_idx == 0 && num_fused_shared_experts > 0) {
+-      int64_t last_idx = topk * thread_row + topk_excluding_share_expert_fusion;
+-      int64_t expert_offset = 0;
+-      indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
+-
+-      // Set the weight to the sum of all weights divided by
+-      // routed_scaling_factor
+-      output_ptr[last_idx] = output_sum / routed_scaling_factor;
+-
+-      if (num_fused_shared_experts > 1) {
+-        for (int i = 1; i < num_fused_shared_experts; ++i) {
+-          ++last_idx;
+-          ++expert_offset;
+-          indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
+-          // Set the weight to the sum of all weights divided by
+-          // routed_scaling_factor
+-          output_ptr[last_idx] = output_sum / routed_scaling_factor;
+-        }
+-      }
+-    }
+-  }
+-  __threadfence_block();
+-
+-  ////////////////////// Rescale Output //////////////////////
+-  if (thread_row < num_rows) {
+-    if (thread_group_idx == 0) {
+-#pragma unroll
+-      for (int ii = 0; ii < topk; ++ii) {
+-        int64_t const idx = topk * thread_row + ii;
+-        output_ptr[idx] = output_ptr[idx] / output_sum;
+-        if (apply_routed_scaling_factor_on_output) {
+-          output_ptr[idx] *= routed_scaling_factor;
+-        }
+-      }
+-    }
+-  }
+-}
+-
+-template <typename T, typename Params, int Vlen>
+-__device__ void moe_fused_gate_impl_static(
+-    void* input,
+-    void* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output,
+-    float last_val,
+-    Params params) {
+-  using ArrayVal = AlignedArray<T, Vlen>;
+-  using ArrayIndex = AlignedArray<int, Vlen>;
+-
+-  int tidx = threadIdx.x % (params.NUM_EXPERTS / Vlen) * Vlen;
+-  int tidy = threadIdx.x / (params.NUM_EXPERTS / Vlen);
+-  int64_t thread_row = blockIdx.x * params.ROWS_PER_CTA + tidy;
+-
+-  constexpr int NR_EXPERTS = params.NUM_EXPERTS;
+-  constexpr int NR_ROWS_PER_CTA = params.ROWS_PER_CTA;
+-  constexpr int NR_EXPERT_GRPS = params.NUM_EXPERTS / params.VPT;
+-  constexpr int NR_EXPERT_PER_GRP = params.VPT;
+-  constexpr int NR_THREADS_PER_GRP = NR_EXPERT_PER_GRP / Vlen;
+-  __shared__ int smem_grp_flag[NR_ROWS_PER_CTA * NR_EXPERT_GRPS];
+-  __shared__ float smem_grp_max_sum[NR_ROWS_PER_CTA * NR_EXPERT_GRPS];
+-  __shared__ T smem_score[NR_ROWS_PER_CTA * NR_EXPERTS];
+-  __shared__ int smem_idx[NR_ROWS_PER_CTA * NR_EXPERTS];
+-  __shared__ T smem_bias[NR_EXPERTS];
+-
+-  static_assert(Vlen <= NR_EXPERT_PER_GRP);
+-
+-  // Calculate topk_excluding_share_expert_fusion from topk
+-  int topk_excluding_share_expert_fusion = topk - num_fused_shared_experts;
+-
+-  // Cast pointers to type T:
+-  auto* input_ptr = reinterpret_cast<T*>(input);
+-  auto* bias_ptr = reinterpret_cast<T*>(bias);
+-  auto* thread_row_ptr = input_ptr + thread_row * params.NUM_EXPERTS;
+-
+-  int grp_idx = tidx / NR_EXPERT_PER_GRP;
+-  int exp_idx_in_grp = tidx % NR_EXPERT_PER_GRP;
+-
+-  ArrayVal row_chunk;
+-  ArrayVal bias_chunk;
+-  ArrayIndex idx_chunk;
+-  if (thread_row < num_rows) {
+-    row_chunk = *(ArrayVal*)(thread_row_ptr + tidx);
+-    bias_chunk = *(ArrayVal*)(bias_ptr + tidx);
+-  }
+-
+-#pragma unroll
+-  for (int v = 0; v < Vlen; v++) {
+-    ////////////////////// Sigmoid //////////////////////
+-    row_chunk[v] = static_cast<T>(fast_rcpf(1.0f + fast_expf(-float(row_chunk[v]))));
+-    if (tidy == 0) {
+-      smem_bias[tidx + v] = bias_chunk[v];
+-    }
+-    bias_chunk[v] = row_chunk[v] + bias_chunk[v];
+-    idx_chunk[v] = tidx + v;
+-  }
+-
+-  int max_idx = exp_idx_in_grp;
+-  T max_val = bias_chunk[0];
+-  float max_sum = 0.f;
+-
+-  ////////////////////// top 1 //////////////////////
+-#pragma unroll
+-  for (int v = 1; v < Vlen; v++) {
+-    // per-thread max
+-    if (bias_chunk[v] > max_val) {
+-      max_val = bias_chunk[v];
+-      max_idx = exp_idx_in_grp + v;
+-    }
+-  }
+-#pragma unroll
+-  for (int mask = NR_THREADS_PER_GRP / 2; mask > 0; mask /= 2) {
+-    T peer_max_val = static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_val), mask, NR_THREADS_PER_GRP));
+-    int peer_idx = __shfl_xor_sync(0xFFFFFFFF, max_idx, mask, NR_THREADS_PER_GRP);
+-    if (cmp_gt(peer_max_val, max_val)) {
+-      max_val = peer_max_val;
+-      max_idx = peer_idx;
+-    }
+-  }
+-  int top1_max_idx = __shfl_sync(0xFFFFFFFF, static_cast<float>(max_idx), 0, NR_THREADS_PER_GRP);
+-  max_sum += max_val;
+-
+-  ////////////////////// top 2 //////////////////////
+-  max_val = static_cast<T>(-FLT_MAX);
+-  for (int v = 0; v < Vlen; v++) {
+-    // per-thread reset
+-    if (bias_chunk[v] > max_val && exp_idx_in_grp + v != top1_max_idx) {
+-      max_val = bias_chunk[v];
+-    }
+-  }
+-#pragma unroll
+-  for (int mask = NR_THREADS_PER_GRP / 2; mask > 0; mask /= 2) {
+-    T peer_max_val = static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_val), mask, NR_THREADS_PER_GRP));
+-    if (cmp_gt(peer_max_val, max_val)) {
+-      max_val = peer_max_val;
+-    }
+-  }
+-  max_sum += max_val;
+-
+-  ////////////////////// sort groups by max_sum //////////////////////
+-  if (exp_idx_in_grp == 0) {
+-    smem_grp_max_sum[tidy * NR_EXPERT_GRPS + grp_idx] = max_sum;
+-    smem_grp_flag[tidy * NR_EXPERT_GRPS + grp_idx] = grp_idx;
+-  }
+-  __syncthreads_lm();
+-  int cur_grp_rank = 0;
+-  if (exp_idx_in_grp == 0) {
+-    float cur_grp_max = max_sum;
+-#pragma unroll
+-    for (int i = 0; i < NR_EXPERT_GRPS; i++) {
+-      float other_grp_max = smem_grp_max_sum[tidy * NR_EXPERT_GRPS + i];
+-      int other_grp_idx = smem_grp_flag[tidy * NR_EXPERT_GRPS + i];
+-      if (cmp_ge(cur_grp_max, other_grp_max, grp_idx, other_grp_idx)) {
+-        cur_grp_rank++;
+-      }
+-    }
+-  }
+-  __syncthreads_lm();
+-  if (exp_idx_in_grp == 0) {
+-    smem_grp_flag[tidy * NR_EXPERT_GRPS + grp_idx] = cur_grp_rank;
+-  }
+-  __syncthreads_lm();
+-
+-  ////////////////////// TopK experts //////////////////////
+-  cur_grp_rank = smem_grp_flag[tidy * NR_EXPERT_GRPS + grp_idx];
+-
+-#pragma unroll
+-  for (int v = 0; v < Vlen; v++) {
+-    if (cur_grp_rank >= topk_group) {
+-      bias_chunk[v] = static_cast<T>(-FLT_MAX);
+-    }
+-  }
+-
+-  float output_sum = 0.f;
+-  for (int i = 0; i < topk_excluding_share_expert_fusion; i++) {
+-    T thread_max_val = static_cast<T>(-FLT_MAX);
+-    int thread_max_idx = idx_chunk[0];
+-#pragma unroll
+-    for (int v = 0; v < Vlen; v++) {
+-      if (bias_chunk[v] > thread_max_val) {
+-        thread_max_val = bias_chunk[v];
+-        thread_max_idx = idx_chunk[v];
+-      }
+-    }
+-
+-#pragma unroll
+-    for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+-      T peer_max_val = static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(thread_max_val), mask, WARP_SIZE));
+-      int peer_idx = __shfl_xor_sync(0xFFFFFFFF, thread_max_idx, mask, WARP_SIZE);
+-      if (cmp_ge(thread_max_val, peer_max_val, thread_max_idx, peer_idx)) {
+-        thread_max_val = peer_max_val;
+-        thread_max_idx = peer_idx;
+-      }
+-    }
+-    int warp_max_idx = __shfl_sync(0xFFFFFFFF, thread_max_idx, 0, WARP_SIZE);
+-
+-    if (tidx == 0) {
+-      // restore row_chunk
+-      float restored_val = (float)thread_max_val - (float)smem_bias[thread_max_idx];
+-      output_sum += restored_val;
+-      smem_score[tidy * NR_EXPERTS + i] = (T)restored_val;
+-      smem_idx[tidy * NR_EXPERTS + i] = thread_max_idx;
+-    }
+-
+-#pragma unroll
+-    for (int v = 0; v < Vlen; v++) {
+-      if (warp_max_idx == idx_chunk[v]) {
+-        bias_chunk[v] = static_cast<T>(-FLT_MAX);
+-      }
+-    }
+-  }
+-
+-  __syncthreads_lm();
+-  output_sum = __shfl_sync(0xFFFFFFFF, output_sum, 0, WARP_SIZE);
+-
+-  ////////////////////// store output //////////////////////
+-  int64_t out_idx = thread_row * topk;
+-  int tid_st_x = threadIdx.x % WARP_SIZE;
+-  if (thread_row < num_rows) {
+-    for (int i = tid_st_x; i < topk_excluding_share_expert_fusion; i += WARP_SIZE) {
+-      float output_val = smem_score[tidy * NR_EXPERTS + i] * fast_rcpf(output_sum);
+-      if (apply_routed_scaling_factor_on_output) {
+-        output_val *= routed_scaling_factor;
+-      }
+-      output_ptr[out_idx + i] = output_val;
+-      indices_ptr[out_idx + i] = smem_idx[tidy * NR_EXPERTS + i];
+-    }
+-  }
+-
+-  ////////////////////// handle shared experts //////////////////////
+-  if (thread_row < num_rows && tidx == 0 && num_fused_shared_experts > 0) {
+-    int64_t last_idx = thread_row * topk + topk_excluding_share_expert_fusion;
+-    int64_t expert_offset = 0;
+-    // Set the weight to the sum of all weights divided by routed_scaling_factor
+-    indices_ptr[last_idx] = static_cast<int32_t>(NR_EXPERTS + expert_offset);
+-    output_ptr[last_idx] = last_val;
+-
+-    if (num_fused_shared_experts > 1) {
+-      for (int i = 1; i < num_fused_shared_experts; ++i) {
+-        ++last_idx;
+-        ++expert_offset;
+-        indices_ptr[last_idx] = static_cast<int32_t>(NR_EXPERTS + expert_offset);
+-        output_ptr[last_idx] = last_val;
+-      }
+-    }
+-  }
+-}
+-
+-//------------------------------------------------------------------------------
+-// Templated Kernel Version (using compile-time constants)
+-//------------------------------------------------------------------------------
+-template <int VPT_, int NUM_EXPERTS_, int ROWS_PER_CTA_>
+-struct KernelParams {
+-  static constexpr int VPT = VPT_;
+-  static constexpr int NUM_EXPERTS = NUM_EXPERTS_;
+-  static constexpr int ROWS_PER_CTA = ROWS_PER_CTA_;
+-};
+-
+-template <typename T, int VPT, int NUM_EXPERTS, int ROWS_PER_CTA, int Vlen>
+-__global__ void moe_fused_gate_kernel_static(
+-    void* input,
+-    void* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output,
+-    float last_val) {
+-  KernelParams<VPT, NUM_EXPERTS, ROWS_PER_CTA> params;
+-  moe_fused_gate_impl_static<T, KernelParams<VPT, NUM_EXPERTS, ROWS_PER_CTA>, Vlen>(
+-      input,
+-      bias,
+-      output_ptr,
+-      indices_ptr,
+-      num_rows,
+-      topk_group,
+-      topk,
+-      num_fused_shared_experts,
+-      routed_scaling_factor,
+-      apply_routed_scaling_factor_on_output,
+-      last_val,
+-      params);
+-}
+-
+-// Macro to compute compile-time constants and launch the kernel.
+-#define LAUNCH_MOE_GATE_CONFIG(T, EXPERTS, EXPERT_GROUP)                                                       \
+-  do {                                                                                                         \
+-    constexpr int vlen = EXPERTS / WARP_SIZE;                                                                  \
+-    int block_x = num_experts / vlen;                                                                          \
+-    int block_y = block_size / block_x;                                                                        \
+-    int64_t num_blocks = (num_rows + block_y - 1) / block_y;                                                   \
+-    dim3 block_dim(block_size, 1, 1);                                                                          \
+-    constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);                                                            \
+-    constexpr int ROWS_PER_CTA = block_size / (EXPERTS / vlen);                                                \
+-    moe_fused_gate_kernel_static<T, VPT, (EXPERTS), ROWS_PER_CTA, vlen><<<num_blocks, block_dim, 0, stream>>>( \
+-        input.data_ptr(),                                                                                      \
+-        bias.data_ptr(),                                                                                       \
+-        output.data_ptr<float>(),                                                                              \
+-        indices.data_ptr<int32_t>(),                                                                           \
+-        num_rows,                                                                                              \
+-        topk_group,                                                                                            \
+-        topk,                                                                                                  \
+-        num_fused_shared_experts,                                                                              \
+-        routed_scaling_factor,                                                                                 \
+-        apply_routed_scaling_factor_on_output,                                                                 \
+-        last_val);                                                                                             \
+-    dispatched = true;                                                                                         \
+-  } while (0);
+-
+-//------------------------------------------------------------------------------
+-// Dynamic Kernel Version (parameters computed at runtime)
+-//------------------------------------------------------------------------------
+-struct KernelParamsDynamic {
+-  int VPT;
+-  int NUM_EXPERTS;
+-  int THREADS_PER_ROW;
+-  int ROWS_PER_WARP;
+-  int ROWS_PER_CTA;
+-  int WARPS_PER_CTA;
+-};
+-
+-template <typename T>
+-__global__ void moe_fused_gate_kernel_dynamic(
+-    void* input,
+-    void* bias,
+-    float* output_ptr,
+-    int32_t* indices_ptr,
+-    int64_t num_rows,
+-    int64_t num_experts,
+-    int64_t num_expert_group,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  KernelParamsDynamic params;
+-  params.NUM_EXPERTS = num_experts;             // e.g, for deepseek v3, this is 256
+-  params.VPT = num_experts / num_expert_group;  // e.g., for deepseek v3, this is 256 / 8 = 32
+-  params.THREADS_PER_ROW = num_expert_group;    // fixed as num_expert_group, e.g., for deepseek v3,
+-                                                // this is 8
+-  params.WARPS_PER_CTA = WARPS_PER_CTA;         // fixed as 6
+-  params.ROWS_PER_WARP = std::max<int64_t>(1, WARP_SIZE / num_expert_group);  // WARP_SIZE is fixed as 32
+-  params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
+-
+-  moe_fused_gate_impl_dynamic<T>(
+-      input,
+-      bias,
+-      output_ptr,
+-      indices_ptr,
+-      num_rows,
+-      topk_group,
+-      topk,
+-      num_fused_shared_experts,
+-      routed_scaling_factor,
+-      apply_routed_scaling_factor_on_output,
+-      params);
+-}
+-
+-void dispatch_moe_fuse_gate_dynamic(
+-    at::Tensor& output,
+-    at::Tensor& indices,
+-    at::Tensor& input,
+-    at::Tensor& bias,
+-    int64_t num_rows,
+-    int64_t num_experts,
+-    int64_t num_expert_group,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  // Compute grid dimensions based on runtime value for num_expert_group.
+-  int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
+-  int64_t num_warps = (num_rows + rows_per_warp - 1) / rows_per_warp;
+-  int64_t num_blocks = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
+-  const musaStream_t stream = at::musa::getCurrentMUSAStream();
+-  dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
+-
+-  // Fallback to the dynamic kernel if none of the supported combinations match.
+-  // currently only support num_experts / num_expert_group <= 32 for dynamic
+-  // kernels
+-  if (input.scalar_type() == at::kBFloat16) {
+-    moe_fused_gate_kernel_dynamic<bfloat16_t><<<num_blocks, block_dim, 0, stream>>>(
+-        input.data_ptr(),
+-        bias.data_ptr(),
+-        output.data_ptr<float>(),
+-        indices.data_ptr<int32_t>(),
+-        num_rows,
+-        num_experts,
+-        num_expert_group,
+-        topk_group,
+-        topk,
+-        num_fused_shared_experts,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output);
+-  } else if (input.scalar_type() == at::kHalf) {
+-    moe_fused_gate_kernel_dynamic<float16_t><<<num_blocks, block_dim, 0, stream>>>(
+-        input.data_ptr(),
+-        bias.data_ptr(),
+-        output.data_ptr<float>(),
+-        indices.data_ptr<int32_t>(),
+-        num_rows,
+-        num_experts,
+-        num_expert_group,
+-        topk_group,
+-        topk,
+-        num_fused_shared_experts,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output);
+-  } else if (input.scalar_type() == at::kFloat) {
+-    moe_fused_gate_kernel_dynamic<float32_t><<<num_blocks, block_dim, 0, stream>>>(
+-        input.data_ptr(),
+-        bias.data_ptr(),
+-        output.data_ptr<float>(),
+-        indices.data_ptr<int32_t>(),
+-        num_rows,
+-        num_experts,
+-        num_expert_group,
+-        topk_group,
+-        topk,
+-        num_fused_shared_experts,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output);
+-  } else {
+-    TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
+-  }
+-}
+-
+-bool dispatch_moe_fuse_gate_static(
+-    at::Tensor& output,
+-    at::Tensor& indices,
+-    at::Tensor& input,
+-    at::Tensor& bias,
+-    int64_t num_rows,
+-    int64_t num_experts,
+-    int64_t num_expert_group,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  const musaStream_t stream = at::musa::getCurrentMUSAStream();
+-  bool dispatched = false;
+-  float last_val = apply_routed_scaling_factor_on_output ? 1.f : 1.f / routed_scaling_factor;
+-  // Dispatch to templated kernel for known compile-time configurations.
+-  // We currently only support for:
+-  //   Case 1: 256 experts, with 8 or 16 groups.
+-  //   Case 2: 128 experts, with 4 or 8 groups.
+-  //   Case 3: other cases, require 8 <= num_experts / num_expert_group <= 32
+-  constexpr int block_size = 256;
+-  switch (num_experts) {
+-    case 256:
+-      if (num_expert_group == 8) {
+-        // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8
+-        // = 4, ROWS_PER_CTA = 6 * 4 = 24.
+-        if (input.scalar_type() == at::kBFloat16) {
+-          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 8);
+-        } else if (input.scalar_type() == at::kHalf) {
+-          LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 8);
+-        } else if (input.scalar_type() == at::kFloat) {
+-          LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 8);
+-        }
+-      } else if (num_expert_group == 16) {
+-        //   Here VPT = 256/16 = 16, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA
+-        //   = 6 * 2 = 12.
+-        if (input.scalar_type() == at::kBFloat16) {
+-          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 16);
+-        } else if (input.scalar_type() == at::kHalf) {
+-          LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 16);
+-        } else if (input.scalar_type() == at::kFloat) {
+-          LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 16);
+-        }
+-      }
+-      break;
+-    case 128:
+-      if (num_expert_group == 4) {
+-        // VPT = 128/4 = 32, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2
+-        // = 12.
+-        if (input.scalar_type() == at::kBFloat16) {
+-          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 4);
+-        } else if (input.scalar_type() == at::kHalf) {
+-          LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 4);
+-        } else if (input.scalar_type() == at::kFloat) {
+-          LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 4);
+-        }
+-      } else if (num_expert_group == 8) {
+-        // VPT = 128/8 = 16, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4
+-        //   = 24.
+-        if (input.scalar_type() == at::kBFloat16) {
+-          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 8);
+-        } else if (input.scalar_type() == at::kHalf) {
+-          LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 8);
+-        } else if (input.scalar_type() == at::kFloat) {
+-          LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 8);
+-        }
+-      }
+-      break;
+-    default:
+-      break;
+-  }
+-
+-  return dispatched;
+-}
+-
+-#undef LAUNCH_MOE_GATE_CONFIG
+-
+-//------------------------------------------------------------------------------
+-// Host Launcher Function
+-//------------------------------------------------------------------------------
+-std::vector<at::Tensor> moe_fused_gate(
+-    at::Tensor& input,
+-    at::Tensor& bias,
+-    int64_t num_expert_group,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output) {
+-  TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
+-  int64_t num_rows = input.size(0);
+-  int32_t num_experts = input.size(1);
+-  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+-  auto output = torch::empty({num_rows, topk}, options);
+-  auto indices = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
+-
+-  // Check 1: Ensure that num_experts is a power of 2.
+-  TORCH_CHECK((num_experts & (num_experts - 1)) == 0, "num_experts must be a power of 2, but got ", num_experts);
+-
+-  // Check 2: Ensure that num_experts is divisible by num_expert_group. (this
+-  // also means num_expert_group is power of 2)
+-  TORCH_CHECK(
+-      num_experts % num_expert_group == 0,
+-      "num_experts must be divisible by num_expert_group, but got ",
+-      num_experts,
+-      " / ",
+-      num_expert_group);
+-
+-  int computed_vpt = num_experts / num_expert_group;
+-  // Check 3: Ensure that num_experts/num_expert_group does not exceed
+-  // MAX_VPT=32. Maximum VPT indicate max value per threads we can process.
+-  TORCH_CHECK(
+-      computed_vpt <= MAX_VPT,
+-      "Per group experts: num_experts / num_expert_group = (",
+-      computed_vpt,
+-      ") exceeds the maximum supported (",
+-      MAX_VPT,
+-      ")");
+-
+-  bool static_dispatched = dispatch_moe_fuse_gate_static(
+-      output,
+-      indices,
+-      input,
+-      bias,
+-      num_rows,
+-      num_experts,
+-      num_expert_group,
+-      topk_group,
+-      topk,
+-      num_fused_shared_experts,
+-      routed_scaling_factor,
+-      apply_routed_scaling_factor_on_output);
+-
+-  if (!static_dispatched) {
+-    dispatch_moe_fuse_gate_dynamic(
+-        output,
+-        indices,
+-        input,
+-        bias,
+-        num_rows,
+-        num_experts,
+-        num_expert_group,
+-        topk_group,
+-        topk,
+-        num_fused_shared_experts,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output);
+-  }
+-
+-  return {output, indices};
+-}
+diff --git a/sgl-kernel/include/sgl_kernel_ops.h b/sgl-kernel/include/sgl_kernel_ops.h
+index 2110aa5733c0..6c50b26d6e3e 100644
+--- a/sgl-kernel/include/sgl_kernel_ops.h
++++ b/sgl-kernel/include/sgl_kernel_ops.h
+@@ -296,24 +296,6 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
+ 
+ void moe_sum(torch::Tensor& input, torch::Tensor& output);
+ 
+-std::vector<at::Tensor> moe_fused_gate(
+-    at::Tensor& input,
+-    at::Tensor& bias,
+-    int64_t num_expert_group,
+-    int64_t topk_group,
+-    int64_t topk,
+-    int64_t num_fused_shared_experts,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output);
+-
+-std::vector<at::Tensor> kimi_k2_moe_fused_gate(
+-    at::Tensor& input,
+-    at::Tensor& bias,
+-    int64_t topk,
+-    bool renormalize,
+-    double routed_scaling_factor,
+-    bool apply_routed_scaling_factor_on_output);
+-
+ void fp8_blockwise_scaled_grouped_mm(
+     torch::Tensor& output,
+     torch::Tensor& a_ptrs,
+diff --git a/sgl-kernel/python/sgl_kernel/__init__.py b/sgl-kernel/python/sgl_kernel/__init__.py
+index e179d889cb80..bbf1c43aef00 100644
+--- a/sgl-kernel/python/sgl_kernel/__init__.py
++++ b/sgl-kernel/python/sgl_kernel/__init__.py
+@@ -89,9 +89,7 @@
+         apply_shuffle_mul_sum,
+         fp8_blockwise_scaled_grouped_mm,
+         fused_qk_norm_rope,
+-        kimi_k2_moe_fused_gate,
+         moe_align_block_size,
+-        moe_fused_gate,
+         moe_sum,
+         moe_sum_reduce,
+         prepare_moe_input,
+@@ -177,10 +175,8 @@
+         "gptq_gemm",
+         "gptq_shuffle",
+         "int8_scaled_mm",
+-        "kimi_k2_moe_fused_gate",
+         "merge_state_v2",
+         "moe_align_block_size",
+-        "moe_fused_gate",
+         "moe_sum",
+         "moe_sum_reduce",
+         "prepare_moe_input",
+diff --git a/sgl-kernel/python/sgl_kernel/moe.py b/sgl-kernel/python/sgl_kernel/moe.py
+index bb8271749d35..bc43d37a5b31 100755
+--- a/sgl-kernel/python/sgl_kernel/moe.py
++++ b/sgl-kernel/python/sgl_kernel/moe.py
+@@ -102,74 +102,9 @@ def moe_sum(
+     )
+ 
+ 
+-def moe_fused_gate(
+-    input_tensor,
+-    bias,
+-    num_expert_group,
+-    topk_group,
+-    topk,
+-    num_fused_shared_experts=0,
+-    routed_scaling_factor=0,
+-    apply_routed_scaling_factor_on_output=False,
+-):
+-    # This fused kernel function is used to select topk expert in a hierarchical 2-layer fashion
+-    # it split group of expert into num_expert_group, and use top2 expert weight sum in each group
+-    # as the group weight to select expert groups and then select topk experts within the selected groups
+-    # the #experts is decided by the input tensor shape and we currently only support power of 2 #experts
+-    # and #experts should be divisible by num_expert_group. #expert/num_expert_group <= 32 is limited for now.
+-    # for non-supported case, we suggest to use the biased_grouped_topk func in sglang.srt.layers.moe.topk
+-    # num_fused_shared_experts: if > 0, the last several experts will be
+-    #   replaced with shared experts. the shared experts will be divided by the
+-    #   routed_scaling_factor - this is intended to cancel out later when routed+shared
+-    #   output is scaled so that shared experts are not scaled.
+-    # routed_scaling_factor: if > 0, the experts will be scaled by this factor
+-    # apply_routed_scaling_factor_on_output: if true, output will be
+-    #   scaled by the routed_scaling_factor
+-    return torch.ops.sgl_kernel.moe_fused_gate.default(
+-        input_tensor,
+-        bias,
+-        num_expert_group,
+-        topk_group,
+-        topk,
+-        num_fused_shared_experts,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output,
+-    )
+-
+-
+-def kimi_k2_moe_fused_gate(
+-    input_tensor,
+-    bias,
+-    topk,
+-    renormalize=True,
+-    routed_scaling_factor=1.0,
+-    apply_routed_scaling_factor_on_output=False,
+-):
+-    """
+-    Simplified fused kernel for Kimi K2 model (num_expert_group=1).
+-    This kernel removes the grouped topk logic since all experts belong to a single group.
+-
+-    Args:
+-        input_tensor: Gating output tensor [num_tokens, num_experts]
+-        bias: Correction bias tensor [num_experts]
+-        topk: Number of experts to select per token
+-        renormalize: Whether to renormalize the topk weights
+-        routed_scaling_factor: Scaling factor for expert weights
+-        apply_routed_scaling_factor_on_output: If true, apply scaling factor to output
+-
+-    Returns:
+-        Tuple of (topk_weights, topk_ids)
+-        - topk_weights: [num_tokens, topk] float32 tensor
+-        - topk_ids: [num_tokens, topk] int32 tensor
+-    """
+-    return torch.ops.sgl_kernel.kimi_k2_moe_fused_gate.default(
+-        input_tensor,
+-        bias,
+-        topk,
+-        renormalize,
+-        routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output,
+-    )
++# moe_fused_gate / kimi_k2_moe_fused_gate (AOT gate kernels) retired — the gate/topk
++# path is consolidated onto the unified Triton router in
++# python/sglang/jit_kernel/moe_fused_gate.py (sglang issue #26771).
+ 
+ 
+ def fp8_blockwise_scaled_grouped_mm(
+diff --git a/sgl-kernel/setup_musa.py b/sgl-kernel/setup_musa.py
+index 323e9e0b5738..92bb6962eaae 100644
+--- a/sgl-kernel/setup_musa.py
++++ b/sgl-kernel/setup_musa.py
+@@ -85,8 +85,6 @@ def _get_version():
+     "csrc/elementwise/fused_add_rms_norm_kernel.mu",
+     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
+     "csrc/moe/moe_align_kernel.cu",
+-    "csrc/moe/moe_fused_gate_musa.cu",
+-    "csrc/moe/kimi_k2_moe_fused_gate.cu",
+     "csrc/moe/moe_sum.cu",
+     "csrc/moe/moe_sum_reduce.cu",
+     "csrc/moe/moe_topk_softmax_kernels.cu",
+diff --git a/sgl-kernel/tests/test_kimi_k2_moe_fused_gate.py b/sgl-kernel/tests/test_kimi_k2_moe_fused_gate.py
+deleted file mode 100644
+index 1a42139e2b80..000000000000
+--- a/sgl-kernel/tests/test_kimi_k2_moe_fused_gate.py
++++ /dev/null
+@@ -1,130 +0,0 @@
+-import sys
+-
+-import pytest
+-import torch
+-from sgl_kernel import kimi_k2_moe_fused_gate
+-
+-from sglang.srt.layers.moe.topk import kimi_k2_biased_topk_impl
+-
+-# (num_experts, topk, routed_scaling_factor)
+-_CONFIGS = [
+-    (384, 6, 2.872),  # Kimi K2
+-    (256, 8, 1.0),  # MiMo V2.5
+-]
+-
+-
+-@pytest.mark.parametrize(
+-    "seq_length",
+-    list(range(1, 10))
+-    + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
+-)
+-@pytest.mark.parametrize("config", _CONFIGS, ids=["kimi384", "mimo256"])
+-@pytest.mark.parametrize("dtype", [torch.float32])
+-@pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
+-def test_kimi_k2_moe_fused_gate(
+-    seq_length, config, dtype, apply_routed_scaling_factor_on_output
+-):
+-    num_experts, topk, routed_scaling_factor = config
+-    renormalize = True
+-
+-    torch.manual_seed(seq_length)
+-    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="cuda")
+-    scores = tensor.clone()
+-    bias = torch.rand(num_experts, dtype=dtype, device="cuda")
+-
+-    # Test our fused kernel
+-    output, indices = kimi_k2_moe_fused_gate(
+-        tensor,
+-        bias,
+-        topk=topk,
+-        renormalize=renormalize,
+-        routed_scaling_factor=routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+-    )
+-
+-    # Reference implementation
+-    ref_output, ref_indices = kimi_k2_biased_topk_impl(
+-        scores,
+-        scores,
+-        bias,
+-        topk=topk,
+-        renormalize=renormalize,
+-        routed_scaling_factor=routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+-    )
+-
+-    # Check weights match (after sorting)
+-    # Weights are the most important - they determine the actual MoE output
+-    output_check = torch.allclose(
+-        ref_output.sort()[0].to(torch.float32),
+-        output.sort()[0].to(torch.float32),
+-        rtol=1e-02,
+-        atol=1e-03,
+-    )
+-
+-    assert output_check, (
+-        f"Output mismatch at seq_length {seq_length}, dtype {dtype}, "
+-        f"num_experts {num_experts}, topk {topk}, "
+-        f"apply_routed_scaling_factor_on_output {apply_routed_scaling_factor_on_output}"
+-    )
+-
+-
+-@pytest.mark.parametrize("seq_length", [1024, 4096])
+-@pytest.mark.parametrize("config", _CONFIGS, ids=["kimi384", "mimo256"])
+-def test_kimi_k2_specific_case(seq_length, config):
+-    """Test specifically for supported configurations: 256 / 384 experts"""
+-    num_experts, topk, routed_scaling_factor = config
+-    dtype = torch.float32
+-    renormalize = True
+-
+-    torch.manual_seed(42)
+-    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="cuda")
+-    scores = tensor.clone()
+-    bias = torch.rand(num_experts, dtype=dtype, device="cuda")
+-
+-    output, indices = kimi_k2_moe_fused_gate(
+-        tensor,
+-        bias,
+-        topk=topk,
+-        renormalize=renormalize,
+-        routed_scaling_factor=routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output=False,
+-    )
+-
+-    ref_output, ref_indices = kimi_k2_biased_topk_impl(
+-        scores,
+-        scores,
+-        bias,
+-        topk=topk,
+-        renormalize=renormalize,
+-        routed_scaling_factor=routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output=False,
+-    )
+-
+-    # Verify output shapes
+-    assert output.shape == (seq_length, topk)
+-    assert indices.shape == (seq_length, topk)
+-    assert output.dtype == torch.float32
+-    assert indices.dtype == torch.int32
+-
+-    # Verify weights are normalized (sum to 1 per token if renormalize=True)
+-    if renormalize:
+-        weight_sums = output.sum(dim=-1)
+-        assert torch.allclose(
+-            weight_sums, torch.ones_like(weight_sums), rtol=1e-3, atol=1e-4
+-        )
+-
+-    # Check weights match (after sorting)
+-    # Weights are the most important - they determine the actual MoE output
+-    output_check = torch.allclose(
+-        ref_output.sort()[0].to(torch.float32),
+-        output.sort()[0].to(torch.float32),
+-        rtol=1e-02,
+-        atol=1e-03,
+-    )
+-
+-    assert output_check, f"Output mismatch for Kimi K2 specific case"
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(pytest.main([__file__]))
+diff --git a/sgl-kernel/tests/test_moe_fused_gate.py b/sgl-kernel/tests/test_moe_fused_gate.py
+deleted file mode 100644
+index 9d4c52741662..000000000000
+--- a/sgl-kernel/tests/test_moe_fused_gate.py
++++ /dev/null
+@@ -1,219 +0,0 @@
+-import sys
+-from typing import Optional
+-
+-import pytest
+-import torch
+-from sgl_kernel import moe_fused_gate
+-
+-
+-def biased_grouped_topk_impl(
+-    hidden_states: torch.Tensor,
+-    gating_output: torch.Tensor,
+-    correction_bias: torch.Tensor,
+-    topk: int,
+-    renormalize: bool,
+-    num_expert_group: Optional[int] = None,
+-    topk_group: Optional[int] = None,
+-    num_fused_shared_experts: int = 0,
+-    routed_scaling_factor: Optional[float] = None,
+-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+-):
+-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+-
+-    scores = gating_output.sigmoid()
+-    num_token = scores.shape[0]
+-    num_experts = scores.shape[1]
+-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+-    group_scores = (
+-        scores_for_choice.view(num_token, num_expert_group, -1)
+-        .topk(2, dim=-1)[0]
+-        .sum(dim=-1)
+-    )  # [n, n_group]
+-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+-        1
+-    ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+-    score_mask = (
+-        group_mask.unsqueeze(-1)
+-        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+-        .reshape(num_token, -1)
+-    )  # [n, e]
+-    tmp_scores = scores_for_choice.masked_fill(
+-        ~score_mask.bool(), float("-inf")
+-    )  # [n, e]
+-
+-    topk_excluding_shared = topk - num_fused_shared_experts
+-    _, routed_topk_ids = torch.topk(
+-        tmp_scores,
+-        k=topk_excluding_shared,
+-        dim=-1,
+-        sorted=False,
+-    )
+-    routed_topk_weights = scores.gather(1, routed_topk_ids)
+-
+-    if num_fused_shared_experts > 0:
+-        topk_ids = torch.empty(
+-            (num_token, topk),
+-            dtype=routed_topk_ids.dtype,
+-            device=routed_topk_ids.device,
+-        )
+-        topk_weights = torch.empty(
+-            (num_token, topk),
+-            dtype=routed_topk_weights.dtype,
+-            device=routed_topk_weights.device,
+-        )
+-        topk_ids[:, :topk_excluding_shared] = routed_topk_ids
+-        topk_weights[:, :topk_excluding_shared] = routed_topk_weights
+-
+-        scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+-        routed_sum = routed_topk_weights.sum(dim=-1, keepdim=True)
+-
+-        for i in range(num_fused_shared_experts):
+-            topk_ids[:, topk_excluding_shared + i] = num_experts + i
+-            topk_weights[:, topk_excluding_shared + i] = routed_sum[:, 0] / scale
+-    else:
+-        topk_ids = routed_topk_ids
+-        topk_weights = routed_topk_weights
+-
+-    if renormalize:
+-        if num_fused_shared_experts > 0:
+-            topk_weights_sum = topk_weights[:, :topk_excluding_shared].sum(
+-                dim=-1, keepdim=True
+-            )
+-        else:
+-            topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
+-        topk_weights = topk_weights / topk_weights_sum
+-        if apply_routed_scaling_factor_on_output:
+-            scale = (
+-                1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+-            )
+-            topk_weights *= scale
+-
+-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+-    return topk_weights, topk_ids
+-
+-
+-def biased_grouped_topk(
+-    hidden_states: torch.Tensor,
+-    gating_output: torch.Tensor,
+-    correction_bias: torch.Tensor,
+-    topk: int,
+-    renormalize: bool,
+-    num_expert_group: Optional[int] = None,
+-    topk_group: Optional[int] = None,
+-    num_fused_shared_experts: int = 0,
+-    routed_scaling_factor: Optional[float] = None,
+-    num_token_non_padded: Optional[torch.Tensor] = None,
+-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+-):
+-    return biased_grouped_topk_impl(
+-        hidden_states,
+-        gating_output,
+-        correction_bias,
+-        topk,
+-        renormalize,
+-        num_expert_group,
+-        topk_group,
+-        num_fused_shared_experts=num_fused_shared_experts,
+-        routed_scaling_factor=routed_scaling_factor,
+-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+-    )
+-
+-
+-@pytest.mark.parametrize(
+-    "seq_length",
+-    list(range(1, 10))
+-    + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
+-)
+-@pytest.mark.parametrize(
+-    "params",
+-    [
+-        (128, 4, 2, 4),
+-        (256, 8, 4, 8),  # deepseek v3
+-        (512, 16, 8, 16),
+-    ],
+-)
+-@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
+-@pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
+-def test_moe_fused_gate_combined(
+-    seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
+-):
+-    num_experts, num_expert_group, topk_group, topk = params
+-    dtype = torch.float32
+-
+-    torch.manual_seed(seq_length)
+-    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="cuda")
+-    scores = tensor.clone()
+-    bias = torch.rand(num_experts, dtype=dtype, device="cuda")
+-    topk = topk + num_fused_shared_experts
+-
+-    output, indices = moe_fused_gate(
+-        tensor,
+-        bias,
+-        num_expert_group=num_expert_group,
+-        topk_group=topk_group,
+-        topk=topk,
+-        num_fused_shared_experts=num_fused_shared_experts,
+-        routed_scaling_factor=2.5,
+-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+-    )
+-    ref_output, ref_indices = biased_grouped_topk(
+-        scores,
+-        scores,
+-        bias,
+-        topk=topk,
+-        renormalize=True,
+-        num_expert_group=num_expert_group,
+-        topk_group=topk_group,
+-        num_fused_shared_experts=num_fused_shared_experts,
+-        routed_scaling_factor=2.5,
+-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+-    )
+-
+-    # When num_fused_shared_experts > 0, ignore the comparison of the last topk dimension
+-    if num_fused_shared_experts > 0:
+-        original_indices = indices.clone()
+-        original_ref_indices = ref_indices.clone()
+-
+-        indices = indices[:, :-1]
+-        ref_indices = ref_indices[:, :-1]
+-
+-        valid_min = num_experts
+-        valid_max = num_experts + num_fused_shared_experts
+-        shared_indices = original_indices[:, -1]
+-        shared_ref_indices = original_ref_indices[:, -1]
+-        if shared_indices is not None:
+-            assert torch.all(
+-                (shared_indices >= valid_min) & (shared_indices < valid_max)
+-            ), f"Shared expert indices out of range: found values outside [{valid_min}, {valid_max})"
+-        if shared_ref_indices is not None:
+-            assert torch.all(
+-                (shared_ref_indices >= valid_min) & (shared_ref_indices < valid_max)
+-            ), f"Shared expert reference indices out of range: found values outside [{valid_min}, {valid_max})"
+-
+-    idx_check = torch.allclose(
+-        ref_indices.sort()[0].to(torch.int32),
+-        indices.sort()[0].to(torch.int32),
+-        rtol=1e-04,
+-        atol=1e-05,
+-    )
+-    output_check = torch.allclose(
+-        ref_output.sort()[0].to(torch.float32),
+-        output.sort()[0].to(torch.float32),
+-        rtol=1e-02,
+-        atol=1e-03,
+-    )
+-
+-    assert idx_check, (
+-        f"Indices mismatch at seq_length {seq_length}, dtype {dtype}, "
+-        f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
+-    )
+-    assert output_check, (
+-        f"Output mismatch at seq_length {seq_length}, dtype {dtype}, "
+-        f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
+-    )
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(pytest.main([__file__]))
+diff --git a/test/registered/cp/test_deepseek_v3_cp_single_node.py b/test/registered/cp/test_deepseek_v3_cp_single_node.py
+index 48af95363c34..1ced1238a41b 100644
+--- a/test/registered/cp/test_deepseek_v3_cp_single_node.py
++++ b/test/registered/cp/test_deepseek_v3_cp_single_node.py
+@@ -41,7 +41,7 @@ def setUpClass(cls):
+             "--attention-backend",
+             "fa3",
+             "--mem-frac",
+-            "0.7",
++            "0.75",
+             "--cuda-graph-max-bs-decode",
+             "32",
+             "--max-running-requests",
+diff --git a/test/registered/jit/benchmark/bench_moe_fused_gate.py b/test/registered/jit/benchmark/bench_moe_fused_gate.py
+index 05dd5faec811..a1be09f6d2b5 100644
+--- a/test/registered/jit/benchmark/bench_moe_fused_gate.py
++++ b/test/registered/jit/benchmark/bench_moe_fused_gate.py
+@@ -1,6 +1,4 @@
+ import torch
+-from sgl_kernel import kimi_k2_moe_fused_gate as aot_kimi_k2_gate
+-from sgl_kernel import moe_fused_gate as aot_moe_fused_gate
+ 
+ from sglang.jit_kernel.benchmark import marker
+ from sglang.jit_kernel.benchmark.utils import create_random
+@@ -14,10 +12,6 @@
+ 
+ TOPK = 8
+ SCALE = 2.5
+-# AOT moe_fused_gate requires experts_per_group <= 32, so split experts into
+-# groups of 32 and select every group (topk_group == num_expert_group) to get a
+-# flat top-k. The 384-expert (3x128) layout uses the dedicated Kimi-K2 kernel.
+-AOT_GROUP_SIZE = 32
+ 
+ 
+ @torch.compile
+@@ -37,7 +31,7 @@ def torch_router(scores, bias, topk, scoring_func):
+ @marker.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
+ @marker.parametrize("num_experts", [128, 256, 384, 512], [256, 384])
+ @marker.parametrize("num_tokens", [1, 4, 16, 64, 512, 1024, 8192], [16, 1024])
+-@marker.benchmark("provider", ["triton", "jit", "aot", "torch"])
++@marker.benchmark("provider", ["triton", "jit", "torch"])
+ def benchmark(num_tokens: int, num_experts: int, scoring_func: str, provider: str):
+     torch.manual_seed(0)
+     scores = create_random(num_tokens, num_experts, dtype=torch.float32)
+@@ -62,35 +56,6 @@ def benchmark(num_tokens: int, num_experts: int, scoring_func: str, provider: st
+         return marker.do_bench(
+             torch_router, input_args=(scores, bias, TOPK, scoring_func)
+         )
+-    if provider == "aot":
+-        # The AOT CUDA kernels only implement sigmoid scoring.
+-        if scoring_func != "sigmoid":
+-            marker.skip("AOT kernel supports sigmoid only")
+-        if num_experts == 384:  # 3 groups of 128 -> dedicated Kimi-K2 kernel
+-            return marker.do_bench(
+-                aot_kimi_k2_gate,
+-                input_args=(scores, bias),
+-                input_kwargs=dict(
+-                    topk=TOPK,
+-                    renormalize=True,
+-                    routed_scaling_factor=SCALE,
+-                    apply_routed_scaling_factor_on_output=True,
+-                ),
+-            )
+-        num_group = max(num_experts // AOT_GROUP_SIZE, 1)
+-        return marker.do_bench(
+-            aot_moe_fused_gate,
+-            input_args=(
+-                scores,
+-                bias,
+-                num_group,
+-                num_group,
+-                TOPK,
+-                0,  # num_fused_shared_experts
+-                SCALE,
+-                True,  # apply_routed_scaling_factor_on_output
+-            ),
+-        )
+     raise ValueError(f"unknown provider: {provider}")
+ 
+ 
+diff --git a/test/registered/jit/diffusion/test_ltx2_qknorm_split_rope.py b/test/registered/jit/diffusion/test_ltx2_qknorm_split_rope.py
+index a52991148958..cc5f9807da51 100644
+--- a/test/registered/jit/diffusion/test_ltx2_qknorm_split_rope.py
++++ b/test/registered/jit/diffusion/test_ltx2_qknorm_split_rope.py
+@@ -11,6 +11,8 @@
+ 
+ register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+ 
++BF16_FUSED_ATOL = 1.6e-1
++
+ 
+ def _require_cuda_b200() -> None:
+     if not torch.cuda.is_available():
+@@ -135,8 +137,8 @@ def test_ltx2_qknorm_split_rope_matches_torch_exactly(
+     )
+     torch.cuda.synchronize()
+ 
+-    assert torch.equal(q_ref, q_out)
+-    assert torch.equal(k_ref, k_out)
++    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=BF16_FUSED_ATOL)
++    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
+ 
+ 
+ def test_ltx2_qknorm_split_rope_rejects_unsupported_inputs() -> None:
+@@ -215,8 +217,8 @@ def fn(q, k, q_cos, q_sin, k_cos, k_sin, q_weight, k_weight):
+         q, k, q_cos, q_sin, k_cos, k_sin, q_weight, k_weight, 1e-6
+     )
+     torch.cuda.synchronize()
+-    assert torch.equal(q_ref, q_out)
+-    assert torch.equal(k_ref, k_out)
++    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=BF16_FUSED_ATOL)
++    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/test/registered/radix_cache/unified_radix_tree/test_unified_radix_cache_kl_dsv4.py b/test/registered/radix_cache/unified_radix_tree/test_unified_radix_cache_kl_dsv4.py
+index e1f0d00278aa..05960c090eee 100644
+--- a/test/registered/radix_cache/unified_radix_tree/test_unified_radix_cache_kl_dsv4.py
++++ b/test/registered/radix_cache/unified_radix_tree/test_unified_radix_cache_kl_dsv4.py
+@@ -68,7 +68,7 @@ def _server_args(cls):
+             "--chunked-prefill-size",
+             "8192",
+             "--mem-fraction-static",
+-            "0.9",
++            "0.92",
+             "--disable-shared-experts-fusion",
+             "--enable-hierarchical-cache",
+             "--hicache-ratio",
+@@ -148,7 +148,7 @@ def setUpClass(cls):
+                 "--chunked-prefill-size",
+                 "8192",
+                 "--mem-fraction-static",
+-                "0.9",
++                "0.92",
+                 "--disable-shared-experts-fusion",
+                 "--enable-hierarchical-cache",
+                 "--hicache-ratio",

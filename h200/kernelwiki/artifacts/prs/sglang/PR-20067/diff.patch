@@ -1,0 +1,118 @@
+diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
+index 0db6675e648f..e2f7c6c02977 100644
+--- a/python/sglang/srt/layers/layernorm.py
++++ b/python/sglang/srt/layers/layernorm.py
+@@ -181,6 +181,10 @@ def forward_cuda(
+         post_residual_addition: Optional[torch.Tensor] = None,
+     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+         if x.numel() == 0:
++            if residual is not None:
++                if post_residual_addition is not None:
++                    residual = residual + post_residual_addition
++                return x, residual
+             return x
+         # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
+         needs_reshape = x.dim() != 2 and residual is None
+diff --git a/python/sglang/srt/models/minimax_m2.py b/python/sglang/srt/models/minimax_m2.py
+index d0d2d6c76c5b..c70e7230d0b2 100644
+--- a/python/sglang/srt/models/minimax_m2.py
++++ b/python/sglang/srt/models/minimax_m2.py
+@@ -53,10 +53,13 @@
+     RowParallelLinear,
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessor
++from sglang.srt.layers.moe import (
++    get_moe_a2a_backend,
++    should_use_flashinfer_cutlass_moe_fp4_allgather,
++)
+ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+ from sglang.srt.layers.moe.topk import TopK
+-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.radix_attention import RadixAttention
+ from sglang.srt.layers.rotary_embedding import get_rope
+@@ -417,12 +420,20 @@ def forward_normal(
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+ 
+-        # router_logits: (num_tokens, n_experts)
+-        router_logits, _ = self.gate(hidden_states.to(torch.float32))
+-        topk_output = self.topk(hidden_states, router_logits)
++        if hidden_states.shape[0] > 0:
++            # router_logits: (num_tokens, n_experts)
++            router_logits, _ = self.gate(hidden_states.to(torch.float32))
++            topk_output = self.topk(hidden_states, router_logits)
++        else:
++            topk_output = self.topk.empty_topk_output(hidden_states.device)
+ 
+         final_hidden_states = self.experts(hidden_states, topk_output)
+-        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
++        if (
++            self.tp_size > 1
++            and not should_allreduce_fusion
++            and not use_reduce_scatter
++            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
++        ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+         return final_hidden_states.view(num_tokens, hidden_dim)
+@@ -665,6 +676,11 @@ def forward_prepare(
+         hidden_states: torch.Tensor,
+         forward_batch: ForwardBatch,
+     ):
++        if hidden_states.shape[0] == 0:
++            assert (
++                not self.o_proj.reduce_results
++            ), "short-circuiting allreduce will lead to hangs"
++            return hidden_states, forward_batch, None
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         if self.use_qk_norm:
+@@ -680,7 +696,9 @@ def forward_prepare(
+         return None, forward_batch, inner_state
+ 
+     def forward_core(self, intermediate_state):
+-        _, _, inner_state = intermediate_state
++        hidden_states, forward_batch, inner_state = intermediate_state
++        if inner_state is None:
++            return hidden_states
+         attn_output = self.attn(*inner_state)
+         output, _ = self.o_proj(attn_output)
+         return output
+@@ -764,6 +782,7 @@ def __init__(
+             input_layernorm=self.input_layernorm,
+             post_attention_layernorm=self.post_attention_layernorm,
+             allow_reduce_scatter=True,
++            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+         )
+ 
+     def forward(
+diff --git a/test/registered/8-gpu-models/test_minimax_m25.py b/test/registered/8-gpu-models/test_minimax_m25.py
+index fa8bf70ec988..59091a5a68ae 100644
+--- a/test/registered/8-gpu-models/test_minimax_m25.py
++++ b/test/registered/8-gpu-models/test_minimax_m25.py
+@@ -29,6 +29,10 @@ def test_minimax_m25(self):
+             "--mem-fraction-static=0.85",
+             "--reasoning-parser=minimax-append-think",
+         ]
++        dp_attn_args = base_args + [
++            "--enable-dp-attention",
++            "--dp=8",
++        ]
+ 
+         variants = [
+             ModelLaunchSettings(
+@@ -37,6 +41,12 @@ def test_minimax_m25(self):
+                 extra_args=base_args,
+                 variant="TP8+EP8",
+             ),
++            ModelLaunchSettings(
++                MINIMAX_M25_MODEL_PATH,
++                tp_size=8,
++                extra_args=dp_attn_args,
++                variant="TP8+DP8+EP8+DPAttn",
++            ),
+         ]
+ 
+         run_combined_tests(

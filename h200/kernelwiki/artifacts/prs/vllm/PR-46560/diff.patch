@@ -1,0 +1,263 @@
+diff --git a/tests/v1/sample/test_logprobs.py b/tests/v1/sample/test_logprobs.py
+index 863c1e7a8e59..5ed0a4762792 100644
+--- a/tests/v1/sample/test_logprobs.py
++++ b/tests/v1/sample/test_logprobs.py
+@@ -1263,3 +1263,37 @@ def test_prompt_logprobs_with_chunking_and_preemption():
+         assert preemptions > 0, "Test did not trigger any preemptions"
+ 
+         print(f"Test passed with {preemptions} preemptions")
++
++
++@large_gpu_mark(min_gb=24)
++def test_token_logprobs_large_batch_int64_row_offset():
++    """Regression: logprob kernel row offset (row * vocab_size) must use int64.
++
++    The rejection-sampler logprobs path runs the logprob kernels over the
++    spec-expanded logits batch, so batch_size * vocab_size can exceed 2**31
++    (e.g. DFlash drafts K tokens per request). With int32 offset arithmetic the
++    per-row pointer wraps to a negative address and the kernel hits a CUDA
++    illegal memory access. Run over a batch where batch_size * vocab_size > 2**31
++    and check the highest-offset row matches a reference log-softmax.
++    """
++    if not current_platform.is_cuda():
++        pytest.skip("int32 row-offset overflow is a CUDA kernel issue")
++    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
++
++    device = torch.device("cuda")
++    vocab_size = 131072
++    batch_size = 2**31 // vocab_size + 64  # batch_size * vocab_size > 2**31
++    # logits (the large input) plus small logprob/rank outputs; ~1 GB headroom.
++    required_bytes = batch_size * vocab_size * 4 + (1 << 30)
++    if torch.cuda.mem_get_info()[0] < required_bytes:
++        pytest.skip(f"needs ~{required_bytes / 1e9:.0f} GB of free GPU memory")
++
++    logits = torch.randn(batch_size, vocab_size, device=device, dtype=torch.float32)
++    token_ids = torch.full((batch_size, 1), 7, device=device, dtype=torch.int64)
++    logprobs = compute_token_logprobs(logits, token_ids)
++    torch.accelerator.synchronize()  # surface any async illegal memory access
++    last = batch_size - 1
++    ref = torch.log_softmax(logits[last].float(), dim=-1)[7]
++    assert torch.allclose(logprobs[last, 0], ref, atol=1e-2), (
++        f"logprob {logprobs[last, 0].item()} != ref {ref.item()}"
++    )
+diff --git a/tests/v1/sample/test_topk_topp_sampler.py b/tests/v1/sample/test_topk_topp_sampler.py
+index 047e2b754ef0..8d906e83f2d1 100644
+--- a/tests/v1/sample/test_topk_topp_sampler.py
++++ b/tests/v1/sample/test_topk_topp_sampler.py
+@@ -4,6 +4,7 @@
+ import torch
+ from torch import Generator
+ 
++from tests.utils import large_gpu_mark
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import HAS_TRITON
+ from vllm.utils.torch_utils import set_random_seed
+@@ -404,6 +405,45 @@ def test_large_batch(self):
+ 
+         self._compare_results(logits, k, p)
+ 
++    @large_gpu_mark(min_gb=24)
++    def test_large_batch_int64_row_offset(self):
++        """Regression: per-row offset (row * vocab_size) must not overflow int32.
++
++        Speculative decoding expands the logits batch (e.g. DFlash drafts K
++        tokens per request), so batch_size * vocab_size can exceed 2**31. With
++        int32 offset arithmetic the per-row pointer wraps to a negative address
++        and the kernel hits a CUDA illegal memory access. Use a batch where
++        batch_size * vocab_size > 2**31 and give the highest-offset row the same
++        logits as row 0: an overflow there would read a different row and change
++        the kept set.
++        """
++        from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
++
++        if not current_platform.is_cuda():
++            pytest.skip("int32 row-offset overflow is a CUDA kernel issue")
++        vocab_size = 131072
++        batch_size = 2**31 // vocab_size + 64  # batch_size * vocab_size > 2**31
++        # logits is modified in place; the only extra device memory is the
++        # per-SM scratch buffer (~num_sm * vocab), so allow ~1 GB of headroom.
++        required_bytes = batch_size * vocab_size * 4 + (1 << 30)
++        if torch.cuda.mem_get_info()[0] < required_bytes:
++            pytest.skip(f"needs ~{required_bytes / 1e9:.0f} GB of free GPU memory")
++
++        logits = torch.randn(
++            batch_size, vocab_size, generator=self.generator, dtype=torch.float32
++        )
++        logits[batch_size - 1] = logits[0]
++        k = torch.full((batch_size,), 5, dtype=torch.int32)
++        result = apply_top_k_top_p_triton(logits, k, None)
++        torch.accelerator.synchronize()  # surface any async illegal memory access
++        kept_first = (result[0] > float("-inf")).nonzero(as_tuple=True)[0]
++        kept_last = (result[batch_size - 1] > float("-inf")).nonzero(as_tuple=True)[0]
++        assert kept_first.numel() == 5, f"row 0 kept {kept_first.numel()}, expected 5"
++        assert torch.equal(kept_first, kept_last), (
++            "highest-offset row produced a different top-k mask than the "
++            "identical row 0 (int32 row-offset overflow)"
++        )
++
+     @pytest.mark.parametrize(
+         "mode",
+         ["topk_only", "topp_only", "topk_and_topp"],
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index d20cac37fcd7..c284ff61876b 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -111,7 +111,7 @@ def _topk_topp_kernel(
+     pid = tl.program_id(0)
+     num_programs = tl.num_programs(0)
+     for row_id in tl.range(pid, BATCH_SIZE, num_programs):
+-        LOGITS_ROW = LOGITS + row_id * LOGITS_STRIDE_0
++        LOGITS_ROW = LOGITS + row_id.to(tl.int64) * LOGITS_STRIDE_0
+         BUFFER_ROW = BUFFER + pid * VOCAB_SIZE
+ 
+         final_pivot = -float("inf")
+diff --git a/vllm/v1/worker/gpu/sample/bad_words.py b/vllm/v1/worker/gpu/sample/bad_words.py
+index 6286cc38359c..b5517dee1b18 100644
+--- a/vllm/v1/worker/gpu/sample/bad_words.py
++++ b/vllm/v1/worker/gpu/sample/bad_words.py
+@@ -114,7 +114,7 @@ def _bad_words_kernel(
+     input_ids_ptr,
+     expanded_local_pos_ptr,
+ ):
+-    token_idx = tl.program_id(0)
++    token_idx = tl.program_id(0).to(tl.int64)
+     bw_idx = tl.program_id(1)
+ 
+     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
+index fab53fef7ee8..6dbb04cd933f 100644
+--- a/vllm/v1/worker/gpu/sample/gumbel.py
++++ b/vllm/v1/worker/gpu/sample/gumbel.py
+@@ -23,7 +23,7 @@ def _temperature_kernel(
+     vocab_size,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+-    token_idx = tl.program_id(0)
++    token_idx = tl.program_id(0).to(tl.int64)
+     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
+     if temperature == 0.0 or temperature == 1.0:
+@@ -91,7 +91,7 @@ def gumbel_block_argmax(
+     USE_FP64: tl.constexpr,
+     PER_TOKEN_COL: tl.constexpr = False,
+ ):
+-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
++    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
+     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+     if temp != 0.0 and APPLY_TEMPERATURE:
+         # Apply temperature.
+@@ -169,7 +169,7 @@ def _gumbel_sample_kernel(
+     USE_FP64: tl.constexpr,
+     PER_TOKEN_COL: tl.constexpr,
+ ):
+-    token_idx = tl.program_id(0)
++    token_idx = tl.program_id(0).to(tl.int64)
+     block_idx = tl.program_id(1)
+     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+     mask = block < vocab_size
+diff --git a/vllm/v1/worker/gpu/sample/logit_bias.py b/vllm/v1/worker/gpu/sample/logit_bias.py
+index f3f7c29b3f39..6c95ed7aacb3 100644
+--- a/vllm/v1/worker/gpu/sample/logit_bias.py
++++ b/vllm/v1/worker/gpu/sample/logit_bias.py
+@@ -169,7 +169,7 @@ def _bias_kernel(
+     BLOCK_SIZE: tl.constexpr,
+     LOGITS_BLOCK_SIZE: tl.constexpr,
+ ):
+-    token_idx = tl.program_id(0)
++    token_idx = tl.program_id(0).to(tl.int64)
+     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+ 
+     block = tl.arange(0, BLOCK_SIZE)
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index cf24c186e93a..0028e8c3a9dc 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -21,7 +21,7 @@ def _topk_log_softmax_kernel(
+     BLOCK_SIZE: tl.constexpr,
+     PADDED_TOPK: tl.constexpr,
+ ):
+-    req_idx = tl.program_id(0)
++    req_idx = tl.program_id(0).to(tl.int64)
+     row_ptr = logits_ptr + req_idx * logits_stride
+ 
+     max_val = float("-inf")
+@@ -61,7 +61,7 @@ def _ranks_kernel(
+     vocab_size,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+-    req_idx = tl.program_id(0)
++    req_idx = tl.program_id(0).to(tl.int64)
+     row_ptr = logits_ptr + req_idx * logits_stride
+ 
+     token_id = tl.load(token_ids_ptr + req_idx)
+diff --git a/vllm/v1/worker/gpu/sample/min_p.py b/vllm/v1/worker/gpu/sample/min_p.py
+index 4f08af2f5a5b..b71ae6f3addf 100644
+--- a/vllm/v1/worker/gpu/sample/min_p.py
++++ b/vllm/v1/worker/gpu/sample/min_p.py
+@@ -14,7 +14,7 @@ def _min_p_kernel(
+     vocab_size,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+-    token_idx = tl.program_id(0)
++    token_idx = tl.program_id(0).to(tl.int64)
+     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+     min_p = tl.load(min_p_ptr + req_state_idx).to(tl.float32)
+     if min_p == 0.0:
+diff --git a/vllm/v1/worker/gpu/sample/penalties.py b/vllm/v1/worker/gpu/sample/penalties.py
+index b2ce2fb812a1..25cb2f211d94 100644
+--- a/vllm/v1/worker/gpu/sample/penalties.py
++++ b/vllm/v1/worker/gpu/sample/penalties.py
+@@ -120,7 +120,7 @@ def _penalties_kernel(
+     vocab_size,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+-    token_idx = tl.program_id(0)
++    token_idx = tl.program_id(0).to(tl.int64)
+     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+     rep_penalty = tl.load(repetition_penalty_ptr + req_state_idx)
+     freq_penalty = tl.load(frequency_penalty_ptr + req_state_idx)
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 0cfbdf4182be..ec540ce965b1 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -79,14 +79,14 @@ def _compute_block_stats_kernel(
+     BLOCK_SIZE: tl.constexpr,
+     HAS_DRAFT_LOGITS: tl.constexpr,
+ ):
+-    logit_idx = tl.program_id(0)
++    logit_idx = tl.program_id(0).to(tl.int64)
+     draft_step_idx = tl.load(expanded_local_pos_ptr + logit_idx)
+ 
+     if draft_step_idx >= num_speculative_steps:
+         # Bonus token. Max/argmax and summed exponentials are not needed.
+         return
+ 
+-    req_state_idx = tl.load(expanded_idx_mapping_ptr + logit_idx)
++    req_state_idx = tl.load(expanded_idx_mapping_ptr + logit_idx).to(tl.int64)
+     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+ 
+     block_idx = tl.program_id(1)
+@@ -206,8 +206,8 @@ def _rejection_kernel(
+     SYNTHETIC_MODE: tl.constexpr,
+ ):
+     req_idx = tl.program_id(0)
+-    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
++    req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
++    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
+     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+     num_tokens = end_idx - start_idx
+     seed = tl.load(seed_ptr + req_state_idx)
+@@ -343,10 +343,10 @@ def _resample_kernel(
+ ):
+     req_idx = tl.program_id(0)
+     resample_idx = tl.load(rejected_step_ptr + req_idx)
+-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
++    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
+     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+     resample_token_idx = start_idx + resample_idx
+-    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
++    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
+ 
+     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+     is_bonus = resample_token_idx == end_idx - 1

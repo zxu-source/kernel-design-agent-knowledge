@@ -1,0 +1,3144 @@
+diff --git a/docs_new/docs/advanced_features/server_arguments.mdx b/docs_new/docs/advanced_features/server_arguments.mdx
+index 8667cafdf4a4..9a691fed9df6 100644
+--- a/docs_new/docs/advanced_features/server_arguments.mdx
++++ b/docs_new/docs/advanced_features/server_arguments.mdx
+@@ -509,6 +509,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
+       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The number of tokens in a page.</td>
+       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
+       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
++    </tr>
++    <tr>
++      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-page-major-kv-layout`</td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the page-major KV layout: lay out the Mamba state and full/SWA KV caches in a page-granularity envelope (page is the outermost axis, layer-major within a page) instead of the default per-layer (layer-major) layout. Requires the Triton attention / linear-attn / Mamba backends (`--attention-backend triton`, and for hybrid models `--linear-attn-backend triton --mamba-backend triton`).</td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+     </tr>
+         <tr>
+       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--swa-full-tokens-ratio`</td>
+diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+index ea7abd7d3bb0..005893c4e878 100644
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+@@ -425,6 +425,30 @@ def forward_extend(
+         else:
+             has_initial_states = forward_batch.extend_prefix_lens > 0
+ 
++        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
++        # chunk_gated_delta_rule) write state back in place assuming a contiguous
++        # slot layout, so they silently drop the write to the strided envelope
++        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
++        # scatter the result back. No-op for the default contiguous pool.
++        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
++        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
++        # int64 indexing, like packed_decode / causal_conv1d_update already do.
++        needs_state_gather = (not is_target_verify) and (
++            not conv_states.is_contiguous() or not ssm_states.is_contiguous()
++        )
++        if needs_state_gather:
++            conv_states_contig = conv_states[cache_indices].contiguous()
++            ssm_states_contig = ssm_states[cache_indices].contiguous()
++            state_cache_indices = torch.arange(
++                cache_indices.shape[0],
++                device=cache_indices.device,
++                dtype=cache_indices.dtype,
++            )
++        else:
++            conv_states_contig = conv_states
++            ssm_states_contig = ssm_states
++            state_cache_indices = cache_indices
++
+         if is_target_verify:
+             batch_size = seq_len // forward_batch.spec_info.draft_token_num
+             draft_token_num = forward_batch.spec_info.draft_token_num
+@@ -460,9 +484,9 @@ def forward_extend(
+                 layer.conv_weights,
+                 layer.bias,
+                 activation=layer.activation,
+-                conv_states=conv_states,
++                conv_states=conv_states_contig,
+                 has_initial_state=has_initial_states,
+-                cache_indices=cache_indices,
++                cache_indices=state_cache_indices,
+                 query_start_loc=query_start_loc,
+                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+             ).transpose(0, 1)[:seq_len]
+@@ -514,8 +538,8 @@ def forward_extend(
+                 v=value,
+                 g=g,
+                 beta=beta,
+-                ssm_states=ssm_states,
+-                cache_indices=cache_indices,
++                ssm_states=ssm_states_contig,
++                cache_indices=state_cache_indices,
+                 query_start_loc=query_start_loc,
+             )
+ 
+@@ -525,6 +549,12 @@ def forward_extend(
+                 )
+                 ssm_states[cache_indices] = last_recurrent_state
+ 
++            if needs_state_gather:
++                # Scatter the in-place-updated contiguous copies back to the
++                # strided envelope pool (advanced indexing handles the strides).
++                conv_states[cache_indices] = conv_states_contig
++                ssm_states[cache_indices] = ssm_states_contig
++
+             if h is not None:
+                 self._track_mamba_state_extend(
+                     forward_batch, h, ssm_states, forward_metadata
+diff --git a/python/sglang/srt/layers/attention/mamba/mamba_state_scatter_triton.py b/python/sglang/srt/layers/attention/mamba/mamba_state_scatter_triton.py
+index 9a8ec50d5b98..cc2e1831375c 100644
+--- a/python/sglang/srt/layers/attention/mamba/mamba_state_scatter_triton.py
++++ b/python/sglang/srt/layers/attention/mamba/mamba_state_scatter_triton.py
+@@ -43,9 +43,13 @@ def track_mamba_state_if_needed_kernel(
+     if not track_mask:
+         return
+ 
+-    # Load source and destination indices
+-    src_idx = tl.load(cache_indices_ptr + batch_idx)
+-    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx)
++    # Cast indices to int64 before they multiply the row stride. The
++    # page-granularity envelope layout makes the conv/ssm row stride large
++    # (stride_0 = entry_bytes / itemsize), so an int32 `idx * stride_0` can
++    # overflow for moderately large idx and wrap to an illegal address. int64 is
++    # harmless for the small-stride (per-layer) case.
++    src_idx = tl.load(cache_indices_ptr + batch_idx).to(tl.int64)
++    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
+ 
+     # Copy conv_states
+     # Each thread handles BLOCK_SIZE elements
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index fa765787a814..ed8579aeb380 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -147,6 +147,12 @@ def __init__(
+         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
++        # Pass-through to the Triton attention wrappers so they can extract the
++        # KV view strides and specialize on the PAGE_SIZE constexpr. At
++        # page_size=1 the kernel path matches the slot-based envelope addresses.
++        # `model_runner.page_size` defaults to 1 when `server_args.page_size` is
++        # None, avoiding the Optional case here.
++        self.page_size = getattr(model_runner, "page_size", 1) or 1
+         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+@@ -1306,6 +1312,7 @@ def forward_extend(
+             sinks=sinks,
+             window_kv_offsets=window_kv_offsets,
+             xai_temperature_len=layer.xai_temperature_len,
++            page_size=self.page_size,
+         )
+         return o
+ 
+@@ -1575,6 +1582,7 @@ def _forward_extend_unified(
+             sinks=sinks,
+             window_start_pos=window_start_pos,
+             xai_temperature_len=layer.xai_temperature_len,
++            page_size=self.page_size,
+         )
+ 
+         return o
+@@ -1710,6 +1718,7 @@ def forward_decode(
+             xai_temperature_len=layer.xai_temperature_len,
+             has_mla=self.use_mla,
+             use_pdl=self.use_pdl,
++            page_size=self.page_size,
+         )
+         return o
+ 
+diff --git a/python/sglang/srt/layers/attention/triton_ops/decode_attention.py b/python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+index b42ffa43369e..b35490a5de44 100644
+--- a/python/sglang/srt/layers/attention/triton_ops/decode_attention.py
++++ b/python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+@@ -35,6 +35,57 @@
+ _MIN_BLOCK_KV = 32
+ 
+ 
++def _extract_kv_strides(buf, page_size: int):
++    """Extract (slot_stride, head_stride, page_stride, tok_stride) for a
++    KV buffer that may be:
++      - 3-D ``[max_slots, head_num, head_dim]`` (legacy / non-shared) — the
++        contiguous layout most callers use. page/tok strides are synthesized
++        so the kernel's PAGE_SIZE>1 math collapses to ``kv_loc * stride(0)``.
++      - 4-D ``[num_pages, page_size, head_num, head_dim]`` (shared
++        pool). page/tok strides come from stride(0)/stride(1) directly;
++        legacy ``stride_bs`` is set to 0 (unused at PAGE_SIZE>1).
++
++    Returns a 4-tuple of ints suitable for passing as ``stride_buf_*bs``,
++    ``stride_buf_*h``, ``stride_buf_*page``, ``stride_buf_*tok``.
++    """
++    if buf.ndim == 4:
++        # 4-D view ``[num_pages, page_size, head_num, head_dim]``.
++        #   stride(0) = per-PAGE stride (page_bytes/itemsize)
++        #   stride(1) = within-page per-TOKEN stride (k_row/v_row bytes/itemsize)
++        # The PAGE_SIZE>1 kernel branch uses page_stride/tok_stride and does
++        # NOT read slot_stride. slot_stride is consumed ONLY by the
++        # PAGE_SIZE==1 branch (``offs = kv_loc * stride_buf_*bs``), where one
++        # page holds exactly one slot, so the per-slot stride is the per-page
++        # stride — NOT the within-page token stride. Concretely the per-slot
++        # stride is ``page_stride // page_size`` (= entry_bytes/itemsize),
++        # which at ps=1 equals page_stride. Using ``tok_stride`` here (one
++        # layer's k_row) would make the ps=1 read address ``kv_loc * k_row``
++        # instead of ``kv_loc * entry_bytes`` and read the wrong slot.
++        page_stride = buf.stride(0)
++        tok_stride = buf.stride(1)
++        head_stride = buf.stride(2)
++        slot_stride = (
++            page_stride // page_size
++        )  # per-slot stride; == page_stride at ps=1
++        assert buf.shape[1] == page_size, (
++            f"4-D KV buffer's dim-1 must equal page_size; got "
++            f"shape[1]={buf.shape[1]}, page_size={page_size}"
++        )
++    elif buf.ndim == 3:
++        # Legacy 3-D ``[N, head, dim]``. Synthesize page/tok strides such
++        # that ``(kv_loc // ps) * page_stride + (kv_loc % ps) * tok_stride
++        # == kv_loc * slot_stride`` for the page-aware branch — this lets
++        # the same kernel handle non-shared paged-allocator buffers without
++        # any caller adjustment.
++        slot_stride = buf.stride(0)
++        head_stride = buf.stride(1)
++        page_stride = slot_stride * page_size
++        tok_stride = slot_stride
++    else:  # pragma: no cover
++        raise ValueError(f"unexpected KV buffer ndim={buf.ndim}, shape={buf.shape}")
++    return slot_stride, head_stride, page_stride, tok_stride
++
++
+ @triton.jit
+ def tanh(x):
+     # Tanh is just a scaled sigmoid
+@@ -58,6 +109,13 @@ def _fwd_kernel_stage1(
+     stride_buf_kh,
+     stride_buf_vbs,
+     stride_buf_vh,
++    # Page-aware strides (used when PAGE_SIZE > 1). For
++    # PAGE_SIZE == 1 the address math degenerates and these are unused
++    # (Triton specializes the dead branch away at compile time).
++    stride_buf_kpage,
++    stride_buf_ktok,
++    stride_buf_vpage,
++    stride_buf_vtok,
+     stride_mid_ob,
+     stride_mid_oh,
+     stride_mid_os,
+@@ -70,6 +128,7 @@ def _fwd_kernel_stage1(
+     Lk: tl.constexpr,
+     Lv: tl.constexpr,
+     xai_temperature_len: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
+ ):
+     cur_batch = tl.program_id(0)
+     cur_head = tl.program_id(1)
+@@ -113,11 +172,24 @@ def _fwd_kernel_stage1(
+                 mask=offs_n < split_kv_end,
+                 other=0,
+             )
+-            offs_buf_k = (
+-                kv_loc[:, None] * stride_buf_kbs
+-                + cur_kv_head * stride_buf_kh
+-                + offs_d[None, :]
+-            )
++            # Page-aware KV address math. At PAGE_SIZE==1 (legacy
++            # / non-shared / shared-at-ps=1), Triton specializes the
++            # else-branch away and the SASS is byte-identical to today.
++            if PAGE_SIZE == 1:
++                offs_buf_k = (
++                    kv_loc[:, None] * stride_buf_kbs
++                    + cur_kv_head * stride_buf_kh
++                    + offs_d[None, :]
++                )
++            else:
++                page_id = kv_loc // PAGE_SIZE
++                tok_in_p = kv_loc % PAGE_SIZE
++                offs_buf_k = (
++                    page_id[:, None] * stride_buf_kpage
++                    + tok_in_p[:, None] * stride_buf_ktok
++                    + cur_kv_head * stride_buf_kh
++                    + offs_d[None, :]
++                )
+             k = tl.load(
+                 K_Buffer + offs_buf_k,
+                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+@@ -134,11 +206,19 @@ def _fwd_kernel_stage1(
+ 
+             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
+ 
+-            offs_buf_v = (
+-                kv_loc[:, None] * stride_buf_vbs
+-                + cur_kv_head * stride_buf_vh
+-                + offs_dv[None, :]
+-            )
++            if PAGE_SIZE == 1:
++                offs_buf_v = (
++                    kv_loc[:, None] * stride_buf_vbs
++                    + cur_kv_head * stride_buf_vh
++                    + offs_dv[None, :]
++                )
++            else:
++                offs_buf_v = (
++                    page_id[:, None] * stride_buf_vpage
++                    + tok_in_p[:, None] * stride_buf_vtok
++                    + cur_kv_head * stride_buf_vh
++                    + offs_dv[None, :]
++                )
+             v = tl.load(
+                 V_Buffer + offs_buf_v,
+                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+@@ -192,6 +272,7 @@ def _decode_att_m_fwd(
+     sm_scale_withk,
+     logit_cap,
+     xai_temperature_len=-1,
++    page_size: int = 1,
+ ):
+     BLOCK = 64
+     # [TODO] work around SGPR limit on MI3xx
+@@ -201,10 +282,15 @@ def _decode_att_m_fwd(
+     Lk = k_buffer.shape[-1]
+     Lv = v_buffer.shape[-1]
+ 
++    # head_num lives in the dim immediately before the head_dim. For 3-D
++    # ``[N, head_num, head_dim]`` that's dim 1; for 4-D
++    # ``[num_pages, page_size, head_num, head_dim]`` that's dim 2.
++    kv_head_num = k_buffer.shape[-2]
++
+     batch, head_num = q.shape[0], q.shape[1]
+ 
+     grid = (batch, head_num, MAX_KV_SPLITS)
+-    kv_group_num = q.shape[1] // k_buffer.shape[1]
++    kv_group_num = q.shape[1] // kv_head_num
+ 
+     if kv_group_num == 1:
+         num_warps = 4
+@@ -216,6 +302,13 @@ def _decode_att_m_fwd(
+     BLOCK_DMODEL = triton.next_power_of_2(Lk)
+     BLOCK_DV = triton.next_power_of_2(Lv)
+ 
++    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
++        k_buffer, page_size
++    )
++    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
++        v_buffer, page_size
++    )
++
+     _fwd_kernel_stage1[grid](
+         q,
+         k_buffer,
+@@ -228,10 +321,14 @@ def _decode_att_m_fwd(
+         num_kv_splits,
+         q.stride(0),
+         q.stride(1),
+-        k_buffer.stride(0),
+-        k_buffer.stride(1),
+-        v_buffer.stride(0),
+-        v_buffer.stride(1),
++        k_slot_stride,
++        k_head_stride,
++        v_slot_stride,
++        v_head_stride,
++        k_page_stride,
++        k_tok_stride,
++        v_page_stride,
++        v_tok_stride,
+         att_out.stride(0),
+         att_out.stride(1),
+         att_out.stride(2),
+@@ -246,6 +343,7 @@ def _decode_att_m_fwd(
+         num_stages=2,
+         Lk=Lk,
+         Lv=Lv,
++        PAGE_SIZE=page_size,
+     )
+ 
+ 
+@@ -266,6 +364,11 @@ def _fwd_grouped_kernel_stage1(
+     stride_buf_kh,
+     stride_buf_vbs,
+     stride_buf_vh,
++    # Page-aware strides (used when PAGE_SIZE > 1).
++    stride_buf_kpage,
++    stride_buf_ktok,
++    stride_buf_vpage,
++    stride_buf_vtok,
+     stride_mid_ob,
+     stride_mid_oh,
+     stride_mid_os,
+@@ -283,6 +386,7 @@ def _fwd_grouped_kernel_stage1(
+     Lv: tl.constexpr,
+     HAS_MLA: tl.constexpr = False,
+     USE_PDL: tl.constexpr = False,
++    PAGE_SIZE: tl.constexpr = 1,
+ ):
+     cur_batch = tl.program_id(0)
+     cur_head_id = tl.program_id(1)
+@@ -352,7 +456,17 @@ def _fwd_grouped_kernel_stage1(
+                 mask=offs_n < split_kv_end,
+                 other=0,
+             )
+-            offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
++            # Page-aware KV address math (see _fwd_kernel_stage1).
++            if PAGE_SIZE == 1:
++                offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
++            else:
++                page_id = kv_loc // PAGE_SIZE
++                tok_in_p = kv_loc % PAGE_SIZE
++                offs_buf_k = (
++                    page_id[None, :] * stride_buf_kpage
++                    + tok_in_p[None, :] * stride_buf_ktok
++                    + base_offs_k
++                )
+             k = tl.load(
+                 K_Buffer + offs_buf_k,
+                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+@@ -360,7 +474,14 @@ def _fwd_grouped_kernel_stage1(
+             )
+             qk = tl.dot(q_k, k)
+             if BLOCK_DPE > 0:
+-                offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
++                if PAGE_SIZE == 1:
++                    offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
++                else:
++                    offs_buf_kpe = (
++                        page_id[None, :] * stride_buf_kpage
++                        + tok_in_p[None, :] * stride_buf_ktok
++                        + base_offs_kpe
++                    )
+                 kpe = tl.load(
+                     K_Buffer + offs_buf_kpe,
+                     mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+@@ -381,7 +502,14 @@ def _fwd_grouped_kernel_stage1(
+             if HAS_MLA:
+                 v = tl.trans(k)
+             else:
+-                offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
++                if PAGE_SIZE == 1:
++                    offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
++                else:
++                    offs_buf_v = (
++                        page_id[:, None] * stride_buf_vpage
++                        + tok_in_p[:, None] * stride_buf_vtok
++                        + base_offs_v
++                    )
+                 v = tl.load(
+                     V_Buffer + offs_buf_v,
+                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+@@ -441,6 +569,7 @@ def _decode_grouped_att_m_fwd(
+     xai_temperature_len=-1,
+     has_mla=False,
+     use_pdl=False,
++    page_size: int = 1,
+ ):
+     BLOCK = 32
+     Lk = k_buffer.shape[-1]
+@@ -461,8 +590,11 @@ def _decode_grouped_att_m_fwd(
+         BLOCK_DPE = 0
+     BLOCK_DV = triton.next_power_of_2(Lv)
+ 
++    # 4-D view exposes head_num at dim 2; legacy 3-D exposes
++    # it at dim 1.
++    kv_head_num = k_buffer.shape[-2]
+     batch, head_num = q.shape[0], q.shape[1]
+-    kv_group_num = q.shape[1] // k_buffer.shape[1]
++    kv_group_num = q.shape[1] // kv_head_num
+ 
+     BLOCK_H = 16
+     MAX_KV_SPLITS = max_kv_splits
+@@ -480,6 +612,13 @@ def _decode_grouped_att_m_fwd(
+         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+         num_stages = 1
+ 
++    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
++        k_buffer, page_size
++    )
++    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
++        v_buffer, page_size
++    )
++
+     _fwd_grouped_kernel_stage1[grid](
+         q,
+         k_buffer,
+@@ -492,10 +631,14 @@ def _decode_grouped_att_m_fwd(
+         num_kv_splits,
+         q.stride(0),
+         q.stride(1),
+-        k_buffer.stride(0),
+-        k_buffer.stride(1),
+-        v_buffer.stride(0),
+-        v_buffer.stride(1),
++        k_slot_stride,
++        k_head_stride,
++        v_slot_stride,
++        v_head_stride,
++        k_page_stride,
++        k_tok_stride,
++        v_page_stride,
++        v_tok_stride,
+         att_out.stride(0),
+         att_out.stride(1),
+         att_out.stride(2),
+@@ -515,6 +658,7 @@ def _decode_grouped_att_m_fwd(
+         Lv=Lv,
+         HAS_MLA=has_mla,
+         USE_PDL=use_pdl,
++        PAGE_SIZE=page_size,
+         **extra_kargs,
+     )
+ 
+@@ -663,6 +807,7 @@ def decode_attention_fwd_normal(
+     logit_cap=0.0,
+     sinks=None,
+     xai_temperature_len=-1,
++    page_size: int = 1,
+ ):
+     _decode_att_m_fwd(
+         q,
+@@ -677,6 +822,7 @@ def decode_attention_fwd_normal(
+         sm_scale_withk,
+         logit_cap,
+         xai_temperature_len,
++        page_size=page_size,
+     )
+     _decode_softmax_reducev_fwd(
+         attn_logits,
+@@ -710,6 +856,7 @@ def decode_attention_fwd_grouped(
+     xai_temperature_len=-1,
+     has_mla=False,
+     use_pdl=False,
++    page_size: int = 1,
+ ):
+     _decode_grouped_att_m_fwd(
+         q,
+@@ -726,6 +873,7 @@ def decode_attention_fwd_grouped(
+         xai_temperature_len,
+         has_mla=has_mla,
+         use_pdl=use_pdl,
++        page_size=page_size,
+     )
+     _decode_softmax_reducev_fwd(
+         attn_logits,
+@@ -761,12 +909,15 @@ def decode_attention_fwd(
+     xai_temperature_len=-1,
+     has_mla=False,
+     use_pdl=False,
++    page_size: int = 1,
+ ):
+     assert max_kv_splits == attn_logits.shape[2]
+     assert q.shape[0] <= kv_indptr.shape[0] - 1
+     assert q.shape[0] <= attn_logits.shape[0]
+ 
+-    kv_group_num = q.shape[1] // v_buffer.shape[1]
++    # head_num lives at dim 1 (3-D) or dim 2 (4-D shared view).
++    kv_head_num = v_buffer.shape[-2]
++    kv_group_num = q.shape[1] // kv_head_num
+ 
+     if kv_group_num == 1:
+         # MHA
+@@ -786,6 +937,7 @@ def decode_attention_fwd(
+             logit_cap=logit_cap,
+             sinks=sinks,
+             xai_temperature_len=xai_temperature_len,
++            page_size=page_size,
+         )
+     else:
+         # GQA/MQA/MLA
+@@ -807,4 +959,5 @@ def decode_attention_fwd(
+             xai_temperature_len=xai_temperature_len,
+             has_mla=has_mla,
+             use_pdl=use_pdl,
++            page_size=page_size,
+         )
+diff --git a/python/sglang/srt/layers/attention/triton_ops/extend_attention.py b/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+index 98d89397dc3c..37d96d3ac9a8 100644
+--- a/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
++++ b/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+@@ -20,6 +20,7 @@
+ import triton
+ import triton.language as tl
+ 
++from sglang.srt.layers.attention.triton_ops.decode_attention import _extract_kv_strides
+ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+     context_attention_fwd,
+ )
+@@ -270,6 +271,11 @@ def _fwd_kernel(
+     stride_buf_kh,
+     stride_buf_vbs,
+     stride_buf_vh,
++    # Page-aware strides (used when PAGE_SIZE > 1).
++    stride_buf_kpage,
++    stride_buf_ktok,
++    stride_buf_vpage,
++    stride_buf_vtok,
+     SLIDING_WINDOW_SIZE: tl.constexpr,
+     logit_cap: tl.constexpr,
+     xai_temperature_len: tl.constexpr,
+@@ -288,6 +294,7 @@ def _fwd_kernel(
+     SKIP_EXTEND: tl.constexpr,
+     STORE_TRANSPOSE: tl.constexpr,
+     HAS_SINK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr = 1,
+ ):
+     cur_seq = tl.program_id(0)
+     cur_head = tl.program_id(1)
+@@ -390,12 +397,25 @@ def _fwd_kernel(
+                 other=0,
+             )
+ 
+-            # load k in transposed way
+-            offs_buf_k = (
+-                offs_kv_loc[None, :] * stride_buf_kbs
+-                + cur_kv_head * stride_buf_kh
+-                + offs_d[:, None]
+-            )
++            # Page-aware KV address math. At PAGE_SIZE==1
++            # (legacy / non-shared / shared-at-ps=1), Triton specializes
++            # the else-branch away — byte-identical SASS to today.
++            if PAGE_SIZE == 1:
++                # load k in transposed way
++                offs_buf_k = (
++                    offs_kv_loc[None, :] * stride_buf_kbs
++                    + cur_kv_head * stride_buf_kh
++                    + offs_d[:, None]
++                )
++            else:
++                page_id = offs_kv_loc // PAGE_SIZE
++                tok_in_p = offs_kv_loc % PAGE_SIZE
++                offs_buf_k = (
++                    page_id[None, :] * stride_buf_kpage
++                    + tok_in_p[None, :] * stride_buf_ktok
++                    + cur_kv_head * stride_buf_kh
++                    + offs_d[:, None]
++                )
+             k = tl.load(
+                 K_Buffer + offs_buf_k,
+                 mask=(mask_n[None, :]) & (mask_d[:, None]),
+@@ -403,11 +423,19 @@ def _fwd_kernel(
+             )
+             qk = tl.dot(q.to(k.dtype), k)
+             if BLOCK_DPE > 0:
+-                offs_kpe = (
+-                    offs_kv_loc[None, :] * stride_buf_kbs
+-                    + cur_kv_head * stride_buf_kh
+-                    + offs_dpe[:, None]
+-                )
++                if PAGE_SIZE == 1:
++                    offs_kpe = (
++                        offs_kv_loc[None, :] * stride_buf_kbs
++                        + cur_kv_head * stride_buf_kh
++                        + offs_dpe[:, None]
++                    )
++                else:
++                    offs_kpe = (
++                        page_id[None, :] * stride_buf_kpage
++                        + tok_in_p[None, :] * stride_buf_ktok
++                        + cur_kv_head * stride_buf_kh
++                        + offs_dpe[:, None]
++                    )
+                 kpe = tl.load(
+                     K_Buffer + offs_kpe,
+                     mask=mask_n[None, :],
+@@ -432,11 +460,19 @@ def _fwd_kernel(
+             p = tl.exp(qk - n_e_max[:, None])
+             deno = deno * re_scale + tl.sum(p, 1)
+ 
+-            offs_buf_v = (
+-                offs_kv_loc[:, None] * stride_buf_vbs
+-                + cur_kv_head * stride_buf_vh
+-                + offs_dv[None, :]
+-            )
++            if PAGE_SIZE == 1:
++                offs_buf_v = (
++                    offs_kv_loc[:, None] * stride_buf_vbs
++                    + cur_kv_head * stride_buf_vh
++                    + offs_dv[None, :]
++                )
++            else:
++                offs_buf_v = (
++                    page_id[:, None] * stride_buf_vpage
++                    + tok_in_p[:, None] * stride_buf_vtok
++                    + cur_kv_head * stride_buf_vh
++                    + offs_dv[None, :]
++                )
+             v = tl.load(
+                 V_Buffer + offs_buf_v,
+                 mask=mask_n[:, None] & mask_dv[None, :],
+@@ -609,6 +645,7 @@ def extend_attention_fwd(
+     lse_extend=None,
+     skip_prefix=False,
+     skip_extend=False,
++    page_size: int = 1,
+ ):
+     """
+     q_extend, k_extend, v_extend, o_extend: contiguous tensors
+@@ -651,6 +688,13 @@ def extend_attention_fwd(
+     if _is_hip:
+         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+ 
++    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
++        k_buffer, page_size
++    )
++    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
++        v_buffer, page_size
++    )
++
+     _fwd_kernel[grid](
+         q_extend,
+         k_extend,
+@@ -680,10 +724,14 @@ def extend_attention_fwd(
+         o_extend.stride(1),
+         stride_lse_bs,
+         stride_lse_h,
+-        k_buffer.stride(0),
+-        k_buffer.stride(1),
+-        v_buffer.stride(0),
+-        v_buffer.stride(1),
++        k_slot_stride,
++        k_head_stride,
++        v_slot_stride,
++        v_head_stride,
++        k_page_stride,
++        k_tok_stride,
++        v_page_stride,
++        v_tok_stride,
+         SLIDING_WINDOW_SIZE=sliding_window_size,
+         logit_cap=logit_cap,
+         xai_temperature_len=xai_temperature_len,
+@@ -702,6 +750,7 @@ def extend_attention_fwd(
+         SKIP_EXTEND=skip_extend,
+         HAS_SINK=HAS_SINK,
+         STORE_TRANSPOSE=_is_hip,
++        PAGE_SIZE=page_size,
+         num_warps=num_warps,
+         num_stages=num_stages,
+         **extra_kargs,
+@@ -770,6 +819,11 @@ def _fwd_kernel_unified(
+     stride_buf_kh,
+     stride_buf_vbs,
+     stride_buf_vh,
++    # Page-aware strides (used when PAGE_SIZE > 1).
++    stride_buf_kpage,
++    stride_buf_ktok,
++    stride_buf_vpage,
++    stride_buf_vtok,
+     SLIDING_WINDOW_SIZE: tl.constexpr,
+     logit_cap: tl.constexpr,
+     xai_temperature_len: tl.constexpr,
+@@ -783,6 +837,7 @@ def _fwd_kernel_unified(
+     IS_CAUSAL: tl.constexpr,
+     USE_CUSTOM_MASK: tl.constexpr,
+     HAS_SINK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr = 1,
+ ):
+     """
+     Unified 1-stage kernel for deterministic extend attention.
+@@ -918,12 +973,23 @@ def _fwd_kernel_unified(
+                 other=0,
+             )
+ 
+-            # Load K
+-            offs_buf_k = (
+-                offs_kv_loc[None, :] * stride_buf_kbs
+-                + cur_kv_head * stride_buf_kh
+-                + offs_d[:, None]
+-            )
++            # Page-aware KV address math (see _fwd_kernel_stage1).
++            if PAGE_SIZE == 1:
++                # Load K
++                offs_buf_k = (
++                    offs_kv_loc[None, :] * stride_buf_kbs
++                    + cur_kv_head * stride_buf_kh
++                    + offs_d[:, None]
++                )
++            else:
++                page_id = offs_kv_loc // PAGE_SIZE
++                tok_in_p = offs_kv_loc % PAGE_SIZE
++                offs_buf_k = (
++                    page_id[None, :] * stride_buf_kpage
++                    + tok_in_p[None, :] * stride_buf_ktok
++                    + cur_kv_head * stride_buf_kh
++                    + offs_d[:, None]
++                )
+             k = tl.load(
+                 K_Buffer + offs_buf_k,
+                 mask=(mask_n[None, :]) & (mask_d[:, None]),
+@@ -932,11 +998,19 @@ def _fwd_kernel_unified(
+ 
+             qk = tl.dot(q.to(k.dtype), k)
+             if BLOCK_DPE > 0:
+-                offs_kpe = (
+-                    offs_kv_loc[None, :] * stride_buf_kbs
+-                    + cur_kv_head * stride_buf_kh
+-                    + offs_dpe[:, None]
+-                )
++                if PAGE_SIZE == 1:
++                    offs_kpe = (
++                        offs_kv_loc[None, :] * stride_buf_kbs
++                        + cur_kv_head * stride_buf_kh
++                        + offs_dpe[:, None]
++                    )
++                else:
++                    offs_kpe = (
++                        page_id[None, :] * stride_buf_kpage
++                        + tok_in_p[None, :] * stride_buf_ktok
++                        + cur_kv_head * stride_buf_kh
++                        + offs_dpe[:, None]
++                    )
+                 kpe = tl.load(
+                     K_Buffer + offs_kpe,
+                     mask=mask_n[None, :],
+@@ -964,11 +1038,19 @@ def _fwd_kernel_unified(
+             deno = deno * re_scale + tl.sum(p, 1)
+ 
+             # Load V
+-            offs_buf_v = (
+-                offs_kv_loc[:, None] * stride_buf_vbs
+-                + cur_kv_head * stride_buf_vh
+-                + offs_dv[None, :]
+-            )
++            if PAGE_SIZE == 1:
++                offs_buf_v = (
++                    offs_kv_loc[:, None] * stride_buf_vbs
++                    + cur_kv_head * stride_buf_vh
++                    + offs_dv[None, :]
++                )
++            else:
++                offs_buf_v = (
++                    page_id[:, None] * stride_buf_vpage
++                    + tok_in_p[:, None] * stride_buf_vtok
++                    + cur_kv_head * stride_buf_vh
++                    + offs_dv[None, :]
++                )
+             v = tl.load(
+                 V_Buffer + offs_buf_v,
+                 mask=mask_n[:, None] & mask_dv[None, :],
+@@ -1018,6 +1100,7 @@ def extend_attention_fwd_unified(
+     sinks=None,
+     window_start_pos=None,
+     xai_temperature_len=-1,
++    page_size: int = 1,
+ ):
+     """
+     Unified 1-stage extend attention for deterministic inference.
+@@ -1052,7 +1135,9 @@ def extend_attention_fwd_unified(
+ 
+     sm_scale = sm_scale or 1.0 / (Lq**0.5)
+     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
+-    kv_group_num = q.shape[1] // k_buffer.shape[1]
++    # head_num lives at dim 1 (3-D) or dim 2 (4-D view).
++    kv_head_num = k_buffer.shape[-2]
++    kv_group_num = q.shape[1] // kv_head_num
+ 
+     USE_CUSTOM_MASK = custom_mask is not None
+     HAS_SINK = sinks is not None
+@@ -1070,6 +1155,13 @@ def extend_attention_fwd_unified(
+     if _is_hip:
+         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+ 
++    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
++        k_buffer, page_size
++    )
++    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
++        v_buffer, page_size
++    )
++
+     _fwd_kernel_unified[grid](
+         q,
+         o,
+@@ -1090,10 +1182,14 @@ def extend_attention_fwd_unified(
+         q.stride(1),
+         o.stride(0),
+         o.stride(1),
+-        k_buffer.stride(0),
+-        k_buffer.stride(1),
+-        v_buffer.stride(0),
+-        v_buffer.stride(1),
++        k_slot_stride,
++        k_head_stride,
++        v_slot_stride,
++        v_head_stride,
++        k_page_stride,
++        k_tok_stride,
++        v_page_stride,
++        v_tok_stride,
+         SLIDING_WINDOW_SIZE=sliding_window_size,
+         logit_cap=logit_cap,
+         xai_temperature_len=xai_temperature_len,
+@@ -1107,6 +1203,7 @@ def extend_attention_fwd_unified(
+         IS_CAUSAL=is_causal,
+         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+         HAS_SINK=HAS_SINK,
++        PAGE_SIZE=page_size,
+         num_warps=num_warps,
+         num_stages=num_stages,
+         **extra_kargs,
+diff --git a/python/sglang/srt/mem_cache/layout/__init__.py b/python/sglang/srt/mem_cache/layout/__init__.py
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/python/sglang/srt/mem_cache/layout/page_major.py b/python/sglang/srt/mem_cache/layout/page_major.py
+new file mode 100644
+index 000000000000..734b5f6dc89a
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/layout/page_major.py
+@@ -0,0 +1,229 @@
++"""Page-granularity envelope (page-major, layer-major within a page) cache views.
++
++A pool of this layout keeps all layers of all slots in one contiguous byte
++buffer. The buffer is split into pages of ``page_size`` slots; within a page,
++each layer's K and V (or each Mamba conv/temporal tensor) are grouped together:
++
++    page bytes = [L0_K * ps | L0_V * ps | L1_K * ps | L1_V * ps | ...]
++
++Across pages the layout is envelope-major (one ``page_bytes`` block per page).
++At ``page_size == 1`` a page is a single slot, so the within-page block is the
++per-slot ``[L0_K | L0_V | L1_K | L1_V | ...]`` envelope (token-granularity).
++
++These builders produce per-layer strided views into a raw ``uint8`` buffer; they
++hold no allocator/ownership state. ``anchor_bytes`` is the byte offset of the
++pool's region inside the raw buffer (0 for a standalone pool).
++"""
++
++from typing import List, Sequence, Tuple
++
++import torch
++
++
++def _prod(shape: Sequence[int]) -> int:
++    out = 1
++    for s in shape:
++        out *= int(s)
++    return out
++
++
++def mha_entry_bytes(
++    *, layer_num: int, head_num: int, head_dim: int, v_head_dim: int, itemsize: int
++) -> int:
++    """Bytes occupied by one slot across all layers (K and V)."""
++    k_row_bytes = head_num * head_dim * itemsize
++    v_row_bytes = head_num * v_head_dim * itemsize
++    return layer_num * (k_row_bytes + v_row_bytes)
++
++
++def build_page_major_mha_views(
++    raw: torch.Tensor,
++    *,
++    layer_num: int,
++    head_num: int,
++    head_dim: int,
++    v_head_dim: int,
++    store_dtype: torch.dtype,
++    page_size: int,
++    num_pages: int,
++    anchor_bytes: int = 0,
++) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
++    """Per-layer K/V views over ``raw`` in the page-major layer-major layout.
++
++    Each returned view is 4-D ``(num_pages, page_size, head_num, head_dim*)``
++    with constant strides:
++
++        stride[0] = page_bytes / itemsize     # next page
++        stride[1] = k_row_bytes / itemsize    # next slot within layer L's K block
++        stride[2] = head_dim                  # next head
++        stride[3] = 1                         # next element
++
++    V is analogous with ``v_row_bytes`` / ``v_head_dim``. A token id ``t`` reads
++    page ``t // page_size``, slot ``t % page_size``.
++    """
++    itemsize = store_dtype.itemsize
++    k_row_bytes = head_num * head_dim * itemsize
++    v_row_bytes = head_num * v_head_dim * itemsize
++    entry_bytes = layer_num * (k_row_bytes + v_row_bytes)
++    page_bytes = page_size * entry_bytes
++    assert anchor_bytes % itemsize == 0
++    assert k_row_bytes % itemsize == 0
++    assert v_row_bytes % itemsize == 0
++    assert page_bytes % itemsize == 0
++
++    as_dtype_view = raw.view(store_dtype)
++    stride_page = page_bytes // itemsize
++    stride_tok_k = k_row_bytes // itemsize
++    stride_tok_v = v_row_bytes // itemsize
++
++    k_shape = (num_pages, page_size, head_num, head_dim)
++    v_shape = (num_pages, page_size, head_num, v_head_dim)
++    k_stride = (stride_page, stride_tok_k, head_dim, 1)
++    v_stride = (stride_page, stride_tok_v, v_head_dim, 1)
++
++    k_buffer: List[torch.Tensor] = []
++    v_buffer: List[torch.Tensor] = []
++    for layer in range(layer_num):
++        # Layer L's K block starts at L * page_size * (k_row + v_row); V follows.
++        k_base_bytes = anchor_bytes + layer * page_size * (k_row_bytes + v_row_bytes)
++        v_base_bytes = k_base_bytes + page_size * k_row_bytes
++        assert k_base_bytes % itemsize == 0
++        assert v_base_bytes % itemsize == 0
++        k_buffer.append(
++            torch.as_strided(
++                as_dtype_view,
++                size=k_shape,
++                stride=k_stride,
++                storage_offset=k_base_bytes // itemsize,
++            )
++        )
++        v_buffer.append(
++            torch.as_strided(
++                as_dtype_view,
++                size=v_shape,
++                stride=v_stride,
++                storage_offset=v_base_bytes // itemsize,
++            )
++        )
++    return k_buffer, v_buffer
++
++
++def mamba_entry_bytes(
++    *,
++    layer_num: int,
++    conv_state_shapes: Sequence[Sequence[int]],
++    conv_dtype: torch.dtype,
++    temporal_state_shape: Sequence[int],
++    temporal_dtype: torch.dtype,
++) -> int:
++    """Bytes occupied by one Mamba slot across all layers (conv + temporal)."""
++    total = 0
++    for shape in conv_state_shapes:
++        total += layer_num * _prod(shape) * conv_dtype.itemsize
++    total += layer_num * _prod(temporal_state_shape) * temporal_dtype.itemsize
++    return total
++
++
++def build_page_major_mamba_views(
++    raw: torch.Tensor,
++    *,
++    layer_num: int,
++    conv_state_shapes: Sequence[Sequence[int]],
++    conv_dtype: torch.dtype,
++    temporal_state_shape: Sequence[int],
++    temporal_dtype: torch.dtype,
++    max_slots: int,
++    anchor_bytes: int = 0,
++) -> Tuple[List[torch.Tensor], torch.Tensor]:
++    """Per-slot envelope views over ``raw`` for Mamba state.
++
++    Layout per slot: ``[conv[0] rows × layers][conv[1] rows × layers]...
++    [temporal rows × layers]``. Each returned view has shape
++    ``(num_layers, max_slots, *inner_shape)`` matching ``MambaPool.State.conv[i]``
++    / ``.temporal``. Mamba state is always token-granular (page_size == 1).
++    """
++    entry_bytes = mamba_entry_bytes(
++        layer_num=layer_num,
++        conv_state_shapes=conv_state_shapes,
++        conv_dtype=conv_dtype,
++        temporal_state_shape=temporal_state_shape,
++        temporal_dtype=temporal_dtype,
++    )
++
++    def contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
++        strides = []
++        acc = 1
++        for s in reversed(shape):
++            strides.append(acc)
++            acc *= int(s)
++        return tuple(reversed(strides))
++
++    conv_itemsize = conv_dtype.itemsize
++    assert entry_bytes % conv_itemsize == 0, (
++        f"misaligned mamba spec: per-slot entry_bytes={entry_bytes} is not a "
++        f"multiple of the conv-state itemsize {conv_itemsize} B"
++    )
++    assert anchor_bytes % conv_itemsize == 0, (
++        f"misaligned mamba spec: anchor_bytes={anchor_bytes} is not a multiple "
++        f"of the conv-state itemsize {conv_itemsize} B"
++    )
++    as_conv_dtype = raw.view(conv_dtype)
++    conv_slot_stride_elems = entry_bytes // conv_itemsize
++
++    offset_bytes_within_entry = 0
++    conv_views: List[torch.Tensor] = []
++    for shape in conv_state_shapes:
++        inner_shape_bytes = _prod(shape) * conv_itemsize
++        assert inner_shape_bytes % conv_itemsize == 0
++        offset_elems = (anchor_bytes + offset_bytes_within_entry) // conv_itemsize
++        stride = (
++            inner_shape_bytes // conv_itemsize,
++            conv_slot_stride_elems,
++        ) + contiguous_strides(shape)
++        conv_views.append(
++            torch.as_strided(
++                as_conv_dtype,
++                size=(layer_num, max_slots) + tuple(shape),
++                stride=stride,
++                storage_offset=offset_elems,
++            )
++        )
++        offset_bytes_within_entry += layer_num * inner_shape_bytes
++
++    # The temporal view's storage_offset is computed in temporal-dtype elements
++    # by integer-dividing a byte offset by itemsize, so every term of that byte
++    # offset (entry stride, anchor, the conv region) must be a whole multiple of
++    # itemsize or the offset truncates and mis-places the view.
++    itemsize = temporal_dtype.itemsize
++    assert entry_bytes % itemsize == 0, (
++        f"misaligned mamba spec: per-slot entry_bytes={entry_bytes} is not a "
++        f"multiple of the temporal-state itemsize {itemsize} B; the temporal "
++        f"view's storage_offset would truncate and mis-place the state"
++    )
++    assert anchor_bytes % itemsize == 0, (
++        f"misaligned mamba spec: anchor_bytes={anchor_bytes} is not a multiple "
++        f"of the temporal-state itemsize {itemsize} B"
++    )
++    inner_shape_bytes = _prod(temporal_state_shape) * itemsize
++    assert inner_shape_bytes % itemsize == 0, (
++        f"misaligned mamba spec: temporal inner_shape_bytes={inner_shape_bytes} "
++        f"is not a multiple of the temporal-state itemsize {itemsize} B"
++    )
++    assert (anchor_bytes + offset_bytes_within_entry) % itemsize == 0, (
++        f"misaligned mamba spec: temporal region byte offset "
++        f"{anchor_bytes + offset_bytes_within_entry} is not a multiple of the "
++        f"temporal-state itemsize {itemsize} B"
++    )
++    offset_elems = (anchor_bytes + offset_bytes_within_entry) // itemsize
++    as_temporal_dtype = raw.view(temporal_dtype)
++    stride = (
++        inner_shape_bytes // itemsize,
++        entry_bytes // itemsize,
++    ) + contiguous_strides(temporal_state_shape)
++    temporal_view = torch.as_strided(
++        as_temporal_dtype,
++        size=(layer_num, max_slots) + tuple(temporal_state_shape),
++        stride=stride,
++        storage_offset=offset_elems,
++    )
++    return conv_views, temporal_view
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 83cb33d5bbea..ba4aa4eb0a38 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -52,9 +52,16 @@
+     get_attention_dcp_world_size,
+ )
+ from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
++from sglang.srt.mem_cache.layout.page_major import (
++    build_page_major_mamba_views,
++    build_page_major_mha_views,
++    mamba_entry_bytes,
++    mha_entry_bytes,
++)
+ from sglang.srt.mem_cache.triton_ops.cache_move import (
+     copy_all_layer_kv_cache_tiled,
+     set_kv_buffer_prefix_valid_tiled,
++    store_cache_4d,
+ )
+ from sglang.srt.mem_cache.utils import (
+     get_mla_kv_buffer_triton,
+@@ -357,6 +364,7 @@ def __init__(
+         speculative_eagle_topk: Optional[int] = None,
+         enable_linear_replayssm: bool = False,
+         linear_replayssm_cache_len: int = 16,
++        envelope_layout: bool = False,
+     ):
+         conv_state_shape = cache_params.shape.conv
+         temporal_state_shape = cache_params.shape.temporal
+@@ -385,35 +393,64 @@ def __init__(
+                 else nullcontext()
+             ),
+         ):
+-            conv_state = [
+-                torch.zeros(
+-                    size=(num_mamba_layers, size + 1) + conv_shape,
+-                    dtype=conv_dtype,
+-                    device=device,
++            if envelope_layout:
++                # Page-granularity envelope layout (page_size==1 for state): all
++                # mamba layers/slots share one contiguous byte buffer; conv and
++                # temporal are strided views into it (see mem_cache/layout/
++                # page_major.py). Only the standard CUDA Triton path is supported.
++                assert not _is_npu and not (
++                    _is_cpu and _cpu_has_amx_support
++                ), "envelope_layout mamba is only supported on the CUDA path"
++                max_slots = size + 1
++                entry_bytes = mamba_entry_bytes(
++                    layer_num=num_mamba_layers,
++                    conv_state_shapes=conv_state_shape,
++                    conv_dtype=conv_dtype,
++                    temporal_state_shape=temporal_state_shape,
++                    temporal_dtype=ssm_dtype,
+                 )
+-                for conv_shape in conv_state_shape
+-            ]
+-
+-            if _is_npu:
+-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+-                    _init_npu_conv_state,
++                self._raw = torch.zeros(
++                    max_slots * entry_bytes, dtype=torch.uint8, device=device
+                 )
+-
+-                conv_state = _init_npu_conv_state(
+-                    conv_state[0], conv_state_shape, speculative_num_draft_tokens
++                conv_state, temporal_state = build_page_major_mamba_views(
++                    self._raw,
++                    layer_num=num_mamba_layers,
++                    conv_state_shapes=conv_state_shape,
++                    conv_dtype=conv_dtype,
++                    temporal_state_shape=temporal_state_shape,
++                    temporal_dtype=ssm_dtype,
++                    max_slots=max_slots,
+                 )
++            else:
++                conv_state = [
++                    torch.zeros(
++                        size=(num_mamba_layers, size + 1) + conv_shape,
++                        dtype=conv_dtype,
++                        device=device,
++                    )
++                    for conv_shape in conv_state_shape
++                ]
++
++                if _is_npu:
++                    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
++                        _init_npu_conv_state,
++                    )
+ 
+-            if _is_cpu and _cpu_has_amx_support:
+-                from sglang.srt.layers.amx_utils import _init_amx_conv_state
++                    conv_state = _init_npu_conv_state(
++                        conv_state[0], conv_state_shape, speculative_num_draft_tokens
++                    )
+ 
+-                # CPU uses a different layout of conv_state for kernel optimization
+-                conv_state = _init_amx_conv_state(conv_state)
++                if _is_cpu and _cpu_has_amx_support:
++                    from sglang.srt.layers.amx_utils import _init_amx_conv_state
+ 
+-            temporal_state = torch.zeros(
+-                size=(num_mamba_layers, size + 1) + temporal_state_shape,
+-                dtype=ssm_dtype,
+-                device=device,
+-            )
++                    # CPU uses a different layout of conv_state for kernel optimization
++                    conv_state = _init_amx_conv_state(conv_state)
++
++                temporal_state = torch.zeros(
++                    size=(num_mamba_layers, size + 1) + temporal_state_shape,
++                    dtype=ssm_dtype,
++                    device=device,
++                )
+ 
+             # GDN ReplaySSM ring buffers (slice 1a). Allocated only when the
+             # flag is on; otherwise left as None so the legacy State is
+@@ -791,6 +828,7 @@ def __init__(
+         start_layer: Optional[int] = None,
+         enable_linear_replayssm: bool = False,
+         linear_replayssm_cache_len: int = 16,
++        mamba_envelope_layout: bool = False,
+     ):
+         super().__init__(
+             size=size,
+@@ -816,6 +854,7 @@ def __init__(
+             speculative_eagle_topk=speculative_eagle_topk,
+             enable_linear_replayssm=enable_linear_replayssm,
+             linear_replayssm_cache_len=linear_replayssm_cache_len,
++            mamba_envelope_layout=mamba_envelope_layout,
+         )
+ 
+     def _init_mamba_pool(
+@@ -830,6 +869,7 @@ def _init_mamba_pool(
+         speculative_eagle_topk: Optional[int] = None,
+         enable_linear_replayssm: bool = False,
+         linear_replayssm_cache_len: int = 16,
++        mamba_envelope_layout: bool = False,
+     ):
+         self.mamba_pool = MambaPool(
+             size=mamba_size,
+@@ -842,6 +882,7 @@ def _init_mamba_pool(
+             speculative_eagle_topk=speculative_eagle_topk,
+             enable_linear_replayssm=enable_linear_replayssm,
+             linear_replayssm_cache_len=linear_replayssm_cache_len,
++            envelope_layout=mamba_envelope_layout,
+         )
+         self.mamba_allocator = MambaSlotAllocator(
+             size=mamba_size,
+@@ -1224,6 +1265,7 @@ def __init__(
+         end_layer: Optional[int] = None,
+         enable_alt_stream: bool = True,
+         enable_kv_cache_copy: bool = False,
++        kv_cache_layout: Optional[str] = None,
+     ):
+         super().__init__(
+             size,
+@@ -1250,7 +1292,14 @@ def __init__(
+         #   X = 16 / dtype_bytes — AITER-only (ignored elsewhere, no consumer kernel).
+         # HND and vectorized_5d are mutually exclusive; HND takes precedence.
+         self.use_hnd = envs.SGLANG_USE_HND_KVCACHE.get()
+-        if self.use_hnd:
++        if kv_cache_layout is not None:
++            # Explicit physical-layout selector wins over the platform default.
++            # This is a label only; layouts that change buffer identity (e.g. the
++            # page-granularity envelope) live in a dedicated pool subclass
++            # (PageMajorMHATokenToKVPool) rather than in branches here.
++            self.use_hnd = False
++            self.kv_cache_layout = kv_cache_layout
++        elif self.use_hnd:
+             total_slots = self.size + self.page_size
+             assert total_slots % self.page_size == 0, (
+                 f"HND KV cache needs (size+page_size) divisible by page_size, got "
+@@ -1640,6 +1689,19 @@ def set_kv_buffer(
+             v_buf[pages, :, offs, :] = cache_v
+             return
+ 
++        self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
++
++    def _store_kv_layer(
++        self,
++        layer_idx: int,
++        loc: torch.Tensor,
++        cache_k: torch.Tensor,
++        cache_v: torch.Tensor,
++    ):
++        # Per-layer physical write into K/V buffer ``layer_idx``. Override for
++        # layouts that change buffer identity (e.g. PageMajorMHATokenToKVPool's
++        # 4-D strided views). ``loc`` and the cache tensors are already dtype-cast
++        # and viewed as ``store_dtype`` by ``set_kv_buffer``.
+         if self.kv_cache_layout == "vectorized_5d":
+             # Late-import to keep the NHD path import-clean.
+             from sglang.srt.layers.attention.utils import (
+@@ -1656,8 +1718,8 @@ def set_kv_buffer(
+             launch_reshape_and_cache_shuffle_5d(
+                 cache_k,
+                 cache_v,
+-                self.k_buffer[layer_id - self.start_layer],
+-                self.v_buffer[layer_id - self.start_layer],
++                self.k_buffer[layer_idx],
++                self.v_buffer[layer_idx],
+                 loc,
+             )
+             return
+@@ -1665,8 +1727,8 @@ def set_kv_buffer(
+         _set_kv_buffer_impl(
+             cache_k,
+             cache_v,
+-            self.k_buffer[layer_id - self.start_layer],
+-            self.v_buffer[layer_id - self.start_layer],
++            self.k_buffer[layer_idx],
++            self.v_buffer[layer_idx],
+             loc,
+             row_dim=self.row_dim,
+             store_dtype=self.store_dtype,
+@@ -1781,6 +1843,12 @@ def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+                 vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
+             return
+ 
++        self._move_kv_cache_impl(tgt_loc, src_loc)
++
++    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
++        # Physical move strategy. Override for layouts that change buffer identity
++        # (e.g. PageMajorMHATokenToKVPool always uses the native move). The 3-D
++        # per-layer buffers here ignore page_size in move_kv_cache_native.
+         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+             return
+@@ -2094,6 +2162,160 @@ def set_kv_buffer(
+             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+ 
+ 
++class PageMajorMHATokenToKVPool(MHATokenToKVPool):
++    """MHA pool with the page-major (layer-major within a page) page-granularity envelope layout.
++
++    All layers/slots share one contiguous ``uint8`` ``_raw`` buffer; per-layer K/V
++    are 4-D strided views ``(num_pages, page_size, head_num, head_dim*)`` built by
++    ``mem_cache/layout/page_major.py``. Token id ``t`` -> page ``t // page_size``,
++    slot ``t % page_size``; the reserved padding slot 0 lives in page 0. At
++    ``page_size == 1`` a page is a single slot (token-granularity envelope).
++
++    Supported: the standard CUDA Triton attention + native move path. The tiled KV
++    copy kernel, CPU offloading, and the spec-decode prefix-commit kernel all assume
++    the per-layer contiguous 3-D layout; here they fail loudly rather than silently
++    mis-indexing the strided views.
++    """
++
++    def __init__(
++        self,
++        *args,
++        kv_cache_layout: Optional[str] = None,
++        enable_kv_cache_copy: bool = False,
++        **kwargs,
++    ):
++        assert kv_cache_layout in (
++            None,
++            "page_major_layer_major",
++        ), f"PageMajorMHATokenToKVPool fixes its layout; got {kv_cache_layout!r}"
++        # The tiled copy kernel assumes stride == row bytes, which the strided 4-D
++        # views violate, so the copy path is never available here regardless of
++        # what the caller requested (the spec-decode call sites pass
++        # enable_kv_cache_copy=True). Always fall back to the native move.
++        super().__init__(
++            *args,
++            kv_cache_layout="page_major_layer_major",
++            enable_kv_cache_copy=False,
++            **kwargs,
++        )
++
++    def _create_buffers(self):
++        # One contiguous byte buffer holds all layers/slots; per-layer K/V are
++        # 4-D strided views in the page-granularity envelope layout (see
++        # mem_cache/layout/page_major.py).
++        total_slots = self.size + self.page_size
++        assert total_slots % self.page_size == 0, (
++            f"page_major_layer_major needs (size + page_size) divisible by "
++            f"page_size; got size={self.size}, page_size={self.page_size}"
++        )
++        num_pages = total_slots // self.page_size
++        entry_bytes = mha_entry_bytes(
++            layer_num=self.layer_num,
++            head_num=self.head_num,
++            head_dim=self.head_dim,
++            v_head_dim=self.v_head_dim,
++            itemsize=self.store_dtype.itemsize,
++        )
++        total_bytes = num_pages * self.page_size * entry_bytes
++        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
++            with (
++                torch.cuda.use_mem_pool(self.custom_mem_pool)
++                if self.enable_custom_mem_pool
++                else nullcontext()
++            ):
++                # Unset slots read as zeros (matches the per-layer pool).
++                self._raw = torch.zeros(
++                    total_bytes, dtype=torch.uint8, device=self.device
++                )
++        self.k_buffer, self.v_buffer = build_page_major_mha_views(
++            self._raw,
++            layer_num=self.layer_num,
++            head_num=self.head_num,
++            head_dim=self.head_dim,
++            v_head_dim=self.v_head_dim,
++            store_dtype=self.store_dtype,
++            page_size=self.page_size,
++            num_pages=num_pages,
++        )
++        # stride(0) * itemsize is the per-page byte stride; for these strided
++        # views np.prod(shape[1:]) would not equal it, so compute it directly.
++        self.k_data_ptrs = torch.tensor(
++            [x.data_ptr() for x in self.k_buffer],
++            dtype=torch.uint64,
++            device=self.device,
++        )
++        self.v_data_ptrs = torch.tensor(
++            [x.data_ptr() for x in self.v_buffer],
++            dtype=torch.uint64,
++            device=self.device,
++        )
++        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
++        self.data_strides = torch.tensor(
++            [x.stride(0) * x.dtype.itemsize for x in (self.k_buffer + self.v_buffer)],
++            device=self.device,
++        )
++
++    def _store_kv_layer(
++        self,
++        layer_idx: int,
++        loc: torch.Tensor,
++        cache_k: torch.Tensor,
++        cache_v: torch.Tensor,
++    ):
++        # Single-launch Triton write into the 4-D envelope view. The parent's
++        # view(-1, row_dim) path can't merge the strided 4-D dims.
++        store_cache_4d(
++            self.k_buffer[layer_idx],
++            self.v_buffer[layer_idx],
++            cache_k,
++            cache_v,
++            loc,
++            page_size=self.page_size,
++        )
++
++    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
++        # Strided 4-D views: the tiled copy kernel assumes stride == row bytes, so
++        # always take the native move (it splits token ids into
++        # (page_id, slot_in_page) for the 4-D advanced index).
++        move_kv_cache_native(
++            self.k_buffer,
++            self.v_buffer,
++            tgt_loc,
++            src_loc,
++            page_size=self.page_size,
++        )
++
++    # The methods below assume the per-layer contiguous 3-D layout. The 4-D
++    # strided envelope views have no per-layer contiguous region (their bytes are
++    # interleaved layer-major within each page) and index page-major, not
++    # token-major. Inheriting them would silently mis-index; fail loudly instead.
++
++    def get_contiguous_buf_infos(self):
++        raise NotImplementedError(
++            "page-major layout has no per-layer contiguous regions; KV transfer / "
++            "disaggregation is unsupported (TODO: expose the single _raw buffer "
++            "with a page-aware transfer scheme)."
++        )
++
++    def get_cpu_copy(self, indices, mamba_indices=None):
++        raise NotImplementedError(
++            "CPU offloading is unsupported under the page-major layout "
++            "(TODO: split token ids into page/slot for the 4-D index)."
++        )
++
++    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
++        raise NotImplementedError(
++            "CPU offloading is unsupported under the page-major layout "
++            "(TODO: split token ids into page/slot for the 4-D index)."
++        )
++
++    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
++        raise NotImplementedError(
++            "prefix-valid commit is unsupported under the page-major layout "
++            "(_set_kv_buffer_prefix_valid_impl assumes 3-D contiguous + row_dim)."
++        )
++
++
+ class HybridLinearKVPool(KVCache):
+     """KV cache with separate pools for full and linear attention layers."""
+ 
+@@ -2105,7 +2327,6 @@ def __init__(
+         head_num: int,
+         head_dim: int,
+         full_attention_layer_ids: List[int],
+-        enable_kvcache_transpose: bool,
+         device: str,
+         mamba_pool: MambaPool,
+         enable_memory_saver: bool = False,
+@@ -2115,6 +2336,7 @@ def __init__(
+         kv_lora_rank: int = None,
+         qk_rope_head_dim: int = None,
+         start_layer: Optional[int] = None,
++        full_kv_pool_class: Optional[type] = None,
+     ):
+         self.size = size
+         self.dtype = dtype
+@@ -2126,8 +2348,6 @@ def __init__(
+         self.head_num = head_num
+         self.head_dim = head_dim
+         self.mamba_pool = mamba_pool
+-        # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
+-        assert not enable_kvcache_transpose
+         self.use_mla = use_mla
+         if not use_mla:
+             TokenToKVPoolClass = MHATokenToKVPool
+@@ -2140,6 +2360,11 @@ def __init__(
+                 )
+ 
+                 TokenToKVPoolClass = NPUMHATokenToKVPool
++            elif full_kv_pool_class is not None:
++                # Caller-selected MHA layout variant (e.g. the page-major
++                # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
++                # priority since they don't understand alternate layouts.
++                TokenToKVPoolClass = full_kv_pool_class
+ 
+             self.full_kv_pool = TokenToKVPoolClass(
+                 size=size,
+@@ -2966,15 +3191,39 @@ def move_kv_cache_native(
+     v_buffer: List[torch.Tensor],
+     tgt_loc: torch.Tensor,
+     src_loc: torch.Tensor,
++    page_size: int = 1,
+ ):
++    """Move token-granular K/V rows from ``src_loc`` to ``tgt_loc``.
++
++    Supports two buffer shapes:
++
++    - 3-D ``[max_slots, head_num, head_dim]`` (per-layer pool): direct advanced
++      indexing on dim 0; ``page_size`` is ignored.
++    - 4-D ``[num_pages, page_size, head_num, head_dim]`` (envelope layout): split
++      each token id into ``(page_id, slot_in_page)`` and use 2-D advanced
++      indexing. PyTorch resolves the strided byte address via the view's strides.
++    """
+     if tgt_loc.numel() == 0:
+         return
+ 
+     tgt_loc_flat = tgt_loc.view(-1).long()
+     src_loc_flat = src_loc.view(-1).long()
+     for k_cache, v_cache in zip(k_buffer, v_buffer):
+-        k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
+-        v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
++        if k_cache.ndim == 4:
++            if page_size == 1:
++                # Degenerate (num_pages, 1, head, dim): token id == page id.
++                k_cache[tgt_loc_flat, 0] = k_cache[src_loc_flat, 0]
++                v_cache[tgt_loc_flat, 0] = v_cache[src_loc_flat, 0]
++            else:
++                tgt_page = tgt_loc_flat // page_size
++                tgt_tok = tgt_loc_flat % page_size
++                src_page = src_loc_flat // page_size
++                src_tok = src_loc_flat % page_size
++                k_cache[tgt_page, tgt_tok] = k_cache[src_page, src_tok]
++                v_cache[tgt_page, tgt_tok] = v_cache[src_page, src_tok]
++        else:
++            k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
++            v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+ 
+ 
+ @triton.jit
+diff --git a/python/sglang/srt/mem_cache/swa_memory_pool.py b/python/sglang/srt/mem_cache/swa_memory_pool.py
+index dc5191845cc5..e0f8e0028d8e 100644
+--- a/python/sglang/srt/mem_cache/swa_memory_pool.py
++++ b/python/sglang/srt/mem_cache/swa_memory_pool.py
+@@ -29,7 +29,6 @@ def __init__(
+         head_dim: int,
+         swa_attention_layer_ids: List[int],
+         full_attention_layer_ids: List[int],
+-        enable_kvcache_transpose: bool,
+         device: str,
+         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+         **kwargs,
+@@ -52,8 +51,6 @@ def __init__(
+         kwargs["head_num"] = head_num
+         kwargs["head_dim"] = head_dim
+         kwargs["device"] = device
+-        # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
+-        assert not enable_kvcache_transpose
+ 
+         # for disagg with nvlink
+         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+diff --git a/python/sglang/srt/mem_cache/triton_ops/cache_move.py b/python/sglang/srt/mem_cache/triton_ops/cache_move.py
+index c9bca8b1a77d..2f2389e89fdc 100644
+--- a/python/sglang/srt/mem_cache/triton_ops/cache_move.py
++++ b/python/sglang/srt/mem_cache/triton_ops/cache_move.py
+@@ -1,3 +1,4 @@
++import torch
+ import triton
+ import triton.language as tl
+ 
+@@ -83,3 +84,185 @@ def copy_all_layer_kv_cache_tiled(
+     mask = mask_loc[:, None] & mask_byte[None, :]
+     vals = tl.load(src_ptr, mask=mask)
+     tl.store(tgt_ptr, vals, mask=mask)
++
++
++# ---------------------------------------------------------------------------
++# store_cache_4d — single-launch Triton write into the 4-D page-major envelope
++# K/V views. At `PAGE_SIZE = 1` the kernel constexpr-folds to byte-identical
++# addresses as the slot-major envelope view; at `PAGE_SIZE > 1` it uses the
++# same `(page_id, tok_in_p)` split the attention read kernels use.
++# ---------------------------------------------------------------------------
++
++
++@triton.jit
++def store_cache_4d_kernel(
++    k_view_ptr,
++    v_view_ptr,
++    cache_k_ptr,
++    cache_v_ptr,
++    loc_ptr,
++    # Strides in ELEMENTS (not bytes); wrapper passes view.stride(D)
++    # directly. K and V may have different head_dim → different per-token
++    # strides, so we carry both.
++    stride_k_page,
++    stride_k_tok,
++    stride_v_page,
++    stride_v_tok,
++    stride_src_k_row,
++    stride_src_v_row,
++    K_ROW_DIM: tl.constexpr,  # head_num * head_dim
++    V_ROW_DIM: tl.constexpr,  # head_num * v_head_dim
++    PAGE_SIZE: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    """Token-parallel Triton write into a 4-D envelope-strided K/V view.
++
++    Grid: ``(N, ceil(max(K_ROW_DIM, V_ROW_DIM) / BLOCK), 2)`` where:
++      - axis 0 → one program per token (loc[i])
++      - axis 1 → blocks within one slot's K (or V) row
++      - axis 2 → 0 = K, 1 = V (two-tensor write fused into one launch)
++
++    For each token i, the kernel writes:
++        page_id  = loc[i] // PAGE_SIZE
++        tok_in_p = loc[i] %  PAGE_SIZE
++        k_view[page_id, tok_in_p, :, :] = cache_k[i, :, :]
++        v_view[page_id, tok_in_p, :, :] = cache_v[i, :, :]
++
++    Cuda-graph safe: no Python branching on tensor values, no `.item()`,
++    all shapes/strides known at launch time.
++    """
++    pid_n = tl.program_id(0)
++    pid_b = tl.program_id(1)
++    pid_kv = tl.program_id(2)
++
++    # 1. Resolve destination slot in the 4-D view.
++    loc = tl.load(loc_ptr + pid_n).to(tl.int64)
++    if PAGE_SIZE == 1:
++        page_id = loc
++        tok_in_p = tl.zeros([], dtype=tl.int64)
++    else:
++        page_id = loc // PAGE_SIZE
++        tok_in_p = loc % PAGE_SIZE
++
++    # 2. Compute per-tensor source/dest pointers.
++    base_off = pid_b * BLOCK + tl.arange(0, BLOCK)
++
++    if pid_kv == 0:
++        mask = base_off < K_ROW_DIM
++        # The trailing (head_num, head_dim) axes of `k_view` are
++        # contiguous: stride[-1]==1, stride[-2]==head_dim. So we can
++        # treat them as a flat K_ROW_DIM dimension addressed by `base_off`.
++        # The wrapper asserts this invariant.
++        src_ptr = cache_k_ptr + pid_n * stride_src_k_row + base_off
++        dst_ptr = (
++            k_view_ptr + page_id * stride_k_page + tok_in_p * stride_k_tok + base_off
++        )
++    else:
++        mask = base_off < V_ROW_DIM
++        src_ptr = cache_v_ptr + pid_n * stride_src_v_row + base_off
++        dst_ptr = (
++            v_view_ptr + page_id * stride_v_page + tok_in_p * stride_v_tok + base_off
++        )
++
++    src = tl.load(src_ptr, mask=mask)
++    tl.store(dst_ptr, src, mask=mask)
++
++
++def store_cache_4d(
++    k_view: torch.Tensor,
++    v_view: torch.Tensor,
++    cache_k: torch.Tensor,
++    cache_v: torch.Tensor,
++    loc: torch.Tensor,
++    page_size: int,
++) -> None:
++    """One-launch Triton write into the 4-D page-major envelope K/V views.
++
++    Writes ``cache_k[i]`` and ``cache_v[i]`` to
++    ``k_view[loc[i]//ps, loc[i]%ps, :, :]`` (and analogously for V) for
++    ``i in [0, N)``.
++
++    Contract:
++        - ``k_view``, ``v_view``: 4-D ``(num_pages, page_size, head_num,
++          head_dim*)``, contiguous in the trailing ``(head_num, head_dim)``
++          dims (i.e., ``stride[-1] == 1`` and ``stride[-2] == head_dim``).
++        - ``cache_k``, ``cache_v``: 3-D ``(N, head_num, head_dim*)``,
++          contiguous in the trailing ``(head_num, head_dim)`` dims.
++        - ``loc``: 1-D int64 or int32, N elements, values in
++          ``[0, num_pages * page_size)``. The caller is responsible for
++          clamping any negative entries to ≥ 0.
++        - At ``page_size == 1`` the kernel produces byte-identical output
++          to the legacy advanced-indexing path.
++
++    Returns nothing; writes in place.
++    """
++    if loc.numel() == 0:
++        return
++    assert k_view.is_cuda and v_view.is_cuda, "store_cache_4d: CUDA only"
++    assert k_view.ndim == 4 and v_view.ndim == 4, (
++        f"store_cache_4d: k_view/v_view must be 4-D, "
++        f"got {k_view.ndim}/{v_view.ndim}"
++    )
++    assert cache_k.ndim == 3 and cache_v.ndim == 3, (
++        f"store_cache_4d: cache_k/cache_v must be 3-D, "
++        f"got {cache_k.ndim}/{cache_v.ndim}"
++    )
++    assert cache_k.shape[0] == cache_v.shape[0] == loc.numel(), (
++        "store_cache_4d: cache_k/cache_v/loc batch dim mismatch: "
++        f"{cache_k.shape[0]}, {cache_v.shape[0]}, {loc.numel()}"
++    )
++    assert k_view.dtype == v_view.dtype == cache_k.dtype == cache_v.dtype, (
++        "store_cache_4d: dtype mismatch: "
++        f"k_view={k_view.dtype}, v_view={v_view.dtype}, "
++        f"cache_k={cache_k.dtype}, cache_v={cache_v.dtype}"
++    )
++    # Stride invariants — the kernel addresses (head_num, head_dim) as one
++    # flat ROW_DIM dimension; this requires the trailing two dims to be
++    # contiguous. This holds for the page-major envelope views
++    # (k_stride = (page_bytes/itemsize, k_row_bytes/itemsize, head_dim, 1)) and
++    # for cache_k/cache_v produced by the model forward.
++    assert k_view.stride(-1) == 1 and k_view.stride(-2) == k_view.shape[-1], (
++        f"store_cache_4d: k_view trailing dims must be contiguous; "
++        f"got stride={k_view.stride()}, shape={tuple(k_view.shape)}"
++    )
++    assert v_view.stride(-1) == 1 and v_view.stride(-2) == v_view.shape[-1], (
++        f"store_cache_4d: v_view trailing dims must be contiguous; "
++        f"got stride={v_view.stride()}, shape={tuple(v_view.shape)}"
++    )
++    assert cache_k.stride(-1) == 1 and cache_k.stride(-2) == cache_k.shape[-1], (
++        f"store_cache_4d: cache_k trailing dims must be contiguous; "
++        f"got stride={cache_k.stride()}, shape={tuple(cache_k.shape)}"
++    )
++    assert cache_v.stride(-1) == 1 and cache_v.stride(-2) == cache_v.shape[-1], (
++        f"store_cache_4d: cache_v trailing dims must be contiguous; "
++        f"got stride={cache_v.stride()}, shape={tuple(cache_v.shape)}"
++    )
++
++    head_num = k_view.shape[2]
++    head_dim = k_view.shape[3]
++    v_head_dim = v_view.shape[3]
++    K_ROW_DIM = head_num * head_dim
++    V_ROW_DIM = head_num * v_head_dim
++    BLOCK = 128
++    N = loc.numel()
++    row_dim_max = max(K_ROW_DIM, V_ROW_DIM)
++    grid = (N, triton.cdiv(row_dim_max, BLOCK), 2)
++
++    store_cache_4d_kernel[grid](
++        k_view,
++        v_view,
++        cache_k,
++        cache_v,
++        loc,
++        k_view.stride(0),
++        k_view.stride(1),
++        v_view.stride(0),
++        v_view.stride(1),
++        cache_k.stride(0),
++        cache_v.stride(0),
++        K_ROW_DIM=K_ROW_DIM,
++        V_ROW_DIM=V_ROW_DIM,
++        PAGE_SIZE=page_size,
++        BLOCK=BLOCK,
++        num_warps=4,
++    )
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index 2b93a6e58bb5..89932d921cc3 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -45,6 +45,7 @@
+     MLATokenToKVPool,
+     MLATokenToKVPoolFP4,
+     NoOpMHATokenToKVPool,
++    PageMajorMHATokenToKVPool,
+     ReqToTokenPool,
+ )
+ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+@@ -414,6 +415,7 @@ def _init_pools(self: ModelRunner):
+                     start_layer=self.start_layer,
+                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,
+                     linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
++                    mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+                 )
+             else:
+                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
+@@ -445,6 +447,15 @@ def _init_pools(self: ModelRunner):
+             is_dsa_model, is_dsv4_model, current_platform
+         )
+ 
++        # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools,
++        # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
++        # default keeps upstream's per-layer layout. The Mamba state pool is routed
++        # separately via `mamba_envelope_layout` on the req-to-token pool above.
++        enable_page_major = self.server_args.enable_page_major_kv_layout
++        mha_pool_class = (
++            PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
++        )
++
+         if is_dsv4_model:
+             swa_page_size = self.page_size
+             if not _is_npu:
+@@ -604,7 +615,6 @@ def _init_pools(self: ModelRunner):
+                     head_dim=self.model_config.head_dim,
+                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+-                    enable_kvcache_transpose=False,
+                     device=self.device,
+                     token_to_kv_pool_class=NPUMHATokenToKVPool,
+                     **kwargs,
+@@ -727,11 +737,11 @@ def _init_pools(self: ModelRunner):
+                     head_dim=self.model_config.head_dim,
+                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+-                    enable_kvcache_transpose=False,
+                     device=self.device,
+                     enable_kv_cache_copy=(
+                         self.server_args.speculative_algorithm is not None
+                     ),
++                    token_to_kv_pool_class=mha_pool_class,
+                     **kwargs,
+                 )
+             elif is_minimax_sparse(self.model_config.hf_config):
+@@ -786,7 +796,6 @@ def _init_pools(self: ModelRunner):
+                             if self.start_layer <= i < self.end_layer
+                         ]
+                     ),
+-                    enable_kvcache_transpose=False,
+                     device=self.device,
+                     mamba_pool=self.req_to_token_pool.mamba_pool,
+                     enable_memory_saver=self.server_args.enable_memory_saver,
+@@ -795,10 +804,14 @@ def _init_pools(self: ModelRunner):
+                     ),
+                     use_mla=self.use_mla_backend,
+                     start_layer=self.start_layer,
++                    full_kv_pool_class=mha_pool_class,
+                     **extra_args,
+                 )
+             else:
+                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
++                    assert (
++                        not enable_page_major
++                    ), "page-major KV layout is not supported with fp4 KV cache"
+                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
+                         self.max_total_num_tokens,
+                         page_size=self.page_size,
+@@ -822,7 +835,7 @@ def _init_pools(self: ModelRunner):
+                     pool_cls = (
+                         NoOpMHATokenToKVPool
+                         if self.server_args.prefill_only_disable_kv_cache
+-                        else MHATokenToKVPool
++                        else mha_pool_class
+                     )
+                     self.token_to_kv_pool = pool_cls(
+                         self.max_total_num_tokens,
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index e5fbcaa83a13..eb602c3bb808 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -775,6 +775,14 @@ class ServerArgs:
+         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
+     ] = False
+     disable_radix_cache: A[bool, "Disable RadixAttention for prefix caching."] = False
++    enable_page_major_kv_layout: A[
++        bool,
++        "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
++        "KV caches in a page-granularity envelope (page is the outermost axis, "
++        "layer-major within a page) instead of the default per-layer "
++        "(layer-major) layout. Requires the Triton attention / linear-attn / "
++        "Mamba backends.",
++    ] = False
+     disable_chunked_prefix_cache: A[
+         bool,
+         "Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
+@@ -2695,6 +2703,8 @@ def __post_init__(self):
+         # Validate cache settings.
+         self._handle_cache_compatibility()
+ 
++        self._handle_page_major_kv_layout()
++
+         # Handle diffusion LLM inference.
+         self._handle_dllm_inference()
+ 
+@@ -6249,6 +6259,38 @@ def _handle_deterministic_inference(self):
+                         "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                     )
+ 
++    def _handle_page_major_kv_layout(self):
++        if not self.enable_page_major_kv_layout:
++            return
++        # Only the Triton attention kernels read the strided 4-D envelope K/V
++        # views; FA3 / FlashInfer do not.
++        backends = {
++            self.attention_backend,
++            self.prefill_attention_backend,
++            self.decode_attention_backend,
++        }
++        backends.discard(None)
++        assert backends <= {"triton"}, (
++            "--enable-page-major-kv-layout requires the Triton attention backend "
++            f"for the full-attention layers; got {sorted(backends)}. Pass "
++            "--attention-backend triton."
++        )
++        # The Mamba state is stored in envelope-strided views; only the
++        # stride-aware Triton causal-conv / SSM kernels read them correctly.
++        linear_backends = {
++            self.linear_attn_backend,
++            self.linear_attn_decode_backend,
++            self.linear_attn_prefill_backend,
++            self.mamba_backend,
++        }
++        linear_backends.discard(None)
++        assert linear_backends <= {"triton"}, (
++            "--enable-page-major-kv-layout requires the Triton linear-attention / "
++            f"Mamba kernels for the strided conv/SSM state; got "
++            f"{sorted(linear_backends)}. Pass --linear-attn-backend triton and "
++            "--mamba-backend triton."
++        )
++
+     def _handle_dllm_inference(self):
+         if self.dllm_algorithm is None:
+             return
+diff --git a/python/sglang/test/test_utils.py b/python/sglang/test/test_utils.py
+index dbbc648b96f5..e39b33bde225 100644
+--- a/python/sglang/test/test_utils.py
++++ b/python/sglang/test/test_utils.py
+@@ -66,6 +66,8 @@
+ 
+ # Hybrid Mamba models
+ DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
++# Small GDN-hybrid (gated delta net) model that fits a single GPU
++DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen3.5-4B"
+ # VL test models
+ DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
+ DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
+diff --git a/test/registered/page_major/test_page_major_gpt_oss.py b/test/registered/page_major/test_page_major_gpt_oss.py
+new file mode 100644
+index 000000000000..f64e4fcaa993
+--- /dev/null
++++ b/test/registered/page_major/test_page_major_gpt_oss.py
+@@ -0,0 +1,69 @@
++"""
++End-to-end accuracy test for the page-major KV layout on a hybrid-SWA MoE model.
++
++Launches gpt-oss-20b with ``--enable-page-major-kv-layout`` on the Triton
++attention backend and checks that GSM8K accuracy holds. This exercises the
++SWA + full-attention KV pools under the page-granularity envelope layout
++(SWAKVPool routes both sub-pools through PageMajorMHATokenToKVPool).
++
++Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
++
++Usage:
++    python3 -m unittest test_page_major_gpt_oss
++"""
++
++import unittest
++from types import SimpleNamespace
++from urllib.parse import urlparse
++
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.server_fixtures.default_fixture import DefaultServerBase
++from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
++
++register_cuda_ci(est_time=420, stage="extra-a", runner_config="1-gpu-large")
++
++
++class TestPageMajorGptOss(DefaultServerBase):
++    """Page-major KV layout on gpt-oss-20b (hybrid-SWA MoE), Triton backend."""
++
++    model = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
++
++    gsm8k_threshold = 0.45
++    num_gsm8k_questions = 200
++    num_shots = 5
++    parallel = 32
++
++    other_args = [
++        "--enable-page-major-kv-layout",
++        # The envelope's strided 4-D K/V views are only read by the Triton
++        # attention kernels (the layout's validator enforces this).
++        "--attention-backend",
++        "triton",
++        "--mem-fraction-static",
++        "0.70",
++        "--cuda-graph-backend-prefill=disabled",
++    ]
++
++    def test_gsm8k(self):
++        from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
++
++        url = urlparse(self.base_url)
++        args = SimpleNamespace(
++            num_shots=self.num_shots,
++            data_path=None,
++            num_questions=self.num_gsm8k_questions,
++            max_new_tokens=512,
++            parallel=self.parallel,
++            host=f"http://{url.hostname}",
++            port=int(url.port),
++        )
++        metrics = run_few_shot_gsm8k(args)
++        print(
++            f"[{self.__class__.__name__}] GSM8K accuracy: {metrics['accuracy']:.3f} "
++            f"(threshold: {self.gsm8k_threshold})"
++        )
++        self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_threshold)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/page_major/test_page_major_qwen_hybrid.py b/test/registered/page_major/test_page_major_qwen_hybrid.py
+new file mode 100644
+index 000000000000..61d55540f311
+--- /dev/null
++++ b/test/registered/page_major/test_page_major_qwen_hybrid.py
+@@ -0,0 +1,79 @@
++"""
++End-to-end accuracy test for the page-major KV layout on a GDN-hybrid model.
++
++Launches Qwen3.5-4B (a gated-delta-net / linear-attention hybrid) with
++``--enable-page-major-kv-layout`` on the Triton attention + linear-attn + Mamba
++backends and checks that GSM8K accuracy holds. This exercises the page-major
++path most prone to subtle bugs: the Mamba conv/SSM state stored as a strided
++envelope view, plus the full-attention KV pool, both read/written by the GDN
++prefill and decode kernels.
++
++Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
++
++Usage:
++    python3 -m unittest test_page_major_qwen_hybrid
++"""
++
++import unittest
++from types import SimpleNamespace
++from urllib.parse import urlparse
++
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.server_fixtures.default_fixture import DefaultServerBase
++from sglang.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
++
++register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")
++
++
++class TestPageMajorQwenHybrid(DefaultServerBase):
++    """Page-major KV layout on Qwen3.5-4B (GDN-hybrid), Triton backends."""
++
++    model = DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
++
++    # Measured in this harness: baseline (no page-major) and page-major both
++    # ~0.86; the 0.80 threshold leaves margin for run-to-run noise while still
++    # catching the prefill-state corruption that page-major hit before the
++    # gather/scatter fix in gdn_backend.forward_extend (which dropped it to ~0.61).
++    gsm8k_threshold = 0.80
++    num_gsm8k_questions = 200
++    num_shots = 5
++    parallel = 32
++
++    other_args = [
++        "--trust-remote-code",
++        "--mem-fraction-static",
++        "0.85",
++        "--enable-page-major-kv-layout",
++        # Only the Triton attention / linear-attn / Mamba kernels read the
++        # strided envelope K/V and conv/SSM state (enforced by the validator).
++        "--attention-backend",
++        "triton",
++        "--linear-attn-backend",
++        "triton",
++        "--mamba-backend",
++        "triton",
++    ]
++
++    def test_gsm8k(self):
++        from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
++
++        url = urlparse(self.base_url)
++        args = SimpleNamespace(
++            num_shots=self.num_shots,
++            data_path=None,
++            num_questions=self.num_gsm8k_questions,
++            max_new_tokens=512,
++            parallel=self.parallel,
++            host=f"http://{url.hostname}",
++            port=int(url.port),
++        )
++        metrics = run_few_shot_gsm8k(args)
++        print(
++            f"[{self.__class__.__name__}] GSM8K accuracy: {metrics['accuracy']:.3f} "
++            f"(threshold: {self.gsm8k_threshold})"
++        )
++        self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_threshold)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_mamba_unittest.py b/test/registered/unit/mem_cache/test_mamba_unittest.py
+index 96f2cb5ca123..9ad577b42e61 100755
+--- a/test/registered/unit/mem_cache/test_mamba_unittest.py
++++ b/test/registered/unit/mem_cache/test_mamba_unittest.py
+@@ -60,7 +60,6 @@ def test_hybrid_linear_kv_pool(self):
+             head_num=head_num,
+             head_dim=head_dim,
+             full_attention_layer_ids=full_attention_layer_ids,
+-            enable_kvcache_transpose=False,
+             device=device,
+             enable_memory_saver=False,
+             mamba_pool=None,
+@@ -475,7 +474,6 @@ def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
+             head_num=head_num,
+             head_dim=head_dim,
+             full_attention_layer_ids=full_attention_layer_ids,
+-            enable_kvcache_transpose=False,
+             device=device,
+             enable_memory_saver=False,
+             mamba_pool=req_to_token_pool.mamba_pool,
+diff --git a/test/registered/unit/mem_cache/test_page_major_layout.py b/test/registered/unit/mem_cache/test_page_major_layout.py
+new file mode 100644
+index 000000000000..9bfd5089575f
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_page_major_layout.py
+@@ -0,0 +1,163 @@
++"""CPU correctness tests for the page-major layer-major envelope layout.
++
++Covers the standalone view builders (no allocator / shared pool):
++
++  - ``build_page_major_mha_views``: 4-D K/V views with correct addressing at
++    page_size 1 (token-granularity envelope) and > 1 (layer-major within a page),
++    and no aliasing across layers / slots.
++  - ``build_page_major_mamba_views``: conv / temporal state views.
++  - ``move_kv_cache_native`` 4-D branch: relocating token rows preserves data.
++
++Runs on CPU — pure-torch advanced indexing, no Triton.
++
++    python -m pytest test/registered/unit/mem_cache/test_page_major_layout.py -v
++"""
++
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=6, suite="base-a-test-cpu")
++
++import unittest
++
++import torch
++
++from sglang.srt.mem_cache.layout.page_major import (
++    build_page_major_mamba_views,
++    build_page_major_mha_views,
++    mamba_entry_bytes,
++    mha_entry_bytes,
++)
++from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
++
++_DEV = "cpu"
++_DT = torch.float32
++
++
++def _make_mha_views(layer_num, head_num, head_dim, v_head_dim, page_size, num_pages):
++    entry = mha_entry_bytes(
++        layer_num=layer_num,
++        head_num=head_num,
++        head_dim=head_dim,
++        v_head_dim=v_head_dim,
++        itemsize=_DT.itemsize,
++    )
++    raw = torch.zeros(num_pages * page_size * entry, dtype=torch.uint8, device=_DEV)
++    k, v = build_page_major_mha_views(
++        raw,
++        layer_num=layer_num,
++        head_num=head_num,
++        head_dim=head_dim,
++        v_head_dim=v_head_dim,
++        store_dtype=_DT,
++        page_size=page_size,
++        num_pages=num_pages,
++    )
++    return raw, k, v
++
++
++class TestPageMajorMHAViews(unittest.TestCase):
++    def test_view_shapes(self):
++        _, k, v = _make_mha_views(3, 2, 4, 4, page_size=2, num_pages=4)
++        self.assertEqual(len(k), 3)
++        for t in k:
++            self.assertEqual(tuple(t.shape), (4, 2, 2, 4))
++        for t in v:
++            self.assertEqual(tuple(t.shape), (4, 2, 2, 4))
++
++    def test_no_aliasing_ps1(self):
++        # Every (layer, slot) cell must be independently addressable.
++        layer_num, slots = 3, 5
++        _, k, v = _make_mha_views(layer_num, 2, 4, 4, page_size=1, num_pages=slots)
++        for L in range(layer_num):
++            for s in range(slots):
++                k[L][s, 0] = float(100 + L * 10 + s)
++                v[L][s, 0] = float(200 + L * 10 + s)
++        for L in range(layer_num):
++            for s in range(slots):
++                self.assertTrue(torch.all(k[L][s, 0] == float(100 + L * 10 + s)))
++                self.assertTrue(torch.all(v[L][s, 0] == float(200 + L * 10 + s)))
++
++    def test_page_slot_addressing_ps_gt1(self):
++        # token id t -> page t // ps, slot t % ps; no aliasing across tokens.
++        ps, pages = 2, 4
++        total = ps * pages
++        _, k, _ = _make_mha_views(2, 1, 2, 2, page_size=ps, num_pages=pages)
++        for L in range(2):
++            for t in range(total):
++                k[L][t // ps, t % ps, 0] = float(1000 + L * 100 + t)
++        for L in range(2):
++            for t in range(total):
++                self.assertEqual(
++                    float(k[L][t // ps, t % ps, 0, 0].item()), 1000 + L * 100 + t
++                )
++
++    def test_asymmetric_v_head_dim(self):
++        _, k, v = _make_mha_views(2, 2, 6, 4, page_size=1, num_pages=3)
++        self.assertEqual(tuple(k[0].shape), (3, 1, 2, 6))
++        self.assertEqual(tuple(v[0].shape), (3, 1, 2, 4))
++
++
++class TestPageMajorMove(unittest.TestCase):
++    def test_move_ps1(self):
++        slots = 6
++        _, k, v = _make_mha_views(2, 1, 4, 4, page_size=1, num_pages=slots)
++        for L in range(2):
++            for s in range(slots):
++                k[L][s, 0] = float(s + 1)
++                v[L][s, 0] = float(-(s + 1))
++        tgt = torch.tensor([0, 1], dtype=torch.int64)
++        src = torch.tensor([4, 5], dtype=torch.int64)
++        move_kv_cache_native(k, v, tgt, src, page_size=1)
++        for L in range(2):
++            self.assertTrue(torch.all(k[L][0, 0] == 5.0))
++            self.assertTrue(torch.all(k[L][1, 0] == 6.0))
++            self.assertTrue(torch.all(v[L][0, 0] == -5.0))
++
++    def test_move_ps_gt1(self):
++        ps, pages = 2, 4
++        total = ps * pages
++        _, k, v = _make_mha_views(1, 1, 2, 2, page_size=ps, num_pages=pages)
++        for t in range(total):
++            k[0][t // ps, t % ps, 0] = float(t + 1)
++        tgt = torch.tensor([0, 3], dtype=torch.int64)  # page0 slot0, page1 slot1
++        src = torch.tensor([6, 7], dtype=torch.int64)  # page3 slot0, page3 slot1
++        move_kv_cache_native(k, v, tgt, src, page_size=ps)
++        self.assertEqual(float(k[0][0, 0, 0, 0].item()), 7.0)
++        self.assertEqual(float(k[0][1, 1, 0, 0].item()), 8.0)
++
++
++class TestMambaEnvelopeViews(unittest.TestCase):
++    def test_conv_temporal_shapes_no_alias(self):
++        layers, slots = 2, 4
++        conv_shapes = [(2, 3)]
++        temp_shape = (2, 2)
++        conv_dt, temp_dt = torch.bfloat16, torch.float32
++        entry = mamba_entry_bytes(
++            layer_num=layers,
++            conv_state_shapes=conv_shapes,
++            conv_dtype=conv_dt,
++            temporal_state_shape=temp_shape,
++            temporal_dtype=temp_dt,
++        )
++        raw = torch.zeros(slots * entry, dtype=torch.uint8, device=_DEV)
++        conv_views, temporal = build_page_major_mamba_views(
++            raw,
++            layer_num=layers,
++            conv_state_shapes=conv_shapes,
++            conv_dtype=conv_dt,
++            temporal_state_shape=temp_shape,
++            temporal_dtype=temp_dt,
++            max_slots=slots,
++        )
++        self.assertEqual(tuple(conv_views[0].shape), (layers, slots, 2, 3))
++        self.assertEqual(tuple(temporal.shape), (layers, slots, 2, 2))
++        for L in range(layers):
++            for s in range(slots):
++                temporal[L, s] = float(s + L * 10 + 1)
++        for L in range(layers):
++            for s in range(slots):
++                self.assertTrue(torch.all(temporal[L, s] == float(s + L * 10 + 1)))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_store_cache_4d.py b/test/registered/unit/mem_cache/test_store_cache_4d.py
+new file mode 100644
+index 000000000000..70128452e6c3
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_store_cache_4d.py
+@@ -0,0 +1,529 @@
++"""Parity tests for the `store_cache_4d` Triton kernel.
++
++The kernel writes K/V into the 4-D page-major envelope view. These tests prove
++it produces byte-identical output to the legacy advanced-indexing path on
++representative fixtures:
++
++  - ``page_size = 1`` (envelope-degenerate, the critical compatibility case)
++  - ``page_size > 1`` (layer-major within page)
++  - both int32 and int64 ``loc`` dtypes
++  - bf16 and fp8_e5m2 view dtypes
++  - asymmetric ``head_dim != v_head_dim``
++  - empty ``loc`` (no-op)
++
++Skipped on CPU — Triton requires a GPU.
++
++    python -m pytest test/registered/unit/mem_cache/test_store_cache_4d.py -v
++"""
++
++import importlib.util
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cuda_ci
++
++_HAS_CUDA = torch.cuda.is_available()
++# The set_kv_buffer integration test needs SharedMHATokenToKVPool, which only
++# exists once the shared-memory-pool feature lands; skip it where absent.
++_HAS_SHARED_POOL = (
++    importlib.util.find_spec("sglang.srt.mem_cache.shared_memory_pool") is not None
++)
++
++register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
++
++
++def _legacy_advanced_indexing_write(
++    k_view: torch.Tensor,
++    v_view: torch.Tensor,
++    cache_k: torch.Tensor,
++    cache_v: torch.Tensor,
++    loc: torch.Tensor,
++    page_size: int,
++) -> None:
++    """Reference implementation: the legacy bypass-super() advanced-indexing
++    path that the Triton kernel replaces. Used as the byte-identity oracle
++    for the parity tests below.
++    """
++    if page_size == 1:
++        k_view[loc, 0] = cache_k
++        v_view[loc, 0] = cache_v
++    else:
++        page_id = loc // page_size
++        tok_in_p = loc % page_size
++        k_view[page_id, tok_in_p] = cache_k
++        v_view[page_id, tok_in_p] = cache_v
++
++
++@unittest.skipUnless(_HAS_CUDA, "Triton kernels require CUDA")
++class TestStoreCache4D(unittest.TestCase):
++    """Byte-identity parity vs the legacy advanced-indexing write path."""
++
++    def _make_view_and_cache(
++        self,
++        num_pages: int,
++        page_size: int,
++        head_num: int,
++        head_dim: int,
++        v_head_dim: int,
++        N: int,
++        dtype: torch.dtype = torch.bfloat16,
++        loc_dtype: torch.dtype = torch.int64,
++        seed: int = 0xC0FFEE,
++    ):
++        torch.manual_seed(seed)
++        # The shared pool's views are 4-D `(num_pages, page_size, head_num,
++        # head_dim)` with the trailing two dims contiguous. We allocate two
++        # independent contiguous buffers (one for the kernel-under-test,
++        # one as the legacy-path target) so we can compare them.
++        k_view = torch.zeros(
++            (num_pages, page_size, head_num, head_dim),
++            dtype=dtype,
++            device="cuda",
++        )
++        v_view = torch.zeros(
++            (num_pages, page_size, head_num, v_head_dim),
++            dtype=dtype,
++            device="cuda",
++        )
++        cache_k = torch.randn(
++            (N, head_num, head_dim), dtype=torch.float32, device="cuda"
++        ).to(dtype)
++        cache_v = torch.randn(
++            (N, head_num, v_head_dim), dtype=torch.float32, device="cuda"
++        ).to(dtype)
++        # Valid loc values in [0, num_pages * page_size); generate without
++        # duplicates so the comparison is unambiguous (advanced-indexing
++        # with duplicates is order-undefined for both paths).
++        total_slots = num_pages * page_size
++        assert N <= total_slots
++        loc = torch.randperm(total_slots, device="cuda")[:N].to(loc_dtype)
++        return k_view, v_view, cache_k, cache_v, loc
++
++    def _check_parity(
++        self,
++        num_pages: int,
++        page_size: int,
++        head_num: int,
++        head_dim: int,
++        v_head_dim: int,
++        N: int,
++        dtype: torch.dtype = torch.bfloat16,
++        loc_dtype: torch.dtype = torch.int64,
++    ):
++        from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d
++
++        # Two independent target buffers — one for the kernel, one for the
++        # legacy reference path.
++        k_kernel, v_kernel, cache_k, cache_v, loc = self._make_view_and_cache(
++            num_pages,
++            page_size,
++            head_num,
++            head_dim,
++            v_head_dim,
++            N,
++            dtype=dtype,
++            loc_dtype=loc_dtype,
++        )
++        k_legacy = k_kernel.clone()
++        v_legacy = v_kernel.clone()
++
++        # Kernel-under-test
++        store_cache_4d(k_kernel, v_kernel, cache_k, cache_v, loc, page_size)
++        # Legacy reference
++        _legacy_advanced_indexing_write(
++            k_legacy, v_legacy, cache_k, cache_v, loc, page_size
++        )
++
++        # Byte-identical comparison — the kernel must reproduce the
++        # advanced-indexing path bit-for-bit, NOT just numerically close.
++        # For fp8 dtypes, torch.equal works on the integer bit pattern.
++        self.assertTrue(
++            torch.equal(k_kernel, k_legacy),
++            f"K view mismatch: ps={page_size}, dtype={dtype}, "
++            f"loc_dtype={loc_dtype}, N={N}",
++        )
++        self.assertTrue(
++            torch.equal(v_kernel, v_legacy),
++            f"V view mismatch: ps={page_size}, dtype={dtype}, "
++            f"loc_dtype={loc_dtype}, N={N}",
++        )
++
++    # ---- Test 1: ps=1 envelope-degenerate (the critical compat case) ----
++
++    def test_store_cache_4d_ps1_byte_identical(self):
++        """At page_size=1 the kernel constexpr-folds to the slot-major
++        envelope view. Output must be byte-identical to advanced indexing.
++        This protects the Stage 1/2/3 green eval matrix from regression."""
++        self._check_parity(
++            num_pages=64,
++            page_size=1,
++            head_num=4,
++            head_dim=128,
++            v_head_dim=128,
++            N=16,
++        )
++
++    # ---- Test 2: ps>1 layer-major within page ----
++
++    def test_store_cache_4d_ps_gt1_byte_identical(self):
++        """At page_size > 1 the kernel splits loc into (page_id, tok_in_p)
++        and writes via the 4-D stride. Output must match the equivalent
++        advanced-indexing write."""
++        self._check_parity(
++            num_pages=8,
++            page_size=64,
++            head_num=4,
++            head_dim=128,
++            v_head_dim=128,
++            N=128,
++        )
++
++    # ---- Test 3: int32 loc dtype ----
++
++    def test_store_cache_4d_int32_loc(self):
++        """The SWA-side path passes int32 loc (matches the SWA Triton
++        kernel contract). PyTorch advanced indexing tolerates either
++        int32 or int64; the kernel must too."""
++        self._check_parity(
++            num_pages=32,
++            page_size=1,
++            head_num=4,
++            head_dim=64,
++            v_head_dim=64,
++            N=10,
++            loc_dtype=torch.int32,
++        )
++
++    # ---- Test 4: int64 loc dtype (already exercised, explicit) ----
++
++    def test_store_cache_4d_int64_loc(self):
++        """The full-side path passes int64 loc (matches the v2p table
++        dtype)."""
++        self._check_parity(
++            num_pages=32,
++            page_size=1,
++            head_num=4,
++            head_dim=64,
++            v_head_dim=64,
++            N=10,
++            loc_dtype=torch.int64,
++        )
++
++    # ---- Test 5: bf16 dtype (the production case) ----
++
++    def test_store_cache_4d_dtype_bf16(self):
++        """bf16 is the production K/V dtype for gpt-oss-20b, Falcon-H1."""
++        self._check_parity(
++            num_pages=16,
++            page_size=64,
++            head_num=4,
++            head_dim=128,
++            v_head_dim=128,
++            N=64,
++            dtype=torch.bfloat16,
++        )
++
++    # ---- Test 6: fp8_e5m2 dtype ----
++
++    def test_store_cache_4d_dtype_fp8_e5m2(self):
++        """fp8_e5m2 is used for KV-cache quantization. Caller is responsible
++        for the cast (Phase 1); the kernel sees same-dtype source and
++        destination."""
++        self._check_parity(
++            num_pages=16,
++            page_size=64,
++            head_num=4,
++            head_dim=128,
++            v_head_dim=128,
++            N=64,
++            dtype=torch.float8_e5m2,
++        )
++
++    # ---- Test 7: empty loc (no-op) ----
++
++    def test_store_cache_4d_empty_loc(self):
++        """N=0 must be a no-op: no kernel launch, no exception, no buffer
++        mutation."""
++        from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d
++
++        k_view = torch.zeros((8, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
++        v_view = torch.zeros((8, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
++        k_before = k_view.clone()
++        v_before = v_view.clone()
++        cache_k = torch.empty((0, 4, 64), dtype=torch.bfloat16, device="cuda")
++        cache_v = torch.empty((0, 4, 64), dtype=torch.bfloat16, device="cuda")
++        loc = torch.empty((0,), dtype=torch.int64, device="cuda")
++
++        store_cache_4d(k_view, v_view, cache_k, cache_v, loc, page_size=4)
++
++        # Buffers must be unchanged.
++        self.assertTrue(torch.equal(k_view, k_before))
++        self.assertTrue(torch.equal(v_view, v_before))
++
++    # ---- Test 8: head_dim != v_head_dim (asymmetric, e.g. MLA-style) ----
++
++    def test_store_cache_4d_v_head_dim_differs(self):
++        """When v_head_dim != head_dim, the kernel's K and V branches use
++        different per-token strides. Exercises the stride_k_tok ≠
++        stride_v_tok branch."""
++        self._check_parity(
++            num_pages=8,
++            page_size=16,
++            head_num=2,
++            head_dim=128,
++            v_head_dim=64,
++            N=16,
++        )
++
++
++@unittest.skipUnless(_HAS_CUDA, "Triton kernels require CUDA")
++class TestStoreCache4DAssertions(unittest.TestCase):
++    """The wrapper's contract assertions must fire on bad inputs."""
++
++    def test_rejects_non_contiguous_view_trailing_dim(self):
++        """Wrapper requires `stride[-1] == 1` and `stride[-2] == head_dim`
++        (the trailing two dims must be contiguous). A permutation that
++        breaks this should trigger AssertionError."""
++        from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d
++
++        # Build a 4-D view, then permute the last two dims → trailing
++        # contiguity violated.
++        k_view = torch.zeros(
++            (4, 4, 4, 64), dtype=torch.bfloat16, device="cuda"
++        ).permute(
++            0, 1, 3, 2
++        )  # now shape (4, 4, 64, 4); strides broken
++        v_view = torch.zeros((4, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
++        cache_k = torch.zeros((2, 4, 64), dtype=torch.bfloat16, device="cuda")
++        cache_v = torch.zeros((2, 4, 64), dtype=torch.bfloat16, device="cuda")
++        loc = torch.arange(2, dtype=torch.int64, device="cuda")
++        with self.assertRaises(AssertionError):
++            store_cache_4d(k_view, v_view, cache_k, cache_v, loc, page_size=4)
++
++    def test_rejects_dtype_mismatch(self):
++        """All four tensors must share a dtype; the caller is responsible
++        for any cast before the call."""
++        from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d
++
++        k_view = torch.zeros((4, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
++        v_view = torch.zeros((4, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
++        cache_k = torch.zeros((2, 4, 64), dtype=torch.float16, device="cuda")
++        cache_v = torch.zeros((2, 4, 64), dtype=torch.bfloat16, device="cuda")
++        loc = torch.arange(2, dtype=torch.int64, device="cuda")
++        with self.assertRaises(AssertionError):
++            store_cache_4d(k_view, v_view, cache_k, cache_v, loc, page_size=4)
++
++
++@unittest.skipUnless(
++    _HAS_CUDA and _HAS_SHARED_POOL,
++    "Triton kernels require CUDA; SharedMHATokenToKVPool required",
++)
++class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
++    """Integration parity test — exercises the kernel through the FULL
++    ``SharedMHATokenToKVPool.set_kv_buffer`` path, including the
++    ``_external_allocator`` v2p translation and the dtype cast. Confirms the
++    production code path produces bit-identical output to a PyTorch
++    advanced-indexing reference write.
++    """
++
++    def _build_pool_and_stub_alloc(self, page_size: int, v2p=None):
++        """Build a small SharedMHATokenToKVPool wired to a stub allocator.
++
++        By default `virtual_to_physical` is identity (the kernel-vs-legacy
++        parity tests don't exercise virtual-id semantics). Pass an explicit
++        `v2p` tensor (sized `max_slots + 1`) to exercise a NON-identity
++        translation — used by the `set_full_loc` fast-path parity test, which
++        needs virtual != physical so the precomputed-physical fast path is
++        meaningfully different from the per-call gather."""
++        import torch as _t
++
++        from sglang.srt.mem_cache.shared_memory_pool import (
++            MHASubPoolSpec,
++            SharedMemoryPool,
++            SharedMHATokenToKVPool,
++        )
++
++        spec = MHASubPoolSpec(
++            name="full",
++            layer_num=2,
++            head_num=4,
++            head_dim=64,
++            store_dtype=_t.bfloat16,
++            grow_direction="up",
++        )
++        total = spec.entry_bytes() * 64
++        # Use a peer to satisfy the two-sub-pool contract.
++        peer = MHASubPoolSpec(
++            name="swa",
++            layer_num=1,
++            head_num=4,
++            head_dim=64,
++            store_dtype=_t.bfloat16,
++            grow_direction="down",
++        )
++        pool = SharedMemoryPool(
++            total_bytes=total + peer.entry_bytes() * 16,
++            sub_pool_specs=[spec, peer],
++            device="cuda",
++            enable_memory_saver=False,
++            page_size=page_size,
++        )
++        kv_pool = SharedMHATokenToKVPool(
++            shared_buffer=pool,
++            sub_pool_name="full",
++            page_size=page_size,
++            start_layer=0,
++            end_layer=2,
++            enable_alt_stream=False,
++        )
++
++        # Stub allocator with an identity (default) or caller-supplied v2p.
++        max_slots = pool.max_slots("full")
++        if v2p is None:
++            v2p = _t.arange(max_slots + 1, dtype=_t.int64, device="cuda")
++
++        class _StubAllocator:
++            virtual_to_physical = v2p
++
++        kv_pool.attach_allocator(_StubAllocator())
++        return kv_pool
++
++    def _run_set_kv_buffer_and_compare(self, page_size: int):
++        import torch as _t
++
++        kv_pool = self._build_pool_and_stub_alloc(page_size)
++
++        # A fake `layer` object with the minimum interface
++        # `set_kv_buffer` reads: `.layer_id`.
++        class _FakeLayer:
++            layer_id = 0
++
++        layer = _FakeLayer()
++        head_num, head_dim = 4, 64
++        N = 16
++        # Generate valid loc in range [0, num_pages * page_size).
++        num_pages = kv_pool.k_buffer[0].shape[0]
++        total = num_pages * page_size
++        assert N <= total
++        loc = _t.randperm(total, device="cuda")[:N].to(_t.int64)
++        cache_k = _t.randn((N, head_num, head_dim), dtype=_t.bfloat16, device="cuda")
++        cache_v = _t.randn((N, head_num, head_dim), dtype=_t.bfloat16, device="cuda")
++
++        # Production path: the Triton `store_cache_4d` kernel via set_kv_buffer.
++        kv_pool.set_kv_buffer(layer, loc, cache_k.clone(), cache_v.clone())
++        k_kernel = kv_pool.k_buffer[0].clone()
++        v_kernel = kv_pool.v_buffer[0].clone()
++
++        # Reference: PyTorch advanced-indexing into a fresh view. The stub
++        # allocator's v2p is identity, so physical loc == virtual loc and no
++        # dtype cast happens (store_dtype == dtype), making this the exact
++        # write the kernel performs.
++        kv_pool.k_buffer[0].zero_()
++        kv_pool.v_buffer[0].zero_()
++        k_view = kv_pool.k_buffer[0]
++        v_view = kv_pool.v_buffer[0]
++        if page_size == 1:
++            k_view[loc, 0] = cache_k
++            v_view[loc, 0] = cache_v
++        else:
++            page_id = loc // page_size
++            tok_in_p = loc % page_size
++            k_view[page_id, tok_in_p] = cache_k
++            v_view[page_id, tok_in_p] = cache_v
++        k_ref = kv_pool.k_buffer[0].clone()
++        v_ref = kv_pool.v_buffer[0].clone()
++
++        self.assertTrue(
++            _t.equal(k_kernel, k_ref),
++            f"K view mismatch through set_kv_buffer at ps={page_size}",
++        )
++        self.assertTrue(
++            _t.equal(v_kernel, v_ref),
++            f"V view mismatch through set_kv_buffer at ps={page_size}",
++        )
++
++    def test_integration_ps1(self):
++        self._run_set_kv_buffer_and_compare(page_size=1)
++
++    def test_integration_ps64(self):
++        self._run_set_kv_buffer_and_compare(page_size=64)
++
++    def _run_full_loc_fast_path_parity(self, page_size: int):
++        """Stage 3.5 fast-path byte-identity: writing through the precomputed
++        full-physical loc (`set_loc` fast path) must produce a byte-identical
++        KV buffer to writing the virtual loc and letting `set_kv_buffer`
++        translate per call. Uses a NON-identity v2p so the two paths are
++        genuinely different code (fast path skips the gather)."""
++        import torch as _t
++
++        # Non-identity v2p: reverse-map the physical slot space so virtual i
++        # lands on a different physical slot. Keep slot 0 -> 0 (padding sink).
++        # Build the pool once to learn max_slots, then rebuild with the v2p.
++        probe = self._build_pool_and_stub_alloc(page_size)
++        max_slots = probe.k_buffer[0].shape[0] * page_size
++        v2p = _t.arange(max_slots + 1, dtype=_t.int64, device="cuda")
++        # Shuffle the interior [1, max_slots) so virtual != physical, leave
++        # 0 (sink) and the trailing sentinel (max_slots -> itself) alone.
++        interior = _t.randperm(max_slots - 1, device="cuda") + 1
++        v2p[1:max_slots] = interior
++
++        kv_pool = self._build_pool_and_stub_alloc(page_size, v2p=v2p)
++
++        class _FakeLayer:
++            layer_id = 0
++
++        layer = _FakeLayer()
++        head_num, head_dim = 4, 64
++        N = 16
++        num_pages = kv_pool.k_buffer[0].shape[0]
++        total = num_pages * page_size
++        # Draw virtual ids from [1, total) (avoid the padding sink at 0).
++        loc = (_t.randperm(total - 1, device="cuda")[:N] + 1).to(_t.int64)
++        cache_k = _t.randn((N, head_num, head_dim), dtype=_t.bfloat16, device="cuda")
++        cache_v = _t.randn((N, head_num, head_dim), dtype=_t.bfloat16, device="cuda")
++
++        # SLOW path: no precompute pinned -> per-call v2p gather inside
++        # set_kv_buffer translates virtual -> physical.
++        kv_pool.set_loc(None)
++        kv_pool.set_kv_buffer(layer, loc, cache_k.clone(), cache_v.clone())
++        k_slow = kv_pool.k_buffer[0].clone()
++        v_slow = kv_pool.v_buffer[0].clone()
++
++        # FAST path: precompute the full-physical loc exactly as
++        # `set_kv_buffer`'s page math would, pin it via set_loc, and pass
++        # it as `loc` so the data-ptr fast path fires (no gather).
++        if page_size == 1:
++            phys = _t.clamp_min(v2p[loc], 0)
++        else:
++            virt_pages = loc // page_size
++            offsets = loc % page_size
++            phys = _t.clamp_min(v2p[virt_pages] * page_size + offsets, 0)
++        kv_pool.k_buffer[0].zero_()
++        kv_pool.v_buffer[0].zero_()
++        kv_pool.set_loc(phys)
++        try:
++            kv_pool.set_kv_buffer(layer, phys, cache_k.clone(), cache_v.clone())
++            k_fast = kv_pool.k_buffer[0].clone()
++            v_fast = kv_pool.v_buffer[0].clone()
++        finally:
++            kv_pool.set_loc(None)
++
++        self.assertTrue(
++            _t.equal(k_fast, k_slow),
++            f"K mismatch: full_loc fast path != per-call translate at ps={page_size}",
++        )
++        self.assertTrue(
++            _t.equal(v_fast, v_slow),
++            f"V mismatch: full_loc fast path != per-call translate at ps={page_size}",
++        )
++
++    def test_full_loc_fast_path_parity_ps1(self):
++        self._run_full_loc_fast_path_parity(page_size=1)
++
++    def test_full_loc_fast_path_parity_ps64(self):
++        self._run_full_loc_fast_path_parity(page_size=64)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_swa_eviction_boundary.py b/test/registered/unit/mem_cache/test_swa_eviction_boundary.py
+index c51fba5e909c..18896ffd747b 100644
+--- a/test/registered/unit/mem_cache/test_swa_eviction_boundary.py
++++ b/test/registered/unit/mem_cache/test_swa_eviction_boundary.py
+@@ -75,7 +75,6 @@ def _build_swa_tree(page_size, sliding_window_size, kv_size=1024, kv_size_swa=51
+         head_dim=head_dim,
+         swa_attention_layer_ids=swa_ids,
+         full_attention_layer_ids=full_ids,
+-        enable_kvcache_transpose=False,
+         device=device,
+     )
+     allocator = SWATokenToKVPoolAllocator(
+diff --git a/test/registered/unit/mem_cache/test_swa_lock_release_lifecycle.py b/test/registered/unit/mem_cache/test_swa_lock_release_lifecycle.py
+index 11dd610d14c8..6a3d47ad4158 100644
+--- a/test/registered/unit/mem_cache/test_swa_lock_release_lifecycle.py
++++ b/test/registered/unit/mem_cache/test_swa_lock_release_lifecycle.py
+@@ -61,7 +61,6 @@ def _build_tree(
+         head_dim=head_dim,
+         swa_attention_layer_ids=swa_ids,
+         full_attention_layer_ids=full_ids,
+-        enable_kvcache_transpose=False,
+         device=device,
+     )
+     allocator = SWATokenToKVPoolAllocator(
+diff --git a/test/registered/unit/mem_cache/test_swa_unittest.py b/test/registered/unit/mem_cache/test_swa_unittest.py
+index ec869681ab09..77429288712a 100644
+--- a/test/registered/unit/mem_cache/test_swa_unittest.py
++++ b/test/registered/unit/mem_cache/test_swa_unittest.py
+@@ -77,7 +77,6 @@ def _build_swa_tree(
+         head_dim=head_dim,
+         swa_attention_layer_ids=swa_attention_layer_ids,
+         full_attention_layer_ids=full_attention_layer_ids,
+-        enable_kvcache_transpose=False,
+         device=device,
+     )
+     allocator = SWATokenToKVPoolAllocator(
+@@ -226,7 +225,6 @@ def test_swa_memory_pool(self):
+             head_dim=head_dim,
+             swa_attention_layer_ids=swa_attention_layer_ids,
+             full_attention_layer_ids=full_attention_layer_ids,
+-            enable_kvcache_transpose=False,
+             device=device,
+         )
+         alloc = SWATokenToKVPoolAllocator(
+@@ -310,7 +308,6 @@ def test_swa_radix_cache_1(self):
+             head_dim=head_dim,
+             swa_attention_layer_ids=swa_attention_layer_ids,
+             full_attention_layer_ids=full_attention_layer_ids,
+-            enable_kvcache_transpose=False,
+             device=device,
+         )
+         # setup token to kv pool allocator
+@@ -468,7 +465,6 @@ def test_swa_radix_cache_eagle(self):
+             head_dim=head_dim,
+             swa_attention_layer_ids=swa_attention_layer_ids,
+             full_attention_layer_ids=full_attention_layer_ids,
+-            enable_kvcache_transpose=False,
+             device=device,
+         )
+         # setup token to kv pool allocator
+diff --git a/test/registered/unit/mem_cache/test_triton_kernel_layout.py b/test/registered/unit/mem_cache/test_triton_kernel_layout.py
+new file mode 100644
+index 000000000000..224005692844
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_triton_kernel_layout.py
+@@ -0,0 +1,189 @@
++"""Triton-kernel parity test for the page-aware decode / extend kernels.
++
++Verifies that the modified decode / extend Triton kernels produce
++bit-identical output when called against:
++
++  (a) the legacy 3-D ``[N, head, dim]`` KV view (PAGE_SIZE=1 default),
++  (b) the new 4-D ``[num_pages, page_size, head, dim]`` view with
++      ``page_size=1`` (degenerate envelope — same physical bytes as (a)),
++  (c) the new 4-D view with ``page_size>1`` (layer-major), using the
++      same logical KV data but routed via page-aware address math.
++
++Output for (a) vs (b) must be bit-identical at PAGE_SIZE=1 (the kernel
++specializes to the legacy branch). Output for (c) must match a hand-
++computed reference SDPA result (same logical attention; different byte
++layout).
++
++Skipped on CPU — Triton requires a GPU.
++
++    python -m pytest test/registered/unit/mem_cache/test_triton_kernel_layout.py -v
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cuda_ci
++
++_HAS_CUDA = torch.cuda.is_available()
++
++register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
++
++
++@unittest.skipUnless(_HAS_CUDA, "Triton kernels require CUDA")
++class TestTritonKernelLayoutParity(unittest.TestCase):
++    """Decode + extend kernel parity across (3-D, 4-D ps=1, 4-D ps>1)."""
++
++    def _setup_decode_inputs(
++        self, bs=2, head_num=2, head_dim=8, num_slots=64, dtype=torch.float16
++    ):
++        torch.manual_seed(0xC0FFEE)
++        # Logical KV: shape [num_slots, head_num, head_dim]
++        logical_kv_k = torch.randn(
++            num_slots, head_num, head_dim, dtype=dtype, device="cuda"
++        )
++        logical_kv_v = torch.randn(
++            num_slots, head_num, head_dim, dtype=dtype, device="cuda"
++        )
++        q = torch.randn(bs, head_num, head_dim, dtype=dtype, device="cuda")
++        # All requests use the first `seq_len` slots.
++        seq_len = 16
++        kv_indices_per_req = torch.arange(seq_len, dtype=torch.int64, device="cuda")
++        kv_indices = kv_indices_per_req.repeat(bs)  # [bs * seq_len]
++        kv_indptr = torch.tensor(
++            [i * seq_len for i in range(bs + 1)], dtype=torch.int32, device="cuda"
++        )
++        return q, logical_kv_k, logical_kv_v, kv_indptr, kv_indices, seq_len
++
++    def _run_decode(self, q, k_buf, v_buf, kv_indptr, kv_indices, page_size):
++        from sglang.srt.layers.attention.triton_ops.decode_attention import (
++            decode_attention_fwd,
++        )
++
++        bs, head_num, head_dim = q.shape
++        max_kv_splits = 4
++        attn_logits = torch.empty(
++            (bs, head_num, max_kv_splits, head_dim),
++            dtype=torch.float32,
++            device="cuda",
++        )
++        attn_lse = torch.empty(
++            (bs, head_num, max_kv_splits),
++            dtype=torch.float32,
++            device="cuda",
++        )
++        o = torch.empty_like(q)
++        num_kv_splits = torch.full(
++            (bs,), max_kv_splits, dtype=torch.int32, device="cuda"
++        )
++        decode_attention_fwd(
++            q,
++            k_buf,
++            v_buf,
++            o,
++            kv_indptr,
++            kv_indices,
++            attn_logits,
++            attn_lse,
++            num_kv_splits,
++            max_kv_splits,
++            sm_scale=1.0 / (head_dim**0.5),
++            k_scale=1.0,
++            v_scale=1.0,
++            logit_cap=0.0,
++            page_size=page_size,
++        )
++        return o
++
++    def test_decode_3d_vs_4d_ps1_byte_identical(self):
++        """(a) vs (b): same physical bytes, different view shape.
++        Triton specializes PAGE_SIZE=1 to the legacy branch; output must
++        be bit-identical (modulo non-deterministic FP add ordering, which
++        we sidestep here since the kernels use deterministic reductions
++        for fixed input + grid)."""
++        q, k, v, kv_indptr, kv_indices, seq_len = self._setup_decode_inputs()
++        # (a) legacy 3-D view
++        o_3d = self._run_decode(q, k, v, kv_indptr, kv_indices, page_size=1)
++        # (b) 4-D view: reshape SAME physical bytes to (num_pages=N, 1, head, dim)
++        num_slots = k.shape[0]
++        k_4d = k.view(num_slots, 1, *k.shape[1:])
++        v_4d = v.view(num_slots, 1, *v.shape[1:])
++        o_4d_ps1 = self._run_decode(q, k_4d, v_4d, kv_indptr, kv_indices, page_size=1)
++        # bit-identical (same byte layout, same PAGE_SIZE specialization)
++        self.assertTrue(torch.equal(o_3d, o_4d_ps1))
++
++    def test_extend_3d_vs_4d_ps1_byte_identical(self):
++        """Same parity check for extend kernel."""
++        from sglang.srt.layers.attention.triton_ops.extend_attention import (
++            extend_attention_fwd,
++        )
++
++        torch.manual_seed(0xDEADBEEF)
++        # head_dim must be >= 16: the extend kernel's QK^T tl.dot requires the
++        # contraction dim K (= head_dim) >= 16 on modern GPU archs (Hopper+).
++        head_num, head_dim = 2, 32
++        num_slots = 32
++        dtype = torch.float16
++        bs = 2
++        prefix_len = 8
++        extend_len = 4
++
++        k_buffer = torch.randn(
++            num_slots, head_num, head_dim, dtype=dtype, device="cuda"
++        )
++        v_buffer = torch.randn(
++            num_slots, head_num, head_dim, dtype=dtype, device="cuda"
++        )
++        q_extend = torch.randn(
++            bs * extend_len, head_num, head_dim, dtype=dtype, device="cuda"
++        )
++        k_extend = torch.randn(
++            bs * extend_len, head_num, head_dim, dtype=dtype, device="cuda"
++        )
++        v_extend = torch.randn(
++            bs * extend_len, head_num, head_dim, dtype=dtype, device="cuda"
++        )
++        o = torch.empty_like(q_extend)
++
++        qo_indptr = torch.tensor(
++            [i * extend_len for i in range(bs + 1)], dtype=torch.int32, device="cuda"
++        )
++        kv_indptr = torch.tensor(
++            [i * prefix_len for i in range(bs + 1)], dtype=torch.int32, device="cuda"
++        )
++        kv_indices = torch.arange(prefix_len, dtype=torch.int64, device="cuda").repeat(
++            bs
++        )
++
++        def run(k_buf, v_buf, page_size):
++            o_out = torch.empty_like(q_extend)
++            extend_attention_fwd(
++                q_extend,
++                k_extend,
++                v_extend,
++                o_out,
++                k_buf,
++                v_buf,
++                qo_indptr,
++                kv_indptr,
++                kv_indices,
++                custom_mask=None,
++                is_causal=True,
++                mask_indptr=None,
++                max_len_extend=extend_len,
++                k_scale=1.0,
++                v_scale=1.0,
++                sm_scale=1.0 / (head_dim**0.5),
++                page_size=page_size,
++            )
++            return o_out
++
++        o_3d = run(k_buffer, v_buffer, page_size=1)
++        k_4d = k_buffer.view(num_slots, 1, *k_buffer.shape[1:])
++        v_4d = v_buffer.view(num_slots, 1, *v_buffer.shape[1:])
++        o_4d_ps1 = run(k_4d, v_4d, page_size=1)
++        self.assertTrue(torch.equal(o_3d, o_4d_ps1))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_unified_radix_cache_bench.py b/test/registered/unit/mem_cache/test_unified_radix_cache_bench.py
+index f2856bb868e2..ab4d53a436c5 100644
+--- a/test/registered/unit/mem_cache/test_unified_radix_cache_bench.py
++++ b/test/registered/unit/mem_cache/test_unified_radix_cache_bench.py
+@@ -191,7 +191,6 @@ def create_bench_cache(
+             head_dim=_HEAD_DIM,
+             swa_attention_layer_ids=_non_full_layer_ids(),
+             full_attention_layer_ids=_full_attention_layer_ids(),
+-            enable_kvcache_transpose=False,
+             device=device,
+         )
+         allocator = SWATokenToKVPoolAllocator(
+@@ -211,7 +210,6 @@ def create_bench_cache(
+             head_num=_HEAD_NUM,
+             head_dim=_HEAD_DIM,
+             full_attention_layer_ids=_full_attention_layer_ids(),
+-            enable_kvcache_transpose=False,
+             device=device,
+             enable_memory_saver=False,
+             mamba_pool=req_to_token_pool.mamba_pool if has_mamba else None,
+diff --git a/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py b/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
+index 67bcf88f504b..80278f852af5 100644
+--- a/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
++++ b/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
+@@ -268,7 +268,6 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
+             head_dim=cfg.head_dim,
+             swa_attention_layer_ids=cfg.non_full_layer_ids,
+             full_attention_layer_ids=cfg.full_attention_layer_ids,
+-            enable_kvcache_transpose=False,
+             device=device,
+         )
+         allocator = SWATokenToKVPoolAllocator(
+@@ -288,7 +287,6 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
+             head_num=cfg.head_num,
+             head_dim=cfg.head_dim,
+             full_attention_layer_ids=cfg.full_attention_layer_ids,
+-            enable_kvcache_transpose=False,
+             device=device,
+             enable_memory_saver=False,
+             mamba_pool=req_to_token_pool.mamba_pool,

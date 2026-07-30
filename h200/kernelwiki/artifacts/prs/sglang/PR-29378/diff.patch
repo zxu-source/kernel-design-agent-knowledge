@@ -1,0 +1,261 @@
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index dcab16b8871a..db88f9c12cc5 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -142,6 +142,9 @@ def _disable_shared_experts_fusion() -> bool:
+         fused_qk_gemma_rmsnorm_rope_gate,
+     )
+ 
++if _is_cpu:
++    fused_sigmoid_mul = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
++
+ if _is_npu:
+     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+         split_qkvgate_gemma_rmsnorm_rope,
+@@ -1023,7 +1026,7 @@ def self_attention(
+         attn_output = self.attn(q, k, v, forward_batch)
+ 
+         if self.attn_output_gate:
+-            if not (_is_npu or _is_cpu):
++            if not _is_npu:
+                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+             else:
+                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+diff --git a/sgl-kernel/csrc/cpu/activation.cpp b/sgl-kernel/csrc/cpu/activation.cpp
+index 15ed28237c65..e1011bc49fea 100644
+--- a/sgl-kernel/csrc/cpu/activation.cpp
++++ b/sgl-kernel/csrc/cpu/activation.cpp
+@@ -52,6 +52,55 @@ void act_and_mul_kernel_impl(
+   });
+ }
+ 
++// input : [num_tokens, dim] contiguous
++// gate : [num_tokens, num_heads, head_dim] 2d or 3d, maybe strided
++template <typename scalar_t>
++void fused_sigmoid_mul_kernel_impl(
++    scalar_t* __restrict__ output,
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ gate,
++    int64_t num_tokens,
++    int64_t dim,
++    int64_t num_heads,
++    int64_t head_dim,
++    int64_t g_strideT,
++    int64_t g_strideH) {
++  using bVec = at::vec::Vectorized<scalar_t>;
++  using fVec = at::vec::Vectorized<float>;
++
++  constexpr int64_t kVecSize = bVec::size();
++  const fVec one = fVec(1.f);
++  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t i = begin; i < end; ++i) {
++      const scalar_t* __restrict__ i_ptr = input + i * dim;
++      const scalar_t* __restrict__ g_ptr = gate + i * g_strideT;
++      scalar_t* __restrict__ o_ptr = output + i * dim;
++
++      for (int64_t h = 0; h < num_heads; ++h) {
++        const scalar_t* __restrict__ attn_ptr = i_ptr + h * head_dim;
++        const scalar_t* __restrict__ gate_ptr = g_ptr + h * g_strideH;
++        scalar_t* __restrict__ out_ptr = o_ptr + h * head_dim;
++
++        int64_t d = 0;
++#pragma GCC unroll 4
++        for (; d <= head_dim - kVecSize; d += kVecSize) {
++          auto [x_fvec0, x_fvec1] = load_float_vec2(attn_ptr + d);
++          auto [g_fvec0, g_fvec1] = load_float_vec2(gate_ptr + d);
++          x_fvec0 = x_fvec0 / (one + g_fvec0.neg().exp_u20());
++          x_fvec1 = x_fvec1 / (one + g_fvec1.neg().exp_u20());
++          convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(out_ptr + d);
++        }
++#pragma GCC unroll 4
++        for (; d < head_dim; ++d) {
++          float x_val = static_cast<float>(attn_ptr[d]);
++          float g_val = static_cast<float>(gate_ptr[d]);
++          out_ptr[d] = static_cast<scalar_t>(x_val / (1.f + std::exp(-g_val)));
++        }
++      }
++    }
++  });
++}
++
+ }  // anonymous namespace
+ 
+ // input   : {num_tokens, 2 * d}
+@@ -130,3 +179,41 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
+ 
+   return out;
+ }
++
++at::Tensor fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate, bool inplace) {
++  CHECK_DIM(2, input);
++  const int64_t gate_dim = gate.dim();
++  TORCH_CHECK(gate_dim == 2 || gate_dim == 3, "gate must be a 2D or 3D tensor");
++  CHECK_CONTIGUOUS(input);
++  CHECK_LAST_DIM_CONTIGUOUS_INPUT(gate);
++
++  const auto st = input.scalar_type();
++  CHECK_EQ(gate.scalar_type(), st);
++
++  int64_t num_tokens = input.size(0);
++  int64_t d = input.size(1);
++
++  const bool is_gate_3d = gate_dim == 3;
++  int64_t num_heads = is_gate_3d ? gate.size(1) : 1;
++  int64_t head_dim = gate.size(-1);
++  CHECK_EQ(gate.size(0), num_tokens);
++  CHECK_EQ(d, num_heads * head_dim);
++
++  int64_t g_strideT = gate.stride(0);
++  int64_t g_strideH = is_gate_3d ? gate.stride(1) : 0;
++
++  at::Tensor out = inplace ? input : at::empty_like(input);
++  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_sigmoid_mul", [&] {
++    fused_sigmoid_mul_kernel_impl<scalar_t>(
++        out.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        gate.data_ptr<scalar_t>(),
++        num_tokens,
++        d,
++        num_heads,
++        head_dim,
++        g_strideT,
++        g_strideH);
++  });
++  return out;
++}
+diff --git a/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp b/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
+index 3a52d99388d7..1a889b225887 100644
+--- a/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
++++ b/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
+@@ -27,6 +27,9 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input);
+ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input);
+ at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
+ 
++// fused_sigmoid_mul
++at::Tensor fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate, bool inplace);
++
+ // l2norm
+ at::Tensor l2norm_cpu(at::Tensor& input, double eps);
+ 
+@@ -439,6 +442,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.impl("gelu_tanh_and_mul_cpu", torch::kCPU, &gelu_tanh_and_mul_cpu);
+   m.def("gelu_and_mul_cpu(Tensor input) -> Tensor");
+   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
++  m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate, bool inplace) -> Tensor(a!)");
++  m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
+ 
+   // norm
+   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
+diff --git a/test/registered/cpu/test_activation.py b/test/registered/cpu/test_activation.py
+index 7ca963359b10..74d4764e0733 100644
+--- a/test/registered/cpu/test_activation.py
++++ b/test/registered/cpu/test_activation.py
+@@ -1,60 +1,74 @@
+-import itertools
+-import unittest
++import sys
+ 
++import pytest
+ import torch
+ from utils import GeluAndMul, SiluAndMul, precision
+ 
+ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+ from sglang.test.ci.ci_register import register_cpu_ci
+-from sglang.test.test_utils import CustomTestCase
+ 
+ register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+ register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
+ 
+ torch.manual_seed(1234)
+ 
++M = [128, 129, 257]
++N = [22016, 22018]
++DTYPES = [torch.float16, torch.bfloat16]
+ 
+-class TestActivation(CustomTestCase):
+-    M = [128, 129, 257]
+-    N = [22016, 22018]
+-    dtype = [torch.float16, torch.bfloat16]
+ 
+-    def _silu_and_mul_test(self, m, n, dtype):
+-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
++def _assert_close(ref_out, out):
++    atol = rtol = precision[ref_out.dtype]
++    torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+ 
+-        x = torch.randn([m, n], dtype=dtype)
+ 
+-        out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
+-        ref_out = SiluAndMul(x)
++@pytest.mark.parametrize("dtype", DTYPES)
++@pytest.mark.parametrize("n", N)
++@pytest.mark.parametrize("m", M)
++def test_activation(m, n, dtype):
++    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+ 
+-        atol = rtol = precision[ref_out.dtype]
+-        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
++    x = torch.randn([m, n], dtype=dtype)
++    _assert_close(SiluAndMul(x), torch.ops.sgl_kernel.silu_and_mul_cpu(x))
+ 
+-    def _gelu_and_mul_test(self, m, n, dtype):
+-        x = torch.randn([m, n], dtype=dtype)
++    x = torch.randn([m, n], dtype=dtype)
++    _assert_close(
++        GeluAndMul(x, approximate="none"), torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
++    )
+ 
+-        out = torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
+-        ref_out = GeluAndMul(x, approximate="none")
++    x = torch.randn([m, n], dtype=dtype)
++    _assert_close(
++        GeluAndMul(x, approximate="tanh"),
++        torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x),
++    )
+ 
+-        atol = rtol = precision[ref_out.dtype]
+-        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+ 
+-    def _gelu_tanh_and_mul_test(self, m, n, dtype):
+-        x = torch.randn([m, n], dtype=dtype)
++@pytest.mark.parametrize("gate_3d", [False, True])
++@pytest.mark.parametrize("dtype", DTYPES)
++@pytest.mark.parametrize("head_dim", [256])
++@pytest.mark.parametrize("num_heads", [16])
++@pytest.mark.parametrize("m", [1, 17, 128])
++def test_fused_sigmoid_mul(m, num_heads, head_dim, dtype, gate_3d):
++    x = torch.randn([m, num_heads * head_dim], dtype=dtype)
++    if gate_3d:
++        gate_storage = torch.randn([m, num_heads, head_dim * 2], dtype=dtype)
++        gate = gate_storage[..., :head_dim]
++        assert not gate.is_contiguous()
++    else:
++        gate = torch.randn_like(x)
+ 
+-        out = torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x)
+-        ref_out = GeluAndMul(x, approximate="tanh")
++    gate_ref = gate.reshape(m, -1) if gate_3d else gate
++    _assert_close(
++        x * torch.sigmoid(gate_ref),
++        torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(x, gate, False),
++    )
+ 
+-        atol = rtol = precision[ref_out.dtype]
+-        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+-
+-    def test_activation(self):
+-        for params in itertools.product(self.M, self.N, self.dtype):
+-            with self.subTest(m=params[0], n=params[1], dtype=params[2]):
+-                self._silu_and_mul_test(*params)
+-                self._gelu_and_mul_test(*params)
+-                self._gelu_tanh_and_mul_test(*params)
++    x_inplace = x.clone()
++    ref_inplace = x_inplace * torch.sigmoid(gate_ref)
++    out_inplace = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(x_inplace, gate, True)
++    assert out_inplace.data_ptr() == x_inplace.data_ptr()
++    _assert_close(ref_inplace, x_inplace)
+ 
+ 
+ if __name__ == "__main__":
+-    unittest.main()
++    sys.exit(pytest.main([__file__]))

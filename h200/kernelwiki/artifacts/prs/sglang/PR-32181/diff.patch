@@ -1,0 +1,129 @@
+diff --git a/python/sglang/kernels/ops/attention/utils.py b/python/sglang/kernels/ops/attention/utils.py
+index 21d9953849c5..ce11e8ed10ac 100644
+--- a/python/sglang/kernels/ops/attention/utils.py
++++ b/python/sglang/kernels/ops/attention/utils.py
+@@ -177,6 +177,18 @@ def mla_quantize_and_rope_for_fp8(
+     return q_out, k_nope_out, k_rope_out
+ 
+ 
++def mla_quantize_without_rope_for_fp8(
++    q_nope: torch.Tensor,
++    q_rope: torch.Tensor,
++    k_nope: torch.Tensor,
++    k_rope: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Quantize MLA components to FP8 without applying rotary embeddings."""
++    attn_dtype = torch.float8_e4m3fn
++    q = concat_mla_absorb_q_general(q_nope, q_rope).to(attn_dtype)
++    return q, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
++
++
+ def concat_mla_absorb_q_general(q_nope, q_rope):
+     if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
+         return concat_mla_absorb_q(q_nope, q_rope)
+diff --git a/python/sglang/srt/layers/attention/trtllm_mla_backend.py b/python/sglang/srt/layers/attention/trtllm_mla_backend.py
+index ebd32a3619d0..79a1766a3bb8 100755
+--- a/python/sglang/srt/layers/attention/trtllm_mla_backend.py
++++ b/python/sglang/srt/layers/attention/trtllm_mla_backend.py
+@@ -22,6 +22,7 @@
+ from sglang.kernels.ops.attention.utils import (
+     concat_mla_absorb_q_general,
+     mla_quantize_and_rope_for_fp8,
++    mla_quantize_without_rope_for_fp8,
+ )
+ from sglang.kernels.ops.kvcache.kv_indices import (
+     create_flashmla_kv_indices_triton,
+@@ -760,22 +761,23 @@ def forward_decode(
+         """Run forward for decode using TRTLLM MLA kernel."""
+         merge_query = q_rope is not None
+         if self.data_type == torch.float8_e4m3fn:
+-            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
+-            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
+-            assert all(
+-                x is not None for x in [q_rope, k_rope, cos_sin_cache]
+-            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+-                q,
+-                q_rope,
+-                k.squeeze(1),
+-                k_rope.squeeze(1),
+-                forward_batch.positions,
+-                cos_sin_cache,
+-                is_neox,
+-                self.kv_lora_rank,
+-                self.qk_rope_head_dim,
+-            )
++            assert q_rope is not None and k_rope is not None
++            if cos_sin_cache is None:
++                q, k, k_rope = mla_quantize_without_rope_for_fp8(
++                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
++                )
++            else:
++                q, k, k_rope = mla_quantize_and_rope_for_fp8(
++                    q,
++                    q_rope,
++                    k.squeeze(1),
++                    k_rope.squeeze(1),
++                    forward_batch.positions,
++                    cos_sin_cache,
++                    is_neox,
++                    self.kv_lora_rank,
++                    self.qk_rope_head_dim,
++                )
+             merge_query = False
+ 
+         # Save KV cache if requested
+@@ -868,22 +870,23 @@ def forward_extend(
+         if (
+             self.data_type == torch.float8_e4m3fn
+         ) and forward_batch.forward_mode.is_target_verify():
+-            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
+-            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
+-            assert all(
+-                x is not None for x in [q_rope, k_rope, cos_sin_cache]
+-            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+-                q,
+-                q_rope,
+-                k.squeeze(1),
+-                k_rope.squeeze(1),
+-                forward_batch.positions,
+-                cos_sin_cache,
+-                is_neox,
+-                self.kv_lora_rank,
+-                self.qk_rope_head_dim,
+-            )
++            assert q_rope is not None and k_rope is not None
++            if cos_sin_cache is None:
++                q, k, k_rope = mla_quantize_without_rope_for_fp8(
++                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
++                )
++            else:
++                q, k, k_rope = mla_quantize_and_rope_for_fp8(
++                    q,
++                    q_rope,
++                    k.squeeze(1),
++                    k_rope.squeeze(1),
++                    forward_batch.positions,
++                    cos_sin_cache,
++                    is_neox,
++                    self.kv_lora_rank,
++                    self.qk_rope_head_dim,
++                )
+             merge_query = False
+ 
+         # Save KV cache if requested
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+index bc26c7522e79..6440031739bb 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+@@ -995,7 +995,8 @@ def _fuse_rope_for_trtllm_mla(
+             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
+ 
+         return (
+-            self.current_attention_backend
++            self.rotary_emb is not None
++            and self.current_attention_backend
+             in ("trtllm_mla", "tokenspeed_mla", "cutedsl_mla")
+             and (
+                 forward_batch.forward_mode.is_decode_or_idle()

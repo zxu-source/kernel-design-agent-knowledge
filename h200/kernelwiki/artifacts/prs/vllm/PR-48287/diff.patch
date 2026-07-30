@@ -1,0 +1,239 @@
+diff --git a/vllm/model_executor/layers/fused_moe/activation.py b/vllm/model_executor/layers/fused_moe/activation.py
+index 2d8d46cacb7f..d114992504ba 100644
+--- a/vllm/model_executor/layers/fused_moe/activation.py
++++ b/vllm/model_executor/layers/fused_moe/activation.py
+@@ -107,6 +107,22 @@ def activation_without_mul(activation: str) -> str:
+     return MoEActivation.from_str(activation).without_mul().value
+ 
+ 
++def silu_and_mul_with_clamp(
++    output: torch.Tensor,
++    input: torch.Tensor,
++    clamp_limit: float,
++    topk_ids: torch.Tensor | None = None,
++    expert_map: torch.Tensor | None = None,
++) -> None:
++    if topk_ids is not None and expert_map is not None:
++        from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
++
++        swiglu_limit_func(output, input, clamp_limit, topk_ids, expert_map)
++    else:
++        # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
++        torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, 1.0, 0.0)
++
++
+ def apply_moe_activation(
+     activation: MoEActivation,
+     output: torch.Tensor,
+@@ -115,6 +131,8 @@ def apply_moe_activation(
+     clamp_limit: float | None = None,
+     alpha: float = 1.0,
+     beta: float = 0.0,
++    topk_ids: torch.Tensor | None = None,
++    expert_map: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Apply MoE activation function.
+ 
+@@ -138,8 +156,7 @@ def apply_moe_activation(
+     # Activations with gated multiplication (gate × activation(up))
+     if activation == MoEActivation.SILU:
+         if clamp_limit is not None:
+-            # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
+-            torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, 1.0, 0.0)
++            silu_and_mul_with_clamp(output, input, clamp_limit, topk_ids, expert_map)
+         else:
+             torch.ops._C.silu_and_mul(output, input)
+     elif activation == MoEActivation.GELU:
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 17c166961397..80533410d3a6 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -73,6 +73,7 @@ def _fused_marlin_moe(
+     num_tokens_post_padded: torch.Tensor,
+     activation: MoEActivation = MoEActivation.SILU,
+     activation_func: Callable[..., None] = apply_moe_activation,
++    topk_ids: torch.Tensor | None = None,
+     input_global_scale1: torch.Tensor | None = None,
+     input_global_scale2: torch.Tensor | None = None,
+     global_scale1: torch.Tensor | None = None,
+@@ -168,6 +169,8 @@ def _fused_marlin_moe(
+         clamp_limit=clamp_limit,
+         alpha=gemm1_alpha,
+         beta=gemm1_beta,
++        topk_ids=topk_ids,
++        expert_map=expert_map,
+     )
+ 
+     if output is None:
+@@ -346,6 +349,7 @@ def fused_marlin_moe(
+         w1_scale=w1_scale,
+         w2_scale=w2_scale,
+         topk_weights=topk_weights,
++        topk_ids=topk_ids,
+         num_topk=topk,
+         quant_type=quant_type,
+         apply_router_weight_on_input=apply_router_weight_on_input,
+@@ -827,6 +831,8 @@ def activation_with_lora(
+             clamp_limit: float | None = None,
+             alpha: float = 1.0,
+             beta: float = 0.0,
++            topk_ids: torch.Tensor | None = None,
++            expert_map: torch.Tensor | None = None,
+         ) -> None:
+             # act_input  = intermediate_cache1 (M*topk, 2N for gated)
+             # act_output = intermediate_cache2 (M*topk, N)
+@@ -863,6 +869,8 @@ def activation_with_lora(
+                 clamp_limit=clamp_limit,
+                 alpha=alpha,
+                 beta=beta,
++                topk_ids=topk_ids,
++                expert_map=expert_map,
+             )
+             lora_state["cache2"] = act_output
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index cca978d884a5..5c188e5660ca 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -889,9 +889,18 @@ def activation(
+         clamp_limit: float | None = None,
+         alpha: float = 1.0,
+         beta: float = 0.0,
++        topk_ids: torch.Tensor | None = None,
++        expert_map: torch.Tensor | None = None,
+     ) -> None:
+         apply_moe_activation(
+-            activation, output, input, clamp_limit=clamp_limit, alpha=alpha, beta=beta
++            activation,
++            output,
++            input,
++            clamp_limit=clamp_limit,
++            alpha=alpha,
++            beta=beta,
++            topk_ids=topk_ids,
++            expert_map=expert_map,
+         )
+ 
+     @abstractmethod
+diff --git a/vllm/model_executor/layers/fused_moe/utils.py b/vllm/model_executor/layers/fused_moe/utils.py
+index ed512e1ff8f8..6aa4eb0cd2aa 100644
+--- a/vllm/model_executor/layers/fused_moe/utils.py
++++ b/vllm/model_executor/layers/fused_moe/utils.py
+@@ -454,7 +454,7 @@ def trtllm_moe_pack_topk_ids_weights(
+ 
+ 
+ @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+-def swiglu_limit_func(
++def _swiglu_limit_torch(
+     output: torch.Tensor,
+     input: torch.Tensor,  # first half is gate, second half is up
+     swiglu_limit: float = 0.0,
+@@ -470,6 +470,108 @@ def swiglu_limit_func(
+     output.copy_(F.silu(gate) * up)
+ 
+ 
++@triton.jit
++def _swiglu_limit_pad_aware_kernel(
++    input_ptr,  # [num_tokens, 2 * hidden_size]
++    output_ptr,  # [num_tokens, hidden_size]
++    topk_ids_ptr,  # [num_tokens, num_topk]
++    expert_map_ptr,  # global -> local expert id, or -1 if non-local
++    hidden_size,
++    input_row_stride,
++    num_tokens,
++    swiglu_limit,
++    HAS_LIMIT: tl.constexpr,
++    HAS_EXPERT_MAP: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    # Persistent over rows: each CTA owns one column tile and processes a
++    # strided set of token assignments.
++    pid = tl.program_id(0)
++    row_stride = tl.num_programs(0)
++    column_tile = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = column_tile < hidden_size
++
++    for row in tl.range(pid, num_tokens, row_stride):
++        expert_id = tl.load(topk_ids_ptr + row)
++        should_compute = expert_id != -1
++        if HAS_EXPERT_MAP:
++            local_expert_id = tl.load(
++                expert_map_ptr + expert_id,
++                mask=expert_id >= 0,
++                other=-1,
++            )
++            should_compute = should_compute & (local_expert_id != -1)
++
++        if should_compute:
++            gate_offsets = row.to(tl.int64) * input_row_stride + column_tile
++            up_offsets = gate_offsets + hidden_size
++
++            gate = tl.load(input_ptr + gate_offsets, mask=mask, other=0.0).to(
++                tl.float32
++            )
++
++            up = tl.load(input_ptr + up_offsets, mask=mask, other=0.0).to(tl.float32)
++
++            if HAS_LIMIT:
++                gate = tl.minimum(gate, swiglu_limit)
++                up = tl.maximum(up, -swiglu_limit)
++                up = tl.minimum(up, swiglu_limit)
++
++            silu_gate = gate / (1.0 + tl.exp(-gate))
++            result = silu_gate * up
++            tl.store(
++                output_ptr + row.to(tl.int64) * hidden_size + column_tile,
++                result.to(output_ptr.dtype.element_ty),
++                mask=mask,
++            )
++
++
++def _swiglu_limit_pad_aware(
++    output: torch.Tensor,
++    input: torch.Tensor,
++    topk_ids: torch.Tensor,
++    swiglu_limit: float,
++    expert_map: torch.Tensor | None = None,
++) -> None:
++    num_tokens, gate_up_size = input.shape
++    hidden_size = gate_up_size // 2
++    if num_tokens == 0:
++        return
++
++    BLOCK_SIZE = 1024
++    grid = (min(num_tokens, 256), triton.cdiv(hidden_size, BLOCK_SIZE))
++    _swiglu_limit_pad_aware_kernel[grid](
++        input,
++        output,
++        topk_ids,
++        expert_map,
++        hidden_size,
++        gate_up_size,
++        num_tokens,
++        swiglu_limit,
++        HAS_LIMIT=swiglu_limit > 0,
++        HAS_EXPERT_MAP=expert_map is not None,
++        BLOCK_SIZE=BLOCK_SIZE,
++        num_warps=4,
++    )
++
++
++def swiglu_limit_func(
++    output: torch.Tensor,
++    input: torch.Tensor,  # first half is gate, second half is up
++    swiglu_limit: float = 0.0,
++    topk_ids: torch.Tensor | None = None,
++    expert_map: torch.Tensor | None = None,
++) -> None:
++    # The pad-aware Triton kernel skips unrouted token slots (topk_ids == -1)
++    # and, when expert_map is given, slots routed to non-local experts, so it
++    # requires topk_ids. Fall back to the torch implementation otherwise.
++    if topk_ids is not None:
++        _swiglu_limit_pad_aware(output, input, topk_ids, swiglu_limit, expert_map)
++    else:
++        _swiglu_limit_torch(output, input, swiglu_limit)
++
++
+ @functools.lru_cache
+ def enable_swap_ab(BLOCK_SIZE_M: int, BLOCK_SIZE_N: int) -> bool:
+     return (

@@ -1,0 +1,1305 @@
+diff --git a/benchmarks/attention_benchmarks/README.md b/benchmarks/attention_benchmarks/README.md
+index afce34433167..944ceb91af91 100644
+--- a/benchmarks/attention_benchmarks/README.md
++++ b/benchmarks/attention_benchmarks/README.md
+@@ -108,7 +108,6 @@ python benchmark.py \
+     --backends flash triton flashinfer \
+     --batch-specs "q2k" "8q1s1k" "2q2k_32q1s1k" \
+     --num-layers 10 \
+-    --repeats 5 \
+     --output-csv results.csv
+ ```
+ 
+@@ -164,14 +163,17 @@ python benchmark.py \
+ # Model configuration
+ --num-layers N                      # Number of layers
+ --head-dim N                        # Head dimension
++--v-head-dim N                      # Value head dimension (defaults to --head-dim)
+ --num-q-heads N                     # Query heads
+ --num-kv-heads N                    # KV heads
+ --block-size N                      # Block size
++--kv-lora-rank N                    # MLA KV LoRA rank
++--qk-nope-head-dim N                # MLA non-RoPE QK head dim
++--qk-rope-head-dim N                # MLA RoPE QK head dim
+ 
+ # Benchmark settings
+ --device DEVICE                     # Device (default: cuda:0)
+---repeats N                         # Repetitions
+---warmup-iters N                    # Warmup iterations
++--warmup-ms N                       # Warmup window in ms for triton do_bench
+ --profile-memory                    # Profile memory usage
+ 
+ # Parameter sweeps
+@@ -211,8 +213,6 @@ config = BenchmarkConfig(
+     num_kv_heads=1,
+     block_size=128,
+     device="cuda:0",
+-    repeats=5,
+-    warmup_iters=3,
+ )
+ 
+ # CUTLASS MLA with specific num_kv_splits
+@@ -253,14 +253,10 @@ formatter.save_json(results, "output.json")
+ 
+ ## Tips
+ 
+-**1. Warmup matters** - Use `--warmup-iters 10` for stable results
++**1. Save results** - Always use `--output-csv` or `--output-json`
+ 
+-**2. Multiple repeats** - Use `--repeats 20` for low variance
++**2. Test incrementally** - Start with `--num-layers 1`
+ 
+-**3. Save results** - Always use `--output-csv` or `--output-json`
++**3. Extended grammar** - Leverage spec decode, chunked prefill patterns
+ 
+-**4. Test incrementally** - Start with `--num-layers 1 --repeats 1`
+-
+-**5. Extended grammar** - Leverage spec decode, chunked prefill patterns
+-
+-**6. Parameter sweeps** - Use `--sweep-param` and `--sweep-values` to find optimal values
++**4. Parameter sweeps** - Use `--sweep-param` and `--sweep-values` to find optimal values
+diff --git a/benchmarks/attention_benchmarks/benchmark.py b/benchmarks/attention_benchmarks/benchmark.py
+index c4c331f7f8ef..de7cf04d81e2 100644
+--- a/benchmarks/attention_benchmarks/benchmark.py
++++ b/benchmarks/attention_benchmarks/benchmark.py
+@@ -26,6 +26,9 @@
+ """
+ 
+ import argparse
++import os
++import shutil
++import subprocess
+ import sys
+ from dataclasses import replace
+ from pathlib import Path
+@@ -83,13 +86,15 @@ def run_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
+         else:
+             return run_standard_attention_benchmark(config)
+     except Exception as e:
++        error_msg = str(e) or repr(e)
+         return BenchmarkResult(
+             config=config,
+             mean_time=float("inf"),
++            median_time=float("inf"),
+             std_time=0,
+             min_time=float("inf"),
+             max_time=float("inf"),
+-            error=str(e),
++            error=error_msg,
+         )
+ 
+ 
+@@ -115,9 +120,12 @@ def run_model_parameter_sweep(
+     """
+     all_results = []
+ 
+-    console.print(
+-        f"[yellow]Model sweep mode: testing {sweep.param_name} = {sweep.values}[/]"
++    sweep_desc = (
++        f"{sweep.param_name} = {sweep.values}"
++        if sweep.param_name
++        else f"{len(sweep.values)} configurations"
+     )
++    console.print(f"[yellow]Model sweep mode: testing {sweep_desc}[/]")
+ 
+     total = len(backends) * len(batch_specs) * len(sweep.values)
+ 
+@@ -125,9 +133,9 @@ def run_model_parameter_sweep(
+         for backend in backends:
+             for spec in batch_specs:
+                 for value in sweep.values:
+-                    # Create config with modified model parameter
++                    # Create config with modified model parameter(s)
+                     config_args = base_config_args.copy()
+-                    config_args[sweep.param_name] = value
++                    sweep.apply(config_args, value)
+ 
+                     # Create config with original backend for running
+                     clean_config = BenchmarkConfig(
+@@ -144,13 +152,21 @@ def run_model_parameter_sweep(
+                     all_results.append(result)
+ 
+                     if not result.success:
++                        err_label = (
++                            f"{sweep.param_name}={value}"
++                            if sweep.param_name
++                            else f"{value}"
++                        )
+                         console.print(
+-                            f"[red]Error {backend} {spec} {sweep.param_name}="
+-                            f"{value}: {result.error}[/]"
++                            f"[red]Error {backend} {spec} {err_label}"
++                            f": {result.error}[/]"
+                         )
+ 
+                     pbar.update(1)
+ 
++    if base_config_args.get("ncu_profile"):
++        return all_results
++
+     # Display sweep results - create separate table for each parameter value
+     console.print("\n[bold green]Model Parameter Sweep Results:[/]")
+     formatter = ResultsFormatter(console)
+@@ -184,7 +200,10 @@ def run_model_parameter_sweep(
+     )
+ 
+     for param_value in sorted_param_values:
+-        console.print(f"\n[bold cyan]{sweep.param_name} = {param_value}[/]")
++        label = (
++            f"{sweep.param_name} = {param_value}" if sweep.param_name else param_value
++        )
++        console.print(f"\n[bold cyan]{label}[/]")
+         param_results = by_param_value[param_value]
+ 
+         # Create modified results with original backend names
+@@ -200,8 +219,9 @@ def run_model_parameter_sweep(
+         formatter.print_table(modified_results, backends, compare_to_fastest=True)
+ 
+     # Show optimal backend for each (param_value, batch_spec) combination
++    sweep_name = sweep.param_name or "config"
+     console.print(
+-        f"\n[bold cyan]Optimal backend for each ({sweep.param_name}, batch_spec):[/]"
++        f"\n[bold cyan]Optimal backend for each ({sweep_name}, batch_spec):[/]"
+     )
+ 
+     # Group by (param_value, batch_spec)
+@@ -236,7 +256,10 @@ def run_model_parameter_sweep(
+     for param_value, spec in sorted_keys:
+         # Print header when param value changes
+         if param_value != current_param_value:
+-            console.print(f"\n  [bold]{sweep.param_name}={param_value}:[/]")
++            header = (
++                f"{sweep.param_name}={param_value}" if sweep.param_name else param_value
++            )
++            console.print(f"\n  [bold]{header}:[/]")
+             current_param_value = param_value
+ 
+         results = by_param_and_spec[(param_value, spec)]
+@@ -322,6 +345,9 @@ def run_parameter_sweep(
+ 
+                     pbar.update(1)
+ 
++    if base_config_args.get("ncu_profile"):
++        return all_results
++
+     # Display sweep results
+     console.print("\n[bold green]Sweep Results:[/]")
+     backend_labels = [sweep.get_label(b, v) for b in backends for v in sweep_values]
+@@ -474,11 +500,35 @@ def main():
+     parser.add_argument("--num-q-heads", type=int, default=32, help="Query heads")
+     parser.add_argument("--num-kv-heads", type=int, default=8, help="KV heads")
+     parser.add_argument("--block-size", type=int, default=16, help="Block size")
++    parser.add_argument(
++        "--v-head-dim",
++        type=int,
++        default=None,
++        help="Value head dimension (defaults to --head-dim if unset)",
++    )
++
++    # MLA-specific model dimensions
++    parser.add_argument(
++        "--kv-lora-rank", type=int, default=None, help="MLA KV LoRA rank"
++    )
++    parser.add_argument(
++        "--qk-nope-head-dim", type=int, default=None, help="MLA non-RoPE QK head dim"
++    )
++    parser.add_argument(
++        "--qk-rope-head-dim", type=int, default=None, help="MLA RoPE QK head dim"
++    )
+ 
+     # Benchmark settings
+     parser.add_argument("--device", default="cuda:0", help="Device")
+-    parser.add_argument("--repeats", type=int, default=1, help="Repetitions")
+-    parser.add_argument("--warmup-iters", type=int, default=3, help="Warmup iterations")
++    parser.add_argument(
++        "--warmup-ms",
++        type=int,
++        default=None,
++        help=(
++            "Warmup window in ms for triton's do_bench (default: triton's own). "
++            "Has no effect with CUDA graphs; pass --no-cuda-graphs to use it."
++        ),
++    )
+     parser.add_argument("--profile-memory", action="store_true", help="Profile memory")
+     parser.add_argument(
+         "--kv-cache-dtype",
+@@ -491,10 +541,33 @@ def main():
+         action=argparse.BooleanOptionalAction,
+         default=True,
+         help=(
+-            "Launch kernels with CUDA graphs to eliminate CPU overhead"
+-            "in measurements (default: True)"
++            "Use triton do_bench_cudagraph (True) or do_bench (False) "
++            "for timing. CUDA graphs eliminate CPU launch overhead "
++            "(default: True)"
++        ),
++    )
++    parser.add_argument(
++        "--num-splits",
++        type=int,
++        default=None,
++        help="FlashAttention split-K factor (0=auto heuristic, 1=disabled, >1=force N)",
++    )
++    parser.add_argument(
++        "--ncu-profile",
++        action="store_true",
++        default=False,
++        help=(
++            "Enable Nsight Compute profiling mode. Automatically wraps the "
++            "script with ncu, capturing a profile with source correlation. "
++            "Use --ncu-output to set the output file name."
+         ),
+     )
++    parser.add_argument(
++        "--ncu-output",
++        type=str,
++        default="profile",
++        help="Output file name for ncu profile (default: 'profile').",
++    )
+ 
+     # Parameter sweep (use YAML config for advanced sweeps)
+     parser.add_argument(
+@@ -576,23 +649,28 @@ def main():
+             model = yaml_config["model"]
+             args.num_layers = model.get("num_layers", args.num_layers)
+             args.head_dim = model.get("head_dim", args.head_dim)
++            args.v_head_dim = model.get("v_head_dim", args.v_head_dim)
+             args.num_q_heads = model.get("num_q_heads", args.num_q_heads)
+             args.num_kv_heads = model.get("num_kv_heads", args.num_kv_heads)
+             args.block_size = model.get("block_size", args.block_size)
++            # MLA-specific dimensions
++            args.kv_lora_rank = model.get("kv_lora_rank", args.kv_lora_rank)
++            args.qk_nope_head_dim = model.get("qk_nope_head_dim", args.qk_nope_head_dim)
++            args.qk_rope_head_dim = model.get("qk_rope_head_dim", args.qk_rope_head_dim)
+ 
+         # Benchmark settings (top-level keys)
+         if "device" in yaml_config:
+             args.device = yaml_config["device"]
+-        if "repeats" in yaml_config:
+-            args.repeats = yaml_config["repeats"]
+-        if "warmup_iters" in yaml_config:
+-            args.warmup_iters = yaml_config["warmup_iters"]
++        if "warmup_ms" in yaml_config:
++            args.warmup_ms = yaml_config["warmup_ms"]
+         if "profile_memory" in yaml_config:
+             args.profile_memory = yaml_config["profile_memory"]
+         if "kv_cache_dtype" in yaml_config:
+             args.kv_cache_dtype = yaml_config["kv_cache_dtype"]
+         if "cuda_graphs" in yaml_config:
+             args.cuda_graphs = yaml_config["cuda_graphs"]
++        if "ncu_profile" in yaml_config:
++            args.ncu_profile = yaml_config["ncu_profile"]
+ 
+         # Parameter sweep configuration
+         if "parameter_sweep" in yaml_config:
+@@ -612,7 +690,7 @@ def main():
+         if "model_parameter_sweep" in yaml_config:
+             sweep_config = yaml_config["model_parameter_sweep"]
+             args.model_parameter_sweep = ModelParameterSweep(
+-                param_name=sweep_config["param_name"],
++                param_name=sweep_config.get("param_name"),
+                 values=sweep_config["values"],
+                 label_format=sweep_config.get(
+                     "label_format", "{backend}_{param_name}_{value}"
+@@ -631,6 +709,32 @@ def main():
+ 
+         console.print()
+ 
++    # Re-exec under ncu if --ncu-profile and not already inside ncu. This runs
++    # after YAML processing so ncu_profile set via config file is honored.
++    if args.ncu_profile and "_NCU_INNER" not in os.environ:
++        ncu = shutil.which("ncu")
++        if ncu is None:
++            print("Error: 'ncu' not found in PATH", file=sys.stderr)
++            sys.exit(1)
++        cmd = [
++            ncu,
++            "--profile-from-start",
++            "off",
++            "--set",
++            "full",
++            "--import-source",
++            "yes",
++            "-o",
++            args.ncu_output,
++            sys.executable,
++            *sys.argv,
++        ]
++        env = os.environ.copy()
++        env["CUTE_DSL_LINEINFO"] = "1"
++        env["_NCU_INNER"] = "1"
++        print(f"Launching: {' '.join(cmd)}")
++        sys.exit(subprocess.call(cmd, env=env))
++
+     # Handle CLI-based parameter sweep (if not from YAML)
+     if (
+         (not hasattr(args, "parameter_sweep") or args.parameter_sweep is None)
+@@ -655,6 +759,18 @@ def main():
+     console.print(f"Batch specs: {', '.join(args.batch_specs)}")
+     console.print(f"KV cache dtype: {args.kv_cache_dtype}")
+     console.print(f"CUDA graphs: {args.cuda_graphs}")
++    if args.warmup_ms is not None and args.cuda_graphs:
++        console.print(
++            "[yellow]Warning: --warmup-ms is ignored with CUDA graphs "
++            "(do_bench_cudagraph warms up internally). Pass --no-cuda-graphs "
++            "to use it.[/]"
++        )
++    if args.num_splits == 0 and args.cuda_graphs:
++        console.print(
++            "[yellow]Warning: --num-splits 0 (FA3 heuristic) is not CUDA-graph "
++            "compatible and may fail or fall back. Pass --no-cuda-graphs or use "
++            "--num-splits >=1.[/]"
++        )
+     console.print()
+ 
+     init_workspace_manager(args.device)
+@@ -662,6 +778,15 @@ def main():
+     # Run benchmarks
+     all_results = []
+ 
++    # Under ncu profiling the kernels run only to be captured by the profiler;
++    # timings are placeholder zeros, so the result tables and saved metrics are
++    # skipped. The Nsight Compute report (--ncu-output) holds the real data.
++    if args.ncu_profile:
++        console.print(
++            "[dim]ncu profiling enabled: result tables and saved metrics are "
++            "skipped (timings are placeholder zeros).[/]"
++        )
++
+     # Handle special mode: decode_vs_prefill comparison
+     if hasattr(args, "mode") and args.mode == "decode_vs_prefill":
+         console.print("[yellow]Mode: Decode vs Prefill pipeline comparison[/]")
+@@ -708,11 +833,11 @@ def main():
+                         num_kv_heads=args.num_kv_heads,
+                         block_size=args.block_size,
+                         device=args.device,
+-                        repeats=args.repeats,
+-                        warmup_iters=args.warmup_iters,
+                         profile_memory=args.profile_memory,
+                         kv_cache_dtype=args.kv_cache_dtype,
+                         use_cuda_graphs=args.cuda_graphs,
++                        ncu_profile=args.ncu_profile,
++                        warmup_ms=args.warmup_ms,
+                     )
+ 
+                     # Add decode pipeline config
+@@ -749,6 +874,7 @@ def main():
+                         result = BenchmarkResult(
+                             config=config,
+                             mean_time=timing["mean"],
++                            median_time=timing.get("median", timing["mean"]),
+                             std_time=timing["std"],
+                             min_time=timing["min"],
+                             max_time=timing["max"],
+@@ -770,6 +896,7 @@ def main():
+                         result = BenchmarkResult(
+                             config=config,
+                             mean_time=float("inf"),
++                            median_time=float("inf"),
+                             std_time=0,
+                             min_time=float("inf"),
+                             max_time=float("inf"),
+@@ -779,6 +906,9 @@ def main():
+ 
+                 pbar.update(1)
+ 
++        if args.ncu_profile:
++            return
++
+         # Display decode vs prefill results
+         console.print("\n[bold green]Decode vs Prefill Results:[/]")
+ 
+@@ -858,15 +988,20 @@ def main():
+         base_config_args = {
+             "num_layers": args.num_layers,
+             "head_dim": args.head_dim,
++            "v_head_dim": args.v_head_dim,
+             "num_q_heads": args.num_q_heads,
+             "num_kv_heads": args.num_kv_heads,
+             "block_size": args.block_size,
+             "device": args.device,
+-            "repeats": args.repeats,
+-            "warmup_iters": args.warmup_iters,
+             "profile_memory": args.profile_memory,
+             "kv_cache_dtype": args.kv_cache_dtype,
+             "use_cuda_graphs": args.cuda_graphs,
++            "ncu_profile": args.ncu_profile,
++            "warmup_ms": args.warmup_ms,
++            "num_splits": args.num_splits,
++            "kv_lora_rank": args.kv_lora_rank,
++            "qk_nope_head_dim": args.qk_nope_head_dim,
++            "qk_rope_head_dim": args.qk_rope_head_dim,
+         }
+         all_results = run_model_parameter_sweep(
+             backends,
+@@ -882,15 +1017,17 @@ def main():
+         base_config_args = {
+             "num_layers": args.num_layers,
+             "head_dim": args.head_dim,
++            "v_head_dim": args.v_head_dim,
+             "num_q_heads": args.num_q_heads,
+             "num_kv_heads": args.num_kv_heads,
+             "block_size": args.block_size,
+             "device": args.device,
+-            "repeats": args.repeats,
+-            "warmup_iters": args.warmup_iters,
+             "profile_memory": args.profile_memory,
+             "kv_cache_dtype": args.kv_cache_dtype,
+             "use_cuda_graphs": args.cuda_graphs,
++            "ncu_profile": args.ncu_profile,
++            "warmup_ms": args.warmup_ms,
++            "num_splits": args.num_splits,
+         }
+         all_results = run_parameter_sweep(
+             backends, args.batch_specs, base_config_args, args.parameter_sweep, console
+@@ -914,15 +1051,17 @@ def main():
+                             batch_spec=spec,
+                             num_layers=args.num_layers,
+                             head_dim=args.head_dim,
++                            v_head_dim=getattr(args, "v_head_dim", None),
+                             num_q_heads=args.num_q_heads,
+                             num_kv_heads=args.num_kv_heads,
+                             block_size=args.block_size,
+                             device=args.device,
+-                            repeats=args.repeats,
+-                            warmup_iters=args.warmup_iters,
+                             profile_memory=args.profile_memory,
+                             kv_cache_dtype=args.kv_cache_dtype,
+                             use_cuda_graphs=args.cuda_graphs,
++                            ncu_profile=args.ncu_profile,
++                            warmup_ms=args.warmup_ms,
++                            num_splits=args.num_splits,
+                         )
+ 
+                         result = run_benchmark(config)
+@@ -935,9 +1074,10 @@ def main():
+ 
+                         pbar.update(1)
+ 
+-            console.print("\n[bold green]Results:[/]")
+-            formatter = ResultsFormatter(console)
+-            formatter.print_table(decode_results, backends)
++            if not args.ncu_profile:
++                console.print("\n[bold green]Results:[/]")
++                formatter = ResultsFormatter(console)
++                formatter.print_table(decode_results, backends)
+ 
+         # Run prefill backend comparison
+         if prefill_backends:
+@@ -962,9 +1102,8 @@ def main():
+                             num_kv_heads=args.num_kv_heads,
+                             block_size=args.block_size,
+                             device=args.device,
+-                            repeats=args.repeats,
+-                            warmup_iters=args.warmup_iters,
+                             profile_memory=args.profile_memory,
++                            warmup_ms=args.warmup_ms,
+                             prefill_backend=pb,
+                         )
+ 
+@@ -980,16 +1119,17 @@ def main():
+ 
+                         pbar.update(1)
+ 
+-            console.print("\n[bold green]Prefill Backend Results:[/]")
+-            formatter = ResultsFormatter(console)
+-            formatter.print_table(
+-                prefill_results, prefill_backends, compare_to_fastest=True
+-            )
++            if not args.ncu_profile:
++                console.print("\n[bold green]Prefill Backend Results:[/]")
++                formatter = ResultsFormatter(console)
++                formatter.print_table(
++                    prefill_results, prefill_backends, compare_to_fastest=True
++                )
+ 
+         all_results = decode_results + prefill_results
+ 
+-    # Save results
+-    if all_results:
++    # Save results (skip ncu profiling runs: timings are placeholder zeros)
++    if all_results and not args.ncu_profile:
+         formatter = ResultsFormatter(console)
+         if args.output_csv:
+             formatter.save_csv(all_results, args.output_csv)
+diff --git a/benchmarks/attention_benchmarks/common.py b/benchmarks/attention_benchmarks/common.py
+index 74d9e239725d..106d7854804f 100644
+--- a/benchmarks/attention_benchmarks/common.py
++++ b/benchmarks/attention_benchmarks/common.py
+@@ -15,6 +15,8 @@
+ from rich.console import Console
+ from rich.table import Table
+ 
++from vllm.triton_utils import triton
++
+ 
+ def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
+     """
+@@ -34,6 +36,30 @@ def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
+         return (0, 0, 0)
+ 
+ 
++def run_do_bench(
++    benchmark_fn,
++    use_cuda_graphs: bool,
++    warmup_ms: int | None = None,
++) -> list[float]:
++    kwargs: dict[str, Any] = {"return_mode": "all"}
++    if use_cuda_graphs:
++        result = triton.testing.do_bench_cudagraph(benchmark_fn, **kwargs)
++    else:
++        if warmup_ms is not None:
++            kwargs["warmup"] = warmup_ms
++        result = triton.testing.do_bench(benchmark_fn, **kwargs)
++    return result
++
++
++def run_ncu_profile(benchmark_fn) -> None:
++    benchmark_fn()
++    torch.accelerator.synchronize()
++    torch.cuda.cudart().cudaProfilerStart()
++    benchmark_fn()
++    torch.accelerator.synchronize()
++    torch.cuda.cudart().cudaProfilerStop()
++
++
+ # Mock classes for vLLM attention infrastructure
+ 
+ 
+@@ -182,18 +208,37 @@ def get_label(self, backend: str, value: Any) -> str:
+ 
+ @dataclass
+ class ModelParameterSweep:
+-    """Configuration for sweeping a model configuration parameter."""
++    """Configuration for sweeping model configuration parameter(s).
+ 
+-    param_name: str  # Name of the model config parameter to sweep (e.g., "num_q_heads")
+-    values: list[Any]  # List of values to test
+-    label_format: str = "{backend}_{param_name}_{value}"  # Result label template
++    Supports two modes:
++    - Single param: param_name="head_dim", values=[128, 256, 512]
++    - Multi param: values=[{head_dim: 192, v_head_dim: 128}, {head_dim: 256}]
++      When values are dicts, each dict's keys are applied as config overrides.
++    """
++
++    param_name: str | None = None
++    values: list[Any] | None = None
++    label_format: str = "{backend}_{param_name}_{value}"
+ 
+     def get_label(self, backend: str, value: Any) -> str:
+         """Generate a label for a specific parameter value."""
++        if isinstance(value, dict):
++            return self.label_format.format(
++                backend=backend, param_name=self.param_name, value=value, **value
++            )
+         return self.label_format.format(
+             backend=backend, param_name=self.param_name, value=value
+         )
+ 
++    def apply(self, config_args: dict, value: Any) -> None:
++        """Apply a sweep value to config args."""
++        if isinstance(value, dict):
++            config_args.update(value)
++        elif self.param_name is not None:
++            config_args[self.param_name] = value
++        else:
++            raise ValueError("param_name must be set if sweep values are not dicts")
++
+ 
+ @dataclass
+ class BenchmarkConfig:
+@@ -208,10 +253,10 @@ class BenchmarkConfig:
+     block_size: int
+     device: str
+     dtype: torch.dtype = torch.float16
+-    repeats: int = 1
+-    warmup_iters: int = 3
+     profile_memory: bool = False
+     use_cuda_graphs: bool = False
++    ncu_profile: bool = False
++    warmup_ms: int | None = None
+ 
+     # "auto" or "fp8"
+     kv_cache_dtype: str = "auto"
+@@ -226,6 +271,7 @@ class BenchmarkConfig:
+     # Backend-specific tuning
+     num_kv_splits: int | None = None  # CUTLASS MLA
+     reorder_batch_threshold: int | None = None  # FlashAttn MLA, FlashMLA
++    num_splits: int | None = None  # FlashAttention split-K (0=auto, 1=disabled)
+ 
+ 
+ @dataclass
+@@ -234,6 +280,7 @@ class BenchmarkResult:
+ 
+     config: BenchmarkConfig
+     mean_time: float  # seconds
++    median_time: float  # seconds
+     std_time: float  # seconds
+     min_time: float  # seconds
+     max_time: float  # seconds
+@@ -252,6 +299,7 @@ def to_dict(self) -> dict[str, Any]:
+         return {
+             "config": asdict(self.config),
+             "mean_time": self.mean_time,
++            "median_time": self.median_time,
+             "std_time": self.std_time,
+             "min_time": self.min_time,
+             "max_time": self.max_time,
+diff --git a/benchmarks/attention_benchmarks/configs/mla_decode.yaml b/benchmarks/attention_benchmarks/configs/mla_decode.yaml
+index 8f12ac723064..c1d47bf5748b 100644
+--- a/benchmarks/attention_benchmarks/configs/mla_decode.yaml
++++ b/benchmarks/attention_benchmarks/configs/mla_decode.yaml
+@@ -56,8 +56,6 @@ backends:
+   - TOKENSPEED_MLA  # Blackwell + R1 dims + FP8 KV (use --kv-cache-dtype fp8)
+ 
+ device: "cuda:0"
+-repeats: 100
+-warmup_iters: 10
+ profile_memory: true
+ 
+ # Backend-specific tuning
+diff --git a/benchmarks/attention_benchmarks/configs/mla_mixed_batch.yaml b/benchmarks/attention_benchmarks/configs/mla_mixed_batch.yaml
+index c342e9fb8c1a..fcb1d8639b73 100644
+--- a/benchmarks/attention_benchmarks/configs/mla_mixed_batch.yaml
++++ b/benchmarks/attention_benchmarks/configs/mla_mixed_batch.yaml
+@@ -51,8 +51,6 @@ backends:
+   - FLASHMLA         # Hopper only
+ 
+ device: "cuda:0"
+-repeats: 5
+-warmup_iters: 3
+ profile_memory: true
+ 
+ # Analyze chunked prefill workspace size impact
+diff --git a/benchmarks/attention_benchmarks/configs/mla_prefill.yaml b/benchmarks/attention_benchmarks/configs/mla_prefill.yaml
+index 1e1ab264bace..f39cdd8d1c2f 100644
+--- a/benchmarks/attention_benchmarks/configs/mla_prefill.yaml
++++ b/benchmarks/attention_benchmarks/configs/mla_prefill.yaml
+@@ -124,5 +124,3 @@ prefill_backends:
+   - tokenspeed
+ 
+ device: "cuda:0"
+-repeats: 20
+-warmup_iters: 5
+diff --git a/benchmarks/attention_benchmarks/configs/mla_sparse_decode.yaml b/benchmarks/attention_benchmarks/configs/mla_sparse_decode.yaml
+index 689c9f3c3c66..c791638241f7 100644
+--- a/benchmarks/attention_benchmarks/configs/mla_sparse_decode.yaml
++++ b/benchmarks/attention_benchmarks/configs/mla_sparse_decode.yaml
+@@ -53,6 +53,4 @@ backends:
+   - FLASHINFER_MLA_SPARSE
+ 
+ device: "cuda:0"
+-repeats: 100
+-warmup_iters: 10
+ profile_memory: true
+diff --git a/benchmarks/attention_benchmarks/configs/mla_sparse_prefill.yaml b/benchmarks/attention_benchmarks/configs/mla_sparse_prefill.yaml
+index ef6b2cb07dc7..fd8a0e22c5e0 100644
+--- a/benchmarks/attention_benchmarks/configs/mla_sparse_prefill.yaml
++++ b/benchmarks/attention_benchmarks/configs/mla_sparse_prefill.yaml
+@@ -57,6 +57,4 @@ backends:
+   - FLASHINFER_MLA_SPARSE
+ 
+ device: "cuda:0"
+-repeats: 10
+-warmup_iters: 3
+ profile_memory: true
+diff --git a/benchmarks/attention_benchmarks/configs/reorder_threshold.yaml b/benchmarks/attention_benchmarks/configs/reorder_threshold.yaml
+index 0d76ef0a358c..9f53eac2c9cb 100644
+--- a/benchmarks/attention_benchmarks/configs/reorder_threshold.yaml
++++ b/benchmarks/attention_benchmarks/configs/reorder_threshold.yaml
+@@ -63,8 +63,6 @@ model:
+ 
+ # Benchmark settings
+ device: "cuda:0"
+-repeats: 15          # More repeats for spec decode variance
+-warmup_iters: 5
+ profile_memory: false
+ 
+ # Output
+diff --git a/benchmarks/attention_benchmarks/configs/speculative_decode.yaml b/benchmarks/attention_benchmarks/configs/speculative_decode.yaml
+index 47b6d3604d1d..5e8775f0a426 100644
+--- a/benchmarks/attention_benchmarks/configs/speculative_decode.yaml
++++ b/benchmarks/attention_benchmarks/configs/speculative_decode.yaml
+@@ -49,8 +49,6 @@ backends:
+ 
+ # Benchmark settings
+ device: "cuda:0"
+-repeats: 10  # More repeats for statistical significance
+-warmup_iters: 5
+ profile_memory: false
+ 
+ # Test these threshold values for optimization
+diff --git a/benchmarks/attention_benchmarks/configs/standard_attention.yaml b/benchmarks/attention_benchmarks/configs/standard_attention.yaml
+index deb5a4b27ff3..ccd44a426b90 100644
+--- a/benchmarks/attention_benchmarks/configs/standard_attention.yaml
++++ b/benchmarks/attention_benchmarks/configs/standard_attention.yaml
+@@ -43,6 +43,4 @@ backends:
+   - FLASHINFER
+ 
+ device: "cuda:0"
+-repeats: 5
+-warmup_iters: 3
+ profile_memory: false
+diff --git a/benchmarks/attention_benchmarks/configs/standard_decode.yaml b/benchmarks/attention_benchmarks/configs/standard_decode.yaml
+new file mode 100644
+index 000000000000..0861bd63dad3
+--- /dev/null
++++ b/benchmarks/attention_benchmarks/configs/standard_decode.yaml
+@@ -0,0 +1,142 @@
++# Standard attention decode benchmark configuration
++# Sweeps num_q_heads and num_kv_heads to isolate effects of:
++#   1. GQA ratio (fixed num_q_heads=32, vary num_kv_heads)
++#   2. Absolute head count (fixed 4:1 ratio, vary scale)
++
++model:
++  num_layers: 32
++  num_q_heads: 32 # Base value, overridden by sweep
++  num_kv_heads: 8 # Base value, overridden by sweep
++  head_dim: 128
++  block_size: 16
++
++# Head count sweep: each entry overrides num_q_heads, num_kv_heads, and
++# head_dim where it differs from the base (128). Head counts are per-GPU
++# (i.e. after TP sharding).
++#
++# Group A — vary GQA ratio (fixed q=32, head_dim=128):
++#   32:32 (MHA), 32:8 (GQA 4:1), 32:4 (GQA 8:1), 32:1 (MQA)
++#
++# Groups B-E — real model configs at various TP degrees:
++#   Model              head_dim  Full    TP2      TP4      TP8
++#   Llama 3 8B           128    32:8   16:4      8:2      4:1
++#   Llama 3 70B          128    64:8   32:4     16:2      8:1
++#   GPT-OSS 120B          64    64:8   32:4     16:2      8:1
++#   Llama 3 405B         128   128:8   64:4     32:2     16:1
++model_parameter_sweep:
++  values:
++    # --- head_dim=128 (Llama 3 family) ---
++    - { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 } # MHA 1:1
++    - { num_q_heads: 32, num_kv_heads: 1, head_dim: 128 } # MQA 32:1
++    - { num_q_heads: 4, num_kv_heads: 1, head_dim: 128 } # Llama 3 8B TP8
++    - { num_q_heads: 8, num_kv_heads: 2, head_dim: 128 } # Llama 3 8B TP4
++    - { num_q_heads: 16, num_kv_heads: 4, head_dim: 128 } # Llama 3 8B TP2
++    - { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 } # Llama 3 8B TP1 / GQA 4:1
++    - { num_q_heads: 8, num_kv_heads: 1, head_dim: 128 } # Llama 3 70B TP8
++    - { num_q_heads: 16, num_kv_heads: 2, head_dim: 128 } # Llama 3 70B TP4
++    - { num_q_heads: 32, num_kv_heads: 4, head_dim: 128 } # Llama 3 70B TP2 / GQA 8:1
++    - { num_q_heads: 64, num_kv_heads: 8, head_dim: 128 } # Llama 3 70B TP1
++    - { num_q_heads: 16, num_kv_heads: 1, head_dim: 128 } # Llama 3 405B TP8
++    - { num_q_heads: 32, num_kv_heads: 2, head_dim: 128 } # Llama 3 405B TP4
++    - { num_q_heads: 64, num_kv_heads: 4, head_dim: 128 } # Llama 3 405B TP2
++    - { num_q_heads: 128, num_kv_heads: 8, head_dim: 128 } # Llama 3 405B TP1
++    # --- head_dim=64 (GPT-OSS 120B) ---
++    - { num_q_heads: 8, num_kv_heads: 1, head_dim: 64 } # GPT-OSS 120B TP8
++    - { num_q_heads: 16, num_kv_heads: 2, head_dim: 64 } # GPT-OSS 120B TP4
++    - { num_q_heads: 32, num_kv_heads: 4, head_dim: 64 } # GPT-OSS 120B TP2
++    - { num_q_heads: 64, num_kv_heads: 8, head_dim: 64 } # GPT-OSS 120B TP1
++  label_format: "{backend}_q{num_q_heads}kv{num_kv_heads}d{head_dim}"
++
++batch_specs:
++  # ---- batch_size x seq_len grid (decode: q_len=1) ----
++  # Small grid for quick iteration. Uncomment for full sweep.
++
++  # Batch size 1
++  - "q1s1k"
++  - "q1s512"
++  - "q1s2k"
++  - "q1s4k"
++  - "q1s8k"
++  - "q1s16k"
++  - "q1s32k"
++
++  # Batch size 2
++  - "2q1s512"
++  - "2q1s1k"
++  - "2q1s2k"
++  - "2q1s4k"
++  - "2q1s8k"
++  - "2q1s16k"
++  - "2q1s32k"
++
++  # Batch size 4
++  - "4q1s512"
++  - "4q1s1k"
++  - "4q1s2k"
++  - "4q1s4k"
++  - "4q1s8k"
++  - "4q1s16k"
++  - "4q1s32k"
++
++  # Batch size 8
++  - "8q1s1k"
++  - "8q1s512"
++  - "8q1s2k"
++  - "8q1s4k"
++  - "8q1s8k"
++  - "8q1s16k"
++  - "8q1s32k"
++
++  # Batch size 16
++  - "16q1s512"
++  - "16q1s1k"
++  - "16q1s2k"
++  - "16q1s4k"
++  - "16q1s8k"
++  - "16q1s16k"
++  - "16q1s32k"
++
++  # Batch size 32
++  - "32q1s512"
++  - "32q1s1k"
++  - "32q1s2k"
++  - "32q1s4k"
++  - "32q1s8k"
++  - "32q1s16k"
++  - "32q1s32k"
++
++  # Batch size 64
++  - "64q1s1k"
++  - "64q1s512"
++  - "64q1s2k"
++  - "64q1s4k"
++  - "64q1s8k"
++  - "64q1s16k"
++  - "64q1s32k"
++
++  # Batch size 128
++  - "128q1s512"
++  - "128q1s1k"
++  - "128q1s2k"
++  - "128q1s4k"
++  - "128q1s8k"
++  - "128q1s16k"
++  - "128q1s32k"
++
++  # Batch size 256
++  - "256q1s1k"
++  - "256q1s512"
++  - "256q1s2k"
++  - "256q1s4k"
++  - "256q1s8k"
++  - "256q1s16k"
++  - "256q1s32k"
++
++# Available backends: FLASH_ATTN, TRITON_ATTN, FLASHINFER
++backends:
++  - FLASH_ATTN
++  - TRITON_ATTN
++  - FLASHINFER
++
++device: "cuda:0"
++profile_memory: false
+diff --git a/benchmarks/attention_benchmarks/configs/standard_prefill.yaml b/benchmarks/attention_benchmarks/configs/standard_prefill.yaml
+new file mode 100644
+index 000000000000..278b6347f652
+--- /dev/null
++++ b/benchmarks/attention_benchmarks/configs/standard_prefill.yaml
+@@ -0,0 +1,108 @@
++# Standard attention prefill benchmark configuration
++# Sweeps num_q_heads and num_kv_heads to isolate effects of:
++#   1. GQA ratio (fixed num_q_heads=32, vary num_kv_heads)
++#   2. Absolute head count (fixed 4:1 ratio, vary scale)
++
++model:
++  num_layers: 32
++  num_q_heads: 32 # Base value, overridden by sweep
++  num_kv_heads: 8 # Base value, overridden by sweep
++  head_dim: 128
++  block_size: 16
++
++# Head count sweep: each entry overrides num_q_heads, num_kv_heads, and
++# head_dim where it differs from the base (128). Head counts are per-GPU
++# (i.e. after TP sharding).
++#
++# Group A — vary GQA ratio (fixed q=32, head_dim=128):
++#   32:32 (MHA), 32:8 (GQA 4:1), 32:4 (GQA 8:1), 32:1 (MQA)
++#
++# Groups B-E — real model configs at various TP degrees:
++#   Model              head_dim  Full    TP2      TP4      TP8
++#   Llama 3 8B           128    32:8   16:4      8:2      4:1
++#   Llama 3 70B          128    64:8   32:4     16:2      8:1
++#   GPT-OSS 120B          64    64:8   32:4     16:2      8:1
++#   Llama 3 405B         128   128:8   64:4     32:2     16:1
++model_parameter_sweep:
++  values:
++    # --- head_dim=128 (Llama 3 family) ---
++    - { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 } # MHA 1:1
++    - { num_q_heads: 32, num_kv_heads: 1, head_dim: 128 } # MQA 32:1
++    - { num_q_heads: 4, num_kv_heads: 1, head_dim: 128 } # Llama 3 8B TP8
++    - { num_q_heads: 8, num_kv_heads: 2, head_dim: 128 } # Llama 3 8B TP4
++    - { num_q_heads: 16, num_kv_heads: 4, head_dim: 128 } # Llama 3 8B TP2
++    - { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 } # Llama 3 8B TP1 / GQA 4:1
++    - { num_q_heads: 8, num_kv_heads: 1, head_dim: 128 } # Llama 3 70B TP8
++    - { num_q_heads: 16, num_kv_heads: 2, head_dim: 128 } # Llama 3 70B TP4
++    - { num_q_heads: 32, num_kv_heads: 4, head_dim: 128 } # Llama 3 70B TP2 / GQA 8:1
++    - { num_q_heads: 64, num_kv_heads: 8, head_dim: 128 } # Llama 3 70B TP1
++    - { num_q_heads: 16, num_kv_heads: 1, head_dim: 128 } # Llama 3 405B TP8
++    - { num_q_heads: 32, num_kv_heads: 2, head_dim: 128 } # Llama 3 405B TP4
++    - { num_q_heads: 64, num_kv_heads: 4, head_dim: 128 } # Llama 3 405B TP2
++    - { num_q_heads: 128, num_kv_heads: 8, head_dim: 128 } # Llama 3 405B TP1
++    # --- head_dim=64 (GPT-OSS 120B) ---
++    - { num_q_heads: 8, num_kv_heads: 1, head_dim: 64 } # GPT-OSS 120B TP8
++    - { num_q_heads: 16, num_kv_heads: 2, head_dim: 64 } # GPT-OSS 120B TP4
++    - { num_q_heads: 32, num_kv_heads: 4, head_dim: 64 } # GPT-OSS 120B TP2
++    - { num_q_heads: 64, num_kv_heads: 8, head_dim: 64 } # GPT-OSS 120B TP1
++  label_format: "{backend}_q{num_q_heads}kv{num_kv_heads}d{head_dim}"
++
++batch_specs:
++  # ---- batch_size x prefill_len grid (prefill: q_len == seq_len) ----
++  # Total tokens = batch_size * prefill_len, and prefill compute scales with
++  # prefill_len^2, so the largest cells are expensive. Trim batch sizes or
++  # lengths for quick iteration.
++
++  # Batch size 1
++  - "q512"
++  - "q1k"
++  - "q2k"
++  - "q4k"
++  - "q8k"
++  - "q16k"
++  - "q32k"
++
++  # Batch size 2
++  - "2q512"
++  - "2q1k"
++  - "2q2k"
++  - "2q4k"
++  - "2q8k"
++  - "2q16k"
++  - "2q32k"
++
++  # Batch size 4
++  - "4q512"
++  - "4q1k"
++  - "4q2k"
++  - "4q4k"
++  - "4q8k"
++  - "4q16k"
++  - "4q32k"
++
++  # Batch size 8
++  - "8q512"
++  - "8q1k"
++  - "8q2k"
++  - "8q4k"
++  - "8q8k"
++  - "8q16k"
++  - "8q32k"
++
++  # Batch size 16
++  - "16q512"
++  - "16q1k"
++  - "16q2k"
++  - "16q4k"
++  - "16q8k"
++  - "16q16k"
++  - "16q32k"
++
++# Available backends: FLASH_ATTN, TRITON_ATTN, FLASHINFER
++backends:
++  - FLASH_ATTN
++  - TRITON_ATTN
++  - FLASHINFER
++
++device: "cuda:0"
++profile_memory: false
+diff --git a/benchmarks/attention_benchmarks/mla_runner.py b/benchmarks/attention_benchmarks/mla_runner.py
+index abab1e2edbac..e63b524c71ba 100644
+--- a/benchmarks/attention_benchmarks/mla_runner.py
++++ b/benchmarks/attention_benchmarks/mla_runner.py
+@@ -8,6 +8,8 @@
+ needing full VllmConfig integration.
+ """
+ 
++import statistics
++
+ import numpy as np
+ import torch
+ from batch_spec import parse_batch_spec
+@@ -17,6 +19,8 @@
+     MockIndexer,
+     MockKVBProj,
+     MockLayer,
++    run_do_bench,
++    run_ncu_profile,
+     setup_mla_dims,
+ )
+ 
+@@ -820,7 +824,7 @@ def _run_single_benchmark(
+             num_prefill, mla_dims, query_fmt, device, torch.bfloat16
+         )
+ 
+-    # Build forward function
++    # Build forward function (runs a single decode/prefill pass)
+     def forward_fn():
+         results = []
+         if has_decode:
+@@ -839,44 +843,35 @@ def forward_fn():
+             )
+         return results[0] if len(results) == 1 else tuple(results)
+ 
+-    # Warmup
+-    for _ in range(config.warmup_iters):
+-        forward_fn()
+-    torch.accelerator.synchronize()
+-
+-    # Optionally capture a CUDA graph after warmup.
+-    # Graph replay eliminates CPU launch overhead so timings reflect pure
+-    # kernel time.
+-    if config.use_cuda_graphs:
+-        graph = torch.cuda.CUDAGraph()
+-        with torch.cuda.graph(graph):
++    def benchmark_fn():
++        for _ in range(config.num_layers):
+             forward_fn()
+-        benchmark_fn = graph.replay
+-    else:
+-        benchmark_fn = forward_fn
+ 
+-    # Benchmark
+-    times = []
+-    for _ in range(config.repeats):
+-        start = torch.cuda.Event(enable_timing=True)
+-        end = torch.cuda.Event(enable_timing=True)
++    if config.ncu_profile:
++        run_ncu_profile(benchmark_fn)
++        return BenchmarkResult(
++            config=config,
++            mean_time=0.0,
++            median_time=0.0,
++            std_time=0.0,
++            min_time=0.0,
++            max_time=0.0,
++            throughput_tokens_per_sec=0.0,
++        )
+ 
+-        start.record()
+-        for _ in range(config.num_layers):
+-            benchmark_fn()
+-        end.record()
++    all_ms = run_do_bench(benchmark_fn, config.use_cuda_graphs, config.warmup_ms)
+ 
+-        torch.accelerator.synchronize()
+-        elapsed_ms = start.elapsed_time(end)
+-        times.append(elapsed_ms / 1000.0 / config.num_layers)
++    # Convert ms to seconds per layer
++    times = [t / 1000.0 / config.num_layers for t in all_ms]
++    mean_time = statistics.mean(times)
+ 
+-    mean_time = float(np.mean(times))
+     return BenchmarkResult(
+         config=config,
+         mean_time=mean_time,
+-        std_time=float(np.std(times)),
+-        min_time=float(np.min(times)),
+-        max_time=float(np.max(times)),
++        median_time=statistics.median(times),
++        std_time=statistics.stdev(times) if len(times) > 1 else 0.0,
++        min_time=min(times),
++        max_time=max(times),
+         throughput_tokens_per_sec=total_q / mean_time if mean_time > 0 else 0,
+     )
+ 
+diff --git a/benchmarks/attention_benchmarks/runner.py b/benchmarks/attention_benchmarks/runner.py
+index aa636cd9cb53..8cd20dced179 100644
+--- a/benchmarks/attention_benchmarks/runner.py
++++ b/benchmarks/attention_benchmarks/runner.py
+@@ -9,13 +9,20 @@
+ """
+ 
+ import logging
++import statistics
+ import types
+ from contextlib import contextmanager
+ 
+-import numpy as np
+ import torch
+ from batch_spec import parse_batch_spec, reorder_for_flashinfer
+-from common import BenchmarkConfig, BenchmarkResult, MockLayer, get_attention_scale
++from common import (
++    BenchmarkConfig,
++    BenchmarkResult,
++    MockLayer,
++    get_attention_scale,
++    run_do_bench,
++    run_ncu_profile,
++)
+ 
+ from vllm.config import (
+     CacheConfig,
+@@ -208,6 +215,13 @@ def _create_backend_impl(
+ 
+     scale = get_attention_scale(config.head_dim)
+ 
++    # Set v_head_dim for diff-headdim backends. Always reset (defaulting to
++    # head_dim) so a prior run's value doesn't leak into this one via the
++    # backend's class-level state.
++    if hasattr(backend_class, "set_head_size_v"):
++        v_dim = config.v_head_dim if config.v_head_dim is not None else config.head_dim
++        backend_class.set_head_size_v(v_dim)
++
+     impl = backend_class.get_impl_cls()(
+         num_heads=config.num_q_heads,
+         head_size=config.head_dim,
+@@ -300,6 +314,7 @@ def _create_input_tensors(
+         from vllm.platforms import current_platform
+ 
+         q_dtype = current_platform.fp8_dtype()
++    v_dim = config.v_head_dim if config.v_head_dim is not None else config.head_dim
+     q_list = [
+         torch.randn(
+             total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
+@@ -313,9 +328,7 @@ def _create_input_tensors(
+         for _ in range(config.num_layers)
+     ]
+     v_list = [
+-        torch.randn(
+-            total_q, config.num_kv_heads, config.head_dim, device=device, dtype=dtype
+-        )
++        torch.randn(total_q, config.num_kv_heads, v_dim, device=device, dtype=dtype)
+         for _ in range(config.num_layers)
+     ]
+     return q_list, k_list, v_list
+@@ -389,14 +402,17 @@ def _run_single_benchmark(
+     device: torch.device,
+     dtype: torch.dtype,
+ ) -> tuple:
+-    """Run single benchmark iteration with warmup and timing loop."""
++    """Run single benchmark using triton's do_bench_cudagraph/do_bench.
++
++    Returns:
++        (timing_stats, mem_stats) where timing_stats is a dict with
++        mean/std/min/max in seconds per layer.
++    """
+     total_q = q_list[0].shape[0]
+-    out = torch.empty(
+-        total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
+-    )
++    v_dim = config.v_head_dim if config.v_head_dim is not None else config.head_dim
++    out = torch.empty(total_q, config.num_q_heads, v_dim, device=device, dtype=dtype)
+ 
+-    # Warmup
+-    for _ in range(config.warmup_iters):
++    def benchmark_fn():
+         for i in range(config.num_layers):
+             impl.forward(
+                 layer,
+@@ -407,52 +423,22 @@ def _run_single_benchmark(
+                 attn_metadata,
+                 output=out,
+             )
+-    torch.accelerator.synchronize()
+-
+-    # Optionally capture a CUDA graph after warmup.
+-    # Graph replay eliminates CPU launch overhead so timings reflect pure
+-    # kernel time.
+-    if config.use_cuda_graphs:
+-        graph = torch.cuda.CUDAGraph()
+-        with torch.cuda.graph(graph):
+-            for i in range(config.num_layers):
+-                impl.forward(
+-                    layer,
+-                    q_list[i],
+-                    k_list[i],
+-                    v_list[i],
+-                    cache_list[i],
+-                    attn_metadata,
+-                    output=out,
+-                )
+-        benchmark_fn = graph.replay
+-    else:
+-
+-        def benchmark_fn():
+-            for i in range(config.num_layers):
+-                impl.forward(
+-                    layer,
+-                    q_list[i],
+-                    k_list[i],
+-                    v_list[i],
+-                    cache_list[i],
+-                    attn_metadata,
+-                    output=out,
+-                )
+-
+-    # Benchmark
+-    times = []
+-    for _ in range(config.repeats):
+-        start = torch.cuda.Event(enable_timing=True)
+-        end = torch.cuda.Event(enable_timing=True)
+ 
+-        start.record()
+-        benchmark_fn()
+-        end.record()
+-
+-        torch.accelerator.synchronize()
+-        elapsed_ms = start.elapsed_time(end)
+-        times.append(elapsed_ms / 1000.0 / config.num_layers)  # seconds per layer
++    if config.ncu_profile:
++        run_ncu_profile(benchmark_fn)
++        timing_stats = dict.fromkeys(("mean", "median", "std", "min", "max"), 0.0)
++    else:
++        all_ms = run_do_bench(benchmark_fn, config.use_cuda_graphs, config.warmup_ms)
++
++        # Convert ms to seconds per layer
++        times = [t / 1000.0 / config.num_layers for t in all_ms]
++        timing_stats = {
++            "mean": statistics.mean(times),
++            "std": statistics.stdev(times) if len(times) > 1 else 0.0,
++            "min": min(times),
++            "max": max(times),
++            "median": statistics.median(times),
++        }
+ 
+     mem_stats = {}
+     if config.profile_memory:
+@@ -461,7 +447,7 @@ def benchmark_fn():
+             "reserved_mb": torch.accelerator.memory_reserved(device) / 1024**2,
+         }
+ 
+-    return times, mem_stats
++    return timing_stats, mem_stats
+ 
+ 
+ # ============================================================================
+@@ -541,6 +527,12 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
+                 common_attn_metadata=common_metadata,
+             )
+ 
++            # Override num_splits for split-K testing (FlashAttention only)
++            if config.num_splits is not None and hasattr(
++                attn_metadata, "max_num_splits"
++            ):
++                attn_metadata.max_num_splits = config.num_splits
++
+             # Only quantize queries when the impl supports it
+             quantize_query = config.kv_cache_dtype.startswith("fp8") and getattr(
+                 impl, "supports_quant_query_input", False
+@@ -553,7 +545,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
+                 config, max_num_blocks, backend_class, device, dtype
+             )
+ 
+-            times, mem_stats = _run_single_benchmark(
++            timing_stats, mem_stats = _run_single_benchmark(
+                 config,
+                 impl,
+                 layer,
+@@ -566,15 +558,16 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
+                 dtype,
+             )
+ 
+-    mean_time = np.mean(times)
++    mean_time = timing_stats["mean"]
+     throughput = total_q / mean_time if mean_time > 0 else 0
+ 
+     return BenchmarkResult(
+         config=config,
+         mean_time=mean_time,
+-        std_time=np.std(times),
+-        min_time=np.min(times),
+-        max_time=np.max(times),
++        median_time=timing_stats["median"],
++        std_time=timing_stats["std"],
++        min_time=timing_stats["min"],
++        max_time=timing_stats["max"],
+         throughput_tokens_per_sec=throughput,
+         memory_allocated_mb=mem_stats.get("allocated_mb"),
+         memory_reserved_mb=mem_stats.get("reserved_mb"),

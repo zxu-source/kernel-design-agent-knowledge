@@ -1,0 +1,286 @@
+diff --git a/vllm/model_executor/layers/fused_moe/experts/mxfp8_native_moe.py b/vllm/model_executor/layers/fused_moe/experts/mxfp8_native_moe.py
+index fa6e902396f0..b511e368f4af 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/mxfp8_native_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/mxfp8_native_moe.py
+@@ -227,10 +227,16 @@ def fused_moe_mxfp8_native(
+ 
+     tiles = _mxfp8_moe_tiles(T)
+     block_m = tiles["block_m"]
++    # Bin by the actual number of expert weight rows. With fused shared experts
++    # the weight tensor has more rows than ``global_num_experts`` (the routed
++    # count), and their ids fall outside [0, global_num_experts); binning by the
++    # routed count would treat them as invalid. Under EP (expert_map set) the
++    # tensor holds only local experts, so keep the global count for remapping.
++    num_align_experts = w13.shape[0] if expert_map is None else global_num_experts
+     sorted_ids, expert_ids, num_post = moe_align_block_size(
+         topk_ids,
+         block_m,
+-        global_num_experts,
++        num_align_experts,
+         expert_map,
+         ignore_invalid_experts=expert_map is not None,
+     )
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 225484385865..c749056ff8d1 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -6,6 +6,7 @@
+ 
+ import torch
+ 
++import vllm.envs as envs
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.config import ParallelConfig, get_current_vllm_config
+ from vllm.distributed import (
+@@ -77,24 +78,20 @@ def determine_expert_counts(
+ ) -> tuple[int, int, int]:
+     global_num_experts = num_experts + num_redundant_experts
+     logical_num_experts = num_experts
+-    # ROCm aiter shared experts fusion
+-    # AITER only supports gated activations (silu/gelu), so disable it
+-    # for non-gated MoE (is_act_and_mul=False)
+-    # rocm_aiter_fmoe_enabled = rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul
+-    aiter_fmoe_shared_expert_enabled = (
+-        rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() and is_act_and_mul
+-    )
++    # Shared-expert fusion: append the shared expert(s) as routed-expert slots
++    # so they run in the same grouped GEMM. Gated by
++    # VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: either the native aiter fused-MoE
++    # path (env + master switch, via is_fusion_moe_shared_experts_enabled) or the
++    # backend-neutral router-append path (env alone, independent of the master
++    # switch; e.g. the MM3 triton/flydsl mxfp8 MoE). Gated activations only.
++    fuse_shared_enabled = (
++        rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
++        or envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
++    ) and is_act_and_mul
+ 
+     num_fused_shared_experts = (
+-        n_shared_experts
+-        if n_shared_experts is not None and aiter_fmoe_shared_expert_enabled
+-        else 0
++        n_shared_experts if n_shared_experts is not None and fuse_shared_enabled else 0
+     )
+-    if not aiter_fmoe_shared_expert_enabled and num_fused_shared_experts != 0:
+-        raise ValueError(
+-            "n_shared_experts is only supported on ROCm aiter when "
+-            "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled"
+-        )
+ 
+     return global_num_experts, logical_num_experts, num_fused_shared_experts
+ 
+@@ -187,7 +184,8 @@ def FusedMoE(
+         has_bias: Whether expert layers have bias terms
+         is_sequence_parallel: Whether sequence parallelism is enabled
+         expert_mapping: Expert parameter mapping for weight loading
+-        n_shared_experts: Number of shared experts (ROCm aiter only)
++        n_shared_experts: Number of shared experts to fuse into the routed
++            grouped GEMM (ROCm; requires aiter FSE or the router-append path)
+         router_logits_dtype: Data type for router logits buffers
+         gate: Pre-configured gate module
+         shared_experts: Pre-configured shared experts module
+@@ -288,6 +286,19 @@ def FusedMoE(
+             else 1.0,
+             e_score_correction_bias=e_score_correction_bias,
+             num_fused_shared_experts=num_fused_shared_experts,
++            # Fused shared-expert slot weight. With apply_routed_scale_to_output
++            # the runner scales the combined output by routed_scaling_factor, so
++            # the shared slot weight must be 1/routed_scaling_factor for its net
++            # contribution to be 1.0 (matching the un-scaled separate-MLP add).
++            shared_expert_weight=(
++                (1.0 / routed_scaling_factor)
++                if (
++                    apply_routed_scale_to_output
++                    and num_fused_shared_experts > 0
++                    and routed_scaling_factor
++                )
++                else 1.0
++            ),
+             zero_expert_type=zero_expert_type,
+             num_logical_experts=logical_num_experts,
+             hash_indices_table=hash_indices_table,
+diff --git a/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py b/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py
+index f30f81a53c73..d505c5ce4b7e 100644
+--- a/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py
++++ b/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py
+@@ -334,6 +334,8 @@ def __init__(
+         *,
+         scoring_func: str = "sigmoid",
+         hash_indices_table: torch.Tensor | None = None,
++        num_fused_shared_experts: int = 0,
++        shared_expert_weight: float = 1.0,
+     ):
+         super().__init__(
+             top_k=top_k,
+@@ -346,6 +348,11 @@ def __init__(
+         self.routed_scaling_factor = routed_scaling_factor
+         self.scoring_func = scoring_func
+         self._hash_indices_table = hash_indices_table
++        # Fused shared experts: append constant slots (ids immediately after
++        # the routed experts, [global, global+n)) routed to by every token at
++        # ``shared_expert_weight``, AFTER the routed top-k is renormalized.
++        self.num_fused_shared_experts = num_fused_shared_experts
++        self.shared_expert_weight = shared_expert_weight
+ 
+     @property
+     def routing_method_type(self) -> RoutingMethodType:
+@@ -382,4 +389,23 @@ def _compute_routing(
+             routed_scaling_factor=self.routed_scaling_factor,
+         )
+ 
++        if self.num_fused_shared_experts > 0:
++            m = topk_ids.shape[0]
++            n = self.num_fused_shared_experts
++            # global_num_experts counts only the routed experts; the fused
++            # shared experts occupy the slots immediately after them, i.e. ids
++            # [global_num_experts, global_num_experts + n).
++            base = self.global_num_experts
++            shared_ids = torch.arange(
++                base, base + n, dtype=topk_ids.dtype, device=topk_ids.device
++            ).expand(m, n)
++            shared_w = torch.full(
++                (m, n),
++                self.shared_expert_weight,
++                dtype=topk_weights.dtype,
++                device=topk_weights.device,
++            )
++            topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
++            topk_weights = torch.cat([topk_weights, shared_w], dim=-1)
++
+         return topk_weights, topk_ids
+diff --git a/vllm/model_executor/layers/fused_moe/router/router_factory.py b/vllm/model_executor/layers/fused_moe/router/router_factory.py
+index 7246185f394c..c7cfccbe64b9 100644
+--- a/vllm/model_executor/layers/fused_moe/router/router_factory.py
++++ b/vllm/model_executor/layers/fused_moe/router/router_factory.py
+@@ -47,6 +47,7 @@ def create_fused_moe_router(
+     topk_group: int | None = None,
+     scoring_func: str = "softmax",
+     num_fused_shared_experts: int = 0,
++    shared_expert_weight: float = 1.0,
+     # grouped topk + fused topk bias parameters
+     routed_scaling_factor: float = 1.0,
+     e_score_correction_bias: torch.Tensor | None = None,
+@@ -188,6 +189,8 @@ def create_fused_moe_router(
+             routed_scaling_factor=routed_scaling_factor,
+             scoring_func=scoring_func,
+             hash_indices_table=hash_indices_table,
++            num_fused_shared_experts=num_fused_shared_experts,
++            shared_expert_weight=shared_expert_weight,
+         )
+ 
+     if (
+diff --git a/vllm/models/minimax_m3/amd/model.py b/vllm/models/minimax_m3/amd/model.py
+index 4f3528806c9d..4d809d3bff59 100644
+--- a/vllm/models/minimax_m3/amd/model.py
++++ b/vllm/models/minimax_m3/amd/model.py
+@@ -23,6 +23,7 @@
+ from torch import nn
+ from transformers import PretrainedConfig
+ 
++import vllm.envs as envs
+ from vllm import _custom_ops as ops
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import (
+@@ -95,6 +96,7 @@
+ )
+ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
+ from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+ from vllm.v1.kv_cache_interface import (
+@@ -104,6 +106,23 @@
+ )
+ 
+ 
++def _fuse_shared_experts_enabled(config: PretrainedConfig) -> bool:
++    """Whether to fuse the shared expert into the routed grouped MoE.
++
++    ROCm only. Opt-in via ``VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS`` (the
++    router-append fusion runs on the triton/flydsl mxfp8 MoE independent of the
++    aiter master switch); requires a shared expert and is disabled under expert
++    parallelism (the shared slot is appended to the routed top-k, which the EP
++    expert-map path does not handle).
++    """
++    return bool(
++        current_platform.is_rocm()
++        and getattr(config, "n_shared_experts", None)
++        and envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
++        and not get_current_vllm_config().parallel_config.enable_expert_parallel
++    )
++
++
+ def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
+     """Layer ids whose attention runs the extra sparse "index" branch."""
+     cfg = getattr(config, "sparse_attention_config", None)
+@@ -294,8 +313,13 @@ def __init__(
+             prefix=f"{prefix}.gate",
+         )
+ 
++        # Fuse the shared expert into the routed grouped GEMM when opted in via
++        # VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: it becomes routed-expert slot
++        # ``num_local_experts``, reached by every token, eliminating the
++        # separate dense-MLP launches. Not supported under expert parallelism.
++        self.fuse_shared_experts = _fuse_shared_experts_enabled(config)
+         self.shared_experts: MiniMaxM3MLP | None = None
+-        if self.n_shared_experts:
++        if self.n_shared_experts and not self.fuse_shared_experts:
+             self.shared_experts = MiniMaxM3MLP(
+                 config=config,
+                 intermediate_size=config.intermediate_size * self.n_shared_experts,
+@@ -320,6 +344,9 @@ def __init__(
+             apply_routed_scale_to_output=True,
+             router_logits_dtype=self.gate.out_dtype,
+             shared_experts=self.shared_experts,
++            n_shared_experts=(
++                self.n_shared_experts if self.fuse_shared_experts else None
++            ),
+             quant_config=quant_config,
+             prefix=f"{prefix}.experts",
+         )
+@@ -863,13 +890,18 @@ def forward(
+         return hidden_states
+ 
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+-        # Checkpoint experts use w1=gate, w2=down, w3=up.
++        # Checkpoint experts use w1=gate, w2=down, w3=up. When fusing the shared
++        # expert, include the appended slot (id == num_local_experts).
++        n_shared = getattr(self.config, "n_shared_experts", 0) or 0
++        num_experts = self.config.num_local_experts + (
++            n_shared if _fuse_shared_experts_enabled(self.config) else 0
++        )
+         return fused_moe_make_expert_params_mapping(
+             self,
+             ckpt_gate_proj_name="w1",
+             ckpt_down_proj_name="w2",
+             ckpt_up_proj_name="w3",
+-            num_experts=self.config.num_local_experts,
++            num_experts=num_experts,
+         )
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -896,6 +928,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+ 
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
++        _fuse_shared = _fuse_shared_experts_enabled(self.config)
+         for name, loaded_weight in weights:
+             # The MTP module is not modeled yet.
+             if "mtp." in name:
+@@ -906,6 +939,17 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+             if "weight_scale_inv" in name:
+                 name = name.replace("weight_scale_inv", "weight_scale")
+ 
++            # Shared-expert fusion: redirect the checkpoint shared expert into
++            # routed-expert slot ``num_local_experts`` (gate->w1, up->w3,
++            # down->w2) so it loads via the routed expert loader. Runs before the
++            # stacked/dense mappings so shared_experts.gate_proj/up_proj are not
++            # captured by the dense gate_up_proj mapping.
++            if _fuse_shared and ".shared_experts." in name:
++                sid = self.config.num_local_experts
++                name = name.replace(".shared_experts.gate_proj.", f".experts.{sid}.w1.")
++                name = name.replace(".shared_experts.up_proj.", f".experts.{sid}.w3.")
++                name = name.replace(".shared_experts.down_proj.", f".experts.{sid}.w2.")
++
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+                 if weight_name not in name:
+                     continue

@@ -1,0 +1,124 @@
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 377e9e7ab1d3..6c67735e9fcf 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -464,6 +464,26 @@ def __init__(
+         else:
+             self.sliding_window = (sliding_window - 1, 0)
+         self.kv_cache_dtype = kv_cache_dtype
++        cap = current_platform.get_device_capability()
++        cap_str = cap.as_version_str() if cap is not None else "unknown"
++        dev = current_platform.get_device_name()
++        if self.kv_cache_dtype.startswith("fp8") and not (
++            current_platform.has_device_capability(89)
++        ):
++            suggested = "float16" if (cap is None or cap.to_int() < 80) else "bfloat16"
++            raise ValueError(
++                f"FP8 KV cache is not supported by the Triton attention backend "
++                f"on {dev} (compute capability {cap_str}); native FP8 (fp8e4nv) "
++                f"requires SM89+. Re-run with --kv-cache-dtype {suggested}."
++            )
++        if self.kv_cache_dtype == "bfloat16" and not (
++            current_platform.has_device_capability(80)
++        ):
++            raise ValueError(
++                f"bfloat16 KV cache is not supported on {dev} (compute capability "
++                f"{cap_str}); bfloat16 requires SM80+. Re-run with "
++                f"--kv-cache-dtype float16."
++            )
+         if logits_soft_cap is None:
+             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
+             logits_soft_cap = 0
+diff --git a/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py b/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py
+index 08c6673fb589..3959cba575fe 100644
+--- a/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py
++++ b/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py
+@@ -17,9 +17,16 @@
+ 
+ 
+ def _is_supported_kv_cache_dtype(kv_cache_dtype: str) -> bool:
+-    return kv_cache_dtype in _NATIVE_KV_CACHE_DTYPES or is_quantized_kv_cache(
+-        kv_cache_dtype
+-    )
++    if not (
++        kv_cache_dtype in _NATIVE_KV_CACHE_DTYPES
++        or is_quantized_kv_cache(kv_cache_dtype)
++    ):
++        return False
++    if kv_cache_dtype.startswith("fp8"):
++        return current_platform.has_device_capability(89)
++    if kv_cache_dtype == "bfloat16":
++        return current_platform.has_device_capability(80)
++    return True
+ 
+ 
+ @triton.jit
+@@ -359,7 +366,9 @@ def triton_reshape_and_cache_flash(
+     page_stride = key_cache.stride()[1]
+ 
+     assert _is_supported_kv_cache_dtype(kv_cache_dtype), (
+-        f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
++        f"Triton reshape-and-cache cannot store kv_cache_dtype={kv_cache_dtype} "
++        f"on this device: an FP8 KV cache needs native fp8e4nv (SM89+). Use "
++        f"--kv-cache-dtype bfloat16 (or float16 on SM75)."
+     )
+     kv_cache_torch_dtype = (
+         current_platform.fp8_dtype()
+@@ -374,23 +383,7 @@ def triton_reshape_and_cache_flash(
+         # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
+         key_cache = key_cache.view(kv_cache_torch_dtype)
+         value_cache = value_cache.view(kv_cache_torch_dtype)
+-    assert kv_cache_dtype != torch.uint8, (
+-        "explicit fp8 cast and store to "
+-        "uint8 is not supported by triton reshape_and_cache_flash"
+-    )
+-
+     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+-    assert (not FP8_KV_CACHE) or kv_cache_torch_dtype in [
+-        torch.float8_e4m3fn,
+-        torch.float8_e5m2,
+-        torch.uint8,
+-        torch.float8_e4m3fnuz,
+-    ], (
+-        "unsupported dtype of KV cache tensor, got "
+-        "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
+-        "fp8e5m2, uint8, bfloat16, float16, float32, fp8e4m3fnuz."
+-    )
+-
+     # heuristics instead of autotuning
+     TILE_SIZE = min(2048, triton.next_power_of_2(n))
+     if current_platform.is_rocm() or current_platform.is_xpu():
+@@ -537,9 +530,6 @@ def triton_reshape_and_cache_flash_diffkv(
+     block_stride = kv_cache.stride()[0]
+     page_stride = kv_cache.stride()[1]
+ 
+-    assert _is_supported_kv_cache_dtype(kv_cache_dtype), (
+-        f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
+-    )
+     kv_cache_torch_dtype = (
+         current_platform.fp8_dtype()
+         if is_quantized_kv_cache(kv_cache_dtype)
+@@ -550,23 +540,7 @@ def triton_reshape_and_cache_flash_diffkv(
+         # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
+         # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
+         kv_cache = kv_cache.view(kv_cache_torch_dtype)
+-    assert kv_cache_dtype != torch.uint8, (
+-        "explicit fp8 cast and store to "
+-        "uint8 is not supported by triton reshape_and_cache_flash_diffkv"
+-    )
+-
+     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+-    assert (not FP8_KV_CACHE) or kv_cache_torch_dtype in [
+-        torch.float8_e4m3fn,
+-        torch.float8_e5m2,
+-        torch.uint8,
+-        torch.float8_e4m3fnuz,
+-    ], (
+-        "unsupported dtype of KV cache tensor, got "
+-        "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
+-        "fp8e5m2, uint8, bfloat16, float16, float32, fp8e4m3fnuz."
+-    )
+-
+     # heuristics instead of autotuning
+     TILE_SIZE = max(head_size_k, head_size_v)
+     TILE_SIZE = triton.next_power_of_2(TILE_SIZE)

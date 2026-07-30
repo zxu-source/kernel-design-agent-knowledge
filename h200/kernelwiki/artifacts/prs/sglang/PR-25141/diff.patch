@@ -1,0 +1,779 @@
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index 5b7ba8fc7506..4d57d1cf3267 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -1133,15 +1133,16 @@ def load_lora_adapter_from_tensors(
+         load_format: Optional[str] = None,
+     ):
+         if load_format == "flattened_bucket":
+-            serialized_tensors = tensors
++            serialized_named_tensors = list(tensors)
+         else:
+-            serialized_tensors = MultiprocessingSerializer.serialize(
+-                tensors, output_str=True
+-            )
++            serialized_named_tensors = [
++                MultiprocessingSerializer.serialize(tensors, output_str=True)
++                for _ in range(self.server_args.tp_size)
++            ]
+         lora_req = LoadLoRAAdapterFromTensorsReqInput(
+             lora_name=lora_name,
+             config_dict=config_dict,
+-            serialized_tensors=serialized_tensors,
++            serialized_named_tensors=serialized_named_tensors,
+             load_format=load_format,
+         )
+         return self.loop.run_until_complete(
+diff --git a/python/sglang/srt/lora/backend/base_backend.py b/python/sglang/srt/lora/backend/base_backend.py
+index 17b7bef1bf7e..2bb59f8eaf8d 100644
+--- a/python/sglang/srt/lora/backend/base_backend.py
++++ b/python/sglang/srt/lora/backend/base_backend.py
+@@ -19,6 +19,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
+     def __init__(self, max_loras_per_batch: int, device: torch.device):
+         self.max_loras_per_batch = max_loras_per_batch
+         self.device = device
++        self.batch_info = None
+         self.init_lm_head_config()
+ 
+     def run_lora_a_embedding(
+@@ -176,10 +177,12 @@ def init_cuda_graph_moe_buffers(
+         """
+         base = moe_layer.base_layer
+         top_k = base.top_k
+-        qinfo = moe_layer._quant_info
+-        E, N, _ = qinfo.w13_weight.shape
+-        hidden_dim = qinfo.w2_weight.shape[1]
+-        device = qinfo.w13_weight.device
++        # Derive dims from the base FusedMoE rather than quant-specific tensors,
++        # so this works for any scheme (FP, WNA16, Marlin-packed, etc.).
++        E = base.num_local_experts
++        hidden_dim = base.hidden_size
++        N = 2 * base.intermediate_size_per_partition
++        device = next(base.parameters()).device
+         dtype = compute_dtype
+         num_experts = base.num_experts
+ 
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 475df00677f7..dacbe52a5a25 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -41,6 +41,15 @@ def __init__(
+             self.weight = self.base_layer.weight
+         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+             self.bias = self.base_layer.bias
++        if hasattr(self.base_layer, "reduce_results"):
++            self.reduce_results = self.base_layer.reduce_results
++        # Alias remaining base-layer parameters onto the wrapper so
++        # `named_parameters(remove_duplicate=True)` yields them at the outer
++        # path — weight loaders (e.g. FusedMoE's `w13_weight_packed`) lookup
++        # names without the `.base_layer.` segment.
++        for _name, _param in base_layer.named_parameters(recurse=False):
++            if not hasattr(self, _name):
++                setattr(self, _name, _param)
+ 
+     def forward(self, x: torch.Tensor):
+         return self.base_layer.forward(x)
+@@ -207,8 +216,9 @@ def forward(self, input_: torch.Tensor):
+         ):
+             base_output = self.extra_token_embedding(input_, base_output)
+ 
+-        # Apply LoRA if configured
+-        if self.set_lora:
++        # Apply LoRA if configured. Skip if no batch_info (DP-attention idle
++        # forward): the base path is correct because no real tokens need LoRA.
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             # The backend's run_lora_a_embedding now handles both regular
+             # and extra tokens efficiently with CUDA graph support
+             base_output = self.apply_lora(base_output, input_, batch_info)
+@@ -373,8 +383,8 @@ def forward(self, hidden_states: torch.Tensor):
+             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
+         )
+ 
+-        # Apply LoRA if set
+-        if self.set_lora:
++        # Apply LoRA if set. Skip in DP-attention idle forward (batch_info unset).
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             base_output = self.apply_lora(base_output, hidden_states)
+ 
+         return base_output
+@@ -463,7 +473,7 @@ def forward(self, input_: torch.Tensor):
+             self.base_layer, input_, bias
+         )
+ 
+-        if self.set_lora:
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             output_parallel = self.apply_lora(output_parallel, input_)
+ 
+         if self.base_layer.gather_output:
+@@ -477,9 +487,13 @@ def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+         return A
+ 
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
++        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
++        # is authoritative: DP-attention makes output_partition_sizes attn_tp-local while
++        # the caller passes global tp_rank.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         shard_size = self.base_layer.output_partition_sizes[0]
+-        start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
++        start_idx = local_tp_rank * shard_size
++        end_idx = (local_tp_rank + 1) * shard_size
+         B = B[start_idx:end_idx, :]
+         return B
+ 
+@@ -573,12 +587,15 @@ def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+         return A
+ 
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
++        # base_layer.tp_rank is authoritative under DP-attention: the caller passes
++        # the global tp_rank but output_partition_sizes is attn_tp-local.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         partition_sizes = self.base_layer.output_partition_sizes
+         output_sizes = self.base_layer.output_sizes
+         slices = []
+         offset = 0
+         for full_size, part_size in zip(output_sizes, partition_sizes):
+-            start_idx = tp_rank * part_size
++            start_idx = local_tp_rank * part_size
+             end_idx = start_idx + part_size
+             slices.append(B[offset + start_idx : offset + end_idx, :])
+             offset += full_size
+@@ -645,11 +662,14 @@ def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int) -> torch.Tensor:
+         q_proj_shard_size = base_layer.q_proj_shard_size
+         kv_proj_shard_size = base_layer.kv_proj_shard_size
+         num_kv_head_replicas = base_layer.num_kv_head_replicas
++        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
++        # is authoritative under DP-attention.
++        local_tp_rank = getattr(base_layer, "tp_rank", tp_rank)
+ 
+-        q_start_idx = q_proj_shard_size * tp_rank
++        q_start_idx = q_proj_shard_size * local_tp_rank
+         q_end_idx = q_start_idx + q_proj_shard_size
+ 
+-        kv_shard_id = tp_rank // num_kv_head_replicas
++        kv_shard_id = local_tp_rank // num_kv_head_replicas
+         kv_start_idx = kv_proj_shard_size * kv_shard_id
+         kv_end_idx = kv_start_idx + kv_proj_shard_size
+ 
+@@ -731,7 +751,9 @@ def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=Non
+             and not skip_all_reduce
+         )
+ 
+-        if self.set_lora and should_reduce:
++        # LoRA skipped when batch_info is None (DP-attention idle forward).
++        have_batch_info = self.lora_backend.batch_info is not None
++        if self.set_lora and have_batch_info and should_reduce:
+             lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                 input_parallel, self.A_buffer
+             )
+@@ -745,7 +767,7 @@ def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=Non
+                 base_output=output_,
+             )
+         else:
+-            if self.set_lora:
++            if self.set_lora and have_batch_info:
+                 output_parallel = self.apply_lora(output_parallel, input_parallel)
+             if should_reduce:
+                 output_ = tensor_model_parallel_all_reduce(output_parallel)
+@@ -756,9 +778,15 @@ def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=Non
+         return output_, output_bias
+ 
+     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
++        # Use base_layer.tp_rank (not the argument) so the slicing rank matches
++        # the partition group the base layer was built on. For MLA o_proj under
++        # DP-attention, base_layer.tp_rank is attn_tp_rank while the caller
++        # passes the global tp_rank; input_size_per_partition is already
++        # attn_tp-sized, so using global tp_rank overshoots to empty.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         shard_size = self.base_layer.input_size_per_partition
+-        start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
++        start_idx = local_tp_rank * shard_size
++        end_idx = (local_tp_rank + 1) * shard_size
+         A = A[:, start_idx:end_idx].contiguous()
+         return A
+ 
+@@ -844,7 +872,7 @@ def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor
+     def forward(self, x: torch.Tensor):
+         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+-        if self.set_lora:
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             output = self.apply_lora(output, x)
+         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+         return output, output_bias
+@@ -878,7 +906,19 @@ def __init__(
+ 
+         self.experts_shared_outer_loras: bool = False
+         self.lora_use_virtual_experts: bool = False
++        # Forward for the model's own forward-path dispatch — the outer model
++        # reads several FusedMoE attributes (e.g. `self.experts.moe_runner_config`,
++        # `self.experts.dispatcher`, `self.experts.num_local_experts`,
++        # `self.experts.quant_method`) directly on the wrapper. Quant
++        # post-processing iterators skip LoRA wrappers via
++        # `isinstance(module, BaseLayerWithLoRA)` so the packed params on the
++        # inner FusedMoE get processed there, not here.
+         self.quant_method = base_layer.quant_method
++        self.moe_runner_config = base_layer.moe_runner_config
++        self.dispatcher = base_layer.dispatcher
++        self.num_local_experts = base_layer.num_local_experts
++        if hasattr(base_layer, "scheme"):
++            self.scheme = base_layer.scheme
+ 
+         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
+         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
+@@ -903,6 +943,12 @@ def __init__(
+             and base_layer.quant_method.runner is not None
+         ):
+             runner_backend = base_layer.quant_method.runner.runner_backend
++        elif (
++            hasattr(base_layer, "scheme")
++            and hasattr(base_layer.scheme, "runner")
++            and base_layer.scheme.runner is not None
++        ):
++            runner_backend = base_layer.scheme.runner.runner_backend
+         else:
+             runner_backend = MoeRunnerBackend.TRITON
+ 
+@@ -1007,6 +1053,8 @@ def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs
+         1. After gate_up projection, before activation
+         2. After down projection, before final reduction
+         """
++        if self.lora_backend.batch_info is None:
++            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
+ 
+         # Build LoRA info for this batch
+         lora_info = self._get_lora_info()
+@@ -1034,6 +1082,9 @@ def _forward_with_lora(
+ 
+         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
+         quant_info = self._quant_info
++        quant_info.expert_map = getattr(
++            base_layer.dispatcher, "local_expert_mapping", None
++        )
+ 
+         # Run the only lora moe runner (Triton)
+         combine_input = self._lora_runner.run(
+diff --git a/python/sglang/srt/lora/lora_moe_runners.py b/python/sglang/srt/lora/lora_moe_runners.py
+index b3f1389b5c01..81105a63f428 100644
+--- a/python/sglang/srt/lora/lora_moe_runners.py
++++ b/python/sglang/srt/lora/lora_moe_runners.py
+@@ -205,7 +205,14 @@ def _compute_token_lora_mapping(
+     hidden_states: torch.Tensor,
+     lora_info: LoRAInfo,
+ ) -> torch.Tensor:
+-    """Map each token to its LoRA adapter index (-1 for no LoRA)."""
++    """Map each token to its LoRA adapter index (-1 for no LoRA).
++
++    Under DP-attention, `hidden_states` is the gathered batch (local + foreign
++    tokens) but `seg_indptr` / `req_to_lora` cover only local requests, so
++    `searchsorted` on foreign positions would index one past the end. Pad
++    `req_to_lora` with a -1 sentinel; foreign outputs are discarded by the
++    DP-attention scatter anyway.
++    """
+     token_positions = torch.arange(
+         hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
+     )
+@@ -214,7 +221,11 @@ def _compute_token_lora_mapping(
+         token_positions,
+         right=True,
+     )
+-    return lora_info.req_to_lora.to(torch.int32)[req_indices]
++    req_to_lora = lora_info.req_to_lora.to(torch.int32)
++    req_to_lora_padded = torch.cat(
++        [req_to_lora, req_to_lora.new_full((1,), -1)], dim=0
++    )
++    return req_to_lora_padded[req_indices]
+ 
+ 
+ def _compute_lora_alignment(
+@@ -349,7 +360,6 @@ def _add_lora_gate_up_delta(
+     r = lora_info.max_lora_rank
+     gate_up_a = lora_info.gate_up_lora_a_weights
+     gate_up_b = lora_info.gate_up_lora_b_weights
+-
+     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
+         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
+ 
+@@ -359,6 +369,8 @@ def _add_lora_gate_up_delta(
+     if is_gated:
+         inter_size = gate_up_b.shape[2] // 2
+         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
++        # B halves are also the tuple form the virtual-experts kernel wants
++        # (one shrink at K=2*r, two expands at K=r each).
+         lora_b_stacked = [
+             gate_up_b[:, :, :inter_size, :],
+             gate_up_b[:, :, inter_size:, :],
+@@ -372,7 +384,7 @@ def _add_lora_gate_up_delta(
+             output=intermediate_cache,
+             hidden_states=hidden_states,
+             lora_a=gate_up_a,
+-            lora_b=gate_up_b,
++            lora_b=tuple(lora_b_stacked) if is_gated else gate_up_b,
+             topk_ids=topk_ids,
+             topk_weights=topk_weights,
+             token_lora_mapping=token_lora_mapping,
+@@ -447,6 +459,8 @@ def _add_lora_down_delta(
+     down_lora_a = lora_info.down_lora_a_weights
+     down_lora_b = lora_info.down_lora_b_weights
+     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
++        # fused_moe_lora requires B's expert_dim to match A's; expand the
++        # shared B view.
+         down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
+ 
+     if lora_info.fully_sharded and lora_info.tp_size > 1:
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 2a9bb8b7c34b..dbb5a745231c 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -284,6 +284,55 @@ def _iter_local_expert_weights(
+             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
+         )
+ 
++    def _row_parallel_shard_tp(
++        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
++    ) -> int:
++        """Shard count for a non-MoE row-parallel module's activation axis.
++
++        Probes the base module's ``input_size // input_size_per_partition`` so
++        the LoRA buffer matches the actual shard regardless of which TP group
++        owns it — covers DP-attention (``o_proj`` uses ``attn_tp_size``) and
++        shared-expert dense-vs-MoE per-layer-TP differences. Falls back to
++        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
++
++        MoE-internal names go through ``self.moe_tp_size`` upstream.
++        """
++        cache = getattr(self, "_row_parallel_tp_cache", None)
++        if cache is None:
++            cache = {}
++            setattr(self, "_row_parallel_tp_cache", cache)
++        key = (module_name, layer_idx)
++        if key in cache:
++            return cache[key]
++
++        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
++
++        def _probe(m):
++            in_size = getattr(m, "input_size", None)
++            per_part = getattr(m, "input_size_per_partition", None)
++            if in_size is not None and per_part is not None and per_part > 0:
++                return max(1, in_size // per_part)
++            inner = getattr(m, "base_layer", None)
++            if inner is not None and inner is not m:
++                return _probe(inner)
++            return None
++
++        suffix = f".{module_name}"
++        found = None
++        for _name, module in base_model.named_modules():
++            if not _name.endswith(suffix):
++                continue
++            if not any(marker in _name for marker in layer_markers):
++                continue
++            r = _probe(module)
++            if r is not None:
++                found = r
++                break
++
++        out = found if found is not None else self.tp_size
++        cache[key] = out
++        return out
++
+     def _get_standard_shape(
+         self,
+         module_name: str,
+@@ -296,8 +345,12 @@ def _get_standard_shape(
+             module_name, self.base_hf_config, base_model, layer_idx
+         )
+         c = get_stacked_multiply(module_name, base_model)
+-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+-            input_dim = divide(input_dim, self.tp_size)
++        # Non-MoE row-parallel modules: probe the actual shard size so o_proj /
++        # down_proj match attn_tp under DP-attention and the shared-experts
++        # dense-vs-MoE per-layer-TP differences.
++        row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
++        if row_tp > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
++            input_dim = divide(input_dim, row_tp)
+         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
+ 
+     def get_lora_A_shape(
+@@ -318,9 +371,12 @@ def get_lora_A_shape(
+             module_name, self.base_hf_config, base_model, layer_idx
+         )
+         c = get_stacked_multiply(module_name, base_model)
+-        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
++        # MoE modules shard along `moe_tp_size`; non-MoE row-parallel modules
++        # use a probed shard that may be attn_tp under DP-attention.
+         effective_tp_size = (
+-            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
++            self.moe_tp_size
++            if self.is_moe_module(module_name)
++            else self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+         )
+         if (
+             effective_tp_size > 1
+@@ -412,9 +468,12 @@ def get_lora_B_shape(
+         _, output_dim = get_hidden_dim(
+             module_name, self.base_hf_config, base_model, layer_idx
+         )
+-        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
++        # MoE modules shard along `moe_tp_size`; non-MoE column-parallel modules
++        # use a probed shard that may be attn_tp under DP-attention.
+         effective_tp_size = (
+-            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
++            self.moe_tp_size
++            if self.is_moe_module(module_name)
++            else self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+         )
+         if (
+             effective_tp_size > 1
+@@ -765,16 +824,22 @@ def load_lora_weight_tensor(
+                 expert_match = re.search(r"experts\.(\d+)\.", name)
+ 
+                 if expert_match:
+-                    # Per-expert MoE weight — 2D tensors, one per expert
++                    # Per-expert MoE weight — 2D tensors, one per expert.
++                    # Init A and B independently: under ``experts_shared_outer_loras``,
++                    # fc1 has shared A (Tensor in temp_A_buffer) + per-expert B
++                    # (dict in temp_B_buffer), and fc2 has the opposite. A shared
++                    # init on both would either clobber the shared Tensor or leave
++                    # the per-expert side as None.
+                     target_module = target_module + "_moe"
+-                    if temp_A_buffer[target_module] is None:
+-                        temp_A_buffer[target_module] = {}
+-                        temp_B_buffer[target_module] = {}
+ 
+                     expert_id = int(expert_match.group(1))
+                     if "lora_A" in name:
++                        if temp_A_buffer[target_module] is None:
++                            temp_A_buffer[target_module] = {}
+                         temp_A_buffer[target_module][expert_id] = weights
+                     else:
++                        if temp_B_buffer[target_module] is None:
++                            temp_B_buffer[target_module] = {}
+                         temp_B_buffer[target_module][expert_id] = weights
+                 elif "experts" in name and weights.dim() == 3:
+                     # Shared outer MoE weight — 3D tensor [expert_dim, rank, hidden]
+diff --git a/python/sglang/srt/lora/triton_ops/virtual_experts.py b/python/sglang/srt/lora/triton_ops/virtual_experts.py
+index 4781dfe504eb..69339ccfe419 100644
+--- a/python/sglang/srt/lora/triton_ops/virtual_experts.py
++++ b/python/sglang/srt/lora/triton_ops/virtual_experts.py
+@@ -515,7 +515,7 @@ def _merged_experts_fused_moe_lora_add_impl(
+     output: torch.Tensor,
+     hidden_states: torch.Tensor,
+     lora_a: torch.Tensor,
+-    lora_b: torch.Tensor,
++    lora_b: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+     topk_ids: torch.Tensor,
+     topk_weights: torch.Tensor,
+     token_lora_mapping: torch.Tensor,
+@@ -524,13 +524,30 @@ def _merged_experts_fused_moe_lora_add_impl(
+     experts_shared_outer_loras_b: bool,
+     routing_cache: dict | None = None,
+ ) -> None:
++    """Fused virtual-experts LoRA delta add.
++
++    ``lora_b`` accepts either a single tensor or a sequence of tensors stacked
++    along the output dim. Length-2 is the gate_up case where A has rank ``2*r``
++    (gate's A and up's A concatenated along rank) and each B has rank ``r``.
++    The shrink runs once over the full ``2*r`` rank; the expand runs once per
++    B, each reading its half of the intermediate and writing to its slice of
++    ``output``.
+     """
+-    1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
+-    2. Flatten LoRA weights from [max_loras, num_experts, ...] to [max_loras * num_experts, ...].
+-    3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
+-    4. Mask out tokens with token_lora_mapping == -1 on the add path.
+-    """
++    lora_b_list: list[torch.Tensor] = (
++        list(lora_b) if isinstance(lora_b, (list, tuple)) else [lora_b]
++    )
++    n_b = len(lora_b_list)
++    assert n_b in (1, 2), f"lora_b must be length 1 or 2, got {n_b}"
++    b_rank = lora_b_list[0].shape[3]
++    for b in lora_b_list[1:]:
++        assert b.shape == lora_b_list[0].shape, (
++            f"all lora_b tensors must share shape; got {[tuple(t.shape) for t in lora_b_list]}"
++        )
++
+     max_loras, _, max_lora_rank, _ = lora_a.shape
++    assert max_lora_rank == n_b * b_rank, (
++        f"lora_a rank {max_lora_rank} != n_b ({n_b}) * lora_b rank {b_rank}"
++    )
+     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
+ 
+     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
+@@ -642,9 +659,10 @@ def _get_routing(
+     )
+ 
+     lora_a_virtual = _merge_lora_expert_weight(lora_a)
+-    lora_b_virtual = _merge_lora_expert_weight(lora_b)
++    lora_b_virtuals = [_merge_lora_expert_weight(b) for b in lora_b_list]
+     num_experts_a = lora_a.shape[1]
+-    num_experts_b = lora_b.shape[1]
++    num_experts_b = lora_b_list[0].shape[1]
++    half_out = lora_b_list[0].shape[2]
+ 
+     intermediate = torch.zeros(
+         [token_lora_mapping.shape[0], topk_ids.shape[1], max_lora_rank],
+@@ -678,7 +696,7 @@ def _get_routing(
+         a_stage_config,
+     )
+ 
+-    b_stage_config = _get_stage_config(lora_b_virtual, 1)
++    b_stage_config = _get_stage_config(lora_b_virtuals[0], 1)
+     (
+         sorted_token_ids,
+         expert_ids,
+@@ -692,33 +710,47 @@ def _get_routing(
+         b_stage_config["BLOCK_SIZE_M"],
+     )
+ 
+-    invoke_fused_moe_kernel(
+-        intermediate.view(-1, max_lora_rank),
+-        lora_b_virtual,
+-        None,
+-        output,
+-        None,
+-        None,
+-        None,
+-        topk_weights,
+-        topk_ids,
+-        sorted_token_ids,
+-        expert_ids,
+-        num_tokens_post_padded,
+-        mul_routed_weight,
+-        1,
+-        b_stage_config,
+-        tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
+-        False,
+-        False,
+-        False,
+-        False,
+-        False,
+-        None,
+-        fuse_add_to_output=True,
+-        add_output_mask=token_lora_mask,
+-        router_topk=topk_ids.shape[1],
+-    )
++    # n_b expands. For len 1: K=b_rank covers full intermediate, write full output.
++    # For len 2 (gate_up): split intermediate along rank into [gate, up] halves
++    # (each contiguous, K=b_rank=r) and output along last dim into [gate, up]
++    # halves (each of width half_out). Each B in lora_b_virtuals is its own
++    # half's weight tensor, naturally K=b_rank.
++    for b_idx, b_virtual in enumerate(lora_b_virtuals):
++        if n_b == 1:
++            inter_arg = intermediate.view(-1, b_rank)
++            out_arg = output
++        else:
++            inter_arg = intermediate[..., b_idx * b_rank : (b_idx + 1) * b_rank].contiguous().view(-1, b_rank)
++            out_arg = output[..., b_idx * half_out : (b_idx + 1) * half_out].contiguous()
++        invoke_fused_moe_kernel(
++            inter_arg,
++            b_virtual,
++            None,
++            out_arg,
++            None,
++            None,
++            None,
++            topk_weights,
++            topk_ids,
++            sorted_token_ids,
++            expert_ids,
++            num_tokens_post_padded,
++            mul_routed_weight,
++            1,
++            b_stage_config,
++            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
++            False,
++            False,
++            False,
++            False,
++            False,
++            None,
++            fuse_add_to_output=True,
++            add_output_mask=token_lora_mask,
++            router_topk=topk_ids.shape[1],
++        )
++        if n_b != 1:
++            output[..., b_idx * half_out : (b_idx + 1) * half_out].copy_(out_arg)
+ 
+ 
+ def _merged_experts_fused_moe_lora_add_op(
+@@ -761,7 +793,7 @@ def merged_experts_fused_moe_lora_add(
+     output: torch.Tensor,
+     hidden_states: torch.Tensor,
+     lora_a: torch.Tensor,
+-    lora_b: torch.Tensor,
++    lora_b: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+     topk_ids: torch.Tensor,
+     topk_weights: torch.Tensor,
+     token_lora_mapping: torch.Tensor,
+@@ -770,7 +802,12 @@ def merged_experts_fused_moe_lora_add(
+     experts_shared_outer_loras_b: bool,
+     routing_cache: dict | None = None,
+ ) -> None:
+-    """Public API: wraps the registered op with routing_cache support."""
++    """Public API: wraps the registered op with routing_cache support.
++
++    ``lora_b`` accepts a sequence of length 2 for the gate_up case (each B
++    holds one half of the stacked output, rank ``r``, with A's rank ``2*r``);
++    a single tensor is used for the down case.
++    """
+     _merged_experts_fused_moe_lora_add_impl(
+         output,
+         hidden_states,
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index de740d898751..ebd1e83ce8db 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1915,7 +1915,7 @@ def to_ref(self) -> LoRARef:
+ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
+     lora_name: str
+     config_dict: Dict[str, Any]
+-    serialized_tensors: str
++    serialized_named_tensors: List[Union[str, bytes]]
+     pinned: bool = False
+     added_tokens_config: Optional[Dict[str, Any]] = None
+     lora_id: Optional[str] = None
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index a5ae7d4829e0..0fac8dbc736f 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -586,11 +586,9 @@ async def load_lora_adapter(
+                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                 )
+ 
+-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+-            # with dp_size > 1.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start load Lora adapter. Lora name=%s, path=%s",
+                 obj.lora_name,
+@@ -665,8 +663,8 @@ async def load_lora_adapter_from_tensors(
+                 )
+ 
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start load Lora adapter from tensors. Lora name=%s",
+                 obj.lora_name,
+@@ -738,11 +736,9 @@ async def unload_lora_adapter(
+                 obj.lora_name is not None
+             ), "lora_name must be provided to unload LoRA adapter"
+ 
+-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+-            # with dp_size > 1.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start unload Lora adapter. Lora name=%s",
+                 obj.lora_name,
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 1687de74be49..12f1a0784587 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -194,19 +194,23 @@ def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+     def load_lora_adapter_from_tensors(
+         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+     ):
+-        # The LoRA code handles TP sharding internally using slice_lora_a_weights
+-        # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
++        # TP sharding for LoRA happens inside the lora module (see
++        # lora/layers.py:46-49 and mem_pool.py:437-440). Each TP rank
++        # deserializes its own producer's bytes — same convention as
++        # ``update_weights_from_tensor`` above. One producer per one
++        # consumer means the CUDA-IPC ref counter on the producer's
++        # bucket drops cleanly each cycle.
++        monkey_patch_torch_reductions()
++        serialized = recv_req.serialized_named_tensors[self.tp_rank]
+         if recv_req.load_format == "flattened_bucket":
+-            flattened_data = MultiprocessingSerializer.deserialize(
+-                recv_req.serialized_tensors
+-            )
++            flattened_data = MultiprocessingSerializer.deserialize(serialized)
+             bucket = FlattenedTensorBucket(
+                 flattened_tensor=flattened_data["flattened_tensor"],
+                 metadata=flattened_data["metadata"],
+             )
+             tensors = dict(bucket.reconstruct_tensors())
+         else:
+-            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
++            tensors = MultiprocessingSerializer.deserialize(serialized)
+         result = self.model_runner.load_lora_adapter_from_tensors(
+             recv_req.to_ref(),
+             tensors,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 48c4f701e1e0..ca4ca4e934c9 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -3723,8 +3723,15 @@ def post_process_weights(self, recv_req):
+             if hasattr(self.model, "post_load_weights"):
+                 self.model.post_load_weights()
+ 
++        # LoRA wrappers forward `quant_method` for forward-path dispatch but
++        # don't own the packed params; skip them here so the inner base layer
++        # (yielded separately by `named_modules`) handles post-processing.
++        from sglang.srt.lora.layers import BaseLayerWithLoRA
++
+         if recv_req.restore_weights_before_load:
+             for _, module in self.model.named_modules():
++                if isinstance(module, BaseLayerWithLoRA):
++                    continue
+                 quant_method = getattr(module, "quant_method", None)
+                 if quant_method is not None and hasattr(
+                     quant_method, "restore_weights_before_loading"
+@@ -3734,6 +3741,8 @@ def post_process_weights(self, recv_req):
+ 
+         if recv_req.post_process_quantization:
+             for _, module in self.model.named_modules():
++                if isinstance(module, BaseLayerWithLoRA):
++                    continue
+                 quant_method = getattr(module, "quant_method", None)
+                 if quant_method is not None and hasattr(
+                     quant_method, "process_weights_after_loading"
+diff --git a/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py b/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+index 0f9fbc2590c8..bdcbd369937a 100644
+--- a/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
++++ b/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+@@ -130,7 +130,15 @@ def do_load_weights(
+             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
+         )
+ 
+-        cached_a_proj = {} if self.fuse_qkv_a_proj else None
++        # Persist across calls: chunked weight updates can split q_a_proj and
++        # kv_a_proj_with_mqa for the same layer into different chunks, and
++        # the fusion only fires once both halves have been seen.
++        if self.fuse_qkv_a_proj:
++            if not hasattr(self, "_persistent_cached_a_proj"):
++                self._persistent_cached_a_proj = {}
++            cached_a_proj = self._persistent_cached_a_proj
++        else:
++            cached_a_proj = None
+ 
+         if self.num_fused_shared_experts > 0:
+             assert self.num_fused_shared_experts == 1
+@@ -261,9 +269,10 @@ def do_load_weights(
+                         if self.fuse_qkv_a_proj and (
+                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                         ):
+-                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+-                                loaded_weight
+-                            )
++                            # Clone: `loaded_weight` may be a view into an IPC
++                            # bucket that gets reused by the next chunk, and
++                            # the RunAI streamer also relies on cloning.
++                            cached_a_proj[name] = loaded_weight.detach().clone()
+                             q_a_proj_name = (
+                                 name
+                                 if "q_a_proj" in name

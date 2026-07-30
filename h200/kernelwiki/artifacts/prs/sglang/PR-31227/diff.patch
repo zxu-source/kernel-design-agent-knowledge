@@ -1,0 +1,1508 @@
+diff --git a/python/sglang/srt/layers/attention/vision.py b/python/sglang/srt/layers/attention/vision.py
+index 4970251ae8e8..e3b36e5d33b4 100644
+--- a/python/sglang/srt/layers/attention/vision.py
++++ b/python/sglang/srt/layers/attention/vision.py
+@@ -174,6 +174,23 @@ def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
+     return int(seq_lens.max().item())
+ 
+ 
++def resolve_precomputed_max_seqlen(
++    cu_seqlens: torch.Tensor, max_seqlen: int | torch.Tensor | None
++) -> int:
++    """Use an encoder-provided max sequence length when one is available.
++
++    Packed vision encoders execute many attention blocks for one image batch.
++    Deriving the max from GPU ``cu_seqlens`` in every block synchronizes the
++    launch stream, whereas the encoder can materialize this host scalar once.
++    """
++    if max_seqlen is None:
++        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
++        return int(seq_lens.max().item())
++    if isinstance(max_seqlen, torch.Tensor):
++        return int(max_seqlen.item())
++    return int(max_seqlen)
++
++
+ class VisionSdpaAttention(nn.Module):
+     r"""
+     Scaled Dot Product Attention inner product
+@@ -392,15 +409,21 @@ def forward(
+             # [b * s, head, head_size]
+             output = torch.empty_like(q)
+ 
+-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+-            max_seqlen = seq_lens.max().item()
++            seq_lens = kwargs.get("sequence_lengths")
++            if seq_lens is None:
++                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
++            else:
++                seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
++            max_seqlen = resolve_precomputed_max_seqlen(
++                cu_seqlens, kwargs.get("max_seqlen")
++            )
+             context_attention_fwd(
+                 q,
+                 k,
+                 v,
+                 output,
+                 cu_seqlens.to(q.device),
+-                seq_lens.to(q.device),
++                seq_lens,
+                 max_seqlen,
+                 is_causal=False,
+                 sm_scale=softmax_scale,
+@@ -458,19 +481,9 @@ def forward(
+         else:
+             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+-            # Some vision encoders precompute this scalar once per encoder
+-            # forward and share it across all of their attention blocks.  Use
+-            # that value when available: deriving it here requires a
+-            # GPU-to-host sync, so repeating it per block serializes the ViT
+-            # launch stream for variable-size images.
+-            max_seqlen = kwargs.get("max_seqlen")
+-            if max_seqlen is None:
+-                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+-                max_seqlen = int(seq_lens.max().item())
+-            elif isinstance(max_seqlen, torch.Tensor):
+-                max_seqlen = int(max_seqlen.item())
+-            else:
+-                max_seqlen = int(max_seqlen)
++            max_seqlen = resolve_precomputed_max_seqlen(
++                cu_seqlens, kwargs.get("max_seqlen")
++            )
+ 
+             fa_kwargs = dict(
+                 cu_seqlens_q=cu_seqlens,
+@@ -523,8 +536,9 @@ def forward(
+             cu_seqlens = cu_seqlens.get_data()
+ 
+         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+-        max_seqlen = seq_lens.max().item()
++        max_seqlen = resolve_precomputed_max_seqlen(
++            cu_seqlens, kwargs.get("max_seqlen")
++        )
+ 
+         output = flash_attn_varlen_func(
+             q,
+diff --git a/python/sglang/srt/managers/mm_utils.py b/python/sglang/srt/managers/mm_utils.py
+index 545a70b56d6d..2bd3c74ae319 100644
+--- a/python/sglang/srt/managers/mm_utils.py
++++ b/python/sglang/srt/managers/mm_utils.py
+@@ -32,7 +32,7 @@
+ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.multimodal.evs import EVSEmbeddingResult
+-from sglang.srt.runtime_context import get_server_args
++from sglang.srt.runtime_context import get_parallel, get_server_args
+ from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
+ from sglang.utils import logger
+@@ -478,7 +478,7 @@ def _get_precomputed_embedding(
+ 
+ 
+ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
+-    """qwen-vl visual forward already moves batched features to the target device.
++    """Models that materialize and batch visual features inside their encoder.
+ 
+     instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
+     for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
+@@ -496,6 +496,7 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) ->
+         "Qwen3VLMoeForConditionalGeneration",
+         "Qwen3_5ForConditionalGeneration",
+         "Qwen3_5MoeForConditionalGeneration",
++        "KimiK25ForConditionalGeneration",
+     }
+ 
+ 
+@@ -508,6 +509,27 @@ def _move_items_to_device(
+             item.feature = item.feature.to(device, non_blocking=True)
+ 
+ 
++def _acknowledge_deferred_cuda_ipc_cache_hits(
++    items: List[MultimodalDataItem],
++) -> None:
++    """Release lazy Kimi IPC slices when a cached embedding skips ViT.
++
++    On an encoder-DP miss, exactly one rank copies an image and acknowledges
++    the full TP group.  On a cache hit no rank copies it, so rank zero performs
++    the equivalent single acknowledgement.  This preserves the fixed-pool
++    lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
++    """
++    parallel = get_parallel()
++    if parallel.attn_tp_rank != 0:
++        return
++    server_args = get_server_args()
++    # The pool's recycler uses ServerArgs.tp_size, so its acknowledgement must
++    # match that count even when an attention subgroup is smaller.
++    consumer_count = max(getattr(server_args, "tp_size", parallel.attn_tp_size), 1)
++    for item in items:
++        item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
++
++
+ def _get_chunked_embedding_full(
+     data_embedding_func: DataEmbeddingFunc,
+     embedding_items_per_req: List[MultimodalDataItem],
+@@ -535,6 +557,8 @@ def _get_chunked_embedding_full(
+             else embedding
+         )
+         embedding_cache.set(embedding_items_hash, embedding_per_req)
++    else:
++        _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
+ 
+     if isinstance(embedding_per_req, EVSEmbeddingResult):
+         item = embedding_items_per_req[0]
+@@ -594,13 +618,15 @@ def _get_chunked_embedding_by_item(
+         cached = embedding_cache.get_single(item.hash)
+         if cached is not None:
+             cached_embeddings[idx] = cached.embedding
++            _acknowledge_deferred_cuda_ipc_cache_hits([item])
+         else:
+             miss_items.append((idx, item, start, end))
+ 
+     # 3. Batch encode all cache-miss items in one ViT call
+     if miss_items:
+         miss_item_list = [item for _, item, _, _ in miss_items]
+-        _move_items_to_device(miss_item_list, device)
++        if not _can_skip_pre_embed_feature_move(data_embedding_func):
++            _move_items_to_device(miss_item_list, device)
+         all_miss_embedding = data_embedding_func(miss_item_list)
+         all_miss_embedding = all_miss_embedding.reshape(
+             -1, all_miss_embedding.shape[-1]
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 5424f6e2f125..6d9c6aa10865 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -111,7 +111,10 @@
+ from sglang.srt.sampling.sampling_params import SamplingParams
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.utils import flatten_nested_list
+-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
++from sglang.srt.utils.cuda_ipc_transport_utils import (
++    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
++    CudaIpcTensorTransportProxy,
++)
+ 
+ if TYPE_CHECKING:
+     from typing import Any, Dict
+@@ -359,10 +362,15 @@ def has_cuda_ipc_proxy(self):
+             )
+         )
+ 
+-    def reconstruct(self, target_device: int):
++    def reconstruct(self, target_device: int, ipc_consumer_count: int = 1):
+         """materialize cuda ipc proxy tensors in-place on target_device"""
+         if isinstance(self.feature, CudaIpcTensorTransportProxy):
+-            self.feature = self.feature.reconstruct_on_target_device(target_device)
++            if ipc_consumer_count == 1:
++                self.feature = self.feature.reconstruct_on_target_device(target_device)
++            else:
++                self.feature = self.feature.reconstruct_on_target_device(
++                    target_device, consumer_count=ipc_consumer_count
++                )
+         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
+             self.precomputed_embeddings = (
+                 self.precomputed_embeddings.reconstruct_on_target_device(target_device)
+@@ -376,6 +384,32 @@ def reconstruct(self, target_device: int):
+                 ].reconstruct_on_target_device(target_device)
+                 self.model_specific_data[extra_key] = extra_data
+ 
++    def can_defer_cuda_ipc_feature_reconstruction(self) -> bool:
++        """Whether a DP-aware model will materialize this feature lazily.
++
++        Hashing and pad-value generation must already have completed on the
++        tokenizer worker.  Any additional IPC proxy would still need eager
++        reconstruction, so keep the narrow fast path feature-only.
++        """
++        return (
++            self.model_specific_data.get(
++                DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY, False
++            )
++            and self.hash is not None
++            and self.pad_value is not None
++            and isinstance(self.feature, CudaIpcTensorTransportProxy)
++            and not isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
++            and not any(
++                isinstance(value, CudaIpcTensorTransportProxy)
++                for value in self.model_specific_data.values()
++            )
++        )
++
++    def acknowledge_deferred_cuda_ipc_feature(self, consumer_count: int = 1):
++        """Release a lazy IPC feature when an embedding-cache hit skips ViT."""
++        if isinstance(self.feature, CudaIpcTensorTransportProxy):
++            self.feature.acknowledge_consumption(consumer_count)
++
+ 
+ @dataclasses.dataclass
+ class MultimodalProcessorOutput:
+@@ -510,7 +544,10 @@ def from_processor_output(obj: MultimodalProcessorOutput):
+         # try reconstructing from cuda-ipc
+         reconstruct_device = None
+         for mm_item in mm_items:
+-            if mm_item.has_cuda_ipc_proxy():
++            if (
++                mm_item.has_cuda_ipc_proxy()
++                and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
++            ):
+                 if reconstruct_device is None:
+                     reconstruct_device = torch.cuda.current_device()
+                 mm_item.reconstruct(reconstruct_device)
+diff --git a/python/sglang/srt/models/kimi_k25.py b/python/sglang/srt/models/kimi_k25.py
+index 60f0f5fd095a..05bf837e7f58 100644
+--- a/python/sglang/srt/models/kimi_k25.py
++++ b/python/sglang/srt/models/kimi_k25.py
+@@ -30,8 +30,11 @@
+ from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+ from sglang.srt.models.kimi_vl_moonvit import MLP2
+ from sglang.srt.models.utils import WeightsMapper
+-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+-from sglang.srt.runtime_context import get_server_args
++from sglang.srt.multimodal.mm_utils import (
++    materialize_multimodal_features,
++    run_dp_sharded_mrope_vision_model,
++)
++from sglang.srt.runtime_context import get_parallel, get_server_args
+ from sglang.srt.utils import add_prefix, is_npu
+ 
+ logger = logging.getLogger(__name__)
+@@ -142,6 +145,7 @@ def forward(
+         cu_seqlens: torch.Tensor,
+         max_seqlen: int,
+         rope_freqs_cis: torch.Tensor | None = None,
++        sequence_lengths: torch.Tensor | None = None,
+     ):
+         residual = hidden_states
+         hidden_states = self.norm0(hidden_states)
+@@ -151,6 +155,7 @@ def forward(
+             cu_seqlens=cu_seqlens,
+             position_embeddings=rope_freqs_cis,
+             max_seqlen=max_seqlen,
++            sequence_lengths=sequence_lengths,
+         )
+ 
+         hidden_states = residual + hidden_states
+@@ -463,10 +468,13 @@ def forward(
+             grid_thws=grid_thws, device=hidden_states.device
+         )
+ 
++        sequence_lengths = (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
++            device=hidden_states.device, dtype=torch.int32
++        )
+         lengths = torch.cat(
+             (
+-                torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
+-                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
++                torch.zeros(1, dtype=torch.int32, device=hidden_states.device),
++                sequence_lengths,
+             )
+         )
+ 
+@@ -478,7 +486,11 @@ def forward(
+ 
+         for block in self.blocks:
+             hidden_states = block(
+-                hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis
++                hidden_states,
++                cu_seqlens,
++                max_seqlen,
++                rope_freqs_cis=rope_freqs_cis,
++                sequence_lengths=sequence_lengths,
+             )
+ 
+         hidden_states = self.final_layernorm(hidden_states)
+@@ -685,28 +697,69 @@ def __setattr__(self, name, value):
+     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+         device = self.vision_tower.device
+         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
+-        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
+-            device=device, dtype=target_dtype
+-        )
+         image_grid_thws = []
+         for item in items:
+             grid_thw = item.model_specific_data.get("image_grid_thw")
+             if grid_thw is None:
+                 grid_thw = item.model_specific_data["grid_thws"]
+             image_grid_thws.append(grid_thw)
+-        grid_thws = torch.concat(image_grid_thws, dim=0).to(device)
++        grid_thws = torch.concat(image_grid_thws, dim=0)
++
++        def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
++            """Move only this encoder-DP rank's images to its local GPU.
++
++            CUDA IPC features are intentionally reconstructed after the image
++            assignment.  Each image therefore crosses the tokenizer/scheduler
++            boundary once instead of once per TP rank.  The selected consumer
++            acknowledges the entire TP group so the bounded IPC pool remains
++            recyclable.
++            """
++            parallel = get_parallel()
++            server_args = get_server_args()
++            # Match MmItemMemoryPool.try_to_recycle(), which waits for the
++            # server TP size rather than the attention subgroup size.
++            ipc_consumer_count = max(
++                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
++            )
++            device_index = device.index
++            if device.type == "cuda" and device_index is None:
++                device_index = torch.cuda.current_device()
++
++            features = []
++            for image_index in image_indices:
++                item = items[image_index]
++                if device.type == "cuda":
++                    item.reconstruct(
++                        device_index, ipc_consumer_count=ipc_consumer_count
++                    )
++                feature = item.feature
++                if not isinstance(feature, torch.Tensor):
++                    raise TypeError(
++                        "Kimi-K2.5/K2.7 image feature must be a torch.Tensor, "
++                        f"got {type(feature)}"
++                    )
++                features.append(feature)
++            return materialize_multimodal_features(
++                features, device=device, dtype=target_dtype
++            )
+ 
+         if self.use_data_parallel:
+             image_embeds = run_dp_sharded_mrope_vision_model(
+                 self.vision_tower,
+-                pixel_values,
++                None,
+                 grid_thws.tolist(),
+-                rope_type="rope_2d",
++                # MoonViT3d uses 2D RoPE and returns packed patch embeddings.
++                # Its grid metadata is a positional argument, unlike Kimi-VL.
++                rope_type="rope_2d_packed",
++                load_local_pixel_values=materialize_item_features,
++                pixel_values_device=device,
++                pixel_values_dtype=target_dtype,
+             )
+             image_features = self.mm_projector(image_embeds)
+             return image_features
+ 
+-        image_embeds = self.vision_tower(pixel_values, grid_thws)
++        pixel_values = materialize_item_features(list(range(len(items))))
++        image_embeds = self.vision_tower(pixel_values, grid_thws.to(device))
+         proj_out = mm_projection_auto(self.mm_projector, image_embeds)
+         return torch.cat(proj_out, dim=0)
+ 
+diff --git a/python/sglang/srt/multimodal/mm_utils.py b/python/sglang/srt/multimodal/mm_utils.py
+index 1a4b9db09d1d..e50f50081e5e 100644
+--- a/python/sglang/srt/multimodal/mm_utils.py
++++ b/python/sglang/srt/multimodal/mm_utils.py
+@@ -33,7 +33,7 @@
+ import math
+ import re
+ from io import BytesIO
+-from typing import Literal
++from typing import Callable, Literal, Optional, Sequence
+ 
+ import numpy as np
+ import pybase64
+@@ -58,6 +58,59 @@ def has_valid_data(data) -> bool:
+     return True
+ 
+ 
++def materialize_multimodal_features(
++    features: Sequence[torch.Tensor],
++    *,
++    device: torch.device,
++    dtype: torch.dtype,
++) -> torch.Tensor:
++    """Concatenate variable-length feature tensors into one destination buffer.
++
++    A multimodal item can arrive as a CPU tensor, a CUDA-IPC reconstruction,
++    or an already resident tensor with a different dtype.  Calling ``to`` on
++    every item and then ``torch.cat`` creates one temporary tensor per item
++    before allocating the final packed input.  Allocate the final buffer once
++    and copy each item directly into its slice instead; ``copy_`` performs the
++    required device and dtype conversion in the destination copy.
++
++    All tensors must agree on dimensions after the leading token dimension.
++    The leading dimension may differ because images commonly have different
++    numbers of vision patches.
++    """
++
++    if not features:
++        raise ValueError("features must contain at least one tensor")
++
++    first = features[0]
++    if not isinstance(first, torch.Tensor):
++        raise TypeError(f"expected torch.Tensor, got {type(first)}")
++    if first.ndim == 0:
++        raise ValueError("multimodal feature tensors must have a leading dimension")
++    trailing_shape = first.shape[1:]
++    total_tokens = 0
++    for feature in features:
++        if not isinstance(feature, torch.Tensor):
++            raise TypeError(f"expected torch.Tensor, got {type(feature)}")
++        if feature.ndim == 0 or feature.shape[1:] != trailing_shape:
++            raise ValueError(
++                "multimodal feature tensors must have matching trailing shapes: "
++                f"expected {trailing_shape}, got {feature.shape}"
++            )
++        total_tokens += feature.shape[0]
++
++    output = torch.empty(
++        (total_tokens, *trailing_shape),
++        device=device,
++        dtype=dtype,
++    )
++    offset = 0
++    for feature in features:
++        length = feature.shape[0]
++        output[offset : offset + length].copy_(feature, non_blocking=True)
++        offset += length
++    return output
++
++
+ def select_best_resolution(original_size, possible_resolutions):
+     """
+     Selects the best resolution from a list of possible resolutions based on the original size.
+@@ -470,10 +523,13 @@ def run_dp_sharded_vision_model(
+ # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
+ def run_dp_sharded_mrope_vision_model(
+     vision_model: torch.nn.Module,
+-    pixel_values: torch.Tensor,
++    pixel_values: Optional[torch.Tensor],
+     grid_thw_list: list,
+     *,
+-    rope_type: Literal["rope_3d", "rope_2d"],
++    rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
++    load_local_pixel_values: Optional[Callable[[list[int]], torch.Tensor]] = None,
++    pixel_values_device: Optional[torch.device] = None,
++    pixel_values_dtype: Optional[torch.dtype] = None,
+ ):
+     """Run a vision model with data parallelism (DP) sharding.
+     The function will shard the input image tensor on the
+@@ -487,7 +543,9 @@ def run_dp_sharded_mrope_vision_model(
+         rope_type: Type of rope used in the vision model.
+                    Different rope types have different dimension to do ViT.
+                    "rope_3d" for 3D rope (e.g., Qwen2.5-VL)
+-                   "rope_2d" for 2D rope (e.g., Kimi-VL)
++                   "rope_2d" for packed 2D rope outputs (e.g., Kimi-VL)
++                   "rope_2d_packed" for packed 2D rope outputs that accept
++                   ``grid_thws`` positionally (e.g., Kimi-K2.5/K2.7)
+     Returns:
+         torch.Tensor: Output image embeddings
+ 
+@@ -495,14 +553,29 @@ def run_dp_sharded_mrope_vision_model(
+         ```
+         vision_model.out_hidden_size = 64
+         vision_model.spatial_merge_size = 2
+-        pixel_values.shape = (1350, channel)
++        pixel_values.shape = (1350, channel), or a local loader supplies
++        per-image features after the data-parallel assignment is known.
+         grid_thw_list = [[1, 10, 100], [1, 10, 10], [1, 10, 20], [1, 50]]
+         tp_size = 2
+         ```
+ 
+     """
++    if pixel_values is None and load_local_pixel_values is None:
++        raise ValueError("pixel_values or load_local_pixel_values must be provided")
++
++    input_device = (
++        pixel_values.device if pixel_values is not None else pixel_values_device
++    )
++    input_dtype = pixel_values.dtype if pixel_values is not None else pixel_values_dtype
++    if input_device is None or input_dtype is None:
++        raise ValueError(
++            "pixel_values_device and pixel_values_dtype are required with a local loader"
++        )
++
+     tp_size = get_parallel().attn_tp_size
+     if tp_size == 1:
++        if pixel_values is None:
++            pixel_values = load_local_pixel_values(list(range(len(grid_thw_list))))
+         grid_thw = torch.tensor(
+             grid_thw_list,
+             # MoonViT's 2D RoPE implementation combines the grid metadata
+@@ -522,6 +595,11 @@ def run_dp_sharded_mrope_vision_model(
+             if isinstance(image_embeds, list):
+                 return torch.cat(image_embeds, dim=0)
+             return image_embeds
++        if rope_type == "rope_2d_packed":
++            image_embeds = vision_model(pixel_values, grid_thw)
++            if isinstance(image_embeds, list):
++                return torch.cat(image_embeds, dim=0)
++            return image_embeds
+         return vision_model(pixel_values, grid_thw=grid_thw)
+ 
+     # GPU_0 tp_rank_local = 0
+@@ -553,21 +631,23 @@ def run_dp_sharded_mrope_vision_model(
+ 
+     # Get the pixel values for the local images based on the image_idxs_local
+     if len(image_idxs_local) > 0:
+-        pixel_values_local = torch.cat(
+-            [
+-                pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
+-                for i in image_idxs_local
+-            ]
+-        )
++        if load_local_pixel_values is not None:
++            pixel_values_local = load_local_pixel_values(image_idxs_local)
++        else:
++            assert pixel_values is not None
++            pixel_values_local = torch.cat(
++                [
++                    pixel_values[
++                        cum_patches_per_image[i] : cum_patches_per_image[i + 1]
++                    ]
++                    for i in image_idxs_local
++                ]
++            )
+     else:
+-        # Handle case where this rank has no images
+-        pixel_values_local = torch.empty(
+-            (0, pixel_values.shape[1]),
+-            device=pixel_values.device,
+-            dtype=pixel_values.dtype,
+-        )
++        pixel_values_local = None
+     # embed_dim_reduction_factor = 2 * 2
+-    if rope_type == "rope_2d":
++    packed_2d_rope = rope_type in ("rope_2d", "rope_2d_packed")
++    if packed_2d_rope:
+         embed_dim_reduction_factor = (
+             vision_model.merge_kernel_size[0] * vision_model.merge_kernel_size[1]
+         )
+@@ -584,37 +664,45 @@ def run_dp_sharded_mrope_vision_model(
+     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
+ 
+     # Run the vision model on the local pixel_values_local
+-    if rope_type == "rope_2d":
+-        if pixel_values_local.shape[0] > 0:
++    if packed_2d_rope:
++        if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
+             local_grid_thw = torch.tensor(
+                 local_grid_thw_list, device=pixel_values_local.device
+             )
+-            image_embeds_local = vision_model(
+-                pixel_values_local,
+-                grid_hw=local_grid_thw,
+-                max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
+-            )
++            if rope_type == "rope_2d":
++                image_embeds_local = vision_model(
++                    pixel_values_local,
++                    grid_hw=local_grid_thw,
++                    max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
++                )
++            else:
++                image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
+             if isinstance(image_embeds_local, list):
+                 image_embeds_local = torch.cat(image_embeds_local, dim=0)
+         else:
+             out_dim = getattr(vision_model.config, "hidden_size", None)
+             image_embeds_local = torch.empty(
+                 (0, embed_dim_reduction_factor, out_dim),
+-                device=pixel_values.device,
+-                dtype=pixel_values.dtype,
++                device=input_device,
++                dtype=input_dtype,
+             )
+     else:
+-        if pixel_values_local.shape[0] > 0:
++        if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
+             # print(f"{local_grid_thw_list = }", flush=True)
+             image_embeds_local = vision_model(
+                 pixel_values_local, torch.tensor(local_grid_thw_list)
+             )
++            if isinstance(image_embeds_local, list):
++                image_embeds_local = torch.cat(image_embeds_local, dim=0)
+         else:
+             # Handle empty case
++            out_dim = getattr(vision_model, "out_hidden_size", None)
++            if out_dim is None:
++                out_dim = vision_model.config.hidden_size
+             image_embeds_local = torch.empty(
+-                (0, vision_model.out_hidden_size),
+-                device=pixel_values.device,
+-                dtype=pixel_values.dtype,
++                (0, out_dim),
++                device=input_device,
++                dtype=input_dtype,
+             )
+ 
+     # Pad the output based on max_len_per_rank
+@@ -622,7 +710,7 @@ def run_dp_sharded_mrope_vision_model(
+     current_len = image_embeds_local.shape[0]
+     if current_len < max_len_per_rank:
+         padding_size = max_len_per_rank - current_len
+-        if rope_type == "rope_2d":
++        if packed_2d_rope:
+             padding = torch.empty(
+                 (
+                     padding_size,
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+index fdf9cb55ca58..ed82bb72429d 100644
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -35,6 +35,7 @@
+     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+     CudaIpcTensorTransportProxy,
+     MmItemMemoryPool,
++    get_mm_feature_pool_size_per_worker,
+ )
+ 
+ _is_cpu = is_cpu()
+@@ -280,16 +281,19 @@ def __init__(
+             # tokenizer workers. Each worker gets an equal share so that adding
+             # workers doesn't multiply the GPU-side footprint.
+             worker_num = self.server_args.tokenizer_worker_num
+-            per_worker_pool_size = max(
+-                MM_FEATURE_CACHE_SIZE // worker_num,
+-                128 * 1024 * 1024,
++            per_worker_pool_size = get_mm_feature_pool_size_per_worker(
++                MM_FEATURE_CACHE_SIZE, worker_num
+             )
++            total_pool_size = per_worker_pool_size * worker_num
+             logger.info(
+-                "MmItemMemoryPool size per tokenizer worker: %.0f MiB "
+-                "(budget %.0f MiB / %d worker(s))",
++                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
++                "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
++                "budget %.0f MiB).",
++                total_pool_size / (1024 * 1024),
++                self.server_args.base_gpu_id,
+                 per_worker_pool_size / (1024 * 1024),
+-                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
+                 worker_num,
++                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
+             )
+             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+                 per_worker_pool_size,
+diff --git a/python/sglang/srt/multimodal/processors/kimi_k25.py b/python/sglang/srt/multimodal/processors/kimi_k25.py
+index fa07984fc9f7..e1593562070b 100644
+--- a/python/sglang/srt/multimodal/processors/kimi_k25.py
++++ b/python/sglang/srt/multimodal/processors/kimi_k25.py
+@@ -19,6 +19,9 @@
+     MultimodalSpecialTokens,
+ )
+ from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
++from sglang.srt.utils.cuda_ipc_transport_utils import (
++    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
++)
+ 
+ # ---------------------------------------------------------------------------
+ # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
+@@ -143,6 +146,49 @@ def _process_single_image(
+     return x, grid_thw
+ 
+ 
++def _resize_images_by_source_shape(
++    indexed_images: list[tuple[int, torch.Tensor]],
++    target_height: int,
++    target_width: int,
++) -> list[torch.Tensor]:
++    """Resize images while batching only inputs with an identical source layout.
++
++    A NaViT target-size group can still contain images with different source
++    dimensions.  Interpolation requires a rectangular batch, so preserve the
++    individual path for those images and batch only equal ``(shape, dtype)``
++    inputs.  The returned tensors retain the caller's original image order.
++    """
++    by_source_shape = defaultdict(list)
++    for index, image in indexed_images:
++        by_source_shape[(tuple(image.shape), image.dtype)].append((index, image))
++
++    resized_by_index = {}
++    for images in by_source_shape.values():
++        if len(images) == 1:
++            index, image = images[0]
++            resized_by_index[index] = F.interpolate(
++                image.unsqueeze(0).float(),
++                size=(target_height, target_width),
++                mode="bicubic",
++                align_corners=False,
++            )
++            continue
++
++        source_batch = torch.cat(
++            [image.unsqueeze(0) for _, image in images], dim=0
++        ).float()
++        resized_batch = F.interpolate(
++            source_batch,
++            size=(target_height, target_width),
++            mode="bicubic",
++            align_corners=False,
++        )
++        for local_index, (index, _) in enumerate(images):
++            resized_by_index[index] = resized_batch[local_index : local_index + 1]
++
++    return [resized_by_index[index] for index, _ in indexed_images]
++
++
+ def _gpu_preprocess_images(
+     images: list[Union[torch.Tensor, Image.Image]],
+     resize_configs: list[dict],
+@@ -182,21 +228,22 @@ def _gpu_preprocess_images(
+             all_patches[idx] = patches
+             all_grids[idx] = grid
+         else:
+-            tensors = []
+-            for _, image, _ in group:
++            indexed_images = []
++            for idx, image, _ in group:
+                 if isinstance(image, Image.Image):
+                     image = _pil_to_cuda_chw(image)
+                 else:
+                     image = _ensure_chw_rgb(image)
+-                tensors.append(image.unsqueeze(0).float())
+-
+-            resized = []
+-            for t in tensors:
+-                r = F.interpolate(
+-                    t, size=(target_h, target_w), mode="bicubic", align_corners=False
+-                )
+-                resized.append(r)
+-            batch = torch.cat(resized, dim=0)
++                indexed_images.append((idx, image))
++
++            # One NaViT target group can include several original resolutions.
++            # Batch only source-compatible images, which removes redundant
++            # bicubic launches for common multi-image requests without padding
++            # random-size inputs to a larger source resolution.
++            batch = torch.cat(
++                _resize_images_by_source_shape(indexed_images, target_h, target_w),
++                dim=0,
++            )
+ 
+             pad_h = padded_h - target_h
+             pad_w = padded_w - target_w
+@@ -413,6 +460,16 @@ async def process_mm_data_async(
+             base_output, self.mm_tokens
+         )
+ 
++        # K2.5/K2.7 encoder-DP assigns an image to exactly one TP rank. Keep
++        # its IPC proxy lazy until that assignment is known, avoiding a full
++        # image copy to every rank. The scheduler only honors this marker once
++        # the processor has already set the item's hash and pad value.
++        if self.use_cuda_ipc and self.server_args.mm_enable_dp_encoder:
++            for item in mm_items:
++                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
++                    True
++                )
++
+         return MultimodalProcessorOutput(
+             input_ids=input_ids.tolist(),
+             mm_items=mm_items,
+diff --git a/python/sglang/srt/utils/cuda_ipc_transport_utils.py b/python/sglang/srt/utils/cuda_ipc_transport_utils.py
+index e8df3026b466..7a72f75c8274 100644
+--- a/python/sglang/srt/utils/cuda_ipc_transport_utils.py
++++ b/python/sglang/srt/utils/cuda_ipc_transport_utils.py
+@@ -22,6 +22,32 @@
+ 
+ SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
+ 
++# Processors set this marker only when their encoder consumes each IPC feature
++# on a single TP rank.  The scheduler then keeps the feature lazy until the
++# model has computed the data-parallel assignment.
++DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY = (
++    "_sglang_defer_cuda_ipc_feature_reconstruction"
++)
++
++
++def get_mm_feature_pool_size_per_worker(
++    total_pool_size: int, tokenizer_worker_num: int
++) -> int:
++    """Split the CUDA IPC feature-pool budget without exceeding it.
++
++    Each tokenizer worker owns a distinct CUDA allocation, even though all pools
++    are created on ``base_gpu_id``.  Therefore a minimum per-worker allocation
++    would make the aggregate HBM reservation larger than the configured budget.
++    Keep the configured value as a hard per-node cap and leave at most
++    ``tokenizer_worker_num - 1`` bytes unused when it is not evenly divisible.
++    """
++    if total_pool_size <= 0:
++        raise ValueError("total_pool_size must be positive")
++    if tokenizer_worker_num <= 0:
++        raise ValueError("tokenizer_worker_num must be positive")
++
++    return total_pool_size // tokenizer_worker_num
++
+ 
+ # Cache for pool-level IPC handles on the consumer side.
+ # Key: the pool CUDA IPC handle tuple. Value: opened UntypedStorage.
+@@ -330,6 +356,7 @@ def __init__(
+         self.reconstruct_tensor = None
+         self.sync_data_meta = sync_buffer_meta
+         self.sync_buffer = None
++        self._consumer_acknowledged = False
+ 
+     @property
+     def get_sync_flag(self):
+@@ -404,32 +431,53 @@ def _reconstruct_from_ipc_extra(
+ 
+         return slice_tensor, target_device, cache_key, storage_to_cache
+ 
++    def _acknowledge_consumption(self, consumer_count: int = 1):
++        """Mark this IPC feature as consumed without necessarily copying it.
++
++        A normal TP execution reconstructs a feature once per rank, so each
++        consumer contributes one acknowledgement.  Encoder-DP can instead
++        route a feature to exactly one rank; that rank acknowledges all TP
++        consumers after its copy completes.  Keeping this acknowledgement
++        idempotent is important for chunked-prefill cache hits, where the same
++        proxy may be visited more than once.
++        """
++        if getattr(self, "_consumer_acknowledged", False):
++            return
++        if consumer_count <= 0:
++            raise ValueError("consumer_count must be positive")
++        if self.sync_data_meta is not None:
++            open(SHM_LOCK_FILE, "a").close()
++            # Keep the counter update atomic across scheduler processes.
++            with open(SHM_LOCK_FILE, "w+") as f:
++                fcntl.flock(f, fcntl.LOCK_EX)
++                sync_flag = self.get_sync_flag
++                sync_flag += consumer_count
++                fcntl.flock(f, fcntl.LOCK_UN)
++            self.close_shm()
++        self._consumer_acknowledged = True
++
++    def acknowledge_consumption(self, consumer_count: int = 1):
++        """Release an IPC-pool slice when a cache hit needs no tensor copy."""
++        self._acknowledge_consumption(consumer_count)
++
+     def _copy_slice_tensor_to_target(
+         self,
+         slice_tensor: torch.Tensor,
+         rebuild_device: torch.device,
+         recons_shape,
+         recons_dtype,
++        consumer_count: int,
+     ):
+         with torch.cuda.device(rebuild_device):
+             reconstructed_tensor = torch.empty(
+                 recons_shape, dtype=recons_dtype, device=rebuild_device
+             ).contiguous()
+             reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
+-
+-            open(SHM_LOCK_FILE, "a").close()
+-            # write the shm_sync_buffer with a file lock
+-            with open(SHM_LOCK_FILE, "w+") as f:
+-                fcntl.flock(f, fcntl.LOCK_EX)
+-                sync_flag = self.get_sync_flag
+-                sync_flag += 1
+-                fcntl.flock(f, fcntl.LOCK_UN)
+-
+-            self.close_shm()
++            self._acknowledge_consumption(consumer_count)
+ 
+         return reconstructed_tensor
+ 
+-    def reconstruct_on_target_device(self, rebuild_device_idx):
++    def reconstruct_on_target_device(self, rebuild_device_idx, consumer_count: int = 1):
+         rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
+         if (
+             isinstance(self.reconstruct_tensor, torch.Tensor)
+@@ -501,7 +549,11 @@ def reconstruct_on_target_device(self, rebuild_device_idx):
+                     raise
+ 
+             reconstructed_tensor = self._copy_slice_tensor_to_target(
+-                slice_tensor, rebuild_device, recons_shape, recons_dtype
++                slice_tensor,
++                rebuild_device,
++                recons_shape,
++                recons_dtype,
++                consumer_count,
+             )
+         elif isinstance(self.proxy_state["tensor_data"], torch.Tensor):
+             reconstructed_tensor = self.proxy_state["tensor_data"].to(
+diff --git a/test/registered/unit/layers/attention/test_vision_max_seqlen.py b/test/registered/unit/layers/attention/test_vision_max_seqlen.py
+index 80e020e59041..2d83af2fa9c2 100644
+--- a/test/registered/unit/layers/attention/test_vision_max_seqlen.py
++++ b/test/registered/unit/layers/attention/test_vision_max_seqlen.py
+@@ -4,7 +4,7 @@
+ from torch import nn
+ 
+ from sglang.srt.layers.attention import vision
+-from sglang.srt.models.kimi_k25 import MoonViTEncoderLayer
++from sglang.srt.models.kimi_k25 import MoonViT3dEncoder, MoonViTEncoderLayer
+ from sglang.test.ci.ci_register import register_cpu_ci
+ 
+ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+@@ -44,6 +44,70 @@ def fake_flash_attn(q, k, v, **kwargs):
+     assert recorded["max_seqlen_k"] == 17
+ 
+ 
++def test_vision_triton_uses_precomputed_max_seqlen(monkeypatch):
++    """Triton vision attention must share the encoder-level host scalar."""
++
++    recorded = {}
++
++    def fake_context_attention(q, k, v, output, *args, **kwargs):
++        recorded["max_seqlen"] = args[2]
++        recorded["sequence_lengths"] = args[1]
++        output.copy_(q)
++
++    monkeypatch.setattr(vision, "context_attention_fwd", fake_context_attention)
++
++    attention = vision.VisionTritonAttention(use_data_parallel=True)
++    q = torch.zeros(3, 1, 8)
++    cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int32)
++    sequence_lengths = torch.tensor([1, 2], dtype=torch.int32)
++    output = attention(
++        q,
++        q,
++        q,
++        cu_seqlens=cu_seqlens,
++        bsz=1,
++        seq_len=3,
++        max_seqlen=17,
++        sequence_lengths=sequence_lengths,
++    )
++
++    assert torch.equal(output, q)
++    assert recorded["max_seqlen"] == 17
++    assert recorded["sequence_lengths"] is sequence_lengths
++
++
++def test_vision_flash4_uses_precomputed_max_seqlen(monkeypatch):
++    """FA4 must not re-synchronize for every vision transformer layer."""
++
++    recorded = {}
++
++    def fake_flash_attn(q, k, v, **kwargs):
++        recorded.update(kwargs)
++        return q
++
++    monkeypatch.setattr(vision, "_is_cuda", True)
++    monkeypatch.setattr(
++        vision, "flash_attn_varlen_func", fake_flash_attn, raising=False
++    )
++
++    attention = vision.VisionFlash4Attention(use_data_parallel=True)
++    q = torch.zeros(3, 1, 8)
++    cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int32)
++    output = attention(
++        q,
++        q,
++        q,
++        cu_seqlens=cu_seqlens,
++        bsz=1,
++        seq_len=3,
++        max_seqlen=17,
++    )
++
++    assert output is q
++    assert recorded["max_seqlen_q"] == 17
++    assert recorded["max_seqlen_k"] == 17
++
++
+ def test_kimi_moonvit_forwards_one_precomputed_max_seqlen():
+     """MoonViT must share its encoder-level scalar with each attention block."""
+ 
+@@ -73,6 +137,45 @@ def forward(self, hidden_states, **kwargs):
+     assert recorded["max_seqlen"] == 19
+ 
+ 
++def test_kimi_moonvit_precomputes_sequence_lengths_once():
++    """MoonViT shares packed sequence metadata across all attention blocks."""
++
++    recorded = {}
++
++    class CapturingRope:
++        def get_freqs_cis(self, grid_thws, device):
++            return torch.ones(7, 2, dtype=torch.complex64, device=device)
++
++    class CapturingBlock(nn.Module):
++        def forward(
++            self,
++            hidden_states,
++            cu_seqlens,
++            max_seqlen,
++            rope_freqs_cis,
++            sequence_lengths,
++        ):
++            recorded["cu_seqlens"] = cu_seqlens
++            recorded["max_seqlen"] = max_seqlen
++            recorded["sequence_lengths"] = sequence_lengths
++            return hidden_states
++
++    encoder = MoonViT3dEncoder.__new__(MoonViT3dEncoder)
++    nn.Module.__init__(encoder)
++    encoder.rope_2d = CapturingRope()
++    encoder.blocks = nn.ModuleList([CapturingBlock()])
++    encoder.final_layernorm = nn.Identity()
++
++    hidden_states = torch.ones(7, 4)
++    grid_thws = torch.tensor([[1, 1, 3], [1, 2, 2]], dtype=torch.int32)
++    output = encoder(hidden_states, grid_thws)
++
++    assert torch.equal(output, hidden_states)
++    assert torch.equal(recorded["sequence_lengths"], torch.tensor([3, 4]))
++    assert torch.equal(recorded["cu_seqlens"], torch.tensor([0, 3, 7]))
++    assert recorded["max_seqlen"] == 4
++
++
+ if __name__ == "__main__":
+     import pytest
+ 
+diff --git a/test/registered/unit/models/test_kimi_k25.py b/test/registered/unit/models/test_kimi_k25.py
+new file mode 100644
+index 000000000000..885fbdf2027c
+--- /dev/null
++++ b/test/registered/unit/models/test_kimi_k25.py
+@@ -0,0 +1,241 @@
++"""CPU coverage for Kimi-K2.5/K2.7 encoder-DP wiring."""
++
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from sglang.srt.managers.schedule_batch import (
++    Modality,
++    MultimodalDataItem,
++    MultimodalInputs,
++    MultimodalProcessorOutput,
++)
++from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
++from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
++from sglang.srt.multimodal.processors.kimi_k25 import (
++    _resize_images_by_source_shape,
++)
++from sglang.srt.runtime_context import get_parallel
++from sglang.srt.utils.cuda_ipc_transport_utils import (
++    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
++    CudaIpcTensorTransportProxy,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++
++class _MoonViT3dTower:
++    device = torch.device("cpu")
++    merge_kernel_size = (2, 2)
++
++    def __init__(self):
++        self.config = SimpleNamespace(hidden_size=2)
++        self.patch_embed = SimpleNamespace(
++            proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
++        )
++        self.grid_thws = None
++
++    def __call__(self, pixel_values, grid_thws):
++        self.grid_thws = grid_thws
++        # MoonViT3d returns a list of [tokens, merge_area, hidden] tensors.
++        return [pixel_values.reshape(-1, 4, pixel_values.shape[-1])]
++
++
++class _Projector:
++    def __call__(self, image_embeds):
++        return image_embeds
++
++
++def _image_item(feature, grid_thw):
++    return MultimodalDataItem(
++        modality=Modality.IMAGE,
++        offsets=[(0, 1)],
++        feature=feature,
++        model_specific_data={"image_grid_thw": torch.tensor(grid_thw)},
++    )
++
++
++def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
++    torch.manual_seed(0)
++    indexed_images = [
++        (0, torch.randn(3, 32, 24)),
++        (1, torch.randn(3, 32, 24)),
++        (2, torch.randn(3, 28, 20)),
++    ]
++    expected = [
++        F.interpolate(
++            image.unsqueeze(0), size=(16, 12), mode="bicubic", align_corners=False
++        )
++        for _, image in indexed_images
++    ]
++    real_interpolate = F.interpolate
++    input_shapes = []
++
++    def record_interpolate(image, *args, **kwargs):
++        input_shapes.append(tuple(image.shape))
++        return real_interpolate(image, *args, **kwargs)
++
++    with patch(
++        "sglang.srt.multimodal.processors.kimi_k25.F.interpolate",
++        side_effect=record_interpolate,
++    ):
++        actual = _resize_images_by_source_shape(indexed_images, 16, 12)
++
++    assert input_shapes == [(2, 3, 32, 24), (1, 3, 28, 20)]
++    assert len(actual) == len(expected)
++    for result, reference in zip(actual, expected):
++        torch.testing.assert_close(result, reference)
++
++
++def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
++    tower = _MoonViT3dTower()
++    pixel_values = torch.randn(4, 2)
++
++    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
++        output = run_dp_sharded_mrope_vision_model(
++            tower, pixel_values, [[1, 2, 2]], rope_type="rope_2d_packed"
++        )
++
++    assert torch.equal(output, pixel_values.reshape(1, 4, 2))
++    assert torch.equal(tower.grid_thws, torch.tensor([[1, 2, 2]]))
++
++
++def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
++    tower = _MoonViT3dTower()
++    pixel_values = torch.randn(4, 2)
++    loader = Mock(return_value=pixel_values)
++
++    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
++        output = run_dp_sharded_mrope_vision_model(
++            tower,
++            None,
++            [[1, 2, 2]],
++            rope_type="rope_2d_packed",
++            load_local_pixel_values=loader,
++            pixel_values_device=pixel_values.device,
++            pixel_values_dtype=pixel_values.dtype,
++        )
++
++    assert torch.equal(output, pixel_values.reshape(1, 4, 2))
++    loader.assert_called_once_with([0])
++
++
++def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
++    class _GatherGroup:
++        def all_gather(self, tensor, dim):
++            return torch.cat([torch.ones_like(tensor), tensor], dim=dim)
++
++    tower = _MoonViT3dTower()
++    parallel = SimpleNamespace(
++        attn_tp_size=2,
++        attn_tp_rank=1,
++        attn_tp_group=_GatherGroup(),
++    )
++
++    with patch("sglang.srt.multimodal.mm_utils.get_parallel", return_value=parallel):
++        output = run_dp_sharded_mrope_vision_model(
++            tower,
++            torch.randn(4, 2),
++            [[1, 2, 2]],
++            rope_type="rope_2d_packed",
++        )
++
++    assert output.shape == (1, 4, 2)
++    assert tower.grid_thws is None
++
++
++def test_dp_helper_lazily_loads_only_its_local_image_shard():
++    class _GatherGroup:
++        def all_gather(self, tensor, dim):
++            # Rank one's embedding is irrelevant to this rank's loader call;
++            # retain the expected gathered shape for output reconstruction.
++            return torch.cat([tensor, torch.zeros_like(tensor)], dim=dim)
++
++    tower = _MoonViT3dTower()
++    features = [torch.full((4, 2), 1.0), torch.full((4, 2), 2.0)]
++    loader = Mock(side_effect=lambda indices: torch.cat([features[i] for i in indices]))
++    parallel = SimpleNamespace(
++        attn_tp_size=2,
++        attn_tp_rank=0,
++        attn_tp_group=_GatherGroup(),
++    )
++
++    with patch("sglang.srt.multimodal.mm_utils.get_parallel", return_value=parallel):
++        output = run_dp_sharded_mrope_vision_model(
++            tower,
++            None,
++            [[1, 2, 2], [1, 2, 2]],
++            rope_type="rope_2d_packed",
++            load_local_pixel_values=loader,
++            pixel_values_device=torch.device("cpu"),
++            pixel_values_dtype=torch.float32,
++        )
++
++    loader.assert_called_once_with([0])
++    assert output.shape == (2, 4, 2)
++
++
++def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
++    model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
++    nn.Module.__init__(model)
++    model.use_data_parallel = True
++    model.vision_tower = _MoonViT3dTower()
++    model.mm_projector = _Projector()
++    items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
++    sharded_embeddings = torch.randn(1, 2)
++
++    with patch(
++        "sglang.srt.models.kimi_k25.run_dp_sharded_mrope_vision_model",
++        return_value=sharded_embeddings,
++    ) as run_dp:
++        output = model.get_image_feature(items)
++
++    assert output is sharded_embeddings
++    tower, pixel_values, grid_thws = run_dp.call_args.args
++    assert tower is model.vision_tower
++    assert pixel_values is None
++    assert grid_thws == [[1, 2, 2]]
++    assert run_dp.call_args.kwargs["rope_type"] == "rope_2d_packed"
++    assert callable(run_dp.call_args.kwargs["load_local_pixel_values"])
++
++
++def test_kimi_lazy_ipc_feature_skips_scheduler_reconstruction():
++    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
++    proxy.reconstruct_on_target_device = Mock()
++    item = MultimodalDataItem(
++        modality=Modality.IMAGE,
++        hash=123,
++        pad_value=456,
++        offsets=[(0, 1)],
++        feature=proxy,
++        model_specific_data={DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY: True},
++    )
++
++    with patch(
++        "sglang.srt.managers.schedule_batch.torch.cuda.current_device", return_value=0
++    ):
++        mm_inputs = MultimodalInputs.from_processor_output(
++            MultimodalProcessorOutput(mm_items=[item])
++        )
++
++    assert mm_inputs.mm_items[0].feature is proxy
++    proxy.reconstruct_on_target_device.assert_not_called()
++
++
++def test_kimi_lazy_ipc_feature_acknowledges_all_tp_consumers():
++    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
++    proxy.reconstruct_on_target_device = Mock(return_value=torch.randn(1, 2))
++    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
++
++    item.reconstruct(0, ipc_consumer_count=8)
++
++    proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=8)
++
++
++if __name__ == "__main__":
++    raise SystemExit(pytest.main([__file__, "-v"]))
+diff --git a/test/registered/unit/multimodal/test_cuda_ipc_pool_budget.py b/test/registered/unit/multimodal/test_cuda_ipc_pool_budget.py
+new file mode 100644
+index 000000000000..535314c768b6
+--- /dev/null
++++ b/test/registered/unit/multimodal/test_cuda_ipc_pool_budget.py
+@@ -0,0 +1,35 @@
++"""CPU-only regression tests for CUDA IPC multimodal pool budgeting."""
++
++import unittest
++
++from sglang.srt.utils.cuda_ipc_transport_utils import (
++    get_mm_feature_pool_size_per_worker,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++
++class TestCudaIpcPoolBudget(unittest.TestCase):
++    def test_budget_is_not_multiplied_by_tokenizer_workers(self):
++        budget = 1_024 * 1024 * 1024
++        worker_num = 16
++
++        per_worker = get_mm_feature_pool_size_per_worker(budget, worker_num)
++
++        self.assertEqual(per_worker, 64 * 1024 * 1024)
++        self.assertLessEqual(per_worker * worker_num, budget)
++
++    def test_remainder_is_not_overallocated(self):
++        self.assertEqual(get_mm_feature_pool_size_per_worker(1_001, 8), 125)
++        self.assertLessEqual(get_mm_feature_pool_size_per_worker(1_001, 8) * 8, 1_001)
++
++    def test_rejects_invalid_budget_or_worker_count(self):
++        with self.assertRaisesRegex(ValueError, "total_pool_size"):
++            get_mm_feature_pool_size_per_worker(0, 1)
++        with self.assertRaisesRegex(ValueError, "tokenizer_worker_num"):
++            get_mm_feature_pool_size_per_worker(1, 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/multimodal/test_cuda_ipc_transport.py b/test/registered/unit/multimodal/test_cuda_ipc_transport.py
+new file mode 100644
+index 000000000000..aa1723d6cba1
+--- /dev/null
++++ b/test/registered/unit/multimodal/test_cuda_ipc_transport.py
+@@ -0,0 +1,124 @@
++"""CUDA IPC multimodal feature transport regression tests.
++
++This covers the production path where a tokenizer worker places a feature in
++the bounded pool and the scheduler process opens the shared CUDA allocation.
++CPU-only policy tests intentionally cannot exercise this cross-process handle.
++"""
++
++import gc
++import multiprocessing as mp
++import queue
++import unittest
++
++import torch
++
++from sglang.srt.utils.cuda_ipc_transport_utils import (
++    CudaIpcTensorTransportProxy,
++    MmItemMemoryPool,
++    _pool_handle_cache_clear,
++)
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
++
++
++def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
++    """Create a tokenizer-worker-like CUDA IPC pool in a spawned producer."""
++    pool = source = pool_slice = proxy = None
++    try:
++        torch.cuda.set_device(0)
++        pool = MmItemMemoryPool(
++            memory_size=1 << 20,
++            recycle_interval=60,
++            base_gpu_id=0,
++        )
++        source = torch.arange(35, dtype=torch.float32, device="cuda").reshape(5, 7)
++        expected = source.cpu().tolist()
++        sync_meta, pool_slice, byte_offset = pool.return_a_slice_tensor_with_flag(
++            source
++        )
++        if pool_slice is None:
++            raise RuntimeError("test tensor did not fit in the CUDA IPC pool")
++        pool_slice.copy_(source.view(torch.int8).view(-1), non_blocking=True)
++        torch.cuda.synchronize()
++        proxy = CudaIpcTensorTransportProxy(
++            data=pool_slice,
++            info_data=source,
++            sync_buffer_meta=sync_meta,
++            pool_ipc_handle=pool._pool_ipc_handle,
++            pool_byte_offset=byte_offset,
++            pool_device_index=pool._pool_device_index,
++        )
++        proxy_queue.put((proxy, expected))
++        if not consumer_done.wait(timeout=60):
++            raise TimeoutError("consumer did not release the CUDA IPC tensor")
++    except Exception as exc:  # pragma: no cover - returned to the parent
++        result_queue.put(("error", repr(exc)))
++        return
++    finally:
++        del proxy, pool_slice, source
++        if pool is not None:
++            pool.shutdown()
++            del pool
++        gc.collect()
++        torch.cuda.ipc_collect()
++    result_queue.put(("ok", None))
++
++
++class TestCudaIpcTransport(CustomTestCase):
++    @classmethod
++    def setUpClass(cls):
++        if not torch.cuda.is_available():
++            raise unittest.SkipTest("CUDA is required")
++
++    def test_pooled_tensor_reconstructs_in_spawned_process(self):
++        """Consumer releases the pool mapping before the producer tears down."""
++        ctx = mp.get_context("spawn")
++        proxy_queue = ctx.Queue()
++        producer_results = ctx.Queue()
++        consumer_done = ctx.Event()
++        producer = ctx.Process(
++            target=_produce_pooled_tensor,
++            args=(proxy_queue, consumer_done, producer_results),
++        )
++        producer.start()
++        proxy = reconstructed = None
++        producer_result = None
++        try:
++            try:
++                proxy, expected = proxy_queue.get(timeout=60)
++            except queue.Empty:
++                producer_result = producer_results.get(timeout=5)
++                _status, payload = producer_result
++                self.fail(
++                    f"CUDA IPC producer failed before sending its proxy: {payload}"
++                )
++
++            reconstructed = proxy.reconstruct_on_target_device(0)
++            torch.cuda.synchronize()
++            self.assertEqual(reconstructed.cpu().tolist(), expected)
++        finally:
++            # The scheduler retains this cache for its lifetime. The test's
++            # consumer exits quickly, so it must close the mapping before the
++            # producer destroys the shared allocation.
++            del reconstructed, proxy
++            _pool_handle_cache_clear()
++            gc.collect()
++            torch.cuda.ipc_collect()
++            consumer_done.set()
++            producer.join(timeout=60)
++            try:
++                if producer_result is None:
++                    producer_result = producer_results.get(timeout=5)
++                status, payload = producer_result
++                self.assertEqual(status, "ok", payload)
++            finally:
++                if producer.is_alive():
++                    producer.terminate()
++                    producer.join(timeout=10)
++            self.assertEqual(producer.exitcode, 0)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/test/registered/unit/multimodal/test_feature_materialization.py b/test/registered/unit/multimodal/test_feature_materialization.py
+new file mode 100644
+index 000000000000..5f227ac76b9b
+--- /dev/null
++++ b/test/registered/unit/multimodal/test_feature_materialization.py
+@@ -0,0 +1,39 @@
++"""Tests for the shared multimodal feature materialization helper."""
++
++import unittest
++
++import torch
++
++from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++
++class TestFeatureMaterialization(CustomTestCase):
++    def test_packs_variable_length_features_and_converts_dtype(self):
++        features = [
++            torch.arange(6, dtype=torch.float32).view(2, 3),
++            torch.arange(9, dtype=torch.float32).view(3, 3) + 10,
++        ]
++
++        result = materialize_multimodal_features(
++            features, device=torch.device("cpu"), dtype=torch.bfloat16
++        )
++
++        self.assertEqual(result.shape, (5, 3))
++        self.assertEqual(result.dtype, torch.bfloat16)
++        torch.testing.assert_close(result.float(), torch.cat(features, dim=0))
++
++    def test_rejects_incompatible_trailing_shapes(self):
++        with self.assertRaisesRegex(ValueError, "matching trailing shapes"):
++            materialize_multimodal_features(
++                [torch.empty(2, 3), torch.empty(1, 4)],
++                device=torch.device("cpu"),
++                dtype=torch.float32,
++            )
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)

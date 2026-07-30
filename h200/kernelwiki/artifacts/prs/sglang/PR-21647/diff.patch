@@ -1,0 +1,728 @@
+diff --git a/python/sglang/jit_kernel/moe_lora_align.py b/python/sglang/jit_kernel/moe_lora_align.py
+index c16260078b8f..f18ad7ca0771 100644
+--- a/python/sglang/jit_kernel/moe_lora_align.py
++++ b/python/sglang/jit_kernel/moe_lora_align.py
+@@ -38,15 +38,21 @@ def moe_lora_align_block_size(
+     adapter_enabled: torch.Tensor,
+     lora_ids: torch.Tensor,
+     maybe_expert_map: Optional[torch.Tensor] = None,
++    cumsum_buffer: Optional[torch.Tensor] = None,
++    token_mask: Optional[torch.Tensor] = None,
+ ) -> None:
+     module = _jit_moe_align_module(topk_ids.dtype)
+ 
+-    cumsum_buffer = torch.zeros(
+-        max_loras * (num_experts + 1), dtype=torch.int32, device=topk_ids.device
+-    )
+-    token_mask = torch.empty(
+-        (max_loras * topk_ids.shape[0],), dtype=torch.int32, device=topk_ids.device
+-    )
++    if cumsum_buffer is None:
++        cumsum_buffer = torch.zeros(
++            max_loras * (num_experts + 1), dtype=torch.int32, device=topk_ids.device
++        )
++    else:
++        cumsum_buffer.zero_()
++    if token_mask is None:
++        token_mask = torch.empty(
++            (max_loras * topk_ids.shape[0],), dtype=torch.int32, device=topk_ids.device
++        )
+ 
+     module.moe_lora_align_block_size(
+         topk_ids,
+diff --git a/python/sglang/srt/lora/backend/base_backend.py b/python/sglang/srt/lora/backend/base_backend.py
+index 4d303022d25a..17b7bef1bf7e 100644
+--- a/python/sglang/srt/lora/backend/base_backend.py
++++ b/python/sglang/srt/lora/backend/base_backend.py
+@@ -147,18 +147,97 @@ def init_cuda_graph_batch_info(
+         max_bs_in_cuda_graph: int,
+         num_tokens_per_bs: int,
+     ):
+-        """Initialize the batch info for CUDA Graph mode.
++        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
+ 
+-        This method provides a hook for each backend to conduct its own initialization
+-        logic for CUDA Graph mode.
++        Called during CudaGraphRunner.__init__(), after init_memory_pool().
+ 
+         Args:
+-            cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
+             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
+             num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
+         """
+         pass
+ 
++    def init_cuda_graph_moe_buffers(
++        self,
++        max_bs: int,
++        max_loras: int,
++        compute_dtype: torch.dtype,
++        moe_layer,
++    ):
++        """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
++
++        Called once before init_memory_pool() with a representative MoE layer
++        to extract dimensions.  All FusedMoEWithLoRA layers share the same
++        buffers since they execute sequentially during forward.
++
++        This is backend-agnostic because MoE LoRA always uses the same
++        fused Triton kernel (TritonRunnerCoreWithLoRA) regardless of which
++        dense LoRA backend is selected.
++        """
++        base = moe_layer.base_layer
++        top_k = base.top_k
++        qinfo = moe_layer._quant_info
++        E, N, _ = qinfo.w13_weight.shape
++        hidden_dim = qinfo.w2_weight.shape[1]
++        device = qinfo.w13_weight.device
++        dtype = compute_dtype
++        num_experts = base.num_experts
++
++        block_size_m = 64
++        max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
++        max_num_tokens_padded = (
++            (max_num_tokens_padded + block_size_m - 1) // block_size_m
++        ) * block_size_m
++        max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
++
++        self.moe_cg_buffers = {
++            "intermediate_cache1": torch.empty(
++                (max_bs, top_k, N), device=device, dtype=dtype
++            ),
++            "intermediate_cache2": torch.empty(
++                (max_bs * top_k, N // 2), device=device, dtype=dtype
++            ),
++            "intermediate_cache3": torch.empty(
++                (max_bs, top_k, hidden_dim), device=device, dtype=dtype
++            ),
++            "out_hidden_states": torch.empty(
++                (max_bs, hidden_dim), device=device, dtype=dtype
++            ),
++            "sorted_token_ids_lora": torch.empty(
++                (max_loras * max_num_tokens_padded,),
++                device=device,
++                dtype=torch.int32,
++            ),
++            "expert_ids_lora": torch.empty(
++                (max_loras * max_num_m_blocks,),
++                device=device,
++                dtype=torch.int32,
++            ),
++            "num_tokens_post_padded_lora": torch.empty(
++                (max_loras,), device=device, dtype=torch.int32
++            ),
++            "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
++            # int64 copy of weight_indices for index_fill_(), which requires
++            # LongTensor.  weight_indices itself must stay int32 because the
++            # CUDA moe_lora_align kernel casts it to int32_t*.
++            "weight_indices_long": torch.zeros(
++                max_bs, dtype=torch.int64, device=device
++            ),
++            "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
++            "cumsum_buffer": torch.zeros(
++                max_loras * (num_experts + 1),
++                dtype=torch.int32,
++                device=device,
++            ),
++            "token_mask": torch.empty(
++                (max_loras * max_bs * top_k,),
++                dtype=torch.int32,
++                device=device,
++            ),
++            "max_num_tokens_padded": max_num_tokens_padded,
++            "max_num_m_blocks": max_num_m_blocks,
++        }
++
+     def prepare_lora_batch(
+         self,
+         forward_batch: ForwardBatch,
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 9f2ad1352805..412ff5824f07 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -752,26 +752,26 @@ def set_lora_info(
+         self.down_lora_b_weights = down_lora_b_weights
+ 
+     def _get_lora_info(self):
+-        """
+-        Build LoRAInfo for the current batch.
+-
+-        Returns None if LoRA is not enabled or weights are not set.
+-        """
++        """Build LoRAInfo for the current batch."""
+         from sglang.srt.lora.lora_moe_runners import LoRAInfo
+ 
+-        # Get LoRA batch info from backend
+         batch_info = self.lora_backend.batch_info
+-        lora_ranks = batch_info.lora_ranks  # [num_loras]
++        lora_ranks = batch_info.lora_ranks
+ 
+         max_lora_rank = self.down_lora_a_weights.shape[2]
+ 
+-        # Create adapter_enabled tensor for the current batch
+-        # Only enable LoRA adapters that are actually used in this batch
+-        # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
+-        adapter_enabled = torch.zeros(
+-            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
+-        )
+-        adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
++        cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
++        if cg_buffers is not None and batch_info.use_cuda_graph:
++            adapter_enabled = cg_buffers["adapter_enabled"]
++            adapter_enabled.zero_()
++            idx_buf = cg_buffers["weight_indices_long"]
++            idx_buf[: batch_info.bs] = batch_info.weight_indices[: batch_info.bs]
++            adapter_enabled.index_fill_(0, idx_buf[: batch_info.bs], 1)
++        else:
++            adapter_enabled = torch.zeros(
++                len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
++            )
++            adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
+ 
+         return LoRAInfo(
+             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
+@@ -785,6 +785,8 @@ def _get_lora_info(self):
+             max_lora_rank=max_lora_rank,
+             num_experts=self.base_layer.num_experts,
+             experts_shared_outer_loras=self.experts_shared_outer_loras,
++            cg_buffers=cg_buffers,
++            has_active_lora=batch_info.has_active_lora,
+             tp_size=self.tp_size,
+             tp_rank=self.tp_rank,
+             hidden_size=getattr(self.base_layer, "hidden_size", 0),
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index c704dad27c3c..c8f338cdc113 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -102,12 +102,32 @@ def __init__(
+     def init_cuda_graph_batch_info(
+         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+     ):
++        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
++
++        Called during CudaGraphRunner.__init__(), after init_memory_pool().
++        Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
++        """
+         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+         self.lora_backend.init_cuda_graph_batch_info(
+             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+             num_tokens_per_bs=num_tokens_per_bs,
+         )
+ 
++    def init_cuda_graph_moe_buffers(
++        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
++    ):
++        """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
++
++        Called before init_memory_pool() so memory profiling accounts for them.
++        Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
++        """
++        self.lora_backend.init_cuda_graph_moe_buffers(
++            max_bs=max_bs,
++            max_loras=max_loras,
++            compute_dtype=compute_dtype,
++            moe_layer=moe_layer,
++        )
++
+     def create_lora_update_result(
+         self, success: bool, error_message: str = ""
+     ) -> LoRAUpdateOutput:
+@@ -297,6 +317,9 @@ def prepare_lora_batch(self, forward_batch: ForwardBatch):
+             scalings=scalings,
+             use_cuda_graph=use_cuda_graph,
+         )
++        self.lora_backend.batch_info.has_active_lora = any(
++            lora_ranks[wi] > 0 for wi in weight_indices
++        )
+ 
+     def update_lora_info(self):
+         """
+@@ -444,8 +467,13 @@ def _detect_shared_outer_loras(self) -> bool:
+         dim[0]=1 indicates weights shared across all experts, while
+         dim[0]=num_experts indicates per-expert weights.
+         Returns True if gate_up lora_A has expert_dim=1 (shared).
++
++        All loaded adapters that expose a 3D gate_up lora_A must agree;
++        mixed formats raise RuntimeError.
+         """
+-        for adapter in self.loras.values():
++        shared_outer: Optional[bool] = None
++        for adapter_id, adapter in self.loras.items():
++            found = False
+             for layer in adapter.layers:
+                 for name, weight in layer.weights.items():
+                     if (
+@@ -453,9 +481,21 @@ def _detect_shared_outer_loras(self) -> bool:
+                         and "lora_A" in name
+                         and weight.dim() == 3
+                     ):
+-                        return weight.shape[0] == 1
+-            break
+-        return False
++                        is_shared = weight.shape[0] == 1
++                        if shared_outer is None:
++                            shared_outer = is_shared
++                        elif shared_outer != is_shared:
++                            raise RuntimeError(
++                                "Mixed shared-outer LoRA formats detected across "
++                                f"loaded adapters (conflict in adapter '{adapter_id}'). "
++                                "All MoE adapters must either all use shared outer "
++                                "experts (expert_dim=1) or all use per-expert weights."
++                            )
++                        found = True
++                        break
++                if found:
++                    break
++        return bool(shared_outer) if shared_outer is not None else False
+ 
+     def init_lora_shapes(
+         self,
+diff --git a/python/sglang/srt/lora/lora_moe_runners.py b/python/sglang/srt/lora/lora_moe_runners.py
+index 3060e2fadd19..0f626d740f21 100644
+--- a/python/sglang/srt/lora/lora_moe_runners.py
++++ b/python/sglang/srt/lora/lora_moe_runners.py
+@@ -37,6 +37,7 @@
+     TritonRunnerInput,
+     TritonRunnerOutput,
+ )
++from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_xpu
+ 
+ _is_hip = is_hip()
+@@ -101,6 +102,8 @@ class LoRAInfo:
+ 
+     num_experts: int
+     experts_shared_outer_loras: bool = False
++    cg_buffers: Optional[dict] = None
++    has_active_lora: bool = False
+ 
+     fully_sharded: bool = False
+     tp_size: int = 1
+@@ -146,6 +149,21 @@ def run(
+             TritonRunnerOutput with combined base + LoRA output
+         """
+ 
++        if lora_info is None:
++            return super().run(runner_input, quant_info, running_state)
++
++        if get_is_capture_mode():
++            # During CUDA graph capture, always enter the LoRA path so that
++            # the LoRA kernels are recorded in the graph.  adapter_enabled is
++            # all-zeros during capture, so the Triton kernel early-exits per
++            # program (zero overhead).  During replay the tensor is updated
++            # in-place with the real adapter mask before graph.replay().
++            has_active_lora = True
++        else:
++            has_active_lora = lora_info.has_active_lora
++        if not has_active_lora:
++            return super().run(runner_input, quant_info, running_state)
++
+         # Extract common variables
+         hidden_states = runner_input.hidden_states
+         topk_weights = runner_input.topk_weights
+@@ -196,14 +214,19 @@ def run(
+             moe_sum_reduce_triton,
+         )
+ 
++        cg = lora_info.cg_buffers if get_is_capture_mode() else None
++
+         # ============================================================
+         # Stage 1: Gate/Up projection (base)
+         # ============================================================
+-        intermediate_cache1 = torch.empty(
+-            (M, topk_ids.shape[1], N),
+-            device=hidden_states.device,
+-            dtype=hidden_states.dtype,
+-        )
++        if cg is not None:
++            intermediate_cache1 = cg["intermediate_cache1"][:M, : topk_ids.shape[1], :N]
++        else:
++            intermediate_cache1 = torch.empty(
++                (M, topk_ids.shape[1], N),
++                device=hidden_states.device,
++                dtype=hidden_states.dtype,
++            )
+ 
+         invoke_fused_moe_kernel(
+             hidden_states,
+@@ -249,23 +272,32 @@ def run(
+         ) * block_size_m
+         max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
+ 
+-        # Initialize output tensors (using torch.empty like the reference implementation)
+         device = topk_ids.device
+-        sorted_token_ids_lora = torch.empty(
+-            (max_loras * max_num_tokens_padded,),
+-            dtype=torch.int32,
+-            device=device,
+-        )
+-        expert_ids_lora = torch.empty(
+-            (max_loras * max_num_m_blocks,),
+-            dtype=torch.int32,
+-            device=device,
+-        )
+-        num_tokens_post_padded_lora = torch.empty(
+-            (max_loras,), dtype=torch.int32, device=device
+-        )
++        if cg is not None:
++            sorted_token_ids_lora = cg["sorted_token_ids_lora"][
++                : max_loras * max_num_tokens_padded
++            ]
++            expert_ids_lora = cg["expert_ids_lora"][: max_loras * max_num_m_blocks]
++            num_tokens_post_padded_lora = cg["num_tokens_post_padded_lora"][:max_loras]
++        else:
++            sorted_token_ids_lora = torch.empty(
++                (max_loras * max_num_tokens_padded,),
++                dtype=torch.int32,
++                device=device,
++            )
++            expert_ids_lora = torch.empty(
++                (max_loras * max_num_m_blocks,),
++                dtype=torch.int32,
++                device=device,
++            )
++            num_tokens_post_padded_lora = torch.empty(
++                (max_loras,), dtype=torch.int32, device=device
++            )
+ 
+-        lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
++        if cg is not None and "lora_ids" in cg:
++            lora_ids = cg["lora_ids"][:max_loras]
++        else:
++            lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
+ 
+         moe_lora_align_block_size(
+             topk_ids,
+@@ -282,6 +314,12 @@ def run(
+             lora_info.adapter_enabled,
+             lora_ids,
+             None,  # expert_map
++            cumsum_buffer=cg["cumsum_buffer"] if cg is not None else None,
++            token_mask=(
++                cg["token_mask"][: max_loras * topk_ids.shape[0]]
++                if cg is not None
++                else None
++            ),
+         )
+ 
+         # Reshape the sorted tensors for fused_moe_lora (expects 2D: max_loras x max_num_tokens_padded)
+@@ -305,11 +343,16 @@ def run(
+         # ============================================================
+         # Stage 2: Activation (SiLU or GELU)
+         # ============================================================
+-        intermediate_cache2 = torch.empty(
+-            (M * topk_ids.shape[1], N // 2),
+-            device=hidden_states.device,
+-            dtype=hidden_states.dtype,
+-        )
++        if cg is not None:
++            intermediate_cache2 = cg["intermediate_cache2"][
++                : M * topk_ids.shape[1], : N // 2
++            ]
++        else:
++            intermediate_cache2 = torch.empty(
++                (M * topk_ids.shape[1], N // 2),
++                device=hidden_states.device,
++                dtype=hidden_states.dtype,
++            )
+         if activation == "silu":
+             if gemm1_alpha is not None:
+                 assert gemm1_limit is not None
+@@ -341,11 +384,16 @@ def run(
+         # ============================================================
+         # Stage 3: Down projection (base)
+         # ============================================================
+-        intermediate_cache3 = torch.empty(
+-            (M, topk_ids.shape[1], w2.shape[1]),
+-            device=hidden_states.device,
+-            dtype=hidden_states.dtype,
+-        )
++        if cg is not None:
++            intermediate_cache3 = cg["intermediate_cache3"][
++                :M, : topk_ids.shape[1], : w2.shape[1]
++            ]
++        else:
++            intermediate_cache3 = torch.empty(
++                (M, topk_ids.shape[1], w2.shape[1]),
++                device=hidden_states.device,
++                dtype=hidden_states.dtype,
++            )
+ 
+         if no_combine:
+             assert not inplace
+@@ -356,6 +404,8 @@ def run(
+             )
+         elif inplace:
+             out_hidden_states = hidden_states
++        elif cg is not None:
++            out_hidden_states = cg["out_hidden_states"][:M, : hidden_states.shape[1]]
+         else:
+             out_hidden_states = torch.empty_like(hidden_states)
+ 
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 3746692529f2..22ef4d6adb3c 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -620,11 +620,23 @@ def load_lora_weight_tensor(
+                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
+                     if self.experts_shared_outer_loras and name == "gate_up_proj_moe":
+                         if isinstance(weights, torch.Tensor) and weights.dim() == 3:
++                            if weights.shape[0] != 1:
++                                raise ValueError(
++                                    f"experts_shared_outer_loras is enabled but "
++                                    f"gate_up_proj_moe lora_A has expert_dim="
++                                    f"{weights.shape[0]} (expected 1)."
++                                )
+                             buffer_view = target_buffer[
+                                 buffer_id, 0, : lora_rank * c, :
+                             ]
+                             load_lora_weight_tensor(buffer_view, weights[0])
+                         elif isinstance(weights, dict) and len(weights) > 0:
++                            if len(weights) != 1:
++                                raise ValueError(
++                                    f"experts_shared_outer_loras is enabled but "
++                                    f"gate_up_proj_moe lora_A dict has "
++                                    f"{len(weights)} entries (expected 1)."
++                                )
+                             rep = next(iter(weights.values()))
+                             buffer_view = target_buffer[
+                                 buffer_id, 0, : lora_rank * c, :
+@@ -658,12 +670,24 @@ def load_lora_weight_tensor(
+                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
+                     if self.experts_shared_outer_loras and name == "down_proj_moe":
+                         if isinstance(weights, torch.Tensor) and weights.dim() == 3:
++                            if weights.shape[0] != 1:
++                                raise ValueError(
++                                    f"experts_shared_outer_loras is enabled but "
++                                    f"down_proj_moe lora_B has expert_dim="
++                                    f"{weights.shape[0]} (expected 1)."
++                                )
+                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
+                             w = weights[0]
+                             if w is not None:
+                                 w = w * lora_adapter.scaling
+                             load_lora_weight_tensor(buffer_view, w)
+                         elif isinstance(weights, dict) and len(weights) > 0:
++                            if len(weights) != 1:
++                                raise ValueError(
++                                    f"experts_shared_outer_loras is enabled but "
++                                    f"down_proj_moe lora_B dict has "
++                                    f"{len(weights)} entries (expected 1)."
++                                )
+                             rep = next(iter(weights.values()))
+                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
+                             if rep is not None:
+diff --git a/python/sglang/srt/lora/triton_ops/fused_moe_lora_kernel.py b/python/sglang/srt/lora/triton_ops/fused_moe_lora_kernel.py
+index dc4d05ab15ce..b0c85481e9c8 100644
+--- a/python/sglang/srt/lora/triton_ops/fused_moe_lora_kernel.py
++++ b/python/sglang/srt/lora/triton_ops/fused_moe_lora_kernel.py
+@@ -186,7 +186,7 @@ def _fused_moe_lora_kernel(
+             mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+             other=0.0,
+         )
+-        accumulator += tl.dot(a, b)
++        accumulator += tl.dot(a, b.to(a.dtype))
+         # Advance the ptrs to the next K block.
+         a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
+         b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+diff --git a/python/sglang/srt/lora/utils.py b/python/sglang/srt/lora/utils.py
+index a5d56c479502..4ed9691fa8a0 100644
+--- a/python/sglang/srt/lora/utils.py
++++ b/python/sglang/srt/lora/utils.py
+@@ -44,6 +44,10 @@ class LoRABatchInfo:
+     # Used by lm_head LoRA to validate input shape without GPU sync.
+     expected_tokens: Optional[int] = None
+ 
++    # CPU-side flag: True when at least one request uses a LoRA adapter.
++    # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
++    has_active_lora: bool = False
++
+ 
+ class LoRAType(Enum):
+     LORA_A = 0
+@@ -211,7 +215,10 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
+     """
+     from sglang.srt.layers.linear import LinearBase
+     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+-    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
++    from sglang.srt.layers.vocab_parallel_embedding import (
++        ParallelLMHead,
++        VocabParallelEmbedding,
++    )
+ 
+     raw_names: set = set()
+     for name, module in model.named_modules():
+@@ -220,6 +227,8 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
+             raw_names.add("down_proj")
+         elif isinstance(module, ParallelLMHead):
+             raw_names.add("lm_head")
++        elif isinstance(module, VocabParallelEmbedding):
++            raw_names.add("embed_tokens")
+         elif isinstance(module, LinearBase):
+             raw_names.add(name.split(".")[-1])
+ 
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 066d4fedac43..c7c7d6b5ec0b 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -601,6 +601,9 @@ def __init__(self, model_runner: ModelRunner):
+             set_torch_compile_config()
+ 
+         if self.model_runner.server_args.enable_lora:
++            # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
++            # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
++            # lora_manager.init_cuda_graph_moe_buffers().
+             self.model_runner.lora_manager.init_cuda_graph_batch_info(
+                 max_bs_in_cuda_graph=self.max_bs,
+                 num_tokens_per_bs=self.num_tokens_per_bs,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 046af2d07907..5810849be423 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -593,6 +593,13 @@ def initialize(self, pre_model_load_memory: float):
+         # Init lora
+         if server_args.enable_lora:
+             self.init_lora_manager()
++            if not server_args.disable_cuda_graph:
++                # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
++                # intermediate buffers before init_memory_pool() so memory
++                # profiling accounts for them.  Phase 2 (dense LoRA batch
++                # metadata) is handled in CudaGraphRunner.__init__() via
++                # lora_manager.init_cuda_graph_batch_info().
++                self._init_lora_cuda_graph_moe_buffers()
+ 
+         # Init Double Sparsity
+         if server_args.enable_double_sparsity:
+@@ -1734,6 +1741,34 @@ def init_lora_manager(self):
+             lora_paths=self.server_args.lora_paths,
+         )
+ 
++    def _init_lora_cuda_graph_moe_buffers(self):
++        """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
++
++        Must be called before init_memory_pool() so that profile_max_num_token()
++        sees the reduced available memory and sizes KV cache correctly.
++        All MoE LoRA layers share one set of buffers (managed by the
++        lora_backend) since they execute sequentially during forward.
++
++        Phase 2 (dense LoRA batch metadata) is handled later in
++        CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
++        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
++        that are only available at that stage.
++        """
++        from sglang.srt.lora.layers import FusedMoEWithLoRA
++
++        max_bs = self.server_args.cuda_graph_max_bs
++        max_loras = self.server_args.max_loras_per_batch
++        for module in self.model.modules():
++            if isinstance(module, FusedMoEWithLoRA):
++                self.lora_manager.init_cuda_graph_moe_buffers(
++                    max_bs, max_loras, self.dtype, module
++                )
++                logger.info(
++                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
++                    f"(max_bs={max_bs}, max_loras={max_loras})"
++                )
++                break
++
+     def load_lora_adapter(self, lora_ref: LoRARef):
+         """Load a new lora adapter from disk or huggingface."""
+ 
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 6da839063c56..a1cc790c1b64 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -4656,10 +4656,11 @@ def add_cli_args(parser: argparse.ArgumentParser):
+         parser.add_argument(
+             "--experts-shared-outer-loras",
+             default=ServerArgs.experts_shared_outer_loras,
+-            action="store_true",
++            action=argparse.BooleanOptionalAction,
+             help="Force shared outer LoRA mode for MoE models. "
+             "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
+-            "(expert_dim=1). By default this is auto-detected from adapter weights.",
++            "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
++            "By default this is auto-detected from adapter weights.",
+         )
+ 
+         # Kernel backend
+diff --git a/test/registered/lora/test_lora_gpt_oss_20b_logprob_diff.py b/test/registered/lora/test_lora_gpt_oss_20b_logprob_diff.py
+index e3a5e9dd6c4b..f6d3fab97e91 100644
+--- a/test/registered/lora/test_lora_gpt_oss_20b_logprob_diff.py
++++ b/test/registered/lora/test_lora_gpt_oss_20b_logprob_diff.py
+@@ -44,7 +44,6 @@
+ LORA_BACKEND = "triton"
+ MAX_LORA_RANK = 32
+ TP_SIZE = 4
+-DISABLE_CUDA_GRAPH = True
+ MOE_RUNNER_BACKEND = "triton"
+ EXPERTS_SHARED_OUTER_LORAS = True
+ PREFILL_ATTENTION_BACKEND = "fa4"
+@@ -86,7 +85,6 @@ def test_lora_gpt_oss_20b_logprob_accuracy(self):
+             lora_paths={"my_lora": adapter_path},
+             lora_backend=LORA_BACKEND,
+             attention_backend="flashinfer",
+-            disable_cuda_graph=DISABLE_CUDA_GRAPH,
+             moe_runner_backend=MOE_RUNNER_BACKEND,
+             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
+             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
+diff --git a/test/registered/lora/test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff.py b/test/registered/lora/test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff.py
+index a729407f6986..c9647f52421f 100644
+--- a/test/registered/lora/test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff.py
++++ b/test/registered/lora/test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff.py
+@@ -44,7 +44,6 @@
+ LORA_BACKEND = "triton"
+ MAX_LORA_RANK = 32
+ TP_SIZE = 4
+-DISABLE_CUDA_GRAPH = True
+ MOE_RUNNER_BACKEND = "triton"
+ EXPERTS_SHARED_OUTER_LORAS = True
+ PREFILL_ATTENTION_BACKEND = "fa4"
+@@ -86,7 +85,6 @@ def test_lora_qwen3_30b_a3b_instruct_2507_logprob_accuracy(self):
+             lora_paths={"my_lora": adapter_path},
+             lora_backend=LORA_BACKEND,
+             attention_backend="flashinfer",
+-            disable_cuda_graph=DISABLE_CUDA_GRAPH,
+             moe_runner_backend=MOE_RUNNER_BACKEND,
+             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
+             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
+diff --git a/test/registered/lora/test_lora_qwen3_8b_logprob_diff.py b/test/registered/lora/test_lora_qwen3_8b_logprob_diff.py
+index c2b9039a2ccf..4c0e8e1f382d 100644
+--- a/test/registered/lora/test_lora_qwen3_8b_logprob_diff.py
++++ b/test/registered/lora/test_lora_qwen3_8b_logprob_diff.py
+@@ -47,7 +47,6 @@
+ LORA_BACKEND = "triton"
+ MAX_LORA_RANK = 32
+ TP_SIZE = 1
+-DISABLE_CUDA_GRAPH = True
+ PREFILL_ATTENTION_BACKEND = "fa4"
+ DECODE_ATTENTION_BACKEND = "fa4"
+ 
+@@ -139,7 +138,6 @@ def test_lora_qwen3_8b_logprob_accuracy(self):
+             lora_paths={"my_lora": adapter_path},
+             lora_backend=LORA_BACKEND,
+             attention_backend="flashinfer",
+-            disable_cuda_graph=DISABLE_CUDA_GRAPH,
+             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
+             decode_attention_backend=DECODE_ATTENTION_BACKEND,
+         )
+diff --git a/test/registered/lora/test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py b/test/registered/lora/test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py
+index 176d16919cd6..ca52832c7d4d 100644
+--- a/test/registered/lora/test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py
++++ b/test/registered/lora/test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py
+@@ -44,7 +44,6 @@
+ LORA_BACKEND = "triton"
+ MAX_LORA_RANK = 32
+ TP_SIZE = 4
+-DISABLE_CUDA_GRAPH = True
+ MOE_RUNNER_BACKEND = "triton"
+ EXPERTS_SHARED_OUTER_LORAS = True
+ PREFILL_ATTENTION_BACKEND = "fa4"
+@@ -86,7 +85,6 @@ def test_lora_qwen3_vl_30b_a3b_instruct_logprob_accuracy(self):
+             lora_paths={"my_lora": adapter_path},
+             lora_backend=LORA_BACKEND,
+             attention_backend="flashinfer",
+-            disable_cuda_graph=DISABLE_CUDA_GRAPH,
+             moe_runner_backend=MOE_RUNNER_BACKEND,
+             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
+             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,

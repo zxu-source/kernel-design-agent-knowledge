@@ -1,0 +1,1110 @@
+diff --git a/csrc/libtorch_stable/attention/mla/sm100_cutlass_mla_kernel.cu b/csrc/libtorch_stable/attention/mla/sm100_cutlass_mla_kernel.cu
+index de62052b4b09..150e32462812 100644
+--- a/csrc/libtorch_stable/attention/mla/sm100_cutlass_mla_kernel.cu
++++ b/csrc/libtorch_stable/attention/mla/sm100_cutlass_mla_kernel.cu
+@@ -136,8 +136,12 @@ typename T::Fmha::Arguments args_from_options(
+   StrideQ stride_Q_pe = cute::make_tuple(
+       static_cast<int64_t>(q_pe.stride(1)), _1{}, static_cast<int64_t>(q_pe.stride(0)));
+ 
++  // Read the token and page strides from the cache tensor instead of assuming
++  // packed pages, so strided views (e.g. per-layer views into a cross-layer
++  // block-major cache) are addressed correctly.
+   StrideK stride_C = cute::make_tuple(
+-      static_cast<int64_t>(0 + D_latent + D_rope), _1{}, static_cast<int64_t>(page_size * (D_latent + D_rope)));
++      static_cast<int64_t>(kv_c_and_k_pe_cache.stride(1)), _1{},
++      static_cast<int64_t>(kv_c_and_k_pe_cache.stride(0)));
+   StrideLSE stride_PT = cute::make_stride(_1{}, page_count_per_seq);
+   StrideLSE stride_LSE = cute::make_tuple(_1{}, 0 + H);
+   StrideO stride_O = cute::make_tuple(static_cast<int64_t>(0 + D_latent), _1{}, static_cast<int64_t>(0 + H * D_latent));
+diff --git a/csrc/libtorch_stable/cache_kernels.cu b/csrc/libtorch_stable/cache_kernels.cu
+index eac93ac9a9f0..ebeba380afc5 100644
+--- a/csrc/libtorch_stable/cache_kernels.cu
++++ b/csrc/libtorch_stable/cache_kernels.cu
+@@ -549,7 +549,7 @@ __global__ void indexer_k_quant_and_cache_kernel(
+     const int head_dim,                        // dimension of each head
+     const int quant_block_size,                // quantization block size
+     const int cache_block_size,                // cache block size
+-    const int cache_stride,  // stride for each token in kv_cache
++    const int64_t cache_block_stride,  // stride for each block in kv_cache
+ 
+     const bool use_ue8m0  // use ue8m0 scale format
+ ) {
+@@ -590,16 +590,15 @@ __global__ void indexer_k_quant_and_cache_kernel(
+     scale = exp2f(ceilf(log2f(scale)));
+   }
+ 
+-  const int64_t dst_offset = block_idx * cache_block_size * cache_stride +
+-                             block_offset * head_dim + head_dim_idx;
++  const int64_t dst_offset =
++      block_idx * cache_block_stride + block_offset * head_dim + head_dim_idx;
+   for (int i = 0; i < VEC_SIZE; i++) {
+     kv_cache[dst_offset + i] =
+         fp8::scaled_convert<cache_t, scalar_t, kv_dt>(k_val_ptr[i], scale);
+   }
+   if (threadIdx.x == 0) {
+     const int64_t dst_scale_idx =
+-        block_idx * cache_block_size * cache_stride +
+-        cache_block_size * head_dim +
++        block_idx * cache_block_stride + cache_block_size * head_dim +
+         (block_offset * head_dim + head_dim_idx) * 4 / quant_block_size;
+     reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
+   }
+@@ -1452,7 +1451,7 @@ void cp_gather_and_upconvert_fp8_kv_cache(
+           reinterpret_cast<KV_T*>(k.data_ptr()),                              \
+           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                    \
+           slot_mapping.const_data_ptr<int64_t>(), head_dim, quant_block_size, \
+-          cache_block_size, cache_stride, use_ue8m0);
++          cache_block_size, cache_block_stride, use_ue8m0);
+ 
+ void indexer_k_quant_and_cache(
+     torch::stable::Tensor& k,         // [num_tokens, head_dim]
+@@ -1463,7 +1462,7 @@ void indexer_k_quant_and_cache(
+   int num_tokens = k.size(0);
+   int head_dim = k.size(1);
+   int cache_block_size = kv_cache.size(1);
+-  int cache_stride = kv_cache.size(2);
++  int64_t cache_block_stride = kv_cache.stride(0);
+   bool use_ue8m0 = scale_fmt == "ue8m0";
+ 
+   STD_TORCH_CHECK(k.device() == kv_cache.device(),
+diff --git a/tests/kernels/attention/test_cutlass_mla_decode.py b/tests/kernels/attention/test_cutlass_mla_decode.py
+index 33bd3605863a..c0e319a27ad2 100644
+--- a/tests/kernels/attention/test_cutlass_mla_decode.py
++++ b/tests/kernels/attention/test_cutlass_mla_decode.py
+@@ -212,3 +212,69 @@ def ref_mla():
+     print(
+         f"{t:.3f} ms, {FLOPS / 10**9 / t:.0f} TFLOPS,", f"{bytes / 10**6 / t:.0f} GB/s"
+     )
++
++
++@pytest.mark.skipif(
++    not current_platform.has_device_capability(100),
++    reason=CUTLASS_MLA_UNSUPPORTED_REASON,
++)
++@torch.inference_mode()
++def test_cutlass_mla_decode_cross_layer_view():
++    """The kernel must read the cache's page-dim stride instead of assuming
++    pages are packed back-to-back. A per-layer view into a cross-layer
++    (block-major) cache has stride(0) inflated by num_layers; outputs must
++    match a contiguous cache holding the same data exactly."""
++    device = torch.device("cuda:0")
++    torch.set_default_dtype(torch.bfloat16)
++    torch.set_default_device(device)
++    torch.manual_seed(42)
++
++    b, mean_sk, d, dv, block_size = 4, 512, 576, 512, 64
++    num_layers, layer_idx = 3, 1
++    scale = math.sqrt(d) ** (-1)
++
++    num_pages = b * (mean_sk // block_size)
++    cache_seqlens = torch.full((b,), mean_sk, dtype=torch.int32)
++    block_table = torch.arange(num_pages, dtype=torch.int32).view(
++        b, mean_sk // block_size
++    )
++
++    kv_contig = torch.randn(num_pages, block_size, d)
++    # Neighbor layers hold random data so packed-pages addressing reads
++    # garbage rather than zeros.
++    kv_cross_layer = torch.randn(num_pages, num_layers, block_size, d)
++    kv_view = kv_cross_layer[:, layer_idx]
++    kv_view.copy_(kv_contig)
++    assert kv_view.stride(0) == num_layers * block_size * d
++
++    q_nope = torch.randn(b, 128, dv)
++    q_pe = torch.randn(b, 128, d - dv)
++    sm_count = num_compute_units(device.index)
++    workspace_size = ops.sm100_cutlass_mla_get_workspace_size(
++        mean_sk, b, sm_count, num_kv_splits=1
++    )
++    workspace = torch.empty(workspace_size, dtype=torch.uint8)
++
++    def run(cache):
++        out = torch.empty(b, 128, dv)
++        lse = torch.empty(b, 128, dtype=torch.float32)
++        ops.sm100_cutlass_mla_decode(
++            out,
++            lse,
++            q_nope,
++            q_pe,
++            cache,
++            cache_seqlens,
++            block_table,
++            workspace,
++            scale,
++            1,
++        )
++        return out, lse
++
++    out_contig, lse_contig = run(kv_contig)
++    out_view, lse_view = run(kv_view)
++
++    # Same data and same compute order; only addressing differs.
++    assert torch.equal(out_contig, out_view)
++    assert torch.equal(lse_contig, lse_view)
+diff --git a/tests/kernels/attention/test_mla_cross_layer_kernel_equivalence.py b/tests/kernels/attention/test_mla_cross_layer_kernel_equivalence.py
+new file mode 100644
+index 000000000000..48a236a01579
+--- /dev/null
++++ b/tests/kernels/attention/test_mla_cross_layer_kernel_equivalence.py
+@@ -0,0 +1,566 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Bit-exact kernel equivalence for MLA decode/write kernels on the
++cross-layer (block-major) KV cache layout.
++
++The cross-layer layout carves each layer's per-block page out of a single
++unified slot, so the per-layer view has an inflated ``stride(0)`` (the full
++unified slot) and a non-zero storage offset. These tests confirm the MLA
++kernels behind the backends that opt in to the layout (FlashMLA dense,
++FlashInfer MLA dense, FlashMLA fp8 sparse, plus the ``concat_and_cache_mla``
++write) honor that strided view bit-identically to a contiguous per-layer
++cache, and that writes do not bleed into neighbouring layers' segments.
++"""
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="MLA cache kernels require CUDA"
++)
++
++
++def test_concat_and_cache_mla_into_unified_slot_view():
++    """concat_and_cache_mla must write correctly into a per-layer view whose
++    block stride is the full unified slot (block-major), with zero bleed into
++    the other layers' segments of the same slot."""
++    from vllm import _custom_ops as ops
++
++    torch.manual_seed(0)
++    dev = "cuda"
++    kv_lora_rank = 512
++    pe = 64
++    entry = kv_lora_rank + pe
++    page = 64
++    num_blocks = 32
++    ntok = 200
++
++    kv_c = torch.randn(ntok, kv_lora_rank, device=dev, dtype=torch.bfloat16)
++    k_pe = torch.randn(ntok, pe, device=dev, dtype=torch.bfloat16)
++    slot = torch.randperm(num_blocks * page, device=dev, dtype=torch.int64)[:ntok]
++    scale = torch.tensor(1.0, device=dev)
++
++    def write(cache):
++        ops.concat_and_cache_mla(kv_c, k_pe, cache, slot, "auto", scale)
++
++    # Contiguous per-layer reference: (num_blocks, page, entry).
++    ref = torch.zeros(num_blocks, page, entry, device=dev, dtype=torch.bfloat16)
++    write(ref)
++
++    # Unified slot holding three layer pages per block. Carve the middle
++    # layer's view (non-zero offset, block stride == full unified slot).
++    layer_page_elems = page * entry
++    n_layers = 3
++    unified_slot_elems = n_layers * layer_page_elems
++    big = torch.zeros(num_blocks, unified_slot_elems, device=dev, dtype=torch.bfloat16)
++    flat = big.view(-1)
++    offset = layer_page_elems  # middle layer
++    view = torch.as_strided(
++        flat,
++        size=(num_blocks, page, entry),
++        stride=(unified_slot_elems, entry, 1),
++        storage_offset=offset,
++    )
++    assert not view.is_contiguous()
++    assert view.stride(0) == unified_slot_elems
++    write(view)
++
++    # Bit-exact equivalence and zero bleed into the neighbour segments.
++    max_diff = (ref.float() - view.float()).abs().max().item()
++    assert max_diff == 0.0, f"max|Δ| = {max_diff}"
++
++    neighbour_lo = torch.as_strided(
++        flat, (num_blocks, layer_page_elems), (unified_slot_elems, 1), 0
++    )
++    neighbour_hi = torch.as_strided(
++        flat,
++        (num_blocks, layer_page_elems),
++        (unified_slot_elems, 1),
++        2 * layer_page_elems,
++    )
++    assert neighbour_lo.abs().max().item() == 0.0
++    assert neighbour_hi.abs().max().item() == 0.0
++
++
++def test_flashmla_dense_decode_unified_slot_view():
++    """FlashMLA dense decode (FLASHMLA backend, e.g. Kimi-K2-style dense MLA
++    on Hopper) must read a unified-slot block-major view bit-identically to a
++    contiguous per-layer cache."""
++    import vllm.v1.attention.ops.flashmla as fm
++
++    ok, reason = fm.is_flashmla_dense_supported()
++    if not ok:
++        pytest.skip(reason)
++
++    torch.manual_seed(0)
++    dev = "cuda"
++    dt = torch.bfloat16
++    head_dim = 576
++    hdv = 512
++    h_q = 128
++    page = 64
++    num_blocks = 64
++    bs = 4
++    n_layers = 3
++    layer = 1
++
++    q = torch.randn(bs, 1, h_q, head_dim, device=dev, dtype=dt) * 0.1
++    kv_data = torch.randn(num_blocks, page, 1, head_dim, device=dev, dtype=dt) * 0.1
++
++    # (A) contiguous per-layer reference.
++    cache_contiguous = kv_data.clone().contiguous()
++
++    # (B) unified slot: view one layer -> inflated stride(0), non-zero offset.
++    unified = (
++        torch.randn(num_blocks, n_layers, page, 1, head_dim, device=dev, dtype=dt) * 0.1
++    )
++    unified[:, layer].copy_(kv_data)
++    cache_view = unified[:, layer]
++    assert not cache_view.is_contiguous()
++    assert cache_view.stride(0) == n_layers * page * 1 * head_dim
++
++    max_blk = num_blocks // bs
++    block_table = torch.arange(num_blocks, device=dev, dtype=torch.int32).view(
++        bs, max_blk
++    )
++    cache_seqlens = torch.full((bs,), max_blk * page, device=dev, dtype=torch.int32)
++
++    def run(kc):
++        meta, num_splits = fm.get_mla_metadata()
++        out, _ = fm.flash_mla_with_kvcache(
++            q=q,
++            k_cache=kc,
++            block_table=block_table,
++            cache_seqlens=cache_seqlens,
++            head_dim_v=hdv,
++            tile_scheduler_metadata=meta,
++            num_splits=num_splits,
++            softmax_scale=head_dim**-0.5,
++            causal=True,
++        )
++        return out.clone().float()
++
++    out_ref = run(cache_contiguous)
++    out_view = run(cache_view)
++    assert torch.isfinite(out_ref).all()
++    assert out_ref.abs().max().item() > 0.0
++    assert (out_ref - out_view).abs().max().item() == 0.0
++
++
++def test_flashinfer_mla_dense_decode_unified_slot_view():
++    """FlashInfer MLA dense decode must read a unified-slot block-major view
++    (inflated stride(0), non-zero storage offset) bit-identically to a
++    contiguous per-layer cache."""
++    try:
++        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
++    except ImportError:
++        pytest.skip("flashinfer is not available")
++    from vllm.platforms import current_platform
++
++    if not current_platform.is_device_capability_family(100):
++        pytest.skip("FlashInfer trtllm-gen MLA requires sm100")
++
++    torch.manual_seed(0)
++    dev = "cuda"
++    dt = torch.bfloat16
++    kv_lora_rank = 512
++    qk_rope_head_dim = 64
++    qk_nope_head_dim = 128
++    head_dim = kv_lora_rank + qk_rope_head_dim  # 576
++    num_qo_heads = 128
++    page = 64
++    num_blocks = 64
++    bs = 4
++    n_layers = 3  # >1 so the per-layer view's block stride is inflated.
++    layer = 1
++
++    q = torch.randn(bs, 1, num_qo_heads, head_dim, device=dev, dtype=dt)
++    kv_data = torch.randn(num_blocks, 1, page, head_dim, device=dev, dtype=dt)
++
++    # (A) contiguous per-layer reference.
++    kv_contiguous = kv_data.clone().contiguous()
++
++    # (B) unified slot: block b of every layer packed together; view one layer
++    # -> stride(0) is n_layers x larger and storage offset is non-zero.
++    unified = torch.randn(num_blocks, n_layers, 1, page, head_dim, device=dev, dtype=dt)
++    unified[:, layer].copy_(kv_data)
++    kv_view = unified[:, layer]
++    assert not kv_view.is_contiguous()
++    assert kv_view.stride(0) == n_layers * 1 * page * head_dim
++
++    max_blk = num_blocks // bs
++    block_tables = torch.arange(num_blocks, device=dev, dtype=torch.int32).view(
++        bs, max_blk
++    )
++    seq_lens = torch.full((bs,), max_blk * page, device=dev, dtype=torch.int32)
++    ws = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=dev)
++    scale = head_dim**-0.5
++
++    def run(kv):
++        return trtllm_batch_decode_with_kv_cache_mla(
++            query=q,
++            kv_cache=kv,
++            workspace_buffer=ws,
++            qk_nope_head_dim=qk_nope_head_dim,
++            kv_lora_rank=kv_lora_rank,
++            qk_rope_head_dim=qk_rope_head_dim,
++            block_tables=block_tables,
++            seq_lens=seq_lens,
++            max_seq_len=int(seq_lens.max().item()),
++            bmm1_scale=scale,
++            bmm2_scale=1.0,
++        ).clone()
++
++    out_ref = run(kv_contiguous).float()
++    out_view = run(kv_view).float()
++    assert torch.isfinite(out_ref).all()
++    assert (out_ref - out_view).abs().max().item() == 0.0
++
++
++def test_flashmla_fp8_sparse_decode_unified_slot_view():
++    """FlashMLA fp8 sparse decode (DeepSeek V3.2/V4 DSA path) must read a
++    unified-slot block-major view bit-identically to a contiguous fp8_ds_mla
++    cache, with finite nonzero output."""
++    import vllm.v1.attention.ops.flashmla as fm
++
++    ok, reason = fm.is_flashmla_sparse_supported()
++    if not ok:
++        pytest.skip(reason)
++
++    torch.manual_seed(0)
++    dev = "cuda"
++    entry = 656  # fp8_ds_mla bytes per token
++    page = 64
++    num_blocks = 32
++    h_q = 128
++    head_dim = 576
++    hdv = 512
++    batch = 2
++    topk = 128
++    n_layers = 3
++    layer = 1
++
++    q = torch.randn(batch, 1, h_q, head_dim, device=dev, dtype=torch.bfloat16) * 0.1
++
++    # Structurally valid fp8 ds_mla payload: 512B fp8 + 16B f32 scales + 128B
++    # bf16 rope (random bytes corrupt the scale region and yield NaNs).
++    nope = (torch.randn(num_blocks, page, 1, 512, device=dev) * 0.1).to(
++        torch.float8_e4m3fn
++    )
++    scales = torch.ones(num_blocks, page, 1, 4, device=dev, dtype=torch.float32)
++    rope = (torch.randn(num_blocks, page, 1, 64, device=dev) * 0.1).to(torch.bfloat16)
++    payload = torch.cat(
++        [
++            nope.view(torch.uint8).view(num_blocks, page, 1, 512),
++            scales.view(torch.uint8).view(num_blocks, page, 1, 16),
++            rope.view(torch.uint8).view(num_blocks, page, 1, 128),
++        ],
++        dim=-1,
++    ).contiguous()
++    assert payload.shape[-1] == entry and payload.dtype == torch.uint8
++
++    # (A) contiguous reference.
++    cache_contiguous = payload.clone().contiguous()
++
++    # (B) unified slot: view one layer -> inflated stride(0), non-zero offset.
++    unified = torch.randint(
++        0, 256, (num_blocks, n_layers, page, 1, entry), device=dev, dtype=torch.uint8
++    )
++    unified[:, layer].copy_(payload)
++    cache_view = unified[:, layer]
++    assert not cache_view.is_contiguous()
++    assert cache_view.stride(0) == n_layers * page * 1 * entry
++
++    # Sparse indices: each batch uses its own disjoint blocks.
++    blocks_per_batch = num_blocks // batch
++    idx = torch.full((batch, 1, topk), -1, device=dev, dtype=torch.int32)
++    for b in range(batch):
++        slots: list[int] = []
++        for blk in range(b * blocks_per_batch, (b + 1) * blocks_per_batch):
++            slots.extend(blk * page + off for off in range(page))
++        slots_t = torch.tensor(slots[:topk], device=dev, dtype=torch.int32)
++        idx[b, 0, : slots_t.numel()] = slots_t
++
++    def run(kc):
++        meta, num_splits = fm.get_mla_metadata()
++        out, _ = fm.flash_mla_with_kvcache(
++            q=q,
++            k_cache=kc,
++            block_table=None,
++            cache_seqlens=None,
++            head_dim_v=hdv,
++            tile_scheduler_metadata=meta,
++            is_fp8_kvcache=True,
++            indices=idx,
++            softmax_scale=head_dim**-0.5,
++        )
++        return out.clone().float()
++
++    out_ref = run(cache_contiguous)
++    out_view = run(cache_view)
++    assert torch.isfinite(out_ref).all()
++    assert out_ref.abs().max().item() > 0.0
++    assert (out_ref - out_view).abs().max().item() == 0.0
++
++
++def test_indexer_k_quant_and_cache_into_unified_slot_view():
++    """indexer_k_quant_and_cache (DeepSeek V3.2/V4 DSA indexer K write) must
++    write correctly into a per-layer view whose block stride is the full
++    unified slot, with zero bleed into the other layers' segments."""
++    from vllm import _custom_ops as ops
++
++    torch.manual_seed(0)
++    dev = "cuda"
++    head_dim = 128
++    quant_block_size = 128
++    block_size = 64
++    num_blocks = 16
++    ntok = 100
++    # Indexer cache layout per token: head_dim fp8 bytes followed by
++    # head_dim * 4 / quant_block_size scale bytes.
++    cache_stride = head_dim + head_dim * 4 // quant_block_size
++
++    k = torch.randn(ntok, head_dim, device=dev, dtype=torch.bfloat16)
++    slot = torch.randperm(num_blocks * block_size, device=dev, dtype=torch.int64)[:ntok]
++
++    def write(cache):
++        ops.indexer_k_quant_and_cache(k, cache, slot, quant_block_size, "ue8m0")
++
++    # Contiguous per-layer reference.
++    ref = torch.zeros(
++        num_blocks, block_size, cache_stride, device=dev, dtype=torch.uint8
++    )
++    write(ref)
++
++    # Unified slot holding three layer pages per block; carve the middle one.
++    n_layers = 3
++    layer = 1
++    unified = torch.zeros(
++        num_blocks, n_layers, block_size, cache_stride, device=dev, dtype=torch.uint8
++    )
++    view = unified[:, layer]
++    assert not view.is_contiguous()
++    assert view.stride(0) == n_layers * block_size * cache_stride
++    write(view)
++
++    assert torch.equal(ref, view.contiguous())
++    # Zero bleed into the neighbour layers' segments.
++    assert unified[:, 0].abs().max().item() == 0
++    assert unified[:, 2].abs().max().item() == 0
++
++
++def test_flashattn_mla_dense_decode_unified_slot_view():
++    """FA3 decode (FLASH_ATTN_MLA backend) must read a unified-slot
++    block-major view bit-identically to a contiguous per-layer cache."""
++    try:
++        from vllm.vllm_flash_attn import flash_attn_varlen_func
++    except ImportError:
++        pytest.skip("vllm_flash_attn is not available")
++    from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
++
++    if not flash_attn_supports_mla():
++        pytest.skip("FA3 MLA requires a Hopper device")
++
++    torch.manual_seed(0)
++    dev = "cuda"
++    dt = torch.bfloat16
++    kv_lora_rank = 512
++    rope_dim = 64
++    entry = kv_lora_rank + rope_dim  # 576
++    h_q = 16
++    page = 64
++    num_blocks = 64
++    bs = 4
++    n_layers = 3
++    layer = 1
++
++    q_pe = torch.randn(bs, h_q, rope_dim, device=dev, dtype=dt) * 0.1
++    q_nope = torch.randn(bs, h_q, kv_lora_rank, device=dev, dtype=dt) * 0.1
++    kv_data = torch.randn(num_blocks, page, entry, device=dev, dtype=dt) * 0.1
++
++    # (A) contiguous per-layer reference.
++    cache_contiguous = kv_data.clone().contiguous()
++
++    # (B) unified slot: view one layer -> inflated stride(0), non-zero offset.
++    unified = torch.randn(num_blocks, n_layers, page, entry, device=dev, dtype=dt) * 0.1
++    unified[:, layer].copy_(kv_data)
++    cache_view = unified[:, layer]
++    assert not cache_view.is_contiguous()
++    assert cache_view.stride(0) == n_layers * page * entry
++
++    max_blk = num_blocks // bs
++    block_table = torch.arange(num_blocks, device=dev, dtype=torch.int32).view(
++        bs, max_blk
++    )
++    seq_lens = torch.full((bs,), max_blk * page, device=dev, dtype=torch.int32)
++    cu_seqlens_q = torch.arange(bs + 1, device=dev, dtype=torch.int32)
++
++    def run(cache):
++        kv_c_cache = cache[..., :kv_lora_rank]
++        k_pe_cache = cache[..., kv_lora_rank:]
++        out = flash_attn_varlen_func(
++            q=q_pe,
++            k=k_pe_cache.unsqueeze(-2),  # Add head dim of 1
++            v=kv_c_cache.unsqueeze(-2),  # Add head dim of 1
++            q_v=q_nope,
++            max_seqlen_q=1,
++            cu_seqlens_q=cu_seqlens_q,
++            max_seqlen_k=int(seq_lens.max().item()),
++            seqused_k=seq_lens,
++            block_table=block_table,
++            softmax_scale=entry**-0.5,
++            causal=True,
++            fa_version=3,
++        )
++        return out.clone().float()
++
++    out_ref = run(cache_contiguous)
++    out_view = run(cache_view)
++    assert torch.isfinite(out_ref).all()
++    assert out_ref.abs().max().item() > 0.0
++    assert (out_ref - out_view).abs().max().item() == 0.0
++
++
++def test_flashmla_dense_fp8_decode_unified_slot_view():
++    """FlashMLA dense fp8 decode (FLASHMLA backend with quantized KV cache)
++    must read a unified-slot block-major view bit-identically to a contiguous
++    per-layer fp8 cache."""
++    import vllm.v1.attention.ops.flashmla as fm
++
++    ok, reason = fm.is_flashmla_dense_supported()
++    if not ok:
++        pytest.skip(reason)
++
++    torch.manual_seed(0)
++    dev = "cuda"
++    head_dim = 576
++    hdv = 512
++    h_q = 128
++    page = 64
++    num_blocks = 64
++    bs = 4
++    n_layers = 3
++    layer = 1
++
++    q = torch.randn(bs, 1, h_q, head_dim, device=dev, dtype=torch.bfloat16) * 0.1
++    kv_data = (torch.randn(num_blocks, page, head_dim, device=dev) * 0.1).to(
++        torch.float8_e4m3fn
++    )
++
++    # (A) contiguous per-layer reference.
++    cache_contiguous = kv_data.clone().contiguous()
++
++    # (B) unified slot: view one layer -> inflated stride(0), non-zero offset.
++    unified = (torch.randn(num_blocks, n_layers, page, head_dim, device=dev) * 0.1).to(
++        torch.float8_e4m3fn
++    )
++    unified[:, layer].copy_(kv_data)
++    cache_view = unified[:, layer]
++    assert not cache_view.is_contiguous()
++    assert cache_view.stride(0) == n_layers * page * head_dim
++
++    max_blk = num_blocks // bs
++    block_table = torch.arange(num_blocks, device=dev, dtype=torch.int32).view(
++        bs, max_blk
++    )
++    cache_seqlens = torch.full((bs,), max_blk * page, device=dev, dtype=torch.int32)
++    descale = torch.ones(1, device=dev, dtype=torch.float32)
++
++    def run(kc):
++        tile_md, num_splits = fm.get_mla_metadata_dense_fp8(cache_seqlens, h_q, 1)
++        out, _ = fm.flash_mla_with_kvcache_fp8(
++            q=q,
++            k_cache=kc.unsqueeze(-2),  # Add head dim of 1
++            block_table=block_table,
++            cache_seqlens=cache_seqlens,
++            head_dim_v=hdv,
++            tile_scheduler_metadata=tile_md,
++            num_splits=num_splits,
++            softmax_scale=head_dim**-0.5,
++            causal=True,
++            descale_q=descale,
++            descale_k=descale,
++        )
++        return out.clone().float()
++
++    out_ref = run(cache_contiguous)
++    out_view = run(cache_view)
++    assert torch.isfinite(out_ref).all()
++    assert out_ref.abs().max().item() > 0.0
++    assert (out_ref - out_view).abs().max().item() == 0.0
++
++
++def test_flashinfer_mla_dense_fp8_decode_unified_slot_view():
++    """FlashInfer MLA dense decode with an fp8 KV cache must read a
++    unified-slot block-major view bit-identically to a contiguous per-layer
++    cache."""
++    try:
++        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
++    except ImportError:
++        pytest.skip("flashinfer is not available")
++    from vllm.platforms import current_platform
++
++    if not current_platform.is_device_capability_family(100):
++        pytest.skip("FlashInfer trtllm-gen MLA requires sm100")
++
++    torch.manual_seed(0)
++    dev = "cuda"
++    kv_lora_rank = 512
++    qk_rope_head_dim = 64
++    qk_nope_head_dim = 128
++    head_dim = kv_lora_rank + qk_rope_head_dim  # 576
++    num_qo_heads = 128
++    page = 64
++    num_blocks = 64
++    bs = 4
++    n_layers = 3
++    layer = 1
++
++    # With a quantized KV cache the decode query is quantized to fp8 as well
++    # (trtllm-gen has no bf16-query x fp8-cache decode kernel).
++    q = (torch.randn(bs, 1, num_qo_heads, head_dim, device=dev) * 0.1).to(
++        torch.float8_e4m3fn
++    )
++    kv_data = (torch.randn(num_blocks, 1, page, head_dim, device=dev) * 0.1).to(
++        torch.float8_e4m3fn
++    )
++
++    # (A) contiguous per-layer reference.
++    kv_contiguous = kv_data.clone().contiguous()
++
++    # (B) unified slot: view one layer -> inflated stride(0), non-zero offset.
++    unified = (
++        torch.randn(num_blocks, n_layers, 1, page, head_dim, device=dev) * 0.1
++    ).to(torch.float8_e4m3fn)
++    unified[:, layer].copy_(kv_data)
++    kv_view = unified[:, layer]
++    assert not kv_view.is_contiguous()
++    assert kv_view.stride(0) == n_layers * 1 * page * head_dim
++
++    max_blk = num_blocks // bs
++    block_tables = torch.arange(num_blocks, device=dev, dtype=torch.int32).view(
++        bs, max_blk
++    )
++    seq_lens = torch.full((bs,), max_blk * page, device=dev, dtype=torch.int32)
++    ws = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=dev)
++    scale = head_dim**-0.5
++
++    def run(kv):
++        return trtllm_batch_decode_with_kv_cache_mla(
++            query=q,
++            kv_cache=kv,
++            workspace_buffer=ws,
++            qk_nope_head_dim=qk_nope_head_dim,
++            kv_lora_rank=kv_lora_rank,
++            qk_rope_head_dim=qk_rope_head_dim,
++            block_tables=block_tables,
++            seq_lens=seq_lens,
++            max_seq_len=int(seq_lens.max().item()),
++            bmm1_scale=scale,
++            bmm2_scale=1.0,
++        ).clone()
++
++    out_ref = run(kv_contiguous).float()
++    out_view = run(kv_view).float()
++    assert torch.isfinite(out_ref).all()
++    assert (out_ref - out_view).abs().max().item() == 0.0
+diff --git a/tests/kernels/attention/test_triton_decode_attention.py b/tests/kernels/attention/test_triton_decode_attention.py
+index 81e8bb17e7bc..b4b17d9b5ce8 100644
+--- a/tests/kernels/attention/test_triton_decode_attention.py
++++ b/tests/kernels/attention/test_triton_decode_attention.py
+@@ -231,3 +231,95 @@ def test_decode_attention_fp8(B, L, H_Q, H_KV, D_QK, D_V, CACHE_SIZE, PAGE_SIZE)
+ 
+     # FP8 tolerances match test_mla_backends.py test_backend_correctness.
+     torch.testing.assert_close(o_ref, o_fp8, atol=5e-1, rtol=1e-2)
++
++
++@pytest.mark.parametrize(
++    "H_Q,H_KV,D_QK,D_V,is_mla",
++    [
++        (16, 1, 576, 512, True),  # MLA path (grouped kernel, v = trans(k))
++        (32, 8, 128, 128, False),  # GQA path (grouped kernel)
++        (32, 32, 128, 128, False),  # MHA path (normal kernel)
++    ],
++)
++@pytest.mark.parametrize("PAGE_SIZE", [16])
++def test_decode_attention_cross_layer_view(H_Q, H_KV, D_QK, D_V, is_mla, PAGE_SIZE):
++    """The kernel must honor the cache's page-dim stride, not assume pages are
++    packed back-to-back. A per-layer view into a cross-layer (block-major)
++    cache has stride(0) inflated by num_layers; outputs must match a
++    contiguous cache holding the same data exactly."""
++    B = 3
++    seq_len = 1027
++    CACHE_SIZE = 16384
++    NUM_LAYERS = 3
++    LAYER_IDX = 1
++    dtype = torch.bfloat16
++    sm_scale = 1.0 / (D_QK**0.5)
++    num_kv_splits = 8
++    num_pages = CACHE_SIZE // PAGE_SIZE
++
++    num_pages_per_batch = cdiv(seq_len, PAGE_SIZE)
++    req_to_page = torch.randint(
++        0, num_pages, (B, num_pages_per_batch), device=DEVICE_TYPE
++    )
++
++    q = torch.randn(B, H_Q, D_QK, dtype=dtype, device=DEVICE_TYPE)
++    b_seq_len = torch.full((B,), seq_len, device=DEVICE_TYPE)
++
++    # Reference: contiguous paged cache.
++    k_ref = torch.randn(
++        num_pages, PAGE_SIZE, H_KV, D_QK, dtype=dtype, device=DEVICE_TYPE
++    )
++    if is_mla:
++        v_ref = k_ref[..., :D_V]
++    else:
++        v_ref = torch.randn(
++            num_pages, PAGE_SIZE, H_KV, D_V, dtype=dtype, device=DEVICE_TYPE
++        )
++
++    # Cross-layer cache: all layers' pages for a block are adjacent. The
++    # per-layer view has the same shape as the contiguous cache but
++    # stride(0) is NUM_LAYERS x larger. Neighbor layers hold random data so
++    # any packed-pages addressing reads garbage rather than zeros.
++    k_xl = torch.randn(
++        num_pages, NUM_LAYERS, PAGE_SIZE, H_KV, D_QK, dtype=dtype, device=DEVICE_TYPE
++    )
++    k_view = k_xl[:, LAYER_IDX]
++    k_view.copy_(k_ref)
++    assert k_view.stride(0) == NUM_LAYERS * PAGE_SIZE * H_KV * D_QK
++    if is_mla:
++        v_view = k_view[..., :D_V]
++    else:
++        v_xl = torch.randn(
++            num_pages, NUM_LAYERS, PAGE_SIZE, H_KV, D_V, dtype=dtype, device=DEVICE_TYPE
++        )
++        v_view = v_xl[:, LAYER_IDX]
++        v_view.copy_(v_ref)
++
++    def run(k_buffer, v_buffer):
++        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=DEVICE_TYPE)
++        lse = torch.zeros(B, H_Q, dtype=dtype, device=DEVICE_TYPE)
++        attn_logits = torch.empty(
++            (B, H_Q, num_kv_splits, D_V + 1), dtype=torch.float32, device=DEVICE_TYPE
++        )
++        decode_attention_fwd(
++            q,
++            k_buffer,
++            v_buffer,
++            o,
++            lse,
++            req_to_page,
++            b_seq_len,
++            attn_logits,
++            num_kv_splits,
++            sm_scale,
++            PAGE_SIZE,
++            is_mla=is_mla,
++        )
++        return o, lse
++
++    o_ref, lse_ref = run(k_ref, v_ref)
++    o_xl, lse_xl = run(k_view, v_view)
++
++    # Same data and same compute order; only addressing differs.
++    assert torch.equal(o_ref, o_xl)
++    assert torch.equal(lse_ref, lse_xl)
+diff --git a/tests/v1/kv_connector/unit/test_kv_cache_layout.py b/tests/v1/kv_connector/unit/test_kv_cache_layout.py
+index 7f8028991703..1da64e0b7ecd 100644
+--- a/tests/v1/kv_connector/unit/test_kv_cache_layout.py
++++ b/tests/v1/kv_connector/unit/test_kv_cache_layout.py
+@@ -1,10 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import pytest
+ 
+-def test_mla_backend_rejects_cross_layer_kv_cache():
+-    """MLA backends return identity permutation (layers dim first)
+-    to signal cross-layer KV cache is unsupported."""
++
++def test_mla_common_backend_rejects_cross_layer_kv_cache():
++    """MLACommonBackend defaults to the identity permutation (layers dim
++    first) so MLA backends whose decode kernels are not verified to honor
++    the cache's block-dim stride stay opted out of cross-layer KV cache."""
+     from vllm.model_executor.layers.attention.mla_attention import (
+         MLACommonBackend,
+     )
+@@ -19,6 +22,35 @@ def test_mla_backend_rejects_cross_layer_kv_cache():
+     ) == (0, 1, 2)
+ 
+ 
++@pytest.mark.parametrize(
++    "backend_path",
++    [
++        "vllm.v1.attention.backends.mla.triton_mla.TritonMLABackend",
++        "vllm.v1.attention.backends.mla.cutlass_mla.CutlassMLABackend",
++        "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend",
++        "vllm.v1.attention.backends.mla.flashmla.FlashMLABackend",
++        "vllm.v1.attention.backends.mla.flashinfer_mla.FlashInferMLABackend",
++    ],
++)
++def test_verified_mla_backends_support_cross_layer_kv_cache(backend_path):
++    """Backends whose decode kernels honor the cache's block-dim stride opt
++    in to the cross-layer layout with a non-identity permutation placing
++    num_blocks first in physical layout."""
++    module_path, name = backend_path.rsplit(".", 1)
++    backend = getattr(
++        pytest.importorskip(module_path, reason="backend deps unavailable"), name
++    )
++
++    stride_order = backend.get_kv_cache_stride_order(include_num_layers_dimension=True)
++    assert stride_order == (1, 0, 2, 3)
++    assert stride_order[0] != 0  # num_blocks first => cross-layer supported
++    assert backend.get_kv_cache_stride_order(include_num_layers_dimension=False) == (
++        0,
++        1,
++        2,
++    )
++
++
+ def test_deepseek_v32_indexer_rejects_cross_layer_kv_cache():
+     """DeepseekV32Indexer returns identity permutation (layers dim first)
+     to signal cross-layer KV cache is unsupported."""
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 247d6dc3a4b8..3344f6d00816 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -1212,9 +1212,9 @@ def get_kv_cache_stride_order(
+         include_num_layers_dimension: bool = False,
+     ) -> tuple[int, ...]:
+         if include_num_layers_dimension:
+-            # MLA kernels require contiguous per-layer KV cache views.
+-            # Identity permutation keeps num_layers first in physical
+-            # layout, signaling cross-layer allocation is unsupported.
++            # Default to identity permutation to signal cross-layer allocation
++            # is unsupported. Each MLA backend must opt in to support cross-layer
++            # allocation by overriding this method.
+             return (0, 1, 2, 3)
+         return (0, 1, 2)
+ 
+diff --git a/vllm/v1/attention/backends/mla/cutlass_mla.py b/vllm/v1/attention/backends/mla/cutlass_mla.py
+index 8815bd93407b..832acbc7cec4 100644
+--- a/vllm/v1/attention/backends/mla/cutlass_mla.py
++++ b/vllm/v1/attention/backends/mla/cutlass_mla.py
+@@ -49,6 +49,14 @@ class CutlassMLABackend(MLACommonBackend):
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+         return [128]
+ 
++    @staticmethod
++    def get_kv_cache_stride_order(
++        include_num_layers_dimension: bool = False,
++    ) -> tuple[int, ...]:
++        if include_num_layers_dimension:
++            return (1, 0, 2, 3)
++        return (0, 1, 2)
++
+     @staticmethod
+     def get_name() -> str:
+         return "CUTLASS_MLA"
+diff --git a/vllm/v1/attention/backends/mla/flashattn_mla.py b/vllm/v1/attention/backends/mla/flashattn_mla.py
+index 63daa860fd3c..80833dfba65b 100644
+--- a/vllm/v1/attention/backends/mla/flashattn_mla.py
++++ b/vllm/v1/attention/backends/mla/flashattn_mla.py
+@@ -52,6 +52,14 @@ class FlashAttnMLABackend(MLACommonBackend):
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+         return [MultipleOf(16)]
+ 
++    @staticmethod
++    def get_kv_cache_stride_order(
++        include_num_layers_dimension: bool = False,
++    ) -> tuple[int, ...]:
++        if include_num_layers_dimension:
++            return (1, 0, 2, 3)
++        return (0, 1, 2)
++
+     @staticmethod
+     def get_name() -> str:
+         return "FLASH_ATTN_MLA"
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla.py b/vllm/v1/attention/backends/mla/flashinfer_mla.py
+index e3d8637deb21..25ab3d7f6595 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla.py
+@@ -49,6 +49,14 @@ class FlashInferMLABackend(MLACommonBackend):
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+         return [32, 64]
+ 
++    @staticmethod
++    def get_kv_cache_stride_order(
++        include_num_layers_dimension: bool = False,
++    ) -> tuple[int, ...]:
++        if include_num_layers_dimension:
++            return (1, 0, 2, 3)
++        return (0, 1, 2)
++
+     @staticmethod
+     def get_name() -> str:
+         return "FLASHINFER_MLA"
+diff --git a/vllm/v1/attention/backends/mla/flashmla.py b/vllm/v1/attention/backends/mla/flashmla.py
+index 43aa186b51c0..533e200cac49 100644
+--- a/vllm/v1/attention/backends/mla/flashmla.py
++++ b/vllm/v1/attention/backends/mla/flashmla.py
+@@ -58,6 +58,14 @@ class FlashMLABackend(MLACommonBackend):
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+         return [64]
+ 
++    @staticmethod
++    def get_kv_cache_stride_order(
++        include_num_layers_dimension: bool = False,
++    ) -> tuple[int, ...]:
++        if include_num_layers_dimension:
++            return (1, 0, 2, 3)
++        return (0, 1, 2)
++
+     @staticmethod
+     def get_name() -> str:
+         return "FLASHMLA"
+diff --git a/vllm/v1/attention/backends/mla/triton_mla.py b/vllm/v1/attention/backends/mla/triton_mla.py
+index c2aa5edccb66..db11cd2845ee 100644
+--- a/vllm/v1/attention/backends/mla/triton_mla.py
++++ b/vllm/v1/attention/backends/mla/triton_mla.py
+@@ -57,6 +57,14 @@ def supports_block_size(cls, block_size: int | None) -> bool:
+             return True
+         return block_size % 16 == 0
+ 
++    @staticmethod
++    def get_kv_cache_stride_order(
++        include_num_layers_dimension: bool = False,
++    ) -> tuple[int, ...]:
++        if include_num_layers_dimension:
++            return (1, 0, 2, 3)
++        return (0, 1, 2)
++
+     @staticmethod
+     def get_name() -> str:
+         return "TRITON_MLA"
+diff --git a/vllm/v1/attention/ops/triton_decode_attention.py b/vllm/v1/attention/ops/triton_decode_attention.py
+index c58a7026e89b..dbe3c5705de9 100644
+--- a/vllm/v1/attention/ops/triton_decode_attention.py
++++ b/vllm/v1/attention/ops/triton_decode_attention.py
+@@ -56,6 +56,15 @@ def tanh(x):
+     return 2 * tl.sigmoid(2 * x) - 1
+ 
+ 
++def _page_stride(buf, page_size):
++    # Stride between pages. 4D buffers have a page dim; 3D buffers pack pages
++    # along the token dim, so split it out first. Read the real stride (a
++    # cross-layer view has gaps), don't assume PAGE_SIZE * token stride.
++    if buf.ndim == 3:
++        buf = buf.unflatten(-3, (-1, page_size))
++    return buf.stride(-4)
++
++
+ @triton.jit
+ def _fwd_kernel_stage1(
+     Q,
+@@ -68,8 +77,10 @@ def _fwd_kernel_stage1(
+     stride_req_to_tokens_b,
+     stride_qbs,
+     stride_qh,
++    stride_buf_kpbs,
+     stride_buf_kbs,
+     stride_buf_kh,
++    stride_buf_vpbs,
+     stride_buf_vbs,
+     stride_buf_vh,
+     stride_mid_ob,
+@@ -123,9 +134,11 @@ def _fwd_kernel_stage1(
+                 mask=offs_n < split_kv_end,
+                 other=0,
+             )
+-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
++            kv_in_page = offs_n % PAGE_SIZE
+             offs_buf_k = (
+-                kv_loc[:, None] * stride_buf_kbs
++                (kv_page_number * stride_buf_kpbs + kv_in_page * stride_buf_kbs)[
++                    :, None
++                ]
+                 + cur_kv_head * stride_buf_kh
+                 + offs_d[None, :]
+             )
+@@ -145,7 +158,9 @@ def _fwd_kernel_stage1(
+             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
+ 
+             offs_buf_v = (
+-                kv_loc[:, None] * stride_buf_vbs
++                (kv_page_number * stride_buf_vpbs + kv_in_page * stride_buf_vbs)[
++                    :, None
++                ]
+                 + cur_kv_head * stride_buf_vh
+                 + offs_dv[None, :]
+             )
+@@ -235,8 +250,10 @@ def _decode_att_m_fwd(
+         Req_to_tokens.stride(0),
+         q.stride(0),
+         q.stride(1),
++        _page_stride(k_buffer, page_size),
+         k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+         k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
++        _page_stride(v_buffer, page_size),
+         v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+         v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+         att_out.stride(0),
+@@ -270,8 +287,10 @@ def _fwd_grouped_kernel_stage1(
+     stride_req_to_tokens_b,
+     stride_qbs,
+     stride_qh,
++    stride_buf_kpbs,
+     stride_buf_kbs,
+     stride_buf_kh,
++    stride_buf_vpbs,
+     stride_buf_vbs,
+     stride_buf_vh,
+     stride_mid_ob,
+@@ -357,10 +376,12 @@ def _fwd_grouped_kernel_stage1(
+                 other=0,
+                 cache_modifier=".ca",
+             )
+-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
++            kv_off_k = (
++                kv_page_number * stride_buf_kpbs + (offs_n % PAGE_SIZE) * stride_buf_kbs
++            )
+ 
+             # explicitly facilitate overlapping load/compute
+-            offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
++            offs_buf_k = kv_off_k[None, :] + base_offs_k
+             k = tl.load(
+                 K_Buffer + offs_buf_k,
+                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+@@ -372,7 +393,7 @@ def _fwd_grouped_kernel_stage1(
+                 k = (k.to(tl.float32) * ks).to(q.dtype)
+             qk = tl.dot(q, k.to(q.dtype))
+             if BLOCK_DPE > 0:
+-                offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
++                offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
+                 kpe = tl.load(
+                     K_Buffer + offs_buf_kpe,
+                     mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+@@ -392,7 +413,11 @@ def _fwd_grouped_kernel_stage1(
+             )
+ 
+             if not IS_MLA:
+-                offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
++                kv_off_v = (
++                    kv_page_number * stride_buf_vpbs
++                    + (offs_n % PAGE_SIZE) * stride_buf_vbs
++                )
++                offs_buf_v = kv_off_v[:, None] + base_offs_v
+                 v = tl.load(
+                     V_Buffer + offs_buf_v,
+                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+@@ -517,8 +542,10 @@ def _decode_grouped_att_m_fwd(
+         Req_to_tokens.stride(0),
+         q.stride(0),
+         q.stride(1),
++        _page_stride(k_buffer, page_size),
+         k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+         k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
++        _page_stride(v_buffer, page_size),
+         v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+         v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+         att_out.stride(0),

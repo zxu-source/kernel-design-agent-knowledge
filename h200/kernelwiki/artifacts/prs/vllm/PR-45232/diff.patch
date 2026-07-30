@@ -1,0 +1,154 @@
+diff --git a/tests/kernels/test_flex_attention.py b/tests/kernels/test_flex_attention.py
+index 41d298134762..86f26cfe8cab 100644
+--- a/tests/kernels/test_flex_attention.py
++++ b/tests/kernels/test_flex_attention.py
+@@ -13,6 +13,7 @@
+     create_standard_kv_cache_spec,
+     create_vllm_config,
+ )
++from vllm.model_executor.layers.attention import Attention
+ from vllm.v1.attention.backends.flex_attention import (
+     BlockSparsityHint,
+     FlexAttentionMetadataBuilder,
+@@ -79,6 +80,72 @@ def test_flex_attention_full_cudagraphs(vllm_runner):
+     )
+ 
+ 
++def windowed_causal_mask_mod(b, h, q_idx, kv_idx):
++    return (kv_idx <= q_idx) & (q_idx - kv_idx < 4)
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available() or TORCH_VERSION < MINIMUM_TORCH_VERSION,
++    reason="CUDA not available or PyTorch version < 2.7",
++)
++def test_flex_attention_custom_mask_full_cudagraphs(vllm_runner, monkeypatch):
++    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
++    monkeypatch.setattr(
++        Attention,
++        "logical_mask_mod",
++        staticmethod(windowed_causal_mask_mod),
++        raising=False,
++    )
++
++    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
++    seed = 42
++    max_tokens = 24
++    num_logprobs = 5
++    prompts = [
++        "Hello, my name is",
++        "The president of the United States is",
++        "The capital of France is",
++    ]
++
++    set_random_seed(seed)
++    with vllm_runner(
++        model_name,
++        runner="generate",
++        tensor_parallel_size=1,
++        num_gpu_blocks_override=128,
++        enforce_eager=True,
++        attention_config={"backend": "FLEX_ATTENTION"},
++    ) as llm_eager:
++        output_eager = llm_eager.generate_greedy_logprobs(
++            prompts, max_tokens, num_logprobs
++        )
++
++    set_random_seed(seed)
++    with vllm_runner(
++        model_name,
++        runner="generate",
++        tensor_parallel_size=1,
++        num_gpu_blocks_override=128,
++        enforce_eager=False,
++        gpu_memory_utilization=0.85,
++        compilation_config={
++            "cudagraph_mode": "FULL",
++            "cudagraph_capture_sizes": [4],
++        },
++        attention_config={"backend": "FLEX_ATTENTION"},
++    ) as llm_cudagraph:
++        output_cudagraph = llm_cudagraph.generate_greedy_logprobs(
++            prompts, max_tokens, num_logprobs
++        )
++
++    check_logprobs_close(
++        outputs_0_lst=output_eager,
++        outputs_1_lst=output_cudagraph,
++        name_0="eager",
++        name_1="cudagraph",
++    )
++
++
+ @pytest.mark.skipif(
+     not torch.cuda.is_available() or TORCH_VERSION < MINIMUM_TORCH_VERSION,
+     reason="CUDA not available or PyTorch version < 2.7",
+diff --git a/vllm/v1/attention/backends/flex_attention.py b/vllm/v1/attention/backends/flex_attention.py
+index f1299f53ad21..829f3472dd77 100644
+--- a/vllm/v1/attention/backends/flex_attention.py
++++ b/vllm/v1/attention/backends/flex_attention.py
+@@ -22,9 +22,10 @@
+ )
+ 
+ import vllm.envs as envs
+-from vllm.config import VllmConfig
++from vllm.config import VllmConfig, get_layers_from_vllm_config
+ from vllm.config.cache import CacheDType
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.attention import Attention
+ from vllm.platforms import current_platform
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import is_quantized_kv_cache, is_torch_equal_or_newer
+@@ -807,6 +808,13 @@ def __init__(
+         self.persistent_physical_to_logical = None
+         self.persistent_kv_indices = None
+ 
++        self.custom_logical_mask_mod: _mask_mod_signature | None = None
++        if self._uses_full_cudagraphs():
++            layers = get_layers_from_vllm_config(
++                vllm_config, Attention, self.layer_names
++            )
++            self.custom_logical_mask_mod = self._maybe_get_custom_mask_mod(layers)
++
+     @staticmethod
+     def _get_block_sizes(
+         attn_cfg,
+@@ -853,6 +861,21 @@ def build_for_cudagraph_capture(
+             common_prefix_len=0, common_attn_metadata=common_attn_metadata
+         )
+ 
++    def _maybe_get_custom_mask_mod(self, layers) -> _mask_mod_signature | None:
++        mask_mods = {
++            getattr(layer, "logical_mask_mod", None) for layer in layers.values()
++        }
++        if len(mask_mods) > 1:
++            raise ValueError(
++                f"Found differing mask mods {mask_mods}, "
++                "cannot use alternating mask mods w/ full CUDA graphs"
++            )
++        return next(iter(mask_mods), None)
++
++    def _uses_full_cudagraphs(self) -> bool:
++        mode = self.vllm_config.compilation_config.cudagraph_mode
++        return mode is not None and mode.has_full_cudagraphs()
++
+     def build(
+         self,
+         common_prefix_len: int,
+@@ -924,9 +947,16 @@ def build(
+             else causal_mask_mod
+         )
+ 
++        sliding_window = None
++        if self._uses_full_cudagraphs():
++            if self.custom_logical_mask_mod is not None:
++                logical_mask_mod = self.custom_logical_mask_mod
++            sliding_window = getattr(self.kv_cache_spec, "sliding_window", None)
++
+         out = FlexAttentionMetadata(
+             causal=common_attn_metadata.causal,
+             logical_mask_mod=logical_mask_mod,
++            sliding_window=sliding_window,
+             num_actual_tokens=num_actual_tokens,
+             max_query_len=max_query_len,
+             query_start_loc=query_start_loc,

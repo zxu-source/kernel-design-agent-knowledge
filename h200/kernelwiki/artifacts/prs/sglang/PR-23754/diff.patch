@@ -1,0 +1,3236 @@
+diff --git a/docs_new/docs/references/environment_variables.mdx b/docs_new/docs/references/environment_variables.mdx
+index 6a417ad0c825..350d6632389e 100644
+--- a/docs_new/docs/references/environment_variables.mdx
++++ b/docs_new/docs/references/environment_variables.mdx
+@@ -779,6 +779,26 @@ SGLang supports various environment variables that can be used to configure its
+       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A comma-separated list of layer names to keep out of FP4 online quantization, including <code>nvfp4_online</code>. For example: <code>model.layers.40,model.layers.41</code>.</td>
+       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+     </tr>
++    <tr>
++      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_ONLINE_QUANT_CONFIG</code></td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object or JSON file path for Humming online weight quantization. When a layer has no checkpoint quantization config, this config tells Humming how to quantize the loaded fp16/bf16 weight. When the checkpoint already has a Humming config, add <code>"force_requant": true</code> to requantize it to this schema during loading. Common keys include <code>dtype</code>/<code>weight_dtype</code>, <code>scale_dtype</code>, <code>group_size</code>, <code>scale_type</code>, <code>ignored_layers</code>, <code>ignore</code>, and <code>modules_to_not_convert</code>.</td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
++    </tr>
++    <tr>
++      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_INPUT_QUANT_CONFIG</code></td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object or JSON file path for Humming input activation quantization. This controls the activation dtype and scale grouping passed into Humming kernels, independently of the weight schema. For example, <code>{'{"dtype": "float8e4m3"}'}</code> quantizes Humming inputs to FP8 E4M3.</td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
++    </tr>
++    <tr>
++      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_USE_F16_ACCUM</code></td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FP16 accumulation in Humming compute/tuning config. This is only meaningful for Humming dtype combinations that support FP16 accumulation, such as fp16 or FP8 E4M3 activations with float16 output. Leave it <code>false</code> for the default accumulator behavior.</td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
++    </tr>
++    <tr>
++      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_MOE_GEMM_TYPE</code></td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the Humming MoE GEMM path for standard dispatch and DeepEP normal dispatch. <code>indexed</code> uses top-k expert ids directly and is the fallback for unset or unknown values. <code>grouped</code> maps to Humming grouped-contiguous GEMM. DeepEP low-latency dispatch uses grouped-masked GEMM internally and does not use this selector.</td>
++      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code> (<code>indexed</code>)</td>
++    </tr>
+ </tbody>
+ </table>
+ 
+diff --git a/python/pyproject.toml b/python/pyproject.toml
+index 7ab0c9df84f7..6306798f625e 100755
+--- a/python/pyproject.toml
++++ b/python/pyproject.toml
+@@ -33,6 +33,7 @@ dependencies = [
+   "flash-attn-4==4.0.0b15",
+   "flashinfer_python[cu13]==0.6.14", # keep it aligned with jit-cache version in Dockerfile
+   "gguf",
++  "humming-kernels[cu13]==0.1.10",
+   "interegular",
+   "IPython",
+   "kernels>=0.14.1,<0.15",
+diff --git a/python/sglang/jit_kernel/csrc/moe/moe_permute_prepare.cu b/python/sglang/jit_kernel/csrc/moe/moe_permute_prepare.cu
+new file mode 100644
+index 000000000000..3d21de92d2b7
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/moe/moe_permute_prepare.cu
+@@ -0,0 +1,127 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include "tvm_ffi_utils.h"
++#include <algorithm>
++#include <cuda_runtime.h>
++#include <limits>
++
++namespace sglang {
++
++// Binary search: find first index where data[index] >= target.
++__device__ __forceinline__ int32_t lower_bound(const int32_t* __restrict__ data, int32_t n, int32_t target) {
++  int32_t lo = 0, hi = n;
++  while (lo < hi) {
++    int32_t mid = lo + (hi - lo) / 2;
++    if (data[mid] < target) {
++      lo = mid + 1;
++    } else {
++      hi = mid;
++    }
++  }
++  return lo;
++}
++
++// All blocks cooperate on both expert_offsets and src2dst.
++__global__ void moe_permute_prepare_kernel(
++    const int32_t* __restrict__ sorted_topk_ids,
++    const int64_t* __restrict__ reorder_ids,
++    void* __restrict__ expert_offsets,
++    int32_t* __restrict__ src2dst,
++    int32_t num_experts,
++    int32_t numel,
++    bool use_int64_offset,
++    bool is_ep) {
++  int tid = blockIdx.x * blockDim.x + threadIdx.x;
++  int stride = gridDim.x * blockDim.x;
++  int32_t neg_count = 0;
++  if (is_ep) neg_count = lower_bound(sorted_topk_ids, numel, 0);
++
++  for (int e = tid; e <= num_experts; e += stride) {
++    int32_t offset;
++    if (e < num_experts) {
++      offset = lower_bound(sorted_topk_ids, numel, e) - neg_count;
++    } else {
++      offset = numel - neg_count;
++    }
++
++    if (use_int64_offset) {
++      reinterpret_cast<int64_t*>(expert_offsets)[e] = static_cast<int64_t>(offset);
++    } else {
++      reinterpret_cast<int32_t*>(expert_offsets)[e] = offset;
++    }
++  }
++
++  for (int i = tid; i < numel; i += stride) {
++    src2dst[reorder_ids[i]] = i - neg_count;
++  }
++}
++
++}  // namespace sglang
++
++void moe_permute_prepare(
++    TensorView sorted_topk_ids,
++    TensorView reorder_ids,
++    TensorView expert_offsets,
++    TensorView src2dst,
++    int64_t num_experts,
++    bool use_int64_offset,
++    bool is_ep) {
++  CHECK_INPUT_AND_TYPE(sorted_topk_ids, dl_int32);
++  CHECK_INPUT_AND_TYPE(reorder_ids, dl_int64);
++  CHECK_INPUT_AND_TYPE(src2dst, dl_int32);
++  CHECK_CUDA(expert_offsets);
++  CHECK_CONTIGUOUS(expert_offsets);
++  CHECK_DEVICE(sorted_topk_ids, reorder_ids);
++  CHECK_DEVICE(sorted_topk_ids, expert_offsets);
++  CHECK_DEVICE(sorted_topk_ids, src2dst);
++  CHECK_DIM(1, sorted_topk_ids);
++  CHECK_DIM(1, reorder_ids);
++  CHECK_DIM(1, expert_offsets);
++  CHECK_DIM(1, src2dst);
++  TVM_FFI_ICHECK_EQ(reorder_ids.size(0), sorted_topk_ids.size(0));
++  TVM_FFI_ICHECK_EQ(src2dst.size(0), sorted_topk_ids.size(0));
++  TVM_FFI_ICHECK_GE(num_experts, 0);
++  TVM_FFI_ICHECK_LT(num_experts, std::numeric_limits<int32_t>::max());
++  TVM_FFI_ICHECK_LE(sorted_topk_ids.size(0), std::numeric_limits<int32_t>::max());
++  TVM_FFI_ICHECK_EQ(expert_offsets.size(0), num_experts + 1);
++  if (use_int64_offset) {
++    CHECK_INPUT_TYPE(expert_offsets, dl_int64);
++  } else {
++    CHECK_INPUT_TYPE(expert_offsets, dl_int32);
++  }
++
++  cudaSetDevice(sorted_topk_ids.device().device_id);
++  cudaStream_t stream = get_stream(sorted_topk_ids.device());
++  int32_t numel = static_cast<int32_t>(sorted_topk_ids.size(0));
++  int32_t num_experts_i32 = static_cast<int32_t>(num_experts);
++  constexpr int threads = 256;
++  int num_blocks = std::max(1, (std::max(numel, num_experts_i32 + 1) + threads - 1) / threads);
++
++  sglang::moe_permute_prepare_kernel<<<num_blocks, threads, 0, stream>>>(
++      static_cast<const int32_t*>(sorted_topk_ids.data_ptr()),
++      static_cast<const int64_t*>(reorder_ids.data_ptr()),
++      expert_offsets.data_ptr(),
++      static_cast<int32_t*>(src2dst.data_ptr()),
++      num_experts_i32,
++      numel,
++      use_int64_offset,
++      is_ep);
++
++  cudaError_t err = cudaGetLastError();
++  TVM_FFI_ICHECK(err == cudaSuccess) << "moe_permute_prepare launch failed: " << cudaGetErrorString(err);
++}
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare, moe_permute_prepare);
+diff --git a/python/sglang/jit_kernel/moe_permute_prepare.py b/python/sglang/jit_kernel/moe_permute_prepare.py
+new file mode 100644
+index 000000000000..679c52332203
+--- /dev/null
++++ b/python/sglang/jit_kernel/moe_permute_prepare.py
+@@ -0,0 +1,77 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Tuple
++
++import torch
++
++from sglang.jit_kernel.utils import cache_once, load_jit
++from sglang.srt.utils.custom_op import register_custom_op
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++
++@cache_once
++def _jit_moe_permute_prepare_module() -> Module:
++    return load_jit(
++        "moe_permute_prepare",
++        cuda_files=["moe/moe_permute_prepare.cu"],
++        header_only=False,
++    )
++
++
++@register_custom_op(
++    op_name="moe_permute_prepare_out",
++    mutates_args=["expert_offsets", "src2dst"],
++)
++def _moe_permute_prepare_out(
++    sorted_topk_ids: torch.Tensor,
++    reorder_ids: torch.Tensor,
++    expert_offsets: torch.Tensor,
++    src2dst: torch.Tensor,
++    num_experts: int,
++    use_int64_offset: bool,
++    is_ep: bool,
++) -> None:
++    module = _jit_moe_permute_prepare_module()
++    module.moe_permute_prepare(
++        sorted_topk_ids,
++        reorder_ids,
++        expert_offsets,
++        src2dst,
++        num_experts,
++        use_int64_offset,
++        is_ep,
++    )
++
++
++def moe_permute_prepare(
++    topk_ids: torch.Tensor,
++    num_experts: int,
++    use_int64_offset: bool = False,
++    is_ep: bool = False,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    if topk_ids.dtype != torch.int32:
++        raise TypeError(f"topk_ids must be int32, got {topk_ids.dtype}")
++    if not topk_ids.is_cuda:
++        raise ValueError("topk_ids must be a CUDA tensor")
++
++    sorted_topk_ids, reorder_ids = torch.sort(topk_ids.flatten())
++    offset_dtype = torch.int64 if use_int64_offset else torch.int32
++    expert_offsets = torch.empty(
++        (num_experts + 1,), dtype=offset_dtype, device=topk_ids.device
++    )
++    src2dst = torch.empty(
++        (topk_ids.numel(),), dtype=torch.int32, device=topk_ids.device
++    )
++
++    _moe_permute_prepare_out(
++        sorted_topk_ids,
++        reorder_ids,
++        expert_offsets,
++        src2dst,
++        num_experts,
++        use_int64_offset,
++        is_ep,
++    )
++    return expert_offsets, src2dst
+diff --git a/python/sglang/kernels/ops/moe/__init__.py b/python/sglang/kernels/ops/moe/__init__.py
+index 6ad53d16b382..85012c388513 100644
+--- a/python/sglang/kernels/ops/moe/__init__.py
++++ b/python/sglang/kernels/ops/moe/__init__.py
+@@ -66,9 +66,23 @@ def moe_align_block_size(
+     num_tokens_post_pad: torch.Tensor,
+     cumsum_buffer: torch.Tensor,
+     pad_sorted_token_ids: bool = False,
++    ignore_invalid_expert: bool = False,
+ ) -> None:
+     """Align and sort expert token ids into block-padded output buffers."""
+-    return get_kernel("moe.moe_align_block_size", KernelBackend.CUDA_AOT)(
++    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.CUDA_AOT)
++    if ignore_invalid_expert:
++        return kernel(
++            topk_ids,
++            num_experts,
++            block_size,
++            sorted_token_ids,
++            experts_ids,
++            num_tokens_post_pad,
++            cumsum_buffer,
++            pad_sorted_token_ids,
++            ignore_invalid_expert,
++        )
++    return kernel(
+         topk_ids,
+         num_experts,
+         block_size,
+diff --git a/python/sglang/multimodal_gen/runtime/layers/vocab_parallel_embedding.py b/python/sglang/multimodal_gen/runtime/layers/vocab_parallel_embedding.py
+index 30950f013abe..050f9e9acaed 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/vocab_parallel_embedding.py
++++ b/python/sglang/multimodal_gen/runtime/layers/vocab_parallel_embedding.py
+@@ -446,8 +446,8 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+             assert loaded_weight.shape[output_dim] == (
+                 self.org_vocab_size // param.packed_factor
+             )
+-            start_idx = start_idx // packed_factor
+-            shard_size = shard_size // packed_factor
++            start_idx = round(start_idx // packed_factor)
++            shard_size = round(shard_size // packed_factor)
+         else:
+             assert loaded_weight.shape[output_dim] == self.org_vocab_size
+ 
+diff --git a/python/sglang/multimodal_gen/runtime/models/parameter.py b/python/sglang/multimodal_gen/runtime/models/parameter.py
+index 4f72feb74f42..08ba55785db7 100644
+--- a/python/sglang/multimodal_gen/runtime/models/parameter.py
++++ b/python/sglang/multimodal_gen/runtime/models/parameter.py
+@@ -419,6 +419,6 @@ def permute_param_layout_(
+ def _adjust_shard_indexes_for_packing(
+     shard_size, shard_offset, packed_factor
+ ) -> tuple[Any, Any]:
+-    shard_size = shard_size // packed_factor
+-    shard_offset = shard_offset // packed_factor
++    shard_size = round(shard_size // packed_factor)
++    shard_offset = round(shard_offset // packed_factor)
+     return shard_size, shard_offset
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index 238f2fa16a1e..f0c7d64b4b81 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -1345,6 +1345,7 @@ def _verify_quantization(self) -> None:
+             "petit_nvfp4",
+             "quark",
+             "modelslim",
++            "humming",
+             "quark_mxfp4",
+         ]
+         compatible_quantization_methods = {
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 170e6f63e521..e6426896d31b 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1,4 +1,5 @@
+ import functools
++import json
+ import os
+ import subprocess
+ import warnings
+@@ -111,6 +112,16 @@ def parse(self, value: str) -> str:
+         return value
+ 
+ 
++class EnvJSON(EnvField):
++    def parse(self, value: str | None) -> list | dict | None:
++        if not value:
++            return None
++        if os.path.exists(value):
++            with open(value) as f:
++                return json.load(f)
++        return json.loads(value)
++
++
+ class EnvBool(EnvField):
+     def parse(self, value: str) -> bool:
+         value = value.lower()
+@@ -582,6 +593,12 @@ class Envs:
+     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
+     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+ 
++    # Quantization (Humming)
++    SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
++    SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
++    SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
++    SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
++
+     # Flashinfer
+     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
+diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
+index bfb8009b2a3a..ea14529a23e4 100644
+--- a/python/sglang/srt/layers/linear.py
++++ b/python/sglang/srt/layers/linear.py
+@@ -75,6 +75,7 @@
+     "IPEXAWQLinearMethod",
+     "PetitNvFp4LinearMethod",
+     "QuarkInt4Fp8LinearMethod",
++    "HummingLinearMethod",
+ ]
+ 
+ _is_cpu = is_cpu()
+@@ -225,6 +226,7 @@ def __init__(
+ 
+         # All the linear layer supports quant method.
+         assert self.quant_method is not None
++        self.with_bias = bias
+         self.quant_method.create_weights(
+             self,
+             self.input_size,
+@@ -331,6 +333,7 @@ def __init__(
+             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+         )
+ 
++        self.with_bias = bias
+         self.gather_output = gather_output
+         self.use_presharded_weights = use_presharded_weights
+ 
+@@ -522,6 +525,7 @@ def __init__(
+         tp_size: Optional[int] = None,
+         use_presharded_weights: bool = False,
+     ):
++        self.with_bias = bias
+         self.output_sizes = output_sizes
+         if tp_rank is None:
+             tp_rank = get_parallel().tp_rank
+@@ -621,8 +625,8 @@ def weight_loader(
+                 # If quantized, we need to adjust the offset and size to account
+                 # for the packing.
+                 if packed_dim == output_dim:
+-                    shard_size = shard_size // param.pack_factor
+-                    shard_offset = shard_offset // param.pack_factor
++                    shard_size = round(shard_size // param.pack_factor)
++                    shard_offset = round(shard_offset // param.pack_factor)
+                     # Special case for Marlin.
+                     shard_size, shard_offset = adjust_marlin_shard(
+                         param, shard_size, shard_offset
+@@ -654,8 +658,8 @@ def weight_loader(
+             # for the packing.
+             packed_dim = getattr(param, "packed_dim", None)
+             if packed_dim == output_dim:
+-                shard_size = shard_size // param.pack_factor
+-                shard_offset = shard_offset // param.pack_factor
++                shard_size = round(shard_size // param.pack_factor)
++                shard_offset = round(shard_offset // param.pack_factor)
+                 # Special case for Marlin.
+                 shard_size, shard_offset = adjust_marlin_shard(
+                     param, shard_size, shard_offset
+@@ -932,6 +936,7 @@ def __init__(
+         v_head_size: Optional[int] = None,
+         skip_block_quant_check: bool = False,
+     ):
++        self.with_bias = bias
+         self.hidden_size = hidden_size
+         self.head_size = head_size
+         self.v_head_size = v_head_size if v_head_size is not None else head_size
+@@ -1193,8 +1198,8 @@ def weight_loader(
+                 # If quantized, we need to adjust the offset and size to account
+                 # for the packing.
+                 if packed_dim == output_dim:
+-                    shard_size = shard_size // param.pack_factor
+-                    shard_offset = shard_offset // param.pack_factor
++                    shard_size = round(shard_size // param.pack_factor)
++                    shard_offset = round(shard_offset // param.pack_factor)
+ 
+                     # Special case for Marlin.
+                     shard_size, shard_offset = adjust_marlin_shard(
+@@ -1250,8 +1255,8 @@ def weight_loader(
+             # for the packing.
+             packed_dim = getattr(param, "packed_dim", None)
+             if packed_dim == output_dim:
+-                shard_size = shard_size // param.pack_factor
+-                shard_offset = shard_offset // param.pack_factor
++                shard_size = round(shard_size // param.pack_factor)
++                shard_offset = round(shard_offset // param.pack_factor)
+ 
+                 # Special case for Marlin.
+                 shard_size, shard_offset = adjust_marlin_shard(
+@@ -1382,6 +1387,7 @@ def __init__(
+             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+         )
+ 
++        self.with_bias = bias
+         self.input_is_parallel = input_is_parallel
+         self.reduce_results = reduce_results
+         self.use_dp_attention_reduce = use_dp_attention_reduce
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 4c3dced36cc4..780ba0e52160 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -98,7 +98,7 @@ def deepep_permute_triton_kernel(
+         in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+ 
+         for idx in range(topk):
+-            dst_idx = tl.load(src2dst_ptr + idx)
++            dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
+             if dst_idx >= 0:
+                 dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                 tl.store(dst_ptr + offset, in_data, mask=mask)
+@@ -113,6 +113,7 @@ def deepep_post_reorder_triton_kernel(
+     topk_weights_ptr,
+     topk,
+     hidden_size,
++    routed_scaling_factor: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+     InDtype = down_output_ptr.dtype.element_ty
+@@ -128,9 +129,11 @@ def deepep_post_reorder_triton_kernel(
+         mask = offset < hidden_size
+         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+         for idx in range(topk):
+-            dst_idx = tl.load(src2dst_ptr + idx)
++            dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
+             if dst_idx >= 0:
+                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
++                if routed_scaling_factor != 1.0:
++                    weigh_scale = weigh_scale * routed_scaling_factor
+                 load_ptr = down_output_ptr + dst_idx * hidden_size
+                 in_data = tl.load(load_ptr + offset, mask=mask)
+                 sum_vec += in_data * weigh_scale
+@@ -1908,3 +1911,74 @@ def fp8_per_token_to_per_tensor_quant_triton(
+         K_BLOCK_SIZE=K_BLOCK_SIZE,
+         num_warps=8,
+     )
++
++
++def moe_permute(
++    inputs: torch.Tensor,
++    topk_ids: torch.Tensor,
++    num_experts: int,
++    use_int64_offset: bool = False,
++    is_ep: bool = False,
++    outputs: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    from sglang.jit_kernel.moe_permute_prepare import moe_permute_prepare
++
++    expert_offsets, src2dst = moe_permute_prepare(
++        topk_ids=topk_ids,
++        num_experts=num_experts,
++        use_int64_offset=use_int64_offset,
++        is_ep=is_ep,
++    )
++    output_shape = (topk_ids.nelement(), inputs.size(-1))
++    if outputs is None:
++        outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
++
++    assert outputs.shape == output_shape
++    assert outputs.dtype == inputs.dtype
++    assert outputs.device == inputs.device
++
++    deepep_permute_triton_kernel[(inputs.shape[0],)](
++        inputs,
++        outputs,
++        src2dst,
++        topk_ids,
++        None,
++        topk_ids.size(1),
++        inputs.size(1),
++        BLOCK_SIZE=512,
++    )
++
++    return outputs, src2dst, expert_offsets
++
++
++def moe_unpermute(
++    inputs: torch.Tensor,
++    src2dst: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    routed_scaling_factor: float | None = None,
++    outputs: torch.Tensor | None = None,
++) -> torch.Tensor:
++    num_tokens = topk_ids.size(0)
++    output_shape = (num_tokens, inputs.size(1))
++    if outputs is None:
++        outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
++
++    assert outputs.shape == output_shape
++    assert outputs.dtype == inputs.dtype
++    assert outputs.device == inputs.device
++
++    deepep_post_reorder_triton_kernel[(num_tokens,)](
++        inputs,
++        outputs,
++        src2dst,
++        topk_ids,
++        topk_weights,
++        topk_ids.size(1),
++        inputs.size(1),
++        1.0 if routed_scaling_factor is None else routed_scaling_factor,
++        BLOCK_SIZE=512,
++    )
++
++    assert outputs is not None
++    return outputs
+diff --git a/python/sglang/srt/layers/moe/ep_moe/layer.py b/python/sglang/srt/layers/moe/ep_moe/layer.py
+index 98012bfcda0d..d1e5cc2bd66e 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/layer.py
++++ b/python/sglang/srt/layers/moe/ep_moe/layer.py
+@@ -83,7 +83,15 @@ def __init__(
+             routed_scaling_factor=routed_scaling_factor,
+             **kwargs,
+         )
+-        if _use_aiter:
++        is_humming = (
++            get_moe_runner_backend().is_humming()
++            or get_moe_runner_backend().is_auto()
++            and quant_config is not None
++            and quant_config.get_name() == "humming"
++        )
++        if is_humming:
++            self.deprecate_flag = True
++        elif _use_aiter:
+             self.deprecate_flag = True
+         elif _is_npu:
+             self.deprecate_flag = True
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index e4f9c88fcbf1..c1b432a38f1f 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -198,10 +198,13 @@ def __init__(
+         if params_dtype is None:
+             params_dtype = torch.get_default_dtype()
+ 
++        self.params_dtype = params_dtype
++        self.layer_name = prefix
+         self.layer_id = layer_id
+         self.top_k = top_k
+         self.hidden_size = hidden_size
+         self.num_experts = num_experts
++        self.with_bias = with_bias
+         self.num_fused_shared_experts = num_fused_shared_experts
+ 
+         self.enable_flashinfer_cutlass_moe = (
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/moe_fused_mul_sum.py b/python/sglang/srt/layers/moe/fused_moe_triton/moe_fused_mul_sum.py
+new file mode 100644
+index 000000000000..94f57ffbf585
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/moe_fused_mul_sum.py
+@@ -0,0 +1,218 @@
++import torch
++import triton
++import triton.language as tl
++from torch._subclasses.fake_tensor import FakeTensor
++
++from sglang.srt.utils import get_device_capability
++
++
++@triton.jit
++def moe_fused_mul_sum_kernel(
++    inputs_ptr,
++    topk_weights_ptr,
++    outputs_ptr,
++    top_ids_ptr,
++    expert_map_ptr,
++    num_tokens,
++    stride_m,
++    has_expert_map: tl.constexpr,
++    is_ep: tl.constexpr,
++    top_k: tl.constexpr,
++    size: tl.constexpr,
++    routed_scaling_factor: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    pid_k = tl.program_id(0)
++    pid_m = tl.program_id(1).to(tl.int64)
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
++
++    m_mask = offs_m < num_tokens
++    k_mask = offs_k < size
++    mask = m_mask[:, None] & k_mask[None, :]
++
++    a_base = inputs_ptr + (offs_m * stride_m)[:, None] + offs_k[None, :]
++    b_base = topk_weights_ptr + offs_m * top_k
++
++    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
++
++    for n in tl.static_range(top_k):
++        b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
++        if routed_scaling_factor != 1.0:
++            b_val = b_val * routed_scaling_factor
++        if has_expert_map:
++            id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
++            expert_mask = tl.load(expert_map_ptr + id_val) >= 0
++            a_vec = tl.load(
++                a_base + n * size,
++                mask=mask & expert_mask[:, None],
++                other=0.0,
++            ).to(tl.float32)
++        elif is_ep:
++            id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
++            expert_mask = id_val >= 0
++            a_vec = tl.load(
++                a_base + n * size,
++                mask=mask & expert_mask[:, None],
++                other=0.0,
++            ).to(tl.float32)
++        else:
++            a_vec = tl.load(
++                a_base + n * size,
++                mask=mask,
++                other=0.0,
++            ).to(tl.float32)
++        acc += a_vec * b_val[:, None]
++
++    out_ptrs = outputs_ptr + (offs_m * size)[:, None] + offs_k[None, :]
++    tl.store(
++        out_ptrs,
++        acc.to(outputs_ptr.dtype.element_ty),
++        mask=mask,
++    )
++
++
++def _heuristic_config(
++    num_tokens: int,
++    top_k: int,
++    size: int,
++    element_size: int,
++):
++    is_fp32 = element_size > 2
++    major, _ = get_device_capability()
++    is_sm90_plus = major is not None and major >= 9
++    is_sm80_before = major is None or major < 8
++
++    if is_sm90_plus:
++        # SM90/SM100+: prefer small tiles + many CTAs.
++        if is_fp32:
++            BLOCK_M = 1 if num_tokens <= 4 else 2
++        else:
++            if num_tokens <= 4:
++                BLOCK_M = 1
++            elif num_tokens <= 128:
++                BLOCK_M = 2
++            else:
++                BLOCK_M = 4
++    elif is_fp32:
++        if num_tokens <= 4:
++            BLOCK_M = 1
++        elif num_tokens <= 32:
++            BLOCK_M = 2
++        elif num_tokens <= 128:
++            BLOCK_M = 4
++        else:
++            BLOCK_M = 4
++    else:
++        if num_tokens <= 4:
++            BLOCK_M = 1
++        elif num_tokens <= 32:
++            BLOCK_M = 2
++        elif num_tokens <= 128:
++            BLOCK_M = 4
++        elif num_tokens <= 1024:
++            BLOCK_M = 16
++        else:
++            BLOCK_M = 8
++
++    if is_fp32:
++        max_block_k = 256
++    elif is_sm80_before or is_sm90_plus:
++        max_block_k = 512
++    else:
++        max_block_k = 1024
++    BLOCK_K = min(triton.next_power_of_2(size), max_block_k)
++    BLOCK_K = max(BLOCK_K, 256)
++
++    total = BLOCK_M * BLOCK_K
++    if is_fp32:
++        num_warps = max(8, min(16, total // 64))
++    else:
++        num_warps = max(4, min(16, total // 256))
++
++    if is_sm80_before:
++        num_warps = min(num_warps, 8)
++        num_stages = 2
++    elif is_sm90_plus:
++        num_warps = min(num_warps, 8)
++        num_stages = 4 if total <= 2048 else 2
++    else:
++        num_stages = 4 if total <= 2048 else 2
++
++    return BLOCK_M, BLOCK_K, num_warps, num_stages
++
++
++def moe_fused_mul_sum(
++    inputs: torch.Tensor,
++    topk_weights: torch.Tensor,
++    outputs: torch.Tensor | None = None,
++    topk_ids: torch.Tensor | None = None,
++    expert_map: torch.Tensor | None = None,
++    routed_scaling_factor: float | None = None,
++    is_ep: bool = False,
++) -> torch.Tensor:
++    """
++    Fused kernel for MoE (Mixture of Experts) to perform weighted summation
++    of expert outputs.
++
++    Args:
++        inputs: The output from experts.
++            Shape: (num_tokens, top_k, hidden_size).
++        topk_weights: The weights assigned to each expert for each token.
++            Shape: (num_tokens, top_k).
++        outputs: Optional pre-allocated output tensor.
++            Shape: (num_tokens, hidden_size).
++        topk_ids: Optional indices of the top-k experts. Used when
++            `expert_map` is provided. Shape: (num_tokens, top_k).
++        expert_map: Optional mapping for Expert Parallelism. A value < 0
++            indicates an invalid token/expert pair that will be skipped.
++
++    Returns:
++        The fused weighted sum of expert outputs.
++        Shape: (num_tokens, hidden_size).
++    """
++    assert inputs.ndim == 3
++    assert topk_weights.ndim == 2
++    assert inputs.is_contiguous()
++    assert topk_weights.is_contiguous()
++    assert inputs.dtype in (torch.float32, torch.float16, torch.bfloat16)
++    assert topk_weights.dtype in (torch.float32, torch.float16, torch.bfloat16)
++
++    num_tokens, top_k, size = inputs.shape
++    output_shape = (num_tokens, size)
++    if outputs is None:
++        outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
++
++    assert outputs.shape == output_shape
++    assert topk_weights.shape == (num_tokens, top_k)
++
++    if not isinstance(inputs, FakeTensor):
++        BLOCK_M, BLOCK_K, num_warps, num_stages = _heuristic_config(
++            num_tokens,
++            top_k,
++            size,
++            inputs.element_size(),
++        )
++        grid = (triton.cdiv(size, BLOCK_K), triton.cdiv(num_tokens, BLOCK_M))
++        moe_fused_mul_sum_kernel[grid](
++            inputs,
++            topk_weights,
++            outputs,
++            topk_ids,
++            expert_map,
++            num_tokens,
++            top_k * size,
++            expert_map is not None,
++            is_ep,
++            top_k,
++            size,
++            1.0 if routed_scaling_factor is None else routed_scaling_factor,
++            BLOCK_M,
++            BLOCK_K,
++            num_warps=num_warps,
++            num_stages=num_stages,
++        )
++
++    return outputs
+diff --git a/python/sglang/srt/layers/moe/moe_runner/humming.py b/python/sglang/srt/layers/moe/moe_runner/humming.py
+new file mode 100644
+index 000000000000..27170fd8b602
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/moe_runner/humming.py
+@@ -0,0 +1,817 @@
++from __future__ import annotations
++
++import json
++import logging
++import math
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any, Optional
++from weakref import WeakValueDictionary
++
++import torch
++
++from sglang.srt.environ import envs
++from sglang.srt.layers.moe.ep_moe.kernels import moe_permute, moe_unpermute
++from sglang.srt.layers.moe.fused_moe_triton.moe_fused_mul_sum import moe_fused_mul_sum
++from sglang.srt.layers.moe.moe_runner.base import (
++    MoeQuantInfo,
++    MoeRunnerConfig,
++    MoeRunnerCore,
++    RunnerInput,
++    RunnerOutput,
++    register_fused_func,
++    register_post_permute,
++    register_pre_permute,
++)
++from sglang.srt.layers.moe.utils import MoeRunnerBackend
++from sglang.srt.utils.custom_op import register_custom_op
++
++if TYPE_CHECKING:
++    from sglang.srt.layers.moe.token_dispatcher.deepep import (
++        DeepEPLLCombineInput,
++        DeepEPLLDispatchOutput,
++        DeepEPNormalCombineInput,
++        DeepEPNormalDispatchOutput,
++    )
++    from sglang.srt.layers.moe.token_dispatcher.standard import (
++        StandardCombineInput,
++        StandardDispatchOutput,
++    )
++
++
++logger = logging.getLogger(__name__)
++
++
++try:
++    from humming import dtypes
++    from humming.config import GemmType as HummingGemmType
++    from humming.layer import HummingMethod
++
++    _humming_available = True
++except ModuleNotFoundError:
++    _humming_available = False
++
++
++def get_standard_humming_moe_gemm_type() -> HummingGemmType:
++    env_gemm_type_str = envs.SGLANG_HUMMING_MOE_GEMM_TYPE.get().lower()
++    if env_gemm_type_str == "grouped":
++        gemm_type = HummingGemmType.GROUPED_CONTIGUOUS
++    elif env_gemm_type_str == "indexed":
++        gemm_type = HummingGemmType.INDEXED
++    else:
++        gemm_type = HummingGemmType.INDEXED
++
++    logger.info_once(f"Using {gemm_type.value} gemm for humming moe")
++
++    return gemm_type
++
++
++@dataclass
++class HummingRunnerInput(RunnerInput):
++    hidden_states: torch.Tensor
++    topk_weights: torch.Tensor
++    topk_ids: torch.Tensor
++    gemm_type: HummingGemmType
++    expert_num_tokens: torch.Tensor | None = None
++    expected_m: int | None = None
++    apply_routed_scaling_factor: bool = True
++
++    @property
++    def runner_backend(self) -> MoeRunnerBackend:
++        return MoeRunnerBackend.HUMMING
++
++
++@dataclass
++class HummingRunnerOutput(RunnerOutput):
++    hidden_states: torch.Tensor
++
++    @property
++    def runner_backend(self) -> MoeRunnerBackend:
++        return MoeRunnerBackend.HUMMING
++
++
++@dataclass
++class HummingMoeQuantInfo(MoeQuantInfo):
++    layer: torch.nn.Module
++
++
++@register_custom_op()
++def humming_moe_runner_core_run(
++    moe_runner_id: int,
++    gemm_type: str,
++    hidden_states: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    expert_num_tokens: torch.Tensor | None = None,
++    expected_m: int | None = None,
++    apply_routed_scaling_factor: bool = True,
++) -> torch.Tensor:
++    runner = HummingRunnerCore.runner_cores[moe_runner_id]
++    if gemm_type == "indexed":
++        return runner._run_indexed_gemm(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            topk_weights=topk_weights,
++            apply_routed_scaling_factor=apply_routed_scaling_factor,
++        )
++    elif gemm_type == "grouped_contiguous":
++        return runner._run_grouped_contiguous_gemm(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            topk_weights=topk_weights,
++            apply_routed_scaling_factor=apply_routed_scaling_factor,
++        )
++    elif gemm_type == "grouped_masked":
++        assert expected_m is not None and expert_num_tokens is not None
++        return runner._run_grouped_masked_gemm(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            topk_weights=topk_weights,
++            expected_m=expected_m,
++            expert_num_tokens=expert_num_tokens,
++        )
++    else:
++        raise ValueError(f"Unknown gemm type: {gemm_type}")
++
++
++class HummingRunnerCore(MoeRunnerCore):
++    runner_cores: WeakValueDictionary = WeakValueDictionary()
++
++    def __init__(self, config: MoeRunnerConfig):
++        super().__init__(config)
++        assert config.num_local_experts is not None
++        assert config.num_experts is not None
++        self.num_experts = config.num_local_experts
++        self.global_num_experts = config.num_experts
++        self.activation = config.activation
++        self.swiglu_limit = config.swiglu_limit
++        self.layer: torch.nn.Module | None = None
++        self.humming_gemm_configs = {}
++        HummingRunnerCore.runner_cores[id(self)] = self
++
++    @property
++    def runner_backend(self) -> MoeRunnerBackend:
++        return MoeRunnerBackend.HUMMING
++
++    def get_humming_gemm_configs(self, humming_gemm_type: HummingGemmType):
++        if humming_gemm_type.value in self.humming_gemm_configs:
++            return self.humming_gemm_configs[humming_gemm_type.value]
++
++        compute_config = {
++            "use_f16_accum": envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
++            "gemm_type": humming_gemm_type.value,
++        }
++        w13_tuning_config = HummingMethod.get_default_tuning_configs(
++            layer=self.layer,
++            use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
++            gemm_type=humming_gemm_type,
++            sublayer_name="w13",
++        )
++        w2_tuning_config = HummingMethod.get_default_tuning_configs(
++            layer=self.layer,
++            use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
++            gemm_type=humming_gemm_type,
++            sublayer_name="w2",
++        )
++        self.humming_gemm_configs[humming_gemm_type.value] = {
++            "compute_config": compute_config,
++            "w13_tuning_config": w13_tuning_config,
++            "w2_tuning_config": w2_tuning_config,
++            "compute_config_str": json.dumps(compute_config),
++            "w13_tuning_config_str": json.dumps(w13_tuning_config),
++            "w2_tuning_config_str": json.dumps(w2_tuning_config),
++        }
++
++        return self.humming_gemm_configs[humming_gemm_type.value]
++
++    def estimate_local_valid_shape_m(
++        self,
++        topk_ids: torch.Tensor,
++        expected_m: int | None = None,
++    ):
++        # estimate shape_m for kernel tuning
++        if expected_m is not None:
++            return expected_m * self.num_experts
++
++        # TODO: update for EP and DP
++        return topk_ids.nelement()
++
++    def get_buffer_metas(
++        self,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        gemm_type: HummingGemmType,
++    ):
++        num_experts = self.num_experts
++        N = self.layer.intermediate_size_per_partition
++        K = self.layer.hidden_size
++        assert isinstance(num_experts, int)
++        assert isinstance(N, int)
++        assert isinstance(K, int)
++
++        # hidden_states
++        # (-> quanted_gate_up_input) (if not BF16/FP16 activation)
++        # -> gate_up_output
++        # -> activation_output
++        # (-> quanted_down_input) (if not BF16/FP16 activation)
++        # -> down_output
++        # (-> output) (if not is_grouped_masked)
++        # Neighboring nodes are required to utilize distinct workspaces.
++        # The output must be derived from workspace1.
++
++        is_grouped_masked = gemm_type == HummingGemmType.GROUPED_MASKED
++        output_shape: tuple[int, ...]
++        if gemm_type == HummingGemmType.GROUPED_MASKED:
++            if hidden_states.ndim == 3:
++                max_num_tokens = hidden_states.size(1)
++            else:
++                max_num_tokens = hidden_states.size(0) // num_experts
++            input_shape_m = num_experts * max_num_tokens
++            real_shape_m = num_experts * max_num_tokens
++            output_shape = (num_experts, max_num_tokens, K)
++        else:
++            input_shape_m = hidden_states.size(0)
++            real_shape_m = hidden_states.size(0) * topk_ids.size(1)
++            if gemm_type == HummingGemmType.GROUPED_CONTIGUOUS:
++                input_shape_m = real_shape_m
++            output_shape = (hidden_states.size(0), K)
++
++        down_input_size = N
++        a_dtype = self.layer.humming_metas["w13"].a_dtype
++        c_dtype = self.layer.humming_metas["w13"].c_dtype
++        num_bits = a_dtype.num_bits
++        torch_dtype_map = {
++            dtypes.float16: torch.float16,
++            dtypes.bfloat16: torch.bfloat16,
++            dtypes.float8e4m3: torch.float8_e4m3fn,
++            dtypes.int8: torch.int8,
++            dtypes.int4: torch.uint8,
++        }
++
++        buffer_metas = {
++            "quanted_gate_up_input": {
++                "shape": (input_shape_m, K),
++                "dtype": torch_dtype_map[a_dtype],
++            },
++            "gate_up_output": {
++                "shape": (real_shape_m, N * 2),
++                "dtype": torch_dtype_map[c_dtype],
++            },
++            "activation_output": {
++                "shape": (real_shape_m, down_input_size),
++                "dtype": torch_dtype_map[c_dtype],
++            },
++            "quanted_down_input": {
++                "shape": (real_shape_m, down_input_size),
++                "dtype": torch_dtype_map[a_dtype],
++            },
++            "down_output": {
++                "shape": output_shape if is_grouped_masked else (real_shape_m, K),
++                "dtype": torch_dtype_map[c_dtype],
++            },
++            "output": {
++                "shape": output_shape,
++                "dtype": torch_dtype_map[c_dtype],
++            },
++        }
++
++        for key in buffer_metas:
++            meta = buffer_metas[key]
++            if "quanted" in key and a_dtype.num_bits == 4:
++                meta["shape"] = meta["shape"][:-1] + (meta["shape"][-1] // 2,)
++
++        if num_bits == 16:
++            required_buffers = ["gate_up_output", "activation_output", "down_output"]
++        else:
++            required_buffers = [
++                "quanted_gate_up_input",
++                "gate_up_output",
++                "activation_output",
++                "quanted_down_input",
++                "down_output",
++            ]
++
++        # grouped masked moe use down_output as output
++        if gemm_type != HummingGemmType.GROUPED_MASKED:
++            required_buffers.append("output")
++
++        return buffer_metas, required_buffers
++
++    def _workspace_shapes(
++        self,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        gemm_type: HummingGemmType,
++    ):
++        buffer_metas, required_buffers = self.get_buffer_metas(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            gemm_type=gemm_type,
++        )
++
++        workspace1_nbytes = 0
++        workspace2_nbytes = 0
++
++        for index, name in enumerate(required_buffers[::-1]):
++            buffer_meta = buffer_metas[name]
++            nelement = math.prod(buffer_meta["shape"])
++            nbytes = nelement * buffer_meta["dtype"].itemsize
++            if index % 2 == 0:
++                workspace1_nbytes = max(workspace1_nbytes, nbytes)
++            else:
++                workspace2_nbytes = max(workspace2_nbytes, nbytes)
++
++        output_key = (
++            "down_output" if gemm_type == HummingGemmType.GROUPED_MASKED else "output"
++        )
++        output_shape = buffer_metas[output_key]["shape"]
++
++        return (workspace1_nbytes // 2,), (workspace2_nbytes // 2,), output_shape
++
++    def make_workspaces(
++        self,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        gemm_type: HummingGemmType,
++    ):
++        shapes = self._workspace_shapes(hidden_states, topk_ids, gemm_type)
++        workspace1_shape, workspace2_shape, output_shape = shapes
++        torch_dtype = self.layer.params_dtype
++        device = hidden_states.device
++        workspace1 = torch.empty(workspace1_shape, dtype=torch_dtype, device=device)
++        workspace2 = torch.empty(workspace2_shape, dtype=torch_dtype, device=device)
++        output = workspace1[: math.prod(output_shape)].view(*output_shape)
++        return workspace1, workspace2, output
++
++    def prepare_buffers(
++        self,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        gemm_type: HummingGemmType,
++    ) -> dict[str, torch.Tensor]:
++        workspace1, workspace2, output = self.make_workspaces(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            gemm_type=gemm_type,
++        )
++        buffer_metas, required_buffers = self.get_buffer_metas(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            gemm_type=gemm_type,
++        )
++        buffers = {"output": output}
++        for index, name in enumerate(required_buffers[::-1]):
++            buffer_meta = buffer_metas[name]
++            workspace = workspace1 if index % 2 == 0 else workspace2
++            workspace = workspace.view(buffer_meta["dtype"])
++            shape = buffer_meta["shape"]
++            tensor = workspace[: math.prod(shape)].view(*shape)
++            buffers[name] = tensor
++
++        return buffers
++
++    def apply_activation(self, inputs: torch.Tensor, outputs: torch.Tensor):
++        if self.activation == "silu" and self.swiglu_limit is not None:
++            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
++                act_and_mul_triton,
++            )
++
++            in_2d = inputs.view(-1, inputs.shape[-1])
++            out_2d = outputs.view(-1, outputs.shape[-1])
++            act_and_mul_triton(
++                gateup_output=in_2d,
++                down_input=out_2d,
++                config={},
++                activation="silu",
++                swiglu_limit=float(self.swiglu_limit),
++            )
++            return
++        if self.activation == "silu":
++            from sgl_kernel import silu_and_mul
++
++            silu_and_mul(inputs, outputs)
++        elif self.activation == "gelu":
++            from sgl_kernel import gelu_and_mul
++
++            gelu_and_mul(inputs, outputs)
++        else:
++            raise ValueError(f"Unsupported activation: {self.activation}")
++
++    def run(
++        self,
++        runner_input: HummingRunnerInput,
++        quant_info: HummingMoeQuantInfo,
++        running_state: dict,
++        hooks: Optional[Any] = None,
++    ) -> HummingRunnerOutput:
++        self.layer = quant_info.layer
++        if runner_input.hidden_states.size(0) == 0:
++            return HummingRunnerOutput(
++                hidden_states=torch.empty_like(runner_input.hidden_states)
++            )
++
++        # To make it compatible with dynamic shapes in torch.compile,
++        # we wrap the main logic inside a torch op.
++        # (the moe_block_size selection in indexed gemm would break dynamic shapes).
++        output = humming_moe_runner_core_run(
++            moe_runner_id=id(self),
++            gemm_type=runner_input.gemm_type.value,
++            hidden_states=runner_input.hidden_states,
++            topk_weights=runner_input.topk_weights,
++            topk_ids=runner_input.topk_ids,
++            expected_m=runner_input.expected_m,
++            expert_num_tokens=runner_input.expert_num_tokens,
++            apply_routed_scaling_factor=runner_input.apply_routed_scaling_factor,
++        )
++
++        return HummingRunnerOutput(hidden_states=output)
++
++    def _prepare_indexed_gemm_kwargs(
++        self, topk_ids: torch.Tensor
++    ) -> tuple[dict[str, Any], dict[str, Any]]:
++        from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
++
++        configs = self.get_humming_gemm_configs(HummingGemmType.INDEXED)
++        valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
++
++        for min_shape_m, max_shape_m, config in configs["w13_tuning_config"]:
++            if valid_shape_m > min_shape_m and valid_shape_m <= max_shape_m:
++                moe_block_size = config["block_shape"][0]
++                break
++        else:
++            raise ValueError(f"cannot found moe_block_size for shape {valid_shape_m}")
++
++        sorted_ids, expert_ids, num_tokens_padded = moe_align_block_size(
++            topk_ids=topk_ids,
++            block_size=moe_block_size,
++            num_experts=self.num_experts,
++            ignore_invalid_expert=True,
++        )
++
++        moe_common_kwargs = {
++            "sorted_ids": sorted_ids,
++            "expert_ids": expert_ids,
++            "num_tokens_padded": num_tokens_padded,
++            "compute_config": configs["compute_config_str"],
++            "valid_shape_m": valid_shape_m,
++        }
++
++        top_k = topk_ids.size(1)
++        moe_kwargs1 = {
++            "top_k": top_k,
++            "tuning_config": configs["w13_tuning_config_str"],
++        }
++        moe_kwargs2 = {"top_k": 1, "tuning_config": configs["w2_tuning_config_str"]}
++        moe_kwargs1.update(moe_common_kwargs)
++        moe_kwargs2.update(moe_common_kwargs)
++
++        return moe_kwargs1, moe_kwargs2
++
++    def _run_indexed_gemm(
++        self,
++        hidden_states: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        apply_routed_scaling_factor: bool = True,
++    ):
++        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
++        buffers = self.prepare_buffers(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            gemm_type=HummingGemmType.INDEXED,
++        )
++
++        moe_kwargs1, moe_kwargs2 = self._prepare_indexed_gemm_kwargs(topk_ids)
++
++        inputs, input_scale = HummingMethod.may_quant_input(
++            layer=self.layer,
++            inputs=hidden_states,
++            quanted_input=buffers.get("quanted_gate_up_input", None),
++            sublayer_name="w13",
++        )
++
++        HummingMethod.forward_layer(
++            layer=self.layer,
++            inputs=inputs,
++            input_scale=input_scale,
++            outputs=buffers["gate_up_output"],
++            sublayer_name="w13",
++            **moe_kwargs1,
++        )
++
++        self.apply_activation(
++            inputs=buffers["gate_up_output"],
++            outputs=buffers["activation_output"],
++        )
++
++        inputs, input_scale = HummingMethod.may_quant_input(
++            layer=self.layer,
++            inputs=buffers["activation_output"],
++            quanted_input=buffers.get("quanted_down_input", None),
++            sublayer_name="w2",
++        )
++
++        HummingMethod.forward_layer(
++            layer=self.layer,
++            inputs=inputs,
++            input_scale=input_scale,
++            outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
++            sublayer_name="w2",
++            **moe_kwargs2,
++        )
++
++        routed_scaling_factor = (
++            self.config.routed_scaling_factor if apply_routed_scaling_factor else None
++        )
++        moe_fused_mul_sum(
++            inputs=buffers["down_output"].view(*topk_ids.shape, -1),
++            topk_weights=topk_weights,
++            topk_ids=topk_ids,
++            is_ep=self.num_experts != self.global_num_experts,
++            routed_scaling_factor=routed_scaling_factor,
++            outputs=buffers["output"],
++        )
++
++        return buffers["output"]
++
++    def _run_grouped_contiguous_gemm(
++        self,
++        hidden_states: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        apply_routed_scaling_factor: bool = True,
++    ):
++        configs = self.get_humming_gemm_configs(HummingGemmType.GROUPED_CONTIGUOUS)
++        valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
++
++        buffers = self.prepare_buffers(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            gemm_type=HummingGemmType.GROUPED_CONTIGUOUS,
++        )
++
++        hidden_states, src2dst, expert_first_token_offset = moe_permute(
++            inputs=hidden_states,
++            topk_ids=topk_ids,
++            num_experts=self.num_experts,
++            is_ep=self.num_experts != self.global_num_experts,
++        )
++
++        inputs, input_scale = HummingMethod.may_quant_input(
++            layer=self.layer,
++            inputs=hidden_states,
++            quanted_input=buffers.get("quanted_gate_up_input", None),
++            sublayer_name="w13",
++        )
++
++        HummingMethod.forward_layer(
++            layer=self.layer,
++            inputs=inputs,
++            input_scale=input_scale,
++            outputs=buffers["gate_up_output"],
++            valid_shape_m=valid_shape_m,
++            expert_layout=expert_first_token_offset,
++            compute_config=configs["compute_config_str"],
++            tuning_config=configs["w13_tuning_config_str"],
++            sublayer_name="w13",
++        )
++
++        self.apply_activation(
++            inputs=buffers["gate_up_output"],
++            outputs=buffers["activation_output"],
++        )
++
++        inputs, input_scale = HummingMethod.may_quant_input(
++            layer=self.layer,
++            inputs=buffers["activation_output"],
++            quanted_input=buffers.get("quanted_down_input", None),
++            sublayer_name="w2",
++        )
++
++        HummingMethod.forward_layer(
++            layer=self.layer,
++            inputs=inputs,
++            input_scale=input_scale,
++            outputs=buffers["down_output"],
++            valid_shape_m=valid_shape_m,
++            expert_layout=expert_first_token_offset,
++            compute_config=configs["compute_config_str"],
++            tuning_config=configs["w2_tuning_config_str"],
++            sublayer_name="w2",
++        )
++
++        routed_scaling_factor = (
++            self.config.routed_scaling_factor if apply_routed_scaling_factor else None
++        )
++        moe_unpermute(
++            outputs=buffers["output"],
++            inputs=buffers["down_output"],
++            topk_weights=topk_weights,
++            topk_ids=topk_ids,
++            src2dst=src2dst,
++            routed_scaling_factor=routed_scaling_factor,
++        )
++
++        return buffers["output"]
++
++    def _run_grouped_masked_gemm(
++        self,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        topk_weights: torch.Tensor,
++        expert_num_tokens: torch.Tensor,
++        expected_m: int,
++    ):
++        configs = self.get_humming_gemm_configs(HummingGemmType.GROUPED_MASKED)
++        valid_shape_m = self.estimate_local_valid_shape_m(topk_ids, expected_m)
++        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
++
++        buffers = self.prepare_buffers(
++            hidden_states=hidden_states,
++            topk_ids=topk_ids,
++            gemm_type=HummingGemmType.GROUPED_MASKED,
++        )
++
++        inputs, input_scale = HummingMethod.may_quant_input(
++            layer=self.layer,
++            inputs=hidden_states,
++            quanted_input=buffers.get("quanted_gate_up_input", None),
++            sublayer_name="w13",
++        )
++
++        HummingMethod.forward_layer(
++            layer=self.layer,
++            inputs=inputs,
++            input_scale=input_scale,
++            outputs=buffers["gate_up_output"],
++            valid_shape_m=valid_shape_m,
++            expert_layout=expert_num_tokens,
++            compute_config=configs["compute_config_str"],
++            tuning_config=configs["w13_tuning_config_str"],
++            sublayer_name="w13",
++        )
++
++        self.apply_activation(
++            inputs=buffers["gate_up_output"],
++            outputs=buffers["activation_output"],
++        )
++
++        inputs, input_scale = HummingMethod.may_quant_input(
++            layer=self.layer,
++            inputs=buffers["activation_output"],
++            quanted_input=buffers.get("quanted_down_input", None),
++            sublayer_name="w2",
++        )
++
++        HummingMethod.forward_layer(
++            layer=self.layer,
++            inputs=inputs,
++            input_scale=input_scale,
++            outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
++            valid_shape_m=valid_shape_m,
++            expert_layout=expert_num_tokens,
++            compute_config=configs["compute_config_str"],
++            tuning_config=configs["w2_tuning_config_str"],
++            sublayer_name="w2",
++        )
++
++        return buffers["down_output"]
++
++
++@register_fused_func("none", "humming")
++def fused_experts_none_to_humming(
++    dispatch_output: StandardDispatchOutput,
++    quant_info: HummingMoeQuantInfo,
++    runner_config: MoeRunnerConfig,
++) -> StandardCombineInput:
++    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
++
++    hidden_states = dispatch_output.hidden_states
++    topk_output = dispatch_output.topk_output
++    topk_ids = topk_output.topk_ids
++    topk_weights = topk_output.topk_weights
++
++    runner_input = HummingRunnerInput(
++        hidden_states=hidden_states,
++        topk_weights=topk_weights,
++        topk_ids=topk_ids,
++        gemm_type=get_standard_humming_moe_gemm_type(),
++    )
++
++    runner_core = HummingRunnerCore(runner_config)
++    runner_output = runner_core.run(runner_input, quant_info, {})
++
++    return StandardCombineInput(hidden_states=runner_output.hidden_states)
++
++
++@register_pre_permute("deepep_ll", "humming")
++def pre_permute_deepep_ll_to_humming(
++    dispatch_output: DeepEPLLDispatchOutput,
++    quant_info: HummingMoeQuantInfo,
++    runner_config: MoeRunnerConfig,
++    running_state: dict,
++) -> HummingRunnerInput:
++    hidden_states = dispatch_output.hidden_states
++    topk_ids = dispatch_output.topk_ids
++    topk_weights = dispatch_output.topk_weights
++    running_state["topk_ids"] = topk_ids
++    running_state["topk_weights"] = topk_weights
++
++    return HummingRunnerInput(
++        hidden_states=hidden_states,
++        topk_weights=topk_weights,
++        topk_ids=topk_ids.int(),
++        expert_num_tokens=dispatch_output.masked_m,
++        expected_m=dispatch_output.expected_m,
++        gemm_type=HummingGemmType.GROUPED_MASKED,
++        apply_routed_scaling_factor=False,
++    )
++
++
++@register_post_permute("humming", "deepep_ll")
++def post_permute_humming_to_deepep_ll(
++    runner_output: HummingRunnerOutput,
++    quant_info: HummingMoeQuantInfo,
++    runner_config: MoeRunnerConfig,
++    running_state: dict,
++) -> DeepEPLLCombineInput:
++    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
++
++    # Pass raw topk_weights to the DeepEP LL combine (matching the deep_gemm
++    # runner): the model applies routed_scaling_factor once on the combined
++    # output (e.g. DeepSeek's op_output does so unconditionally on the EP
++    # path). Pre-scaling here would double-apply it (s^2 on the routed branch)
++    return DeepEPLLCombineInput(
++        hidden_states=runner_output.hidden_states,
++        topk_ids=running_state["topk_ids"],
++        topk_weights=running_state["topk_weights"],
++    )
++
++
++@register_pre_permute("deepep_normal", "humming")
++def pre_permute_deepep_normal_to_humming(
++    dispatch_output: DeepEPNormalDispatchOutput,
++    quant_info: HummingMoeQuantInfo,
++    runner_config: MoeRunnerConfig,
++    running_state: dict,
++) -> HummingRunnerInput:
++    hidden_states = dispatch_output.hidden_states
++    topk_ids = dispatch_output.topk_ids
++    topk_weights = dispatch_output.topk_weights
++    running_state["topk_ids"] = topk_ids
++    running_state["topk_weights"] = topk_weights
++
++    return HummingRunnerInput(
++        hidden_states=hidden_states,
++        topk_weights=topk_weights,
++        topk_ids=topk_ids.int(),
++        gemm_type=get_standard_humming_moe_gemm_type(),
++        apply_routed_scaling_factor=False,
++    )
++
++
++@register_post_permute("humming", "deepep_normal")
++def post_permute_humming_to_deepep_normal(
++    runner_output: HummingRunnerOutput,
++    quant_info: HummingMoeQuantInfo,
++    runner_config: MoeRunnerConfig,
++    running_state: dict,
++) -> DeepEPNormalCombineInput:
++    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
++
++    return DeepEPNormalCombineInput(
++        hidden_states=runner_output.hidden_states,
++        topk_ids=running_state["topk_ids"],
++        topk_weights=running_state["topk_weights"],
++    )
++
++
++@register_pre_permute("standard", "humming")
++def pre_permute_standard_to_humming(
++    dispatch_output: StandardDispatchOutput,
++    quant_info: HummingMoeQuantInfo,
++    runner_config: MoeRunnerConfig,
++    running_state: dict,
++) -> HummingRunnerInput:
++    hidden_states = dispatch_output.hidden_states
++    topk_output = dispatch_output.topk_output
++    topk_ids = topk_output.topk_ids
++    topk_weights = topk_output.topk_weights
++
++    return HummingRunnerInput(
++        hidden_states=hidden_states,
++        topk_weights=topk_weights,
++        topk_ids=topk_ids.int(),
++        gemm_type=get_standard_humming_moe_gemm_type(),
++    )
++
++
++@register_post_permute("humming", "standard")
++def post_permute_humming_to_standard(
++    runner_output: HummingRunnerOutput,
++    quant_info: HummingMoeQuantInfo,
++    runner_config: MoeRunnerConfig,
++    running_state: dict,
++) -> StandardCombineInput:
++    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
++
++    return StandardCombineInput(hidden_states=runner_output.hidden_states)
+diff --git a/python/sglang/srt/layers/moe/moe_runner/runner.py b/python/sglang/srt/layers/moe/moe_runner/runner.py
+index b237c0cb6bbf..c96b4674a800 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/runner.py
++++ b/python/sglang/srt/layers/moe/moe_runner/runner.py
+@@ -43,6 +43,10 @@ def __init__(
+             self.runner_core = TritonKernelsRunnerCore(config)
+         elif runner_backend.is_deep_gemm():
+             self.runner_core = DeepGemmRunnerCore(config)
++        elif runner_backend.is_humming():
++            from sglang.srt.layers.moe.moe_runner.humming import HummingRunnerCore
++
++            self.runner_core = HummingRunnerCore(config)
+         elif runner_backend.is_aiter():
+             from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
+ 
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py
+index 234157516f6c..54b38f5303e3 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py
+@@ -996,6 +996,7 @@ def act_and_mul_kernel(
+     ACTIVATION_TYPE: tl.constexpr,
+     SWIGLU_LIMIT: tl.constexpr = 0.0,
+     HAS_SWIGLU_LIMIT: tl.constexpr = False,
++    HAS_EXPERT_FILTER: tl.constexpr = True,
+ ):
+     """
+     Unified activation and multiply kernel that handles both sorted and unsorted routing,
+@@ -1007,10 +1008,10 @@ def act_and_mul_kernel(
+     half_hidden_size = hidden_size // 2
+     pid = tl.program_id(0)
+ 
+-    expert_id = tl.load(expert_ids_ptr + pid // expert_step)
+-
+-    if expert_id == -1:
+-        return
++    if HAS_EXPERT_FILTER:
++        expert_id = tl.load(expert_ids_ptr + pid // expert_step)
++        if expert_id == -1:
++            return
+ 
+     gateup_output_ptr = gateup_output + pid * hidden_size
+     down_input_ptr = down_input + pid * half_hidden_size
+@@ -1060,8 +1061,13 @@ def act_and_mul_triton(
+     """
+     grid = (down_input.shape[0],)
+     hidden_size = gateup_output.shape[1]
+-    expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
+-    expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
++    has_expert_filter = topk_ids is not None or expert_ids is not None
++    if has_expert_filter:
++        expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
++        expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
++    else:
++        expert_ids_row = None
++        expert_step = 1
+     has_swiglu_limit = swiglu_limit is not None
+     act_and_mul_kernel[grid](
+         gateup_output,
+@@ -1073,6 +1079,7 @@ def act_and_mul_triton(
+         ACTIVATION_TYPE=activation,
+         SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+         HAS_SWIGLU_LIMIT=has_swiglu_limit,
++        HAS_EXPERT_FILTER=has_expert_filter,
+     )
+ 
+ 
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py
+index 472bc55a5c25..7188bb51425f 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py
+@@ -20,7 +20,10 @@
+ 
+ 
+ def moe_align_block_size(
+-    topk_ids: torch.Tensor, block_size: int, num_experts: int
++    topk_ids: torch.Tensor,
++    block_size: int,
++    num_experts: int,
++    ignore_invalid_expert: bool = False,
+ ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """
+     Aligns the token distribution across experts to be compatible with block
+@@ -109,5 +112,6 @@ def moe_align_block_size(
+             num_tokens_post_pad,
+             cumsum_buffer,
+             True,
++            ignore_invalid_expert,
+         )
+     return sorted_ids, expert_ids, num_tokens_post_pad
+diff --git a/python/sglang/srt/layers/moe/utils.py b/python/sglang/srt/layers/moe/utils.py
+index c43c2069a2d4..779ac855cdaa 100644
+--- a/python/sglang/srt/layers/moe/utils.py
++++ b/python/sglang/srt/layers/moe/utils.py
+@@ -97,6 +97,7 @@ class MoeRunnerBackend(Enum):
+     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+     CUTLASS = "cutlass"
+     MARLIN = "marlin"
++    HUMMING = "humming"
+     AITER = "aiter"
+ 
+     def is_auto(self):
+@@ -140,6 +141,9 @@ def is_cutlass(self):
+     def is_marlin(self):
+         return self == MoeRunnerBackend.MARLIN
+ 
++    def is_humming(self):
++        return self == MoeRunnerBackend.HUMMING
++
+     def is_aiter(self):
+         return self == MoeRunnerBackend.AITER
+ 
+@@ -230,10 +234,11 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
+         if dispatcher_output_dtype is not None:
+             return DeepEPOutputDtype(dispatcher_output_dtype)
+ 
+-    # 4. flashinfer_cutedsl and is_cutlass expects BF16 dispatch
++    # 4. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
+     if (
+         get_moe_runner_backend().is_flashinfer_cutedsl()
+         or get_moe_runner_backend().is_cutlass()
++        or get_moe_runner_backend().is_humming()
+     ):
+         return DeepEPOutputDtype.BF16
+ 
+diff --git a/python/sglang/srt/layers/parameter.py b/python/sglang/srt/layers/parameter.py
+index 3b0893c2487b..fed7348c8ddd 100644
+--- a/python/sglang/srt/layers/parameter.py
++++ b/python/sglang/srt/layers/parameter.py
+@@ -590,8 +590,8 @@ def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size)
+ def _adjust_shard_indexes_for_packing(
+     shard_size, shard_offset, packed_factor, marlin_tile_size
+ ):
+-    shard_size = shard_size // packed_factor
+-    shard_offset = shard_offset // packed_factor
++    shard_size = round(shard_size // packed_factor)
++    shard_offset = round(shard_offset // packed_factor)
+     if marlin_tile_size is not None:
+         return _adjust_shard_indexes_for_marlin(
+             shard_size=shard_size,
+diff --git a/python/sglang/srt/layers/quantization/__init__.py b/python/sglang/srt/layers/quantization/__init__.py
+index 1762bcbb475f..5d66ff35f38a 100644
+--- a/python/sglang/srt/layers/quantization/__init__.py
++++ b/python/sglang/srt/layers/quantization/__init__.py
+@@ -35,6 +35,7 @@ def override_quantization_method(self, *args, **kwargs):
+     GPTQConfig,
+     GPTQMarlinConfig,
+ )
++from sglang.srt.layers.quantization.humming import HummingConfig
+ from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
+ from sglang.srt.layers.quantization.modelopt_quant import (
+     ModelOptFp4Config,
+@@ -99,6 +100,7 @@ def override_quantization_method(self, *args, **kwargs):
+     "auto-round-int8": W8A8Int8Config,
+     "modelslim": ModelSlimConfig,
+     "quark_int4fp8_moe": QuarkInt4Fp8Config,
++    "humming": HummingConfig,
+     "mxfp_w4a8": Mxfp4W4A8Config,
+ }
+ 
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index df54095c22ac..fc920d84e146 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -375,6 +375,13 @@ def get_quant_method(
+ 
+                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+ 
++            if self.is_fp4_experts and get_moe_runner_backend().is_humming():
++                from sglang.srt.layers.quantization.mxfp4_humming_moe import (
++                    Mxfp4HummingMoEMethod,
++                )
++
++                return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
++
+             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
+                 # SM100 (Blackwell) -> trtllm-gen path.
+                 # SM90  (Hopper)    -> cutlass mixed-input path (FlashInfer #3084).
+diff --git a/python/sglang/srt/layers/quantization/humming.py b/python/sglang/srt/layers/quantization/humming.py
+new file mode 100644
+index 000000000000..3053c04f5776
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/humming.py
+@@ -0,0 +1,915 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import json
++import math
++from collections.abc import Callable
++from typing import TYPE_CHECKING, Any, List
++
++import regex as re
++import torch
++
++from sglang.srt.environ import envs
++from sglang.srt.layers.linear import LinearBase, set_weight_attrs
++from sglang.srt.layers.moe import (
++    MoeRunner,
++    MoeRunnerBackend,
++    MoeRunnerConfig,
++    get_moe_runner_backend,
++)
++from sglang.srt.layers.parameter import (
++    BasevLLMParameter,
++    BlockQuantScaleParameter,
++    ChannelQuantScaleParameter,
++    GroupQuantScaleParameter,
++    ModelWeightParameter,
++    PackedvLLMParameter,
++    PerTensorScaleParameter,
++    RowvLLMParameter,
++)
++from sglang.srt.layers.quantization.base_config import (
++    FusedMoEMethodBase,
++    LinearMethodBase,
++    QuantizationConfig,
++    QuantizeMethodBase,
++)
++from sglang.srt.layers.quantization.unquant import (
++    UnquantizedFusedMoEMethod,
++    UnquantizedLinearMethod,
++)
++
++if TYPE_CHECKING:
++    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
++    from sglang.srt.models.utils import WeightsMapper
++
++
++DataType = None
++HummingMethod = None
++BaseInputSchema = None
++BaseWeightSchema = None
++HummingInputSchema = None
++HummingWeightSchema = None
++quantize_weight = None
++
++
++def _lazy_import_humming():
++    global DataType, HummingMethod, BaseInputSchema, BaseWeightSchema
++    global HummingInputSchema, HummingWeightSchema, quantize_weight
++
++    if HummingMethod is not None:
++        return
++
++    try:
++        from humming.dtypes import DataType as _DataType
++        from humming.layer import HummingMethod as _HummingMethod
++        from humming.schema import BaseInputSchema as _BaseInputSchema
++        from humming.schema import BaseWeightSchema as _BaseWeightSchema
++        from humming.schema import HummingInputSchema as _HummingInputSchema
++        from humming.schema import HummingWeightSchema as _HummingWeightSchema
++        from humming.utils.weight import quantize_weight as _quantize_weight
++    except ImportError as err:
++        if isinstance(err, ModuleNotFoundError) and err.name == "humming":
++            message = (
++                "Humming quantization requires `humming-kernels`. "
++                "Please install it to use `--quantization humming`."
++            )
++        else:
++            message = (
++                "Failed to import Humming quantization dependencies from "
++                f"`humming-kernels`: {err}"
++            )
++        raise ImportError(message) from err
++
++    DataType = _DataType
++    HummingMethod = _HummingMethod
++    BaseInputSchema = _BaseInputSchema
++    BaseWeightSchema = _BaseWeightSchema
++    HummingInputSchema = _HummingInputSchema
++    HummingWeightSchema = _HummingWeightSchema
++    quantize_weight = _quantize_weight
++
++
++def prepare_padded_shape(shape, x):
++    padded_shape = math.ceil(shape / x) * x
++    return padded_shape, padded_shape - shape
++
++
++def prepare_param(tensor, name, extra_attrs):
++    extra_attrs = extra_attrs.copy()
++    scale_type = extra_attrs.pop("scale_type", None)
++    param_cls_name_map = {
++        "block": BlockQuantScaleParameter,
++        "tensor": PerTensorScaleParameter,
++        "group": GroupQuantScaleParameter,
++        "channel": ChannelQuantScaleParameter,
++        "input_scale": PerTensorScaleParameter,
++    }
++
++    param_cls: type[BasevLLMParameter]
++    if "packed_dim" in extra_attrs:
++        param_cls = PackedvLLMParameter
++    elif scale_type in param_cls_name_map:
++        param_cls = param_cls_name_map[scale_type]
++    elif "output_dim" in extra_attrs and "input_dim" in extra_attrs:
++        param_cls = ModelWeightParameter
++    elif "input_dim" in extra_attrs:
++        param_cls = RowvLLMParameter
++    elif "output_dim" in extra_attrs:
++        param_cls = ChannelQuantScaleParameter
++    else:
++        param_cls = BasevLLMParameter
++
++    kwargs_keys = [
++        "input_dim",
++        "output_dim",
++        "packed_dim",
++        "packed_factor",
++        "weight_loader",
++    ]
++    cls_kwargs = {}
++    for key in extra_attrs.copy():
++        if key in kwargs_keys:
++            cls_kwargs[key] = extra_attrs.pop(key)
++
++    param = param_cls(data=tensor, **cls_kwargs)
++    set_weight_attrs(param, extra_attrs)
++
++    param.param_name = name
++    param.ignore_warning = True
++    if scale_type in ["tensor", "input_scale"]:
++        param.needs_scalar_to_array = True
++
++    return param
++
++
++def prepare_moe_param(tensor, name, extra_attrs):
++    param = torch.nn.Parameter(tensor, requires_grad=False)
++    if "scale_type" in extra_attrs:
++        extra_attrs["quant_method"] = extra_attrs["scale_type"]
++
++    if "input_dim" in extra_attrs and "output_dim" in extra_attrs:
++        input_dim = extra_attrs["input_dim"]
++        output_dim = extra_attrs["output_dim"]
++        extra_attrs["is_transposed"] = input_dim < output_dim
++
++    set_weight_attrs(param, extra_attrs)
++    param.param_name = name
++    return param
++
++
++def may_pad_loaded_weight(param, loaded_weight):
++    pad_shape = getattr(param, "pad_shape", None)
++    if pad_shape is None:
++        return loaded_weight
++    value = 1 if loaded_weight.dtype == torch.float8_e8m0fnu else 0
++    padding = []
++    for x in pad_shape[::-1][: loaded_weight.ndim]:
++        padding += [0, x]
++    loaded_weight = torch.nn.functional.pad(
++        input=loaded_weight,
++        pad=padding,
++        value=value,
++    )
++    return loaded_weight
++
++
++def compressed_tensors_get_config(config: dict[str, Any], key: str):
++    assert key in ["weights", "input_activations"]
++    target_group_config = None
++    for group_config in config["config_groups"].values():
++        if "Linear" in group_config["targets"]:
++            if "weights" not in group_config:
++                return None
++            if key not in group_config or group_config[key] is None:
++                return None
++            target_group_config = group_config[key].copy()
++            break
++
++    if target_group_config is None:
++        return None
++    target_group_config["quant_method"] = config["quant_method"]
++    if config["quant_method"] == "compressed-tensors":
++        target_group_config["format"] = config["format"]
++    elif config["quant_method"] == "modelopt":
++        target_group_config["quant_algo"] = config["quant_algo"]
++    return target_group_config
++
++
++class HummingConfig(QuantizationConfig):
++    packed_modules_mapping = {}
++
++    def __init__(self, full_config: dict[str, Any] | None = None):
++        _lazy_import_humming()
++        self.full_config: dict[str, Any] = full_config or {}
++        self.is_fp4_experts: bool = False
++
++    @classmethod
++    def get_name(cls) -> str:
++        return "humming"
++
++    @classmethod
++    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
++        return [torch.bfloat16, torch.half]
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 75
++
++    @classmethod
++    def get_config_filenames(cls) -> list[str]:
++        return []
++
++    @classmethod
++    def from_config(cls, config: dict[str, Any]) -> "HummingConfig":
++        return cls(full_config=config)
++
++    def get_scaled_act_names(self) -> List[str]:
++        raise NotImplementedError
++
++    @classmethod
++    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
++        if hf_quant_cfg["quant_method"] == "mxfp4":
++            # NOTE: gpt-oss has a special weight loading logic, so we don't support it now.
++            # TODO: integrate humming kernels to mxfp4.py
++            return None
++        return "humming" if user_quant == "humming" else None
++
++    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
++        self.hf_to_sglang_mapper = hf_to_sglang_mapper
++
++    def is_layer_skipped(self, config: dict[str, Any], prefix: str):
++        keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
++        ignored_layers = self.get_from_keys_or(config, keys, []) or []
++        if hasattr(self, "hf_to_sglang_mapper"):
++            ignored_layers = self.hf_to_sglang_mapper.apply_list(ignored_layers)
++
++        for entry in ignored_layers:
++            if isinstance(entry, str) and entry.startswith("re:"):
++                if re.match(entry[3:], prefix):
++                    return True
++            elif entry in prefix:
++                return True
++
++        if "lm_head" in prefix:
++            return True
++
++        for regex in config.get("dynamic", {}):
++            if regex[:1] != "-":
++                continue
++            if re.match(regex[2:], prefix):
++                return True
++
++        return False
++
++    def get_layer_weight_schema(self, config: dict[str, Any], prefix: str):
++        if self.is_layer_skipped(config, prefix):
++            return None
++
++        if config["quant_method"] in ["compressed-tensors", "modelopt"]:
++            group_config = compressed_tensors_get_config(config, "weights")
++            if group_config is None:
++                return None
++            config = group_config
++
++        layer_config = config
++        layer_dynamic = config.get("dynamic", {})
++        if not isinstance(layer_dynamic, dict):
++            layer_dynamic = {}
++        for regex, override_config in layer_dynamic.items():
++            if regex[:1] != "+":
++                continue
++            if re.match(regex[2:], prefix):
++                layer_config = config.copy()
++                layer_config.update(override_config)
++                break
++
++        if "quant_method" in layer_config:
++            return BaseWeightSchema.from_config(layer_config)
++        return None
++
++    def get_layer_input_schema(self, config: dict[str, Any], prefix: str):
++        if self.is_layer_skipped(config, prefix):
++            return None
++        if config["quant_method"] in ["compressed-tensors", "modelopt"]:
++            group_config = compressed_tensors_get_config(config, "input_activations")
++            if group_config is None:
++                return None
++            config = group_config
++
++        if config.get("quant_method", None) in BaseInputSchema.INPUT_SCHEMA_MAP:
++            return BaseInputSchema.from_config(config)
++        return None
++
++    def get_quant_config_for_layer(
++        self, prefix: str, layer_type: str
++    ) -> "HummingLayerQuantizationConfig | None":
++        weight_schema: BaseWeightSchema | None = None
++        force_weight_schema: HummingWeightSchema | None = None
++
++        if self.full_config:
++            weight_schema = self.get_layer_weight_schema(self.full_config, prefix)
++
++        is_online_quant = False
++        online_quant_config = envs.SGLANG_HUMMING_ONLINE_QUANT_CONFIG.get() or {}
++        if online_quant_config and (
++            not self.full_config or online_quant_config.get("force_requant", False)
++        ):
++            online_quant_config["quant_method"] = "humming"
++            schema = self.get_layer_weight_schema(online_quant_config, prefix)
++            if not self.full_config:
++                weight_schema = schema
++                is_online_quant = True
++            else:
++                force_weight_schema = schema
++
++        if weight_schema is not None:
++            input_schema = None
++            force_input_schema = None
++
++            if self.full_config:
++                input_schema = self.get_layer_input_schema(self.full_config, prefix)
++
++            if envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get():
++                quant_config = envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get().copy()
++                quant_config["quant_method"] = "humming"
++                force_input_schema = self.get_layer_input_schema(quant_config, prefix)
++                if input_schema is None:
++                    input_schema = force_input_schema
++
++            if force_weight_schema is not None and force_input_schema is None:
++                force_input_schema = HummingInputSchema()
++
++            return HummingLayerQuantizationConfig(
++                weight_schema=weight_schema,
++                input_schema=input_schema,
++                force_weight_schema=force_weight_schema,
++                force_input_schema=force_input_schema,
++                is_online_quant=is_online_quant,
++            )
++        return None
++
++    def get_quant_method(
++        self, layer: torch.nn.Module, prefix: str
++    ) -> "QuantizeMethodBase | None":
++        layer_type = "other"
++        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
++
++        if isinstance(layer, FusedMoE):
++            layer_type = "moe"
++        elif isinstance(layer, LinearBase):
++            layer_type = "linear"
++
++        if (
++            isinstance(layer, FusedMoE)
++            and self.full_config.get("quant_method") == "fp8"
++            and self.is_fp4_experts
++        ):
++            from sglang.srt.layers.quantization.fp8 import Fp8Config
++
++            fp8_config = Fp8Config.from_config(self.full_config)
++            fp8_config.is_fp4_experts = True
++            return fp8_config.get_quant_method(layer, prefix)
++
++        quant_config = self.get_quant_config_for_layer(prefix, layer_type)
++        if quant_config is None:
++            if isinstance(layer, FusedMoE):
++                return UnquantizedFusedMoEMethod()
++            elif isinstance(layer, LinearBase):
++                return UnquantizedLinearMethod()
++        elif isinstance(layer, LinearBase):
++            return HummingLinearMethod(quant_config)
++        elif isinstance(layer, FusedMoE):
++            return HummingMoEMethod(quant_config)
++        return None
++
++
++class HummingLayerQuantizationConfig(HummingConfig):
++    def __init__(
++        self,
++        weight_schema: "BaseWeightSchema",
++        input_schema: "BaseInputSchema | None" = None,
++        force_weight_schema: "HummingWeightSchema | None" = None,
++        force_input_schema: "HummingInputSchema | None" = None,
++        is_online_quant: bool = False,
++    ):
++        _lazy_import_humming()
++        self.weight_schema = weight_schema
++        self.weight_block_size = getattr(weight_schema, "weight_block_size", None)
++        if input_schema is None:
++            input_schema = HummingInputSchema()
++        self.input_schema = input_schema
++        self.force_weight_schema = force_weight_schema
++        self.force_input_schema = force_input_schema
++        self.is_online_quant = is_online_quant
++
++    @classmethod
++    def from_config(cls, config):
++        _lazy_import_humming()
++        weight_schema = BaseWeightSchema.from_config(config)
++        return cls(weight_schema)
++
++    def get_quant_method(
++        self, layer: torch.nn.Module, prefix: str
++    ) -> QuantizeMethodBase | None:
++        raise NotImplementedError
++
++
++class HummingLinearMethod(LinearMethodBase):
++    def __init__(self, quant_config: HummingLayerQuantizationConfig):
++        self.quant_config = quant_config
++        self.weight_schema = quant_config.weight_schema
++        self.input_schema = quant_config.input_schema
++        self.force_weight_schema = quant_config.force_weight_schema
++        self.force_input_schema = quant_config.force_input_schema
++        self.is_online_quant = self.quant_config.is_online_quant
++
++    def prepare_weight_loader(self, layer: torch.nn.Module, weight_loader: Callable):
++        def new_weight_loader(
++            param: torch.nn.Parameter,
++            loaded_weight: torch.Tensor,
++            shard_id: str | int | None = None,
++        ):
++            name = param.param_name
++            float_dtypes = [torch.float16, torch.bfloat16, torch.float32]
++            is_unquantized = name == "weight" and loaded_weight.dtype in float_dtypes
++            if is_unquantized and self.is_online_quant:
++                # online quant (fp16/bf16 -> quant_type)
++                assert isinstance(self.weight_schema, HummingWeightSchema)
++                f16_dtype = DataType.from_torch_dtype(layer.param_dtype)
++                has_global_scale = "TENSOR" in str(self.weight_schema.weight_scale_type)
++                tensor_list = quantize_weight(
++                    weight=loaded_weight,
++                    dtype=self.weight_schema.b_dtype,
++                    scale_dtype=self.weight_schema.bs_dtype or f16_dtype,
++                    group_size=self.weight_schema.weight_scale_group_size,
++                    has_zero_point=self.weight_schema.has_zero_point,
++                    has_global_scale=has_global_scale,
++                    is_fp_zero_point=self.weight_schema.is_fp_zero_point,
++                    pack=True,
++                )
++
++                key_list = ["weight", "weight_scale", "zero_point", "global_scale"]
++                for key, tensor in zip(key_list, tensor_list):
++                    if tensor is None or tensor.nelement() == 0:
++                        continue
++                    param = getattr(layer, key)
++                    param.weight_loader(param, tensor, shard_id)
++
++                return None
++            elif is_unquantized and not self.is_online_quant:
++                # fallback to unquantized linear
++                # some model skip some layer when quantizing model, but
++                # don't mark the layer as unquantized.
++                if not layer.is_fallback:
++                    layer.is_fallback = True
++                    for name, _ in list(layer.named_parameters()):
++                        if name != "bias":
++                            delattr(layer, name)
++                    delattr(layer, "locks")
++                    self.__class__ = UnquantizedLinearMethod  # type: ignore
++                    tensor = torch.empty(
++                        (
++                            layer.output_partition_sizes_sum,
++                            layer.input_size_per_partition,
++                        ),
++                        dtype=layer.param_dtype,
++                        device=param.device,
++                    )
++                    extra_weight_attrs = layer.extra_weight_attrs.copy()
++                    orig_weight_loader = extra_weight_attrs.pop("weight_loader")
++                    layer.weight = ModelWeightParameter(
++                        data=tensor,
++                        input_dim=1,
++                        output_dim=0,
++                        weight_loader=orig_weight_loader,
++                    )
++                    layer.weight.tp_size = layer.tp_size
++                    layer.weight.tp_rank = layer.tp_rank
++                    set_weight_attrs(layer.weight, extra_weight_attrs)
++
++                param = layer.weight
++                if shard_id is not None:
++                    return layer.weight.weight_loader(param, loaded_weight, shard_id)
++                return layer.weight.weight_loader(param, loaded_weight)
++
++            # weight processing logic for specific quantization schema
++            loaded_weight = self.weight_schema.process_loaded_weight(
++                tensor=loaded_weight,
++                name=name,
++            )
++            if shard_id is not None:
++                return weight_loader(param, loaded_weight, shard_id)
++            return weight_loader(param, loaded_weight)
++
++        return new_weight_loader
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        from sglang.srt.model_loader.weight_utils import default_weight_loader
++
++        layer.is_fallback = False
++        layer.param_dtype = params_dtype
++        layer.input_size = input_size
++        layer.output_size = output_size
++        layer.input_size_per_partition = input_size_per_partition
++        layer.output_partition_sizes_sum = sum(output_partition_sizes)
++        layer.output_partition_sizes = output_partition_sizes
++        layer.extra_weight_attrs = extra_weight_attrs.copy()
++
++        weight_loader = extra_weight_attrs.get("weight_loader", default_weight_loader)
++        new_weight_loader = self.prepare_weight_loader(layer, weight_loader)
++        extra_weight_attrs["weight_loader"] = new_weight_loader
++
++        for key in ["weight_block_size", "block_structure"]:
++            block_size = getattr(self.weight_schema, key, None)
++            if block_size is not None:
++                layer.weight_block_size = block_size
++
++        weight_tensor_attrs = self.weight_schema.get_tensors_attrs(
++            shape_n=layer.output_partition_sizes_sum,
++            shape_k=layer.input_size_per_partition,
++            param_dtype=params_dtype,
++            stack_size=len(layer.output_partition_sizes),
++        )
++
++        input_tensor_attrs = self.input_schema.get_tensors_attrs(
++            shape_k=layer.input_size_per_partition,
++            param_dtype=params_dtype,
++            stack_size=len(layer.output_partition_sizes),
++        )
++
++        tensors_attrs = weight_tensor_attrs | input_tensor_attrs
++
++        for name, attrs in tensors_attrs.items():
++            tensor = torch.empty(attrs["shape"], dtype=attrs["dtype"])
++            extra_attrs = attrs.get("extra_attrs", {}).copy()
++            extra_attrs.update(extra_weight_attrs)
++            param = prepare_param(tensor, name, extra_attrs)
++            setattr(layer, name, param)
++
++        locks = torch.zeros(1024, dtype=torch.int32)
++        layer.register_buffer("locks", locks)
++
++        if self.force_input_schema is not None:
++            self.input_schema = self.force_input_schema
++
++        if not hasattr(layer, "weight"):
++            param = prepare_param(torch.tensor(0), "weight", extra_weight_attrs)
++            layer.weight = param
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if layer.is_fallback:
++            return None
++
++        # convert from checkpoint format to humming format
++        if not isinstance(self.weight_schema, HummingWeightSchema):
++            self.weight_schema, tensors = self.weight_schema.convert_humming(
++                tensors=layer.state_dict(),
++                shape_n_stacks=layer.output_partition_sizes,
++                shape_k_stacks=[layer.input_size_per_partition],
++                param_dtype=layer.param_dtype,
++            )
++
++            self.input_schema, _ = self.input_schema.convert_humming(
++                tensors=layer.state_dict(),
++                shape_n_stacks=layer.output_partition_sizes,
++                shape_k_stacks=[layer.input_size_per_partition],
++                param_dtype=layer.param_dtype,
++            )
++
++            for name, _ in list(layer.named_parameters()):
++                delattr(layer, name)
++
++            for name, tensor in tensors.items():
++                param = torch.nn.Parameter(tensor, requires_grad=False)
++                setattr(layer, name, param)
++
++            del tensors
++
++        # force requant (origin quant setting -> fp16/bf16 -> new_quant setting)
++        assert isinstance(self.weight_schema, HummingWeightSchema)
++        force_requant = self.force_weight_schema is not None
++        if force_requant and self.weight_schema != self.force_weight_schema:
++            tensors = self.weight_schema.requant_tensors(
++                tensors=layer.state_dict(),
++                target_weight_schema=self.force_weight_schema,
++                param_dtype=layer.param_dtype,
++            )
++
++            self.weight_schema = self.force_weight_schema
++
++            for name, _ in list(layer.named_parameters()):
++                if name != "bias":
++                    delattr(layer, name)
++
++            for name, tensor in tensors.items():
++                param = torch.nn.Parameter(tensor, requires_grad=False)
++                setattr(layer, name, param)
++
++            del tensors
++
++        # prepare layer config from humming kernel
++        HummingMethod.prepare_layer_meta(
++            layer=layer,
++            shape_n=layer.output_partition_sizes_sum,
++            shape_k=layer.input_size_per_partition,
++            weight_schema=self.weight_schema,
++            input_schema=self.input_schema,
++            pad_n_to_multiple=256,
++            pad_k_to_multiple=128,
++            has_bias=layer.with_bias,
++            torch_dtype=layer.param_dtype,
++        )
++
++        # preprocess weight for inference
++        HummingMethod.transform_humming_layer(layer)
++
++        # compute_config: kernel configs that do not directly affect weights
++        # but significantly impact kernel behavior or computation precision.
++        # see https://github.com/inclusionAI/humming/blob/main/docs/config.md
++        compute_config = {
++            "use_f16_accum": envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
++            "gemm_type": "dense",
++        }
++        self.compute_config = json.dumps(compute_config)
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        flatten_inputs = x.view(-1, x.size(-1))
++        output = HummingMethod.forward_layer(
++            layer=layer,
++            inputs=flatten_inputs,
++            compute_config=self.compute_config,
++        )
++        output = output.view(*x.shape[:-1], output.size(-1))
++        return output
++
++
++class HummingMoEMethod(FusedMoEMethodBase):
++    def __init__(self, quant_config: HummingLayerQuantizationConfig) -> None:
++        self.quant_config = quant_config
++        self.weight_schema = quant_config.weight_schema
++        self.input_schema = quant_config.input_schema
++        self.force_weight_schema = quant_config.force_weight_schema
++        self.force_input_schema = quant_config.force_input_schema
++
++    def prepare_weight_loader(self, layer, weight_loader):
++        def new_weight_loader(
++            param: torch.nn.Parameter,
++            loaded_weight: torch.Tensor,
++            weight_name: str,
++            shard_id: str,
++            expert_id: int | None = None,
++        ):
++            name = param.param_name
++            float_dtypes = [torch.float16, torch.bfloat16, torch.float32]
++            is_unquantized = name == "weight" and loaded_weight.dtype in float_dtypes
++            # online quant (fp16/bf16 -> quant_type)
++            if is_unquantized:
++                assert isinstance(self.weight_schema, HummingWeightSchema)
++                f16_dtype = DataType.from_torch_dtype(layer.param_dtype)
++                has_global_scale = "TENSOR" in str(self.weight_schema.weight_scale_type)
++                tensor_list = quantize_weight(
++                    weight=loaded_weight,
++                    dtype=self.weight_schema.b_dtype,
++                    scale_dtype=self.weight_schema.bs_dtype or f16_dtype,
++                    group_size=self.weight_schema.weight_scale_group_size,
++                    has_zero_point=self.weight_schema.has_zero_point,
++                    has_global_scale=has_global_scale,
++                    is_fp_zero_point=self.weight_schema.is_fp_zero_point,
++                    pack=True,
++                )
++
++                key_list = ["weight", "weight_scale", "zero_point", "global_scale"]
++                for key, tensor in zip(key_list, tensor_list):
++                    if tensor is None or tensor.nelement() == 0:
++                        continue
++                    sublayer_name = "w2" if shard_id == "w2" else "w13"
++
++                    param = getattr(layer, sublayer_name + "_" + key)
++                    param.weight_loader(
++                        param=param,
++                        loaded_weight=tensor.cpu(),
++                        weight_name=shard_id + "_" + key,
++                        shard_id=shard_id,
++                        expert_id=expert_id,
++                    )
++
++                return None
++
++            # weight processing logic for specific quantization schema
++            loaded_weight = self.weight_schema.process_loaded_weight(
++                tensor=loaded_weight,
++                name=name,
++            )
++            return weight_loader(
++                param,
++                loaded_weight,
++                weight_name,
++                shard_id=shard_id,
++                expert_id=expert_id,
++            )
++
++        return new_weight_loader
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        num_experts: int,
++        hidden_size: int,
++        intermediate_size_per_partition: int,
++        params_dtype: torch.dtype,
++        with_bias: bool = False,
++        **extra_weight_attrs,
++    ):
++        from sglang.srt.model_loader.weight_utils import default_weight_loader
++
++        layer.num_experts = num_experts
++        layer.param_dtype = params_dtype
++        layer.intermediate_size = intermediate_size_per_partition
++        layer.with_bias = with_bias
++        weight_loader = extra_weight_attrs.get("weight_loader", default_weight_loader)
++        weight_loader = self.prepare_weight_loader(layer, weight_loader)
++        extra_weight_attrs["weight_loader"] = weight_loader
++
++        # sublayer: a layer contains multiple sets of weights for quantized GEMM
++        # (e.g., weight, weight_scale, etc.).
++        # The weight names of sublayer start with the prefix "{sublayer_name}_"
++        layer.sublayer_configs = {
++            "w13": {
++                "shape_n": intermediate_size_per_partition * 2,
++                "shape_k": hidden_size,
++                "tensors_attrs": self.weight_schema.get_padded_tensors_attrs(
++                    shape_n=intermediate_size_per_partition * 2,
++                    shape_k=hidden_size,
++                    num_experts=num_experts,
++                    param_dtype=params_dtype,
++                    has_bias=with_bias,
++                ),
++            },
++            "w2": {
++                "shape_n": hidden_size,
++                "shape_k": intermediate_size_per_partition,
++                "tensors_attrs": self.weight_schema.get_padded_tensors_attrs(
++                    shape_n=hidden_size,
++                    shape_k=intermediate_size_per_partition,
++                    num_experts=num_experts,
++                    param_dtype=params_dtype,
++                    has_bias=with_bias,
++                ),
++            },
++        }
++
++        for sublayer_name, configs in layer.sublayer_configs.items():
++            for name, attrs in configs["tensors_attrs"].items():
++                tensor = torch.empty(attrs["shape"], dtype=attrs["dtype"])
++                param = torch.nn.Parameter(tensor, requires_grad=False)
++                extra_attrs = attrs.get("extra_attrs", {}).copy()
++                extra_attrs.update(extra_weight_attrs)
++                param = prepare_moe_param(tensor, name, extra_attrs)
++                setattr(layer, f"{sublayer_name}_{name}", param)
++
++        if self.force_input_schema is not None:
++            self.input_schema = self.force_input_schema
++
++        locks = torch.zeros(1024, dtype=torch.int32)
++        layer.register_buffer("locks", locks)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if getattr(self, "processed", False):
++            return
++        self.processed = True
++        self.weight_schemas = {}
++        self.input_schemas = {}
++        for sublayer_name, configs in layer.sublayer_configs.items():
++            input_schema = self.input_schema
++            weight_schema = self.weight_schema
++            # convert from checkpoint format to humming format
++            if not isinstance(weight_schema, HummingWeightSchema):
++                tensors: dict[str, torch.Tensor] = dict(
++                    (key.removeprefix(sublayer_name + "_"), value)
++                    for key, value in layer.state_dict().items()
++                    if key.startswith(sublayer_name + "_")
++                )
++
++                shape_k_stacks = [configs["shape_k"]]
++                shape_n_stacks = [configs["shape_n"]]
++                if sublayer_name == "w13":
++                    shape_n_stacks = [configs["shape_n"] // 2] * 2
++
++                weight_schema, tensors = weight_schema.convert_humming(
++                    tensors=tensors,
++                    shape_n_stacks=shape_n_stacks,
++                    shape_k_stacks=shape_k_stacks,
++                    param_dtype=layer.param_dtype,
++                    num_experts=layer.num_experts,
++                )
++
++                input_schema, _ = input_schema.convert_humming(
++                    tensors=tensors,
++                    shape_n_stacks=shape_n_stacks,
++                    shape_k_stacks=shape_k_stacks,
++                    param_dtype=layer.param_dtype,
++                    num_experts=layer.num_experts,
++                )
++
++                for name, _ in list(layer.named_parameters()):
++                    if not name.startswith(sublayer_name + "_"):
++                        continue
++                    delattr(layer, name)
++
++                for name, tensor in tensors.items():
++                    name = f"{sublayer_name}_{name}"
++                    param = torch.nn.Parameter(tensor, requires_grad=False)
++                    setattr(layer, name, param)
++
++                self.weight_schemas[sublayer_name] = weight_schema
++                self.input_schemas[sublayer_name] = input_schema
++
++            # force requant (origin quant setting -> fp16/bf16 -> new_quant setting)
++            assert isinstance(weight_schema, HummingWeightSchema)
++            force_requant = self.force_weight_schema is not None
++            if force_requant and weight_schema != self.force_weight_schema:
++                tensors = dict(
++                    (key.removeprefix(sublayer_name + "_"), value)
++                    for key, value in layer.state_dict().items()
++                    if key.startswith(sublayer_name + "_")
++                )
++
++                tensors = weight_schema.requant_tensors(
++                    tensors=tensors,
++                    target_weight_schema=self.force_weight_schema,
++                    param_dtype=layer.param_dtype,
++                )
++
++                weight_schema = self.force_weight_schema
++
++                for name, _ in list(layer.named_parameters()):
++                    if not name.startswith(sublayer_name + "_"):
++                        continue
++                    if name == sublayer_name + "_bias":
++                        continue
++                    delattr(layer, name)
++
++                for name, tensor in tensors.items():
++                    name = f"{sublayer_name}_{name}"
++                    param = torch.nn.Parameter(tensor, requires_grad=False)
++                    setattr(layer, name, param)
++
++                del tensors
++
++            # prepare layer config from humming kernel
++            HummingMethod.prepare_layer_meta(
++                layer=layer,
++                shape_n=configs["shape_n"],
++                shape_k=configs["shape_k"],
++                pad_n_to_multiple=256,
++                pad_k_to_multiple=128,
++                input_schema=input_schema,
++                weight_schema=weight_schema,
++                has_bias=layer.with_bias,
++                num_experts=layer.num_experts,
++                torch_dtype=layer.param_dtype,
++                sublayer_name=sublayer_name,
++            )
++
++            # preprocess weight for inference
++            HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
++
++        if hasattr(layer, "dispatcher"):
++            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
++
++    def create_moe_runner(
++        self,
++        layer: torch.nn.Module,
++        moe_runner_config: MoeRunnerConfig,
++    ):
++        moe_runner_backend = get_moe_runner_backend()
++        if not (moe_runner_backend.is_auto() or moe_runner_backend.is_humming()):
++            raise ValueError(
++                "Humming quantization for MoE only supports "
++                f"moe_runner_backend='auto' or 'humming', got "
++                f"{moe_runner_backend.value!r}."
++            )
++        self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        dispatch_output: "DispatchOutput",
++    ) -> "CombineInput":
++        from sglang.srt.layers.moe.moe_runner.humming import HummingMoeQuantInfo
++
++        quant_info = HummingMoeQuantInfo(layer=layer)
++        return self.runner.run(dispatch_output, quant_info)
+diff --git a/python/sglang/srt/layers/quantization/humming_utils.py b/python/sglang/srt/layers/quantization/humming_utils.py
+new file mode 100644
+index 000000000000..6a5eefd45f88
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/humming_utils.py
+@@ -0,0 +1,156 @@
++from typing import Any
++
++import regex as re
++import torch
++from humming.layer import HummingInputSchema, HummingMethod
++from humming.schema import BaseWeightSchema
++
++from sglang.srt.environ import envs
++from sglang.srt.layers.linear import LinearBase
++from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
++
++
++def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
++    if not config:
++        return True
++
++    keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
++    ignored_layers: list[str] = []
++    for key in keys:
++        ignored_layers = config.get(key, []) or []
++        if not ignored_layers:
++            break
++
++    if any(module_name in prefix for module_name in ignored_layers):
++        return True
++    if "lm_head" in prefix:
++        return True
++
++    for regex in config.get("dynamic", {}):
++        if regex[:1] != "-":
++            continue
++        if re.match(regex[2:], prefix):
++            return True
++
++    return False
++
++
++def prepare_humming_layer(layer: LinearBase, quant_config: dict):
++    weight_schema = BaseWeightSchema.from_config(quant_config)
++    input_schema = HummingInputSchema()
++
++    shape_k_stacks = [layer.input_size_per_partition]
++    shape_n_stacks = layer.output_partition_sizes
++
++    # Step 1: convert weight to humming standard format
++    weight_schema, tensors = weight_schema.convert_humming(
++        tensors=layer.named_parameters(),
++        shape_n_stacks=shape_n_stacks,
++        shape_k_stacks=shape_k_stacks,
++        param_dtype=layer.params_dtype,
++    )
++
++    layer.weight_schema = weight_schema
++
++    for name, _ in list(layer.named_parameters()):
++        delattr(layer, name)
++
++    for name, tensor in tensors.items():
++        param = torch.nn.Parameter(tensor, requires_grad=False)
++        setattr(layer, name, param)
++
++    # Step 2: transform weight (humming standard format) for forwarding
++    HummingMethod.prepare_layer_meta(
++        layer=layer,
++        shape_n=layer.output_partition_sizes_sum,
++        shape_k=layer.input_size_per_partition,
++        weight_schema=weight_schema,
++        input_schema=input_schema,
++        pad_n_to_multiple=256,
++        pad_k_to_multiple=128,
++        has_bias=layer.has_bias,
++        torch_dtype=layer.param_dtype,
++    )
++
++    HummingMethod.transform_humming_layer(layer)
++
++
++def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
++    weight_schema = BaseWeightSchema.from_config(quant_config)
++    input_quant_config = envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get() or {}
++    if humming_is_layer_skipped(input_quant_config, layer.layer_name):
++        input_schema = HummingInputSchema()
++    else:
++        # TODO: read input_quant_config from quant_config
++        input_schema = HummingInputSchema.from_config(input_quant_config)
++
++    shape_config = {
++        "w13": (
++            layer.intermediate_size_per_partition * 2,
++            layer.hidden_size,
++        ),
++        "w2": (
++            layer.hidden_size,
++            layer.intermediate_size_per_partition,
++        ),
++    }
++
++    layer.weight_schemas = {}
++    layer.input_schemas = {}
++
++    for sublayer_name in shape_config:
++        # Step 1: convert weight to humming standard format
++        tensors: dict[str, torch.Tensor] = dict(
++            (key.removeprefix(sublayer_name + "_"), value)
++            for key, value in layer.state_dict().items()
++            if key.startswith(sublayer_name + "_")
++        )
++
++        shape_n, shape_k = shape_config[sublayer_name]
++        shape_n_stacks = [shape_n]
++        shape_k_stacks = [shape_k]
++        if sublayer_name == "w13":
++            shape_n_stacks = [shape_n // 2] * 2
++
++        weight_schema_new, tensors = weight_schema.convert_humming(
++            tensors=tensors,
++            shape_n_stacks=shape_n_stacks,
++            shape_k_stacks=shape_k_stacks,
++            num_experts=layer.num_local_experts,
++            param_dtype=layer.params_dtype,
++        )
++
++        layer.weight_schemas[sublayer_name] = weight_schema_new
++        layer.input_schemas[sublayer_name] = input_schema
++
++        for name, _ in list(layer.named_parameters()):
++            if not name.startswith(sublayer_name + "_"):
++                continue
++            delattr(layer, name)
++
++        for name, tensor in tensors.items():
++            name = f"{sublayer_name}_{name}"
++            param = torch.nn.Parameter(tensor, requires_grad=False)
++            setattr(layer, name, param)
++
++        # Step 2: transform weight (humming standard format) for forwarding
++        HummingMethod.prepare_layer_meta(
++            layer=layer,
++            shape_n=shape_n,
++            shape_k=shape_k,
++            pad_n_to_multiple=256,
++            pad_k_to_multiple=128,
++            input_schema=input_schema,
++            weight_schema=weight_schema_new,
++            has_bias=layer.with_bias,
++            num_experts=layer.num_local_experts,
++            torch_dtype=layer.params_dtype,
++            sublayer_name=sublayer_name,
++        )
++
++        HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
++
++    if not hasattr(layer, "locks"):
++        device = layer.w13_weight.device
++        locks = torch.zeros(1024, dtype=torch.int32, device=device)
++        layer.register_buffer("locks", locks)
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_humming_moe.py b/python/sglang/srt/layers/quantization/mxfp4_humming_moe.py
+new file mode 100644
+index 000000000000..736d1109b148
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/mxfp4_humming_moe.py
+@@ -0,0 +1,101 @@
++from __future__ import annotations
++
++import logging
++from typing import TYPE_CHECKING
++
++import torch
++from torch.nn import Module, Parameter
++
++from sglang.srt.layers.moe.utils import MoeRunnerBackend
++from sglang.srt.utils import log_info_on_rank0
++
++if TYPE_CHECKING:
++    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
++
++logger = logging.getLogger(__name__)
++
++
++class Mxfp4HummingMoEMethod:
++    """MXFP4 (E8M0 scales) MoE quantization method using the Humming runner.
++
++    Used for DeepSeek-V4 FP8 checkpoints when `--moe-runner-backend humming` is
++    selected together with `SGLANG_DSV4_FP4_EXPERTS=1` (which sets
++    ``Fp8Config.is_fp4_experts``). The FP8 base method handles raw weight
++    creation; after load we cast ``w{13,2}_weight_scale_inv`` to
++    ``float8_e8m0fnu`` and call ``prepare_humming_moe_layer`` to lay out the
++    experts in the format the Humming kernel expects.
++    """
++
++    def __init__(self, fp8_method, prefix: str):
++        self._fp8 = fp8_method
++        self.prefix = prefix
++
++    def create_moe_runner(self, layer, moe_runner_config):
++        from sglang.srt.layers.moe.moe_runner import MoeRunner
++
++        self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
++
++    def create_weights(
++        self,
++        layer: Module,
++        num_experts: int,
++        hidden_size: int,
++        intermediate_size_per_partition: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        self._fp8.create_weights(
++            layer,
++            num_experts,
++            hidden_size,
++            intermediate_size_per_partition,
++            params_dtype,
++            **extra_weight_attrs,
++        )
++
++    def process_weights_after_loading(self, layer: Module) -> None:
++        from sglang.srt.layers.quantization.humming_utils import (
++            prepare_humming_moe_layer,
++        )
++
++        # FP8 base normalization (ROCm-specific handling etc.)
++        self._fp8.process_weights_after_loading(layer)
++
++        if getattr(layer, "_mega_moe_weights_built", False):
++            return
++
++        log_info_on_rank0(
++            logger,
++            f"Preparing DeepSeekV4 MXFP4 experts for Humming backend "
++            f"(layer: {self.prefix})...",
++        )
++
++        layer.register_parameter(
++            "w13_weight_scale",
++            Parameter(
++                layer.w13_weight_scale_inv.to(torch.float8_e8m0fnu),
++                requires_grad=False,
++            ),
++        )
++        layer.register_parameter(
++            "w2_weight_scale",
++            Parameter(
++                layer.w2_weight_scale_inv.to(torch.float8_e8m0fnu),
++                requires_grad=False,
++            ),
++        )
++        del layer.w13_weight_scale_inv
++        del layer.w2_weight_scale_inv
++
++        prepare_humming_moe_layer(layer, {"quant_method": "mxfp4"})
++        layer._dsv4_mxfp4_backend = "humming"
++
++    def apply(
++        self,
++        layer: Module,
++        dispatch_output: DispatchOutput,
++    ) -> CombineInput:
++        from sglang.srt.layers.moe.moe_runner.humming import HummingMoeQuantInfo
++
++        quant_info = HummingMoeQuantInfo(layer=layer)
++        return self.runner.run(dispatch_output, quant_info)
+diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
+index 6dacc3ab358a..13c0c07d43e0 100644
+--- a/python/sglang/srt/model_loader/loader.py
++++ b/python/sglang/srt/model_loader/loader.py
+@@ -241,7 +241,7 @@ def _get_quantization_config(
+         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+         if quant_config is None:
+             return None
+-        # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
++        # Carry DSV4 expert layout into quant configs so downstream readers don't read env.
+         from sglang.srt.layers.quantization.fp8 import Fp8Config
+ 
+         if isinstance(quant_config, Fp8Config):
+@@ -268,6 +268,8 @@ def _get_quantization_config(
+                 quant_config = HybridFp8NvFp4Config(
+                     fp8_config=quant_config, nvfp4_config=nvfp4_config
+                 )
++        elif quant_config.get_name() == "humming":
++            quant_config.is_fp4_experts = model_config.is_fp4_experts
+         if not _is_npu:
+             major, minor = get_device_capability()
+ 
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 395e5260b4c1..ebbebe387d03 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -185,6 +185,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
+     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
+     "mlx_q8",  # 8 bits, group_size=64
+     "unquant",
++    "humming",
+ ]
+ 
+ 
+@@ -261,6 +262,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
+     "cutlass",
+     "aiter",
+     "marlin",
++    "humming",
+ ]
+ 
+ MOE_A2A_BACKEND_CHOICES = [
+diff --git a/sgl-kernel/csrc/common_extension.cc b/sgl-kernel/csrc/common_extension.cc
+index 056604e2bb9c..45d3dfe27b55 100644
+--- a/sgl-kernel/csrc/common_extension.cc
++++ b/sgl-kernel/csrc/common_extension.cc
+@@ -161,7 +161,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.def(
+       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
+       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
+-      "pad_sorted_token_ids) -> ()");
++      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
+   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+ 
+   m.def(
+diff --git a/sgl-kernel/csrc/common_extension_musa.cc b/sgl-kernel/csrc/common_extension_musa.cc
+index 6faea31364a8..1b17ad3abc2b 100644
+--- a/sgl-kernel/csrc/common_extension_musa.cc
++++ b/sgl-kernel/csrc/common_extension_musa.cc
+@@ -109,7 +109,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
+   m.def(
+       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
+       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
+-      "pad_sorted_token_ids) -> ()");
++      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
+   m.impl("moe_align_block_size", torch::kMUSA, &moe_align_block_size);
+ 
+   m.def(
+diff --git a/sgl-kernel/csrc/common_extension_rocm.cc b/sgl-kernel/csrc/common_extension_rocm.cc
+index cad9c95d95c5..2aadfc314440 100644
+--- a/sgl-kernel/csrc/common_extension_rocm.cc
++++ b/sgl-kernel/csrc/common_extension_rocm.cc
+@@ -135,7 +135,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
+   m.def(
+       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
+       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
+-      "pad_sorted_token_ids) -> ()");
++      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
+   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+ 
+   m.def(
+diff --git a/sgl-kernel/csrc/moe/moe_align_kernel.cu b/sgl-kernel/csrc/moe/moe_align_kernel.cu
+index b7bad43da6c0..f5ef1b4d0773 100644
+--- a/sgl-kernel/csrc/moe/moe_align_kernel.cu
++++ b/sgl-kernel/csrc/moe/moe_align_kernel.cu
+@@ -29,11 +29,13 @@ __global__ void count_and_sort_expert_tokens_kernel(
+     const scalar_t* __restrict__ topk_ids,
+     int32_t* __restrict__ sorted_token_ids,
+     int32_t* __restrict__ cumsum_buffer,
+-    size_t numel) {
++    size_t numel,
++    bool ignore_invalid_expert) {
+   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+   const size_t stride = blockDim.x * gridDim.x;
+ 
+   for (size_t i = tid; i < numel; i += stride) {
++    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
+     int32_t expert_id = topk_ids[i] + 1;
+     int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
+     sorted_token_ids[rank_post_pad] = i;
+@@ -63,6 +65,7 @@ __global__ void moe_align_block_size_kernel(
+     size_t numel,
+     int32_t* __restrict__ cumsum,
+     bool pad_sorted_token_ids,
++    bool ignore_invalid_expert,
+     const int32_t scan_size,
+     int32_t max_num_tokens_padded) {
+   // Use a separate thread block to populate sorted_token_ids
+@@ -95,6 +98,7 @@ __global__ void moe_align_block_size_kernel(
+   __syncthreads();
+ 
+   for (size_t i = tid; i < numel; i += stride) {
++    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
+     int expert_id = topk_ids[i] + 1;
+     atomicAdd(&shared_counts[expert_id], 1);
+   }
+@@ -242,6 +246,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
+     int32_t block_size,
+     size_t numel,
+     bool pad_sorted_token_ids,
++    bool ignore_invalid_expert,
+     int32_t max_num_tokens_padded) {
+   // Adapted from
+   // https://github.com/vllm-project/vllm/pull/29642/files#diff-5647b1413f4ae9aacba904eca8f8a8aee9079321eadff4c10101a2c6962dcc53R226
+@@ -275,6 +280,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
+   }
+ 
+   for (size_t i = tid; i < numel; i += stride) {
++    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
+     int32_t expert_id = topk_ids[i] + 1;
+     ++tokens_cnts[(tid + 1) * num_experts + expert_id];
+   }
+@@ -307,6 +313,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
+   }
+ 
+   for (size_t i = tid; i < numel; i += stride) {
++    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
+     int32_t expert_id = topk_ids[i] + 1;
+     int32_t rank_post_pad = tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
+     sorted_token_ids[rank_post_pad] = i;
+@@ -322,7 +329,8 @@ void moe_align_block_size(
+     torch::Tensor experts_ids,
+     torch::Tensor num_tokens_post_pad,
+     torch::Tensor cumsum_buffer,
+-    bool pad_sorted_token_ids) {
++    bool pad_sorted_token_ids,
++    bool ignore_invalid_expert) {
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 
+   int threads = 1024;
+@@ -348,6 +356,7 @@ void moe_align_block_size(
+           block_size,
+           topk_ids.numel(),
+           pad_sorted_token_ids,
++          ignore_invalid_expert,
+           max_num_tokens_padded);
+     } else {
+       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
+@@ -364,6 +373,7 @@ void moe_align_block_size(
+           topk_ids.numel(),
+           cumsum_buffer.data_ptr<int32_t>(),
+           pad_sorted_token_ids,
++          ignore_invalid_expert,
+           scan_size,
+           max_num_tokens_padded);
+ 
+@@ -377,7 +387,8 @@ void moe_align_block_size(
+           topk_ids.data_ptr<scalar_t>(),
+           sorted_token_ids.data_ptr<int32_t>(),
+           cumsum_buffer.data_ptr<int32_t>(),
+-          topk_ids.numel());
++          topk_ids.numel(),
++          ignore_invalid_expert);
+     }
+   });
+ }
+diff --git a/sgl-kernel/include/sgl_kernel_ops.h b/sgl-kernel/include/sgl_kernel_ops.h
+index 5ea78e84d949..9a92f38bf6bb 100644
+--- a/sgl-kernel/include/sgl_kernel_ops.h
++++ b/sgl-kernel/include/sgl_kernel_ops.h
+@@ -294,7 +294,8 @@ void moe_align_block_size(
+     torch::Tensor experts_ids,
+     torch::Tensor num_tokens_post_pad,
+     torch::Tensor cumsum_buffer,
+-    bool pad_sorted_token_ids);
++    bool pad_sorted_token_ids,
++    bool ignore_invalid_expert);
+ 
+ void topk_softmax(
+     torch::Tensor& topk_weights,
+diff --git a/sgl-kernel/python/sgl_kernel/moe.py b/sgl-kernel/python/sgl_kernel/moe.py
+index bc43d37a5b31..30bf0fad627e 100755
+--- a/sgl-kernel/python/sgl_kernel/moe.py
++++ b/sgl-kernel/python/sgl_kernel/moe.py
+@@ -12,6 +12,7 @@ def moe_align_block_size(
+     num_tokens_post_pad,
+     cumsum_buffer,
+     pad_sorted_token_ids=False,
++    ignore_invalid_expert=False,
+ ):
+     torch.ops.sgl_kernel.moe_align_block_size.default(
+         topk_ids,
+@@ -22,6 +23,7 @@ def moe_align_block_size(
+         num_tokens_post_pad,
+         cumsum_buffer,
+         pad_sorted_token_ids,
++        ignore_invalid_expert,
+     )
+ 
+ 

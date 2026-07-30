@@ -1,0 +1,2151 @@
+diff --git a/python/sglang/jit_kernel/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_entry.cuh b/python/sglang/jit_kernel/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_entry.cuh
+new file mode 100644
+index 000000000000..cdbecf8a2895
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_entry.cuh
+@@ -0,0 +1,25 @@
++/* Copyright 2026 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include "fp8_blockwise_scaled_mm_sm120.cuh"
++
++void fp8_blockwise_scaled_mm(
++    tvm::ffi::TensorView out,
++    tvm::ffi::TensorView mat_a,
++    tvm::ffi::TensorView mat_b,
++    tvm::ffi::TensorView scales_a,
++    tvm::ffi::TensorView scales_b) {
++  fp8_blockwise_scaled_mm_sm120(out, mat_a, mat_b, scales_a, scales_b);
++}
+diff --git a/python/sglang/jit_kernel/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_sm120.cuh b/python/sglang/jit_kernel/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_sm120.cuh
+new file mode 100644
+index 000000000000..8f802d92efbe
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_sm120.cuh
+@@ -0,0 +1,502 @@
++/* Copyright 2026 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#pragma once
++
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/runtime.cuh>
++#include <sgl_kernel/utils.cuh>
++
++#include <cstddef>
++#include <cstdint>
++#include <cuda_runtime.h>
++
++using namespace host;
++
++// clang-format off
++#include "cutlass/cutlass.h"
++#include "cutlass/detail/blockwise_scale_layout.hpp"
++#include "cutlass/gemm/collective/collective_builder.hpp"
++#include "cutlass/epilogue/collective/collective_builder.hpp"
++#include "cutlass/gemm/device/gemm_universal_adapter.h"
++#include "cutlass/gemm/kernel/gemm_universal.hpp"
++#include "cutlass/gemm/dispatch_policy.hpp"
++#include "cutlass/util/packed_stride.hpp"
++// clang-format on
++
++#define CUTLASS_CHECK(status)                                                        \
++  {                                                                                  \
++    cutlass::Status error = status;                                                  \
++    RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
++  }
++
++using namespace cute;
++
++#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
++
++template <
++    typename OutType,
++    typename MmaTileShape,
++    typename PerSmTileShape,
++    typename EpilogueTileShape,
++    typename ScalesPerTile,
++    int TileSizeM_ = 128,
++    class ClusterShape = Shape<_1, _1, _1>>
++void launch_sm120_fp8_blockwise_scaled_mm(
++    tvm::ffi::TensorView out,
++    tvm::ffi::TensorView a,
++    tvm::ffi::TensorView b,
++    tvm::ffi::TensorView scales_a,
++    tvm::ffi::TensorView scales_b,
++    cudaStream_t stream) {
++  using ElementBlockScale = float;
++
++  // A matrix configuration
++  using ElementA = cutlass::float_e4m3_t;        // Element type for A matrix operand
++  using LayoutATag = cutlass::layout::RowMajor;  // Layout type for A matrix operand
++  constexpr int AlignmentA =
++      128 / cutlass::sizeof_bits<ElementA>::value;  // Memory access granularity/alignment of A matrix in units of
++                                                    // elements (up to 16 bytes)
++
++  // B matrix configuration
++  using ElementB = cutlass::float_e4m3_t;           // Element type for B matrix operand
++  using LayoutBTag = cutlass::layout::ColumnMajor;  // Layout type for B matrix operand
++  constexpr int AlignmentB =
++      128 / cutlass::sizeof_bits<ElementB>::value;  // Memory access granularity/alignment of B matrix in units of
++                                                    // elements (up to 16 bytes)
++
++  // C/D matrix configuration
++  using ElementD = OutType;                      // Element type for D matrix operand
++  using ElementC = void;                         // Element type for C matrix operand
++  using LayoutCTag = cutlass::layout::RowMajor;  // Layout type for C matrix operand
++  using LayoutDTag = cutlass::layout::RowMajor;  // Layout type for D matrix operand
++  constexpr int AlignmentD =
++      128 / cutlass::sizeof_bits<ElementD>::value;  // Memory access granularity/alignment of C matrix in units of
++                                                    // elements (up to 16 bytes)
++  constexpr int AlignmentC =
++      AlignmentD;  // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
++
++  // Kernel functional config
++  using ElementAccumulator = float;      // Element type for internal accumulation
++  using ArchTag = cutlass::arch::Sm120;  // Tag indicating the minimum SM that supports the intended feature
++  using OperatorClass = cutlass::arch::OpClassTensorOp;  // Operator class tag - changed from OpClassBlockScaledTensorOp
++
++  static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
++  static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
++  static constexpr int ScaleGranularityN = size<1>(MmaTileShape{}) / size<1>(ScalesPerTile{});
++  static constexpr int ScaleGranularityK = size<2>(MmaTileShape{}) / size<2>(ScalesPerTile{});
++
++  using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<
++      ScaleGranularityM,
++      ScaleGranularityN,
++      ScaleGranularityK,
++      cute::UMMA::Major::MN,
++      cute::UMMA::Major::K>;
++  // FP8 Block-wise scaling configuration
++  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());  // Layout type for SFA matrix operand
++  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());  // Layout type for SFB matrix operand
++
++  constexpr bool kCanUsePingpong = (64 % ScaleGranularityM == 0);
++
++  int m = a.size(0);
++  int k = a.size(1);
++  int n = b.size(1);
++
++  auto a_ptr = static_cast<ElementA*>(a.data_ptr());
++  auto b_ptr = static_cast<ElementB*>(b.data_ptr());
++  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
++
++  auto scales_a_ptr = static_cast<ElementBlockScale*>(scales_a.data_ptr());
++  auto scales_b_ptr = static_cast<ElementBlockScale*>(scales_b.data_ptr());
++
++  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
++  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
++
++  auto run_gemm = [&](auto tag) -> cutlass::Status {
++    using GemmKernel = decltype(tag);
++    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
++    Gemm gemm_op;
++
++    using StrideA = typename GemmKernel::StrideA;
++    using StrideB = typename GemmKernel::StrideB;
++    using StrideC = typename GemmKernel::StrideD;
++
++    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
++    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
++    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, 1));
++
++    typename GemmKernel::MainloopArguments mainloop_args{
++        a_ptr, stride_a, b_ptr, stride_b, scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB};
++
++    typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, stride_c, c_ptr, stride_c};
++    epilogue_args.thread.alpha = 1.0f;
++
++    typename Gemm::Arguments args = {
++        cutlass::gemm::GemmUniversalMode::kGemm,
++        {m, n, k, 1},
++        mainloop_args,
++        epilogue_args,
++    };
++
++    auto can_implement = gemm_op.can_implement(args);
++    if (can_implement != cutlass::Status::kSuccess) {
++      return can_implement;
++    }
++
++    size_t workspace_size = gemm_op.get_workspace_size(args);
++    auto workspace_tensor = alloc_workspace_tensor(workspace_size, a.device());
++    void* workspace = (workspace_size == 0) ? nullptr : workspace_tensor.data_ptr();
++
++    auto init_status = gemm_op.initialize(args, workspace, stream);
++    if (init_status != cutlass::Status::kSuccess) {
++      return init_status;
++    }
++
++    return gemm_op.run(stream);
++  };
++
++  using CooperativeCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
++      ArchTag,
++      OperatorClass,
++      PerSmTileShape,
++      ClusterShape,
++      cutlass::epilogue::collective::EpilogueTileAuto,
++      ElementAccumulator,
++      ElementAccumulator,
++      ElementC,
++      LayoutCTag,
++      AlignmentC,
++      ElementD,
++      LayoutDTag,
++      AlignmentD,
++      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
++
++  using CooperativeStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
++      sizeof(typename CooperativeCollectiveEpilogue::SharedStorage))>;
++
++  using CooperativeCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
++      ArchTag,
++      OperatorClass,
++      ElementA,
++      cute::tuple<LayoutATag, LayoutSFA>,
++      AlignmentA,
++      ElementB,
++      cute::tuple<LayoutBTag, LayoutSFB>,
++      AlignmentB,
++      ElementAccumulator,
++      MmaTileShape,
++      ClusterShape,
++      CooperativeStageCount,
++      cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
++
++  using CooperativeGemmKernelStreamK = cutlass::gemm::kernel::GemmUniversal<
++      Shape<int, int, int, int>,
++      CooperativeCollectiveMainloop,
++      CooperativeCollectiveEpilogue,
++      cutlass::gemm::StreamKScheduler>;
++  using CooperativeGemmKernelVoid = cutlass::gemm::kernel::
++      GemmUniversal<Shape<int, int, int, int>, CooperativeCollectiveMainloop, CooperativeCollectiveEpilogue, void>;
++
++  auto run_cooperative = [&]() -> cutlass::Status {
++    static const uint32_t kNumSM = host::runtime::get_sm_count(a.device().device_id);
++    constexpr int kTileM = size<0>(MmaTileShape{});
++    constexpr int kTileN = size<1>(MmaTileShape{});
++    uint64_t tiles = static_cast<uint64_t>((m + kTileM - 1) / kTileM) * ((n + kTileN - 1) / kTileN);
++    uint32_t last_wave = static_cast<uint32_t>(tiles % kNumSM);
++    if (last_wave == 0) last_wave = kNumSM;
++    float waste = 1.0f - static_cast<float>(last_wave) / static_cast<float>(kNumSM);
++    return (waste > 0.5f) ? run_gemm(CooperativeGemmKernelStreamK{}) : run_gemm(CooperativeGemmKernelVoid{});
++  };
++
++  cutlass::Status status = cutlass::Status::kSuccess;
++  if constexpr (kCanUsePingpong) {
++    using PingpongMmaTileShape_MNK = Shape<_64, _128, _128>;
++    using PingpongCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
++        ArchTag,
++        OperatorClass,
++        PerSmTileShape,
++        ClusterShape,
++        cutlass::epilogue::collective::EpilogueTileAuto,
++        ElementAccumulator,
++        ElementAccumulator,
++        ElementC,
++        LayoutCTag,
++        AlignmentC,
++        ElementD,
++        LayoutDTag,
++        AlignmentD,
++        cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
++
++    using PingpongStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
++        sizeof(typename PingpongCollectiveEpilogue::SharedStorage))>;
++
++    using PingpongCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
++        ArchTag,
++        OperatorClass,
++        ElementA,
++        cute::tuple<LayoutATag, LayoutSFA>,
++        AlignmentA,
++        ElementB,
++        cute::tuple<LayoutBTag, LayoutSFB>,
++        AlignmentB,
++        ElementAccumulator,
++        PingpongMmaTileShape_MNK,
++        ClusterShape,
++        PingpongStageCount,
++        cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120>::CollectiveOp;
++
++    using PingpongGemmKernel = cutlass::gemm::kernel::
++        GemmUniversal<Shape<int, int, int, int>, PingpongCollectiveMainloop, PingpongCollectiveEpilogue, void>;
++
++    if (m <= 64) {
++      status = run_gemm(PingpongGemmKernel{});
++      if (status != cutlass::Status::kSuccess) {
++        status = run_cooperative();
++      }
++    } else {
++      status = run_cooperative();
++    }
++  } else {
++    status = run_cooperative();
++  }
++
++  CUTLASS_CHECK(status);
++}
++
++// Transposed GEMM D^T = Wgemm(weight, activation): puts tokens on the N axis.
++template <
++    typename OutType,
++    typename MmaTileShape,
++    typename PerSmTileShape,
++    typename EpilogueTileShape,
++    typename ScalesPerTile,
++    class ClusterShape = Shape<_1, _1, _1>>
++void launch_sm120_fp8_blockwise_scaled_mm_swapab(
++    tvm::ffi::TensorView out,
++    tvm::ffi::TensorView a,
++    tvm::ffi::TensorView b,
++    tvm::ffi::TensorView scales_a,
++    tvm::ffi::TensorView scales_b,
++    cudaStream_t stream) {
++  using ElementBlockScale = float;
++
++  using ElementA = cutlass::float_e4m3_t;        // A' = weight
++  using LayoutATag = cutlass::layout::RowMajor;  // weight [N, K] is row-major
++  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
++
++  using ElementB = cutlass::float_e4m3_t;           // B' = activation
++  using LayoutBTag = cutlass::layout::ColumnMajor;  // activation as [K, M] column-major
++  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
++
++  using ElementD = OutType;
++  using ElementC = void;
++  using LayoutCTag = cutlass::layout::ColumnMajor;  // D' = out^T is column-major
++  using LayoutDTag = cutlass::layout::ColumnMajor;
++  constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
++  constexpr int AlignmentC = AlignmentD;
++
++  using ElementAccumulator = float;
++  using ArchTag = cutlass::arch::Sm120;
++  using OperatorClass = cutlass::arch::OpClassTensorOp;
++
++  static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
++  static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
++  static constexpr int ScaleGranularityN = size<1>(MmaTileShape{}) / size<1>(ScalesPerTile{});
++  static constexpr int ScaleGranularityK = size<2>(MmaTileShape{}) / size<2>(ScalesPerTile{});
++
++  // Operands are swapped, so the scale majors swap relative to the non-swap path:
++  // SFA (weight) is K-major; SFB (per-token activation) is MN-major.
++  using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<
++      ScaleGranularityM,
++      ScaleGranularityN,
++      ScaleGranularityK,
++      cute::UMMA::Major::K,
++      cute::UMMA::Major::MN>;
++  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
++  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
++
++  int m = a.size(0);  // original tokens  -> swapped N'
++  int k = a.size(1);
++  int n = b.size(1);  // original weight cols -> swapped M'
++
++  auto weight_ptr = static_cast<ElementA*>(b.data_ptr());
++  auto act_ptr = static_cast<ElementB*>(a.data_ptr());
++  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
++  auto weight_scale_ptr = static_cast<ElementBlockScale*>(scales_b.data_ptr());
++  auto act_scale_ptr = static_cast<ElementBlockScale*>(scales_a.data_ptr());
++
++  // Swapped problem shape (M', N', K) = (n, m, k).
++  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(n, m, k, 1));
++  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(n, m, k, 1));
++
++  auto run_gemm = [&](auto tag) -> cutlass::Status {
++    using GemmKernel = decltype(tag);
++    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
++    Gemm gemm_op;
++
++    using StrideA = typename GemmKernel::StrideA;
++    using StrideB = typename GemmKernel::StrideB;
++    using StrideC = typename GemmKernel::StrideD;
++
++    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(n, k, 1));
++    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(m, k, 1));
++    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(n, m, 1));
++
++    typename GemmKernel::MainloopArguments mainloop_args{
++        weight_ptr, stride_a, act_ptr, stride_b, weight_scale_ptr, layout_SFA, act_scale_ptr, layout_SFB};
++
++    typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, stride_c, c_ptr, stride_c};
++    epilogue_args.thread.alpha = 1.0f;
++
++    typename Gemm::Arguments args = {
++        cutlass::gemm::GemmUniversalMode::kGemm,
++        {n, m, k, 1},
++        mainloop_args,
++        epilogue_args,
++    };
++
++    auto can_implement = gemm_op.can_implement(args);
++    if (can_implement != cutlass::Status::kSuccess) {
++      return can_implement;
++    }
++
++    size_t workspace_size = gemm_op.get_workspace_size(args);
++    auto workspace_tensor = alloc_workspace_tensor(workspace_size, a.device());
++    void* workspace = (workspace_size == 0) ? nullptr : workspace_tensor.data_ptr();
++
++    auto init_status = gemm_op.initialize(args, workspace, stream);
++    if (init_status != cutlass::Status::kSuccess) {
++      return init_status;
++    }
++
++    return gemm_op.run(stream);
++  };
++
++  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
++      ArchTag,
++      OperatorClass,
++      PerSmTileShape,
++      ClusterShape,
++      cutlass::epilogue::collective::EpilogueTileAuto,
++      ElementAccumulator,
++      ElementAccumulator,
++      ElementC,
++      LayoutCTag,
++      AlignmentC,
++      ElementD,
++      LayoutDTag,
++      AlignmentD,
++      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
++
++  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
++      sizeof(typename CollectiveEpilogue::SharedStorage))>;
++
++  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
++      ArchTag,
++      OperatorClass,
++      ElementA,
++      cute::tuple<LayoutATag, LayoutSFA>,
++      AlignmentA,
++      ElementB,
++      cute::tuple<LayoutBTag, LayoutSFB>,
++      AlignmentB,
++      ElementAccumulator,
++      MmaTileShape,
++      ClusterShape,
++      StageCount,
++      cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
++
++  using GemmKernel =
++      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
++
++  CUTLASS_CHECK(run_gemm(GemmKernel{}));
++}
++
++// swapAB (tile N=32) beats the non-swap 128x128 path for M<=64 or M%4!=0
++// (cold-L2 CUPTI benchmarks, up to ~1.2x); tile N=16 is unsupported by the
++// SM120 blockwise collective (needs EPI_TILE_N=32 | CTA_N and B LDSM N>=32).
++template <typename OutType>
++void sm120_fp8_blockwise_dispatch_shape(
++    tvm::ffi::TensorView out,
++    tvm::ffi::TensorView a,
++    tvm::ffi::TensorView b,
++    tvm::ffi::TensorView scales_a,
++    tvm::ffi::TensorView scales_b,
++    cudaStream_t stream) {
++  const int m = a.size(0);
++  using EpilogueTileShape = Shape<_128, _64>;
++  if (m <= 64 || (m % 4 != 0)) {
++    launch_sm120_fp8_blockwise_scaled_mm_swapab<
++        OutType,
++        Shape<_128, _32, _128>,
++        Shape<_128, _32, _128>,
++        EpilogueTileShape,
++        Shape<_1, _32, _1>>(out, a, b, scales_a, scales_b, stream);
++    return;
++  }
++
++  using MmaTileShape = Shape<_128, _128, _128>;
++  using PerSmTileShape = Shape<_128, _128, _128>;
++  using ScalesPerTile = Shape<_128, _1, _1>;
++  launch_sm120_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
++      out, a, b, scales_a, scales_b, stream);
++}
++
++inline void fp8_blockwise_scaled_mm_sm120(
++    tvm::ffi::TensorView out,
++    tvm::ffi::TensorView mat_a,
++    tvm::ffi::TensorView mat_b,
++    tvm::ffi::TensorView scales_a,
++    tvm::ffi::TensorView scales_b) {
++  RuntimeCheck(mat_a.device().device_type == kDLCUDA, "mat_a must be a CUDA tensor");
++  RuntimeCheck(mat_b.device().device_type == kDLCUDA, "mat_b must be a CUDA tensor");
++
++  RuntimeCheck(mat_a.dim() == 2, "mat_a must be a 2D tensor");
++  RuntimeCheck(mat_b.dim() == 2, "mat_b must be a 2D tensor");
++  RuntimeCheck(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
++  RuntimeCheck(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
++  RuntimeCheck(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
++
++  RuntimeCheck(
++      (mat_a.size(1) * (mat_a.dtype().bits / 8)) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
++  RuntimeCheck(
++      (mat_b.size(0) * (mat_b.dtype().bits / 8)) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
++  RuntimeCheck(host::is_type<fp8_e4m3_t>(mat_a.dtype()), "mat_a must be Float8_e4m3fn");
++  RuntimeCheck(host::is_type<fp8_e4m3_t>(mat_b.dtype()), "mat_b must be Float8_e4m3fn");
++
++  RuntimeCheck(mat_a.size(0) == scales_a.size(0), "size of scales_a is not matched");
++  RuntimeCheck(mat_a.size(1) / 128 == scales_a.size(1), "size of scales_a is not matched");
++  RuntimeCheck(mat_b.size(0) / 128 == scales_b.size(0), "size of scales_b is not matched");
++  RuntimeCheck(mat_b.size(1) / 128 == scales_b.size(1), "size of scales_b is not matched");
++  RuntimeCheck(host::is_type<float>(scales_a.dtype()), "scales_a must be Float32");
++  RuntimeCheck(host::is_type<float>(scales_b.dtype()), "scales_b must be Float32");
++
++  RuntimeCheck(
++      (out.size(1) * (out.dtype().bits / 8)) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
++
++  const cudaStream_t stream = LaunchKernel::resolve_device(mat_a.device());
++
++  if (host::is_type<bf16_t>(out.dtype())) {
++    sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, stream);
++  } else if (host::is_type<fp16_t>(out.dtype())) {
++    sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, stream);
++  } else {
++    Panic("out_dtype must be Half or BFloat16");
++  }
++}
++
++#endif  // defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+diff --git a/python/sglang/jit_kernel/fp8_blockwise_gemm.py b/python/sglang/jit_kernel/fp8_blockwise_gemm.py
+new file mode 100644
+index 000000000000..49b4c9606e25
+--- /dev/null
++++ b/python/sglang/jit_kernel/fp8_blockwise_gemm.py
+@@ -0,0 +1,93 @@
++from __future__ import annotations
++
++from contextlib import contextmanager
++from typing import TYPE_CHECKING
++
++import torch
++
++from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
++from sglang.kernel_api_logging import debug_kernel_api
++from sglang.srt.utils.common import is_sm120_supported
++from sglang.srt.utils.custom_op import register_custom_op
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++
++def _fp8_blockwise_cuda_flags() -> list[str]:
++    return [
++        "-DNDEBUG",
++        "-DCUTE_USE_PACKED_TUPLE=1",
++        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
++        "-DCUTLASS_VERSIONS_GENERATED",
++        "-DCUTLASS_TEST_LEVEL=0",
++        "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
++        "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
++        "--expt-relaxed-constexpr",
++        "--expt-extended-lambda",
++    ]
++
++
++@contextmanager
++def _fp8_blockwise_arch_env():
++    if not is_sm120_supported():
++        raise RuntimeError(
++            "fp8_blockwise_scaled_mm JIT kernel requires SM120 (Blackwell)."
++        )
++    major, minor = torch.cuda.get_device_capability()
++    # sm_*a target (e.g. sm_120a) required, not plain sm_120.
++    with override_jit_cuda_arch(major, minor, suffix="a"):
++        yield
++
++
++@cache_once
++def _jit_fp8_blockwise_module() -> Module:
++    """Compile and cache the SM120 fp8 blockwise GEMM module (handles fp16 + bf16)."""
++    with _fp8_blockwise_arch_env():
++        return load_jit(
++            "fp8_blockwise_scaled_mm",
++            cuda_files=["gemm/fp8_blockwise/fp8_blockwise_scaled_mm_entry.cuh"],
++            cuda_wrappers=[
++                ("fp8_blockwise_scaled_mm", "fp8_blockwise_scaled_mm"),
++            ],
++            extra_dependencies=["cutlass"],
++            extra_cuda_cflags=_fp8_blockwise_cuda_flags(),
++        )
++
++
++@register_custom_op(
++    op_name="fp8_blockwise_scaled_mm",
++    mutates_args=["out"],
++)
++def _fp8_blockwise_scaled_mm_custom_op(
++    out: torch.Tensor,
++    mat_a: torch.Tensor,
++    mat_b: torch.Tensor,
++    scales_a: torch.Tensor,
++    scales_b: torch.Tensor,
++) -> None:
++    module = _jit_fp8_blockwise_module()
++    module.fp8_blockwise_scaled_mm(out, mat_a, mat_b, scales_a, scales_b)
++
++
++@debug_kernel_api
++def fp8_blockwise_scaled_mm(
++    mat_a: torch.Tensor,
++    mat_b: torch.Tensor,
++    scales_a: torch.Tensor,
++    scales_b: torch.Tensor,
++    out_dtype: torch.dtype,
++) -> torch.Tensor:
++    """FP8 e4m3 block-wise scaled matmul on SM120."""
++    assert out_dtype in (
++        torch.float16,
++        torch.bfloat16,
++    ), f"out_dtype must be Half or BFloat16, got {out_dtype}"
++
++    out = torch.empty(
++        (mat_a.shape[0], mat_b.shape[1]),
++        dtype=out_dtype,
++        device=mat_a.device,
++    )
++    _fp8_blockwise_scaled_mm_custom_op(out, mat_a, mat_b, scales_a, scales_b)
++    return out
+diff --git a/python/sglang/jit_kernel/include/sgl_kernel/utils.cuh b/python/sglang/jit_kernel/include/sgl_kernel/utils.cuh
+index bd2d9ab52caa..c5681b933ad9 100644
+--- a/python/sglang/jit_kernel/include/sgl_kernel/utils.cuh
++++ b/python/sglang/jit_kernel/include/sgl_kernel/utils.cuh
+@@ -15,6 +15,7 @@
+ 
+ #pragma once
+ 
++#include <sgl_kernel/ffi.h>
+ #include <sgl_kernel/utils.h>
+ 
+ #include <dlpack/dlpack.h>
+@@ -238,6 +239,21 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
+   return RuntimeDeviceCheck(::cudaGetLastError(), location);
+ }
+ 
++inline int getSMVersion(int device_id) {
++  int sm_major = 0;
++  int sm_minor = 0;
++  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
++  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
++  return sm_major * 10 + sm_minor;
++}
++
++inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
++  if (required_bytes == 0) return {};
++  DLDataType u8 = {kDLUInt, 8, 1};
++  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
++  return ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
++}
++
+ /**
+  * \brief Kernel launcher with automatic stream resolution and PDL support.
+  *
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 31cffa226579..accdd4a4a747 100755
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -158,8 +158,9 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
+ 
+ 
+ if _is_cuda:
+-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
++    from sgl_kernel import fp8_scaled_mm
+ 
++    from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+     from sglang.srt.utils.patch_torch import register_fake_if_exists
+ 
+     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
+@@ -169,13 +170,6 @@ def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=No
+         N = mat_b.shape[-1]
+         return mat_a.new_empty((M, N), dtype=out_dtype)
+ 
+-    @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")
+-    def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
+-        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
+-        M = mat_a.shape[-2]
+-        N = mat_b.shape[-1]
+-        return mat_a.new_empty((M, N), dtype=out_dtype)
+-
+ 
+ use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
+ 
+@@ -274,11 +268,6 @@ def is_aiter(self) -> bool:
+ FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
+ 
+ 
+-def _check_cutlass_block_fp8_hardware_support() -> bool:
+-    """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
+-    return is_sm90_supported() or is_blackwell_supported()
+-
+-
+ if is_blackwell_supported() and is_flashinfer_available():
+     from flashinfer import SfLayout
+     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
+@@ -541,11 +530,10 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
+         return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
+ 
+     elif backend.is_cutlass():
+-        if not _check_cutlass_block_fp8_hardware_support():
++        if not is_sm120_supported():
+             raise RuntimeError(
+-                "CUTLASS block FP8 requested via --fp8-gemm-backend=cutlass, "
+-                "but hardware does not support it. CUTLASS block FP8 requires "
+-                "Hopper (SM90+) GPUs with CUDA 12.0+."
++                "--fp8-gemm-backend=cutlass is deprecated on this hardware. "
++                "Please switch to DeepGEMM or FlashInfer TRTLLM on SM90/SM100."
+             )
+         return cutlass_w8a8_block_fp8_linear_with_fallback
+ 
+@@ -579,7 +567,7 @@ def _dispatch_auto_backend() -> Callable:
+     # Priority order for auto selection:
+     # 1. DeepGEMM (if enabled and available)
+     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
+-    # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
++    # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
+     # 4. AITER (if AMD GPU with AITER enabled)
+     # 5. Triton (fallback)
+ 
+@@ -587,7 +575,7 @@ def _dispatch_auto_backend() -> Callable:
+         return deepgemm_w8a8_block_fp8_linear_with_fallback
+     elif is_blackwell_supported() and is_flashinfer_available():
+         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+-    elif _check_cutlass_block_fp8_hardware_support():
++    elif is_sm120_supported():
+         return cutlass_w8a8_block_fp8_linear_with_fallback
+     elif _use_aiter:
+         return aiter_w8a8_block_fp8_linear
+@@ -601,8 +589,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+ 
+     backend = server_args.fp8_gemm_runner_backend
+     if backend == "auto" and is_sm120_supported():
+-        # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
+-        backend = "triton"
++        backend = "cutlass"
+ 
+     backend = Fp8GemmRunnerBackend(backend)
+ 
+diff --git a/scripts/ci/cuda/warmup_deep_gemm.py b/scripts/ci/cuda/warmup_deep_gemm.py
+index 58b7c752c22b..270c2e0bd23b 100644
+--- a/scripts/ci/cuda/warmup_deep_gemm.py
++++ b/scripts/ci/cuda/warmup_deep_gemm.py
+@@ -115,7 +115,7 @@ def compute_deepseek_v2v3_shapes(config, tp):
+     Shape derivation based on:
+     - MoE: python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+     - MLA: python/sglang/srt/models/deepseek_v2.py
+-    - FP8: python/sglang/srt/layers/quantization/fp8_kernel.py
++    - FP8: python/sglang/kernels/ops/quantization/fp8_kernel.py
+     """
+     shapes = []
+ 
+diff --git a/sgl-kernel/CMakeLists.txt b/sgl-kernel/CMakeLists.txt
+index 3c3a9f41641e..dc9b4ca27f6e 100644
+--- a/sgl-kernel/CMakeLists.txt
++++ b/sgl-kernel/CMakeLists.txt
+@@ -265,7 +265,6 @@ set(SOURCES
+     "csrc/gemm/awq_kernel.cu"
+     "csrc/gemm/bmm_fp8.cu"
+     "csrc/gemm/dsv3_fused_a_gemm.cu"
+-    "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
+     "csrc/gemm/fp8_gemm_kernel.cu"
+     "csrc/gemm/int8_gemm_kernel.cu"
+     "csrc/gemm/per_token_group_quant_8bit.cu"
+diff --git a/sgl-kernel/benchmark/bench_fp8_blockwise_gemm.py b/sgl-kernel/benchmark/bench_fp8_blockwise_gemm.py
+deleted file mode 100644
+index f05687261890..000000000000
+--- a/sgl-kernel/benchmark/bench_fp8_blockwise_gemm.py
++++ /dev/null
+@@ -1,237 +0,0 @@
+-import argparse
+-import copy
+-import itertools
+-import os
+-
+-import deep_gemm
+-import torch
+-import triton
+-from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
+-from sgl_kernel import fp8_blockwise_scaled_mm
+-
+-from sglang.utils import is_in_ci
+-
+-# Optional vLLM import
+-try:
+-    from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
+-
+-    VLLM_AVAILABLE = True
+-except ImportError:
+-    vllm_scaled_mm = None
+-    VLLM_AVAILABLE = False
+-
+-from sglang.kernels.ops.quantization.fp8_kernel import (
+-    w8a8_block_fp8_matmul_triton as w8a8_block_fp8_matmul,
+-)
+-
+-IS_CI = is_in_ci()
+-
+-
+-def get_weight_shapes(args):
+-    models_tps = list(itertools.product(args.models, args.tp_sizes))
+-    # NOTE(HandH1998): The weight shapes only works for DeepSeek-V3. Modify them, if you tune for another different model.
+-    # cannot TP
+-    total = [
+-        (512 + 64, 7168),
+-        ((128 + 64) * 128, 7168),
+-        (128 * (128 + 128), 512),
+-        (7168, 16384),
+-        (7168, 18432),
+-    ]
+-    # N can TP
+-    n_tp = [
+-        (18432 * 2, 7168),
+-        ((128 + 64) * 128, 7168),
+-        (128 * (128 + 128), 512),
+-        (24576, 1536),
+-        (4096, 7168),
+-    ]
+-    # K can TP
+-    k_tp = [(7168, 18432), (7168, 16384), (7168, 2048)]
+-    # only support Deepseek-V3
+-    SUPPORT_MODEL = ["deepseek-ai/DeepSeek-V3"]
+-
+-    weight_shapes = []
+-    for model, tp_size in models_tps:
+-        assert model in SUPPORT_MODEL
+-        for t in total:
+-            new_t = [t[0], t[1], model]
+-            weight_shapes.append(new_t)
+-        for n_t in n_tp:
+-            new_t = [n_t[0] // tp_size, n_t[1], model]
+-            weight_shapes.append(new_t)
+-        for k_t in k_tp:
+-            new_t = [k_t[0], k_t[1] // tp_size, model]
+-            weight_shapes.append(new_t)
+-    return weight_shapes
+-
+-
+-def cdiv(a: int, b: int) -> int:
+-    """Ceiling division."""
+-    return -(a // -b)
+-
+-
+-def fp8_gemm_deepgemm(
+-    x_fp8: torch.Tensor,
+-    x_scale: torch.Tensor,
+-    y_fp8: torch.Tensor,
+-    y_scale: torch.Tensor,
+-    m: int,
+-    n: int,
+-    k: int,
+-):
+-    """DeepGEMM implementation of FP8 GEMM"""
+-    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+-
+-    # Run DeepGEMM kernel
+-    deep_gemm.fp8_gemm_nt((x_fp8, x_scale), (y_fp8, y_scale), out)
+-    return out
+-
+-
+-def scale_shape(shape, group_shape):
+-    assert len(shape) == len(group_shape)
+-    return tuple(cdiv(shape[i], group_shape[i]) for i in range(len(group_shape)))
+-
+-
+-# CI environment uses simplified parameters
+-if IS_CI:
+-    batch_sizes = [1, 8]  # Simplified for CI
+-else:
+-    batch_sizes = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+-
+-# Filter providers based on availability
+-available_providers = ["sgl-kernel"]
+-available_names = ["sgl-kernel"]
+-available_styles = [("orange", "-")]
+-
+-if VLLM_AVAILABLE:
+-    available_providers.insert(0, "vllm")
+-    available_names.insert(0, "vllm")
+-    available_styles.insert(0, ("blue", "-"))
+-
+-available_providers.append("triton")
+-available_names.append("sglang triton")
+-available_styles.append(("red", "-"))
+-
+-# Add deepgemm if available
+-try:
+-    import deep_gemm
+-
+-    available_providers.append("deepgemm")
+-    available_names.append("deepgemm")
+-    available_styles.append(("yellow", "-"))
+-except ImportError:
+-    pass
+-
+-
+-@triton.testing.perf_report(
+-    triton.testing.Benchmark(
+-        x_names=["batch_size"],
+-        x_vals=batch_sizes,
+-        x_log=False,
+-        line_arg="provider",
+-        line_vals=available_providers,
+-        line_names=available_names,
+-        styles=available_styles,
+-        ylabel="GB/s",
+-        plot_name="fp8 blockwise scaled matmul",
+-        args={},
+-    )
+-)
+-def benchmark(batch_size, provider, N, K):
+-    M = batch_size
+-    fp8_info = torch.finfo(torch.float8_e4m3fn)
+-    fp8_max, fp8_min = fp8_info.max, fp8_info.min
+-
+-    a_fp32 = (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
+-    a_fp8 = a_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+-
+-    b_fp32 = (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
+-    b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+-
+-    scale_a_group_shape = (1, 128)
+-    scale_b_group_shape = (128, 128)
+-    scale_a_shape = scale_shape(a_fp8.shape, scale_a_group_shape)
+-    scale_b_shape = scale_shape(b_fp8.shape, scale_b_group_shape)
+-
+-    scale_a = torch.randn(scale_a_shape, device="cuda", dtype=torch.float32)
+-    scale_b = torch.randn(scale_b_shape, device="cuda", dtype=torch.float32)
+-
+-    quantiles = [0.5, 0.2, 0.8]
+-    if provider == "sgl-kernel":
+-        scale_a = scale_a.t().contiguous().t()
+-        b_fp8, scale_b = b_fp8.t(), scale_b.t()
+-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+-            lambda: fp8_blockwise_scaled_mm(
+-                a_fp8, b_fp8, scale_a, scale_b, torch.float16
+-            ),
+-            quantiles=quantiles,
+-        )
+-    elif provider == "vllm":
+-        if not VLLM_AVAILABLE:
+-            return (0, 0, 0)
+-        scale_a = scale_a.t().contiguous().t()
+-        b_fp8, scale_b = b_fp8.t(), scale_b.t()
+-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+-            lambda: vllm_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, torch.float16),
+-            quantiles=quantiles,
+-        )
+-    elif provider == "triton":
+-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+-            lambda: w8a8_block_fp8_matmul(
+-                a_fp8, b_fp8, scale_a, scale_b, [128, 128], torch.float16
+-            ),
+-            quantiles=quantiles,
+-        )
+-    if provider == "deepgemm":
+-        scale_a_col_major = get_mn_major_tma_aligned_tensor(scale_a.clone())
+-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+-            lambda: fp8_gemm_deepgemm(
+-                a_fp8, scale_a_col_major, b_fp8, scale_b, M, N, K
+-            ),
+-            quantiles=quantiles,
+-        )
+-    return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
+-
+-
+-if __name__ == "__main__":
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument(
+-        "--models",
+-        nargs="+",
+-        type=str,
+-        default=["deepseek-ai/DeepSeek-V3"],
+-        help="List of models to benchmark",
+-    )
+-    parser.add_argument(
+-        "--tp-sizes",
+-        nargs="+",
+-        type=int,
+-        default=[1],
+-        help="List of tensor parallel sizes",
+-    )
+-    args = parser.parse_args()
+-
+-    # Simplify for CI environment
+-    if IS_CI:
+-        args.models = [args.models[0]]  # Use only first model
+-        args.tp_sizes = [args.tp_sizes[0]]  # Use only first TP size
+-
+-    NK_model_names = get_weight_shapes(args)
+-
+-    # Limit iterations in CI
+-    if IS_CI:
+-        NK_model_names = NK_model_names[:2]  # Only test first 2 shapes in CI
+-
+-    for N, K, model_name in NK_model_names:
+-        if N % 128 != 0 or K % 128 != 0:
+-            print(f"Skip {N=}, {K=} now")
+-            continue
+-        print(f"{model_name} N={N} K={K}: ")
+-        benchmark.run(
+-            print_data=True,
+-            N=N,
+-            K=K,
+-        )
+-
+-    print("Benchmark finished!")
+diff --git a/sgl-kernel/csrc/common_extension.cc b/sgl-kernel/csrc/common_extension.cc
+index 45d3dfe27b55..134aaf453b1d 100644
+--- a/sgl-kernel/csrc/common_extension.cc
++++ b/sgl-kernel/csrc/common_extension.cc
+@@ -123,11 +123,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+       "bias) -> Tensor");
+   m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
+ 
+-  m.def(
+-      "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype) -> "
+-      "Tensor");
+-  m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
+-
+   m.def(
+       "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
+       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
+diff --git a/sgl-kernel/csrc/cutlass_extensions/gemm/fp8_blockwise_gemm_sm90_dispatch.cuh b/sgl-kernel/csrc/cutlass_extensions/gemm/fp8_blockwise_gemm_sm90_dispatch.cuh
+deleted file mode 100644
+index 05b70c4f26f2..000000000000
+--- a/sgl-kernel/csrc/cutlass_extensions/gemm/fp8_blockwise_gemm_sm90_dispatch.cuh
++++ /dev/null
+@@ -1,197 +0,0 @@
+-// Adapted from
+-// https://github.com/vllm-project/vllm/blob/main/csrc/quantization/cutlass_w8a8/c3x/scaled_mm_blockwise_sm90_fp8_dispatch.cuh
+-#pragma once
+-
+-#include "cute/tensor.hpp"
+-#include "cutlass/cutlass.h"
+-#include "cutlass/epilogue/collective/collective_builder.hpp"
+-#include "cutlass/epilogue/dispatch_policy.hpp"
+-#include "cutlass/gemm/collective/collective_builder.hpp"
+-#include "cutlass/gemm/device/gemm_universal_adapter.h"
+-#include "cutlass/gemm/dispatch_policy.hpp"
+-#include "cutlass/gemm/kernel/gemm_universal.hpp"
+-#include "cutlass/gemm/kernel/tile_scheduler_params.h"
+-#include "cutlass/numeric_types.h"
+-#include "cutlass/tensor_ref.h"
+-#include "cutlass_extensions/common.hpp"
+-#include "cutlass_extensions/gemm/cutlass_gemm_caller.cuh"
+-#include "cutlass_extensions/gemm/dispatch_policy.hpp"
+-
+-using namespace cute;
+-
+-template <
+-    typename SchedulerType,
+-    typename OutType,
+-    int GroupSizeM_,
+-    int GroupSizeN_,
+-    int GroupSizeK_,
+-    int TileSizeM_ = 128,
+-    class ClusterShape = Shape<_1, _2, _1>>
+-struct cutlass_3x_gemm_fp8_blockwise {
+-  using GroupSizeM = Int<GroupSizeM_>;
+-  using GroupSizeN = Int<GroupSizeN_>;
+-  using GroupSizeK = Int<GroupSizeK_>;
+-  using TileSizeM = Int<TileSizeM_>;
+-
+-  static_assert(TileSizeM_ % GroupSizeM_ == 0, "TileSizeM must be a multiple of GroupSizeM");
+-
+-  using ElementAB = cutlass::float_e4m3_t;
+-
+-  // A matrix configuration
+-  using ElementA = ElementAB;
+-  using LayoutA = cutlass::layout::RowMajor;
+-  static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+-
+-  // B matrix configuration
+-  using ElementB = ElementAB;
+-  using LayoutB = cutlass::layout::ColumnMajor;
+-  static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+-
+-  // C/D matrix configuration
+-  using ElementC = void;
+-  using LayoutC = cutlass::layout::RowMajor;
+-  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutType>::value;
+-
+-  using ElementD = OutType;
+-  using LayoutD = cutlass::layout::RowMajor;
+-  static constexpr int AlignmentD = AlignmentC;
+-
+-  using ScaleTileShape = Shape<_1, _128, _128>;
+-  using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_config(ScaleTileShape{}));
+-  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+-  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+-
+-  // Multiply-accumulate blocking/pipelining details
+-  using ElementAccumulator = float;                            // Element type for internal accumulation
+-  using ElementCompute = float;                                // Element type for compute
+-  using TileShape = Shape<TileSizeM, GroupSizeN, GroupSizeK>;  // Threadblock-level tile size
+-
+-  using ArchTag = cutlass::arch::Sm90;
+-  using OperatorClass = cutlass::arch::OpClassTensorOp;
+-  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+-  using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
+-  using StoreEpilogueCompute = typename cutlass::epilogue::fusion::Sm90EVT<cutlass::epilogue::fusion::Sm90AccFetch>;
+-
+-  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise;
+-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+-      ArchTag,
+-      OperatorClass,
+-      TileShape,
+-      ClusterShape,
+-      EpilogueTileType,
+-      ElementAccumulator,
+-      ElementCompute,
+-      ElementC,
+-      LayoutC,
+-      AlignmentC,
+-      ElementD,
+-      LayoutD,
+-      AlignmentD,
+-      EpilogueSchedule,
+-      StoreEpilogueCompute>::CollectiveOp;
+-
+-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+-      ArchTag,
+-      OperatorClass,
+-      ElementA,
+-      cute::tuple<LayoutA, LayoutSFA>,
+-      AlignmentA,
+-      ElementB,
+-      cute::tuple<LayoutB, LayoutSFB>,
+-      AlignmentB,
+-      ElementAccumulator,
+-      TileShape,
+-      ClusterShape,
+-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+-          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+-      KernelSchedule>::CollectiveOp;
+-
+-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+-      Shape<int, int, int, int>,  // Indicates ProblemShape
+-      CollectiveMainloop,
+-      CollectiveEpilogue,
+-      SchedulerType>;
+-};
+-
+-template <typename Gemm>
+-void cutlass_gemm_caller_blockwise(
+-    torch::Tensor& out,
+-    torch::Tensor const& a,
+-    torch::Tensor const& b,
+-    torch::Tensor const& a_scales,
+-    torch::Tensor const& b_scales) {
+-  using GemmKernel = typename Gemm::GemmKernel;
+-  using ElementAB = typename Gemm::ElementAB;
+-  using ElementA = ElementAB;
+-  using ElementB = ElementAB;
+-  using ElementD = typename Gemm::ElementD;
+-  using ElementBlockScale = float;
+-
+-  using ScaleTileShape = Shape<_1, _128, _128>;
+-  using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_config(ScaleTileShape{}));
+-  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+-  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+-
+-  int m = a.size(0);
+-  int k = a.size(1);
+-  int n = b.size(1);
+-
+-  auto a_ptr = static_cast<ElementA*>(a.data_ptr());
+-  auto b_ptr = static_cast<ElementB*>(b.data_ptr());
+-
+-  auto a_s_ptr = static_cast<ElementBlockScale*>(a_scales.data_ptr());
+-  auto b_s_ptr = static_cast<ElementBlockScale*>(b_scales.data_ptr());
+-
+-  using StrideA = typename GemmKernel::StrideA;
+-  using StrideB = typename GemmKernel::StrideB;
+-  using StrideD = typename GemmKernel::StrideD;
+-  using StrideC = typename GemmKernel::StrideC;
+-
+-  StrideA a_stride = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+-  StrideB b_stride = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+-  StrideC c_stride = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, 1));
+-  LayoutSFA layout_sfa = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+-  LayoutSFB layout_sfb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+-
+-  typename GemmKernel::MainloopArguments mainloop_args{
+-      a_ptr, a_stride, b_ptr, b_stride, a_s_ptr, layout_sfa, b_s_ptr, layout_sfb};
+-  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+-  typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, c_stride, c_ptr, c_stride};
+-
+-  typename GemmKernel::TileSchedulerArguments scheduler;
+-
+-  static constexpr bool UsesStreamKScheduler =
+-      cute::is_same_v<typename GemmKernel::TileSchedulerTag, cutlass::gemm::StreamKScheduler>;
+-
+-  if constexpr (UsesStreamKScheduler) {
+-    using DecompositionMode =
+-        typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams::DecompositionMode;
+-    using ReductionMode =
+-        typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams::ReductionMode;
+-
+-    scheduler.decomposition_mode = DecompositionMode::StreamK;
+-    scheduler.reduction_mode = ReductionMode::Nondeterministic;
+-  }
+-
+-  cutlass_gemm_caller<GemmKernel>(a.device(), {m, n, k, 1}, mainloop_args, epilogue_args, scheduler);
+-}
+-
+-template <typename OutType>
+-void cutlass_gemm_blockwise_sm90_fp8_dispatch(
+-    torch::Tensor& out,
+-    torch::Tensor const& a,
+-    torch::Tensor const& b,
+-    torch::Tensor const& a_scales,
+-    torch::Tensor const& b_scales) {
+-  auto k = a.size(1);
+-  auto n = b.size(1);
+-
+-  if (k > 3 * n) {
+-    cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::StreamKScheduler, OutType, 1, 128, 128>>(
+-        out, a, b, a_scales, b_scales);
+-  } else {
+-    cutlass_gemm_caller_blockwise<
+-        cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::PersistentScheduler, OutType, 1, 128, 128>>(
+-        out, a, b, a_scales, b_scales);
+-  }
+-}
+diff --git a/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu b/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu
+deleted file mode 100644
+index cc094de51a60..000000000000
+--- a/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu
++++ /dev/null
+@@ -1,522 +0,0 @@
+-#include <ATen/cuda/CUDAContext.h>
+-#include <cudaTypedefs.h>
+-#include <cutlass/arch/arch.h>
+-#include <cutlass/arch/memory.h>
+-#include <cutlass/arch/mma.h>
+-#include <cutlass/array.h>
+-#include <cutlass/cutlass.h>
+-#include <cutlass/epilogue/thread/activation.h>
+-#include <cutlass/epilogue/thread/linear_combination.h>
+-#include <cutlass/epilogue/threadblock/default_thread_map_tensor_op.h>
+-#include <cutlass/gemm/device/gemm.h>
+-#include <cutlass/gemm/device/gemm_universal_adapter.h>
+-#include <cutlass/gemm/gemm.h>
+-#include <cutlass/gemm/kernel/default_gemm_universal_with_visitor.h>
+-#include <cutlass/gemm/thread/mma.h>
+-#include <cutlass/layout/matrix.h>
+-#include <cutlass/matrix_coord.h>
+-#include <cutlass/numeric_types.h>
+-#include <cutlass/tensor_ref.h>
+-#include <cutlass/util/host_tensor.h>
+-#include <cutlass/util/tensor_view_io.h>
+-#include <torch/all.h>
+-
+-#include <cute/tensor.hpp>
+-#include <cutlass/epilogue/collective/collective_builder.hpp>
+-#include <cutlass/epilogue/collective/default_epilogue.hpp>
+-#include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
+-#include <cutlass/gemm/collective/collective_builder.hpp>
+-#include <cutlass/gemm/dispatch_policy.hpp>
+-#include <cutlass/gemm/kernel/gemm_universal.hpp>
+-#include <cutlass/util/packed_stride.hpp>
+-
+-#include "cutlass_extensions/gemm/cutlass_gemm_caller.cuh"
+-#include "cutlass_extensions/gemm/fp8_blockwise_gemm_sm90_dispatch.cuh"
+-#include "utils.h"
+-
+-using namespace cute;
+-
+-template <
+-    typename OutType,
+-    typename MmaTileShape,
+-    typename PerSmTileShape,
+-    typename EpilogueTileShape,
+-    typename ScalesPerTile,
+-    int TileSizeM_ = 128,
+-    class ClusterShape = Shape<_1, _1, _1>>
+-void launch_sm100_fp8_blockwise_scaled_mm(
+-    torch::Tensor& out,
+-    const torch::Tensor& a,
+-    const torch::Tensor& b,
+-    const torch::Tensor& scales_a,
+-    const torch::Tensor& scales_b) {
+-  static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
+-  static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
+-  static constexpr int ScaleGranularityN = size<1>(MmaTileShape{}) / size<1>(ScalesPerTile{});
+-  static constexpr int ScaleGranularityK = size<2>(MmaTileShape{}) / size<2>(ScalesPerTile{});
+-
+-  using ElementAB = cutlass::float_e4m3_t;
+-  using ElementA = ElementAB;
+-  using ElementB = ElementAB;
+-  using ElementC = void;
+-  using ElementD = OutType;
+-  using LayoutA = cutlass::layout::RowMajor;
+-  using LayoutB = cutlass::layout::ColumnMajor;
+-  using LayoutD = cutlass::layout::RowMajor;
+-  using LayoutC = LayoutD;
+-  // This means both SFA and SFB are column-major.
+-  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
+-      ScaleGranularityM,
+-      ScaleGranularityN,
+-      ScaleGranularityK,
+-      cute::UMMA::Major::MN,
+-      cute::UMMA::Major::K>;
+-  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+-  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+-
+-  static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+-  static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+-  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+-  static constexpr int AlignmentC = AlignmentD;
+-
+-  using ElementAccumulator = float;
+-  using ElementBlockScale = float;
+-  using ElementCompute = float;
+-  using ArchTag = cutlass::arch::Sm100;
+-  using OperatorClass = cutlass::arch::OpClassTensorOp;
+-
+-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+-      ArchTag,
+-      cutlass::arch::OpClassTensorOp,
+-      PerSmTileShape,
+-      ClusterShape,
+-      EpilogueTileShape,
+-      ElementAccumulator,
+-      ElementCompute,
+-      ElementC,
+-      LayoutC,
+-      AlignmentC,
+-      ElementD,
+-      LayoutD,
+-      AlignmentD,
+-      cutlass::epilogue::TmaWarpSpecialized1Sm>::CollectiveOp;
+-
+-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+-      ArchTag,
+-      OperatorClass,
+-      ElementA,
+-      cute::tuple<LayoutA, LayoutSFA>,
+-      AlignmentA,
+-      ElementB,
+-      cute::tuple<LayoutB, LayoutSFB>,
+-      AlignmentB,
+-      ElementAccumulator,
+-      MmaTileShape,
+-      ClusterShape,
+-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+-          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+-      cutlass::gemm::KernelTmaWarpSpecializedBlockwise1SmSm100>::CollectiveOp;
+-
+-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+-      Shape<int, int, int, int>,
+-      CollectiveMainloop,
+-      CollectiveEpilogue,
+-      cutlass::gemm::PersistentScheduler>;
+-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+-
+-  Gemm gemm_op;
+-
+-  int m = a.size(0);
+-  int k = a.size(1);
+-  int n = b.size(1);
+-
+-  auto a_ptr = static_cast<ElementAB*>(a.data_ptr());
+-  auto b_ptr = static_cast<ElementAB*>(b.data_ptr());
+-  auto scales_a_ptr = static_cast<float*>(scales_a.data_ptr());
+-  auto scales_b_ptr = static_cast<float*>(scales_b.data_ptr());
+-  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+-
+-  using StrideA = typename GemmKernel::StrideA;
+-  using StrideB = typename GemmKernel::StrideB;
+-  using StrideD = typename GemmKernel::StrideD;
+-  using StrideC = typename GemmKernel::StrideD;
+-
+-  StrideA a_stride = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+-  StrideB b_stride = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+-  StrideC c_stride = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, 1));
+-  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+-  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+-
+-  typename GemmKernel::MainloopArguments mainloop_args{
+-      a_ptr, a_stride, b_ptr, b_stride, scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB};
+-
+-  typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, c_stride, c_ptr, c_stride};
+-  epilogue_args.thread.alpha = 1.0f;
+-
+-  typename GemmKernel::Arguments args = {
+-      cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1}, mainloop_args, epilogue_args};
+-
+-  auto can_implement = gemm_op.can_implement(args);
+-  TORCH_CHECK(can_implement == cutlass::Status::kSuccess, cutlassGetStatusString(can_implement))
+-
+-  size_t workspace_size = gemm_op.get_workspace_size(args);
+-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+-
+-  auto init_status = gemm_op.initialize(args, workspace.get());
+-  TORCH_CHECK(init_status == cutlass::Status::kSuccess, cutlassGetStatusString(init_status));
+-
+-  auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+-
+-  auto status = gemm_op.run(stream);
+-  TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status))
+-}
+-
+-template <typename OutType>
+-void sm100_fp8_blockwise_dispatch_shape(
+-    torch::Tensor& out,
+-    const torch::Tensor& a,
+-    const torch::Tensor& b,
+-    const torch::Tensor& scales_a,
+-    const torch::Tensor& scales_b) {
+-  if (a.size(0) <= 128) {
+-    using MmaTileShape = Shape<_64, _128, _128>;
+-    using PerSmTileShape = Shape<_64, _128, _128>;
+-    using EpilogueTileShape = Shape<_64, _64>;
+-    using ScalesPerTile = Shape<_64, _1, _1>;
+-    launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
+-        out, a, b, scales_a, scales_b);
+-  } else {
+-    using MmaTileShape = Shape<_128, _128, _128>;
+-    using PerSmTileShape = Shape<_128, _128, _128>;
+-    using EpilogueTileShape = Shape<_128, _64>;
+-    using ScalesPerTile = Shape<_128, _1, _1>;
+-    launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
+-        out, a, b, scales_a, scales_b);
+-  }
+-}
+-
+-template <
+-    typename OutType,
+-    typename MmaTileShape,
+-    typename PerSmTileShape,
+-    typename EpilogueTileShape,
+-    typename ScalesPerTile,
+-    int TileSizeM_ = 128,
+-    class ClusterShape = Shape<_1, _1, _1>>
+-void launch_sm120_fp8_blockwise_scaled_mm(
+-    torch::Tensor& out,
+-    const torch::Tensor& a,
+-    const torch::Tensor& b,
+-    const torch::Tensor& scales_a,
+-    const torch::Tensor& scales_b) {
+-  using ElementBlockScale = float;
+-
+-  // A matrix configuration
+-  using ElementA = cutlass::float_e4m3_t;        // Element type for A matrix operand
+-  using LayoutATag = cutlass::layout::RowMajor;  // Layout type for A matrix operand
+-  constexpr int AlignmentA =
+-      128 / cutlass::sizeof_bits<ElementA>::value;  // Memory access granularity/alignment of A matrix in units of
+-                                                    // elements (up to 16 bytes)
+-
+-  // B matrix configuration
+-  using ElementB = cutlass::float_e4m3_t;           // Element type for B matrix operand
+-  using LayoutBTag = cutlass::layout::ColumnMajor;  // Layout type for B matrix operand
+-  constexpr int AlignmentB =
+-      128 / cutlass::sizeof_bits<ElementB>::value;  // Memory access granularity/alignment of B matrix in units of
+-                                                    // elements (up to 16 bytes)
+-
+-  // C/D matrix configuration
+-  using ElementD = OutType;                      // Element type for D matrix operand
+-  using ElementC = void;                         // Element type for C matrix operand
+-  using LayoutCTag = cutlass::layout::RowMajor;  // Layout type for C matrix operand
+-  using LayoutDTag = cutlass::layout::RowMajor;  // Layout type for D matrix operand
+-  constexpr int AlignmentD =
+-      128 / cutlass::sizeof_bits<ElementD>::value;  // Memory access granularity/alignment of C matrix in units of
+-                                                    // elements (up to 16 bytes)
+-  constexpr int AlignmentC =
+-      AlignmentD;  // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
+-
+-  // Kernel functional config
+-  using ElementAccumulator = float;      // Element type for internal accumulation
+-  using ArchTag = cutlass::arch::Sm120;  // Tag indicating the minimum SM that supports the intended feature
+-  using OperatorClass = cutlass::arch::OpClassTensorOp;  // Operator class tag - changed from OpClassBlockScaledTensorOp
+-
+-  static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
+-  static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
+-  static constexpr int ScaleGranularityN = size<1>(MmaTileShape{}) / size<1>(ScalesPerTile{});
+-  static constexpr int ScaleGranularityK = size<2>(MmaTileShape{}) / size<2>(ScalesPerTile{});
+-
+-  using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<
+-      ScaleGranularityM,
+-      ScaleGranularityN,
+-      ScaleGranularityK,
+-      cute::UMMA::Major::MN,
+-      cute::UMMA::Major::K>;
+-  // FP8 Block-wise scaling configuration
+-  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());  // Layout type for SFA matrix operand
+-  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());  // Layout type for SFB matrix operand
+-
+-  constexpr bool kCanUsePingpong = (64 % ScaleGranularityM == 0);
+-
+-  int m = a.size(0);
+-  int k = a.size(1);
+-  int n = b.size(1);
+-
+-  auto a_ptr = static_cast<ElementA*>(a.data_ptr());
+-  auto b_ptr = static_cast<ElementB*>(b.data_ptr());
+-  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+-
+-  auto scales_a_ptr = static_cast<ElementBlockScale*>(scales_a.data_ptr());
+-  auto scales_b_ptr = static_cast<ElementBlockScale*>(scales_b.data_ptr());
+-
+-  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+-  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+-
+-  auto run_gemm = [&](auto tag) -> cutlass::Status {
+-    using GemmKernel = decltype(tag);
+-    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+-    Gemm gemm_op;
+-
+-    using StrideA = typename GemmKernel::StrideA;
+-    using StrideB = typename GemmKernel::StrideB;
+-    using StrideC = typename GemmKernel::StrideD;
+-
+-    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+-    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+-    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, 1));
+-
+-    typename GemmKernel::MainloopArguments mainloop_args{
+-        a_ptr, stride_a, b_ptr, stride_b, scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB};
+-
+-    typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, stride_c, c_ptr, stride_c};
+-    epilogue_args.thread.alpha = 1.0f;
+-
+-    typename Gemm::Arguments args = {
+-        cutlass::gemm::GemmUniversalMode::kGemm,
+-        {m, n, k, 1},
+-        mainloop_args,
+-        epilogue_args,
+-    };
+-
+-    auto can_implement = gemm_op.can_implement(args);
+-    if (can_implement != cutlass::Status::kSuccess) {
+-      return can_implement;
+-    }
+-
+-    size_t workspace_size = gemm_op.get_workspace_size(args);
+-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+-
+-    auto init_status = gemm_op.initialize(args, workspace.get());
+-    if (init_status != cutlass::Status::kSuccess) {
+-      return init_status;
+-    }
+-
+-    auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+-    return gemm_op.run(stream);
+-  };
+-
+-  using CooperativeCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+-      ArchTag,
+-      OperatorClass,
+-      PerSmTileShape,
+-      ClusterShape,
+-      cutlass::epilogue::collective::EpilogueTileAuto,
+-      ElementAccumulator,
+-      ElementAccumulator,
+-      ElementC,
+-      LayoutCTag,
+-      AlignmentC,
+-      ElementD,
+-      LayoutDTag,
+-      AlignmentD,
+-      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+-
+-  using CooperativeStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+-      sizeof(typename CooperativeCollectiveEpilogue::SharedStorage))>;
+-
+-  using CooperativeCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+-      ArchTag,
+-      OperatorClass,
+-      ElementA,
+-      cute::tuple<LayoutATag, LayoutSFA>,
+-      AlignmentA,
+-      ElementB,
+-      cute::tuple<LayoutBTag, LayoutSFB>,
+-      AlignmentB,
+-      ElementAccumulator,
+-      MmaTileShape,
+-      ClusterShape,
+-      CooperativeStageCount,
+-      cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
+-
+-  using CooperativeGemmKernel = cutlass::gemm::kernel::
+-      GemmUniversal<Shape<int, int, int, int>, CooperativeCollectiveMainloop, CooperativeCollectiveEpilogue, void>;
+-
+-  cutlass::Status status = cutlass::Status::kSuccess;
+-  if constexpr (kCanUsePingpong) {
+-    using PingpongMmaTileShape_MNK = Shape<_64, _128, _128>;
+-    using PingpongCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+-        ArchTag,
+-        OperatorClass,
+-        PerSmTileShape,
+-        ClusterShape,
+-        cutlass::epilogue::collective::EpilogueTileAuto,
+-        ElementAccumulator,
+-        ElementAccumulator,
+-        ElementC,
+-        LayoutCTag,
+-        AlignmentC,
+-        ElementD,
+-        LayoutDTag,
+-        AlignmentD,
+-        cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+-
+-    using PingpongStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+-        sizeof(typename PingpongCollectiveEpilogue::SharedStorage))>;
+-
+-    using PingpongCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+-        ArchTag,
+-        OperatorClass,
+-        ElementA,
+-        cute::tuple<LayoutATag, LayoutSFA>,
+-        AlignmentA,
+-        ElementB,
+-        cute::tuple<LayoutBTag, LayoutSFB>,
+-        AlignmentB,
+-        ElementAccumulator,
+-        PingpongMmaTileShape_MNK,
+-        ClusterShape,
+-        PingpongStageCount,
+-        cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120>::CollectiveOp;
+-
+-    using PingpongGemmKernel = cutlass::gemm::kernel::
+-        GemmUniversal<Shape<int, int, int, int>, PingpongCollectiveMainloop, PingpongCollectiveEpilogue, void>;
+-
+-    if (m <= 64) {
+-      status = run_gemm(PingpongGemmKernel{});
+-      if (status != cutlass::Status::kSuccess) {
+-        status = run_gemm(CooperativeGemmKernel{});
+-      }
+-    } else {
+-      status = run_gemm(CooperativeGemmKernel{});
+-    }
+-  } else {
+-    status = run_gemm(CooperativeGemmKernel{});
+-  }
+-
+-  TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status));
+-}
+-
+-template <typename OutType>
+-void sm120_fp8_blockwise_dispatch_shape(
+-    torch::Tensor& out,
+-    const torch::Tensor& a,
+-    const torch::Tensor& b,
+-    const torch::Tensor& scales_a,
+-    const torch::Tensor& scales_b) {
+-  using MmaTileShape = Shape<_128, _128, _128>;
+-  using PerSmTileShape = Shape<_128, _128, _128>;
+-  using EpilogueTileShape = Shape<_128, _64>;
+-  using ScalesPerTile = Shape<_128, _1, _1>;
+-  launch_sm120_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
+-      out, a, b, scales_a, scales_b);
+-}
+-
+-torch::Tensor fp8_blockwise_scaled_mm(
+-    const torch::Tensor& mat_a,
+-    const torch::Tensor& mat_b,
+-    const torch::Tensor& scales_a,
+-    const torch::Tensor& scales_b,
+-    const torch::Dtype& out_dtype) {
+-  TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
+-  TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
+-  TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
+-  TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
+-  TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
+-  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
+-  TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
+-
+-  TORCH_CHECK(
+-      (mat_a.size(1) * mat_a.element_size()) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
+-  TORCH_CHECK(
+-      (mat_b.size(0) * mat_b.element_size()) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
+-  TORCH_CHECK(mat_a.scalar_type() == torch::kFloat8_e4m3fn, "mat_a must be Float8_e4m3fn");
+-  TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
+-  TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
+-
+-  auto is_contiguous_vector = [](const torch::Tensor& t) {
+-    auto t_sizes = t.sizes();
+-    return t.is_contiguous() &&
+-           (t.dim() == 1 || (t.dim() == 2 && *std::min_element(t_sizes.begin(), t_sizes.end()) == 1));
+-  };
+-
+-  TORCH_CHECK(mat_a.size(0) == scales_a.size(0), "size of scales_a is not matched");
+-  TORCH_CHECK(mat_a.size(1) / 128 == scales_a.size(1), "size of scales_a is not matched");
+-  TORCH_CHECK(scales_a.stride(0) == 1 || is_contiguous_vector(scales_a), "scales_a must be M major");
+-  TORCH_CHECK(mat_b.size(0) / 128 == scales_b.size(0), "size of scales_b is not matched");
+-  TORCH_CHECK(mat_b.size(1) / 128 == scales_b.size(1), "size of scales_b is not matched");
+-  TORCH_CHECK(scales_b.stride(0) == 1 || is_contiguous_vector(scales_b), "scales_b must be K major");
+-  TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
+-  TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
+-
+-  torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
+-  TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
+-
+-  auto sm_version = getSMVersion();
+-
+-  int64_t original_rows = mat_a.size(0);
+-  torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
+-  torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
+-  torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
+-
+-#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
+-#if defined CUDA_VERSION && CUDA_VERSION >= 12000
+-  if (sm_version == 90) {
+-    torch::Tensor scales_b_contiguous = scales_b.contiguous();
+-    if (out_dtype == torch::kBFloat16) {
+-      cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::bfloat16_t>(
+-          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
+-    } else {
+-      cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::half_t>(
+-          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
+-    }
+-    return out_padded.slice(0, 0, original_rows);
+-  }
+-#endif
+-#endif
+-
+-#if defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+-#if defined CUDA_VERSION && CUDA_VERSION >= 12080
+-  if (sm_version == 100
+-#if CUDA_VERSION >= 12090
+-      || sm_version == 103
+-#endif
+-  ) {
+-    if (out_dtype == torch::kBFloat16) {
+-      sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
+-          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+-    } else {
+-      sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+-    }
+-    return out_padded.slice(0, 0, original_rows);
+-  }
+-#endif
+-#endif
+-
+-#if defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
+-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+-  if (sm_version >= 120) {
+-    if (out_dtype == torch::kBFloat16) {
+-      sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
+-          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+-    } else {
+-      sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+-    }
+-    return out_padded.slice(0, 0, original_rows);
+-  }
+-#endif
+-#endif
+-
+-  TORCH_CHECK_NOT_IMPLEMENTED(
+-      false, "No implemented fp8_blockwise_scaled_mm for current compute capability: ", sm_version);
+-}
+diff --git a/sgl-kernel/include/sgl_kernel_ops.h b/sgl-kernel/include/sgl_kernel_ops.h
+index 9a92f38bf6bb..3f9cda5029ee 100644
+--- a/sgl-kernel/include/sgl_kernel_ops.h
++++ b/sgl-kernel/include/sgl_kernel_ops.h
+@@ -235,12 +235,6 @@ torch::Tensor fp8_scaled_mm(
+     const torch::Tensor& scales_b,
+     const torch::Dtype& out_dtype,
+     const c10::optional<torch::Tensor>& bias);
+-torch::Tensor fp8_blockwise_scaled_mm(
+-    const torch::Tensor& mat_a,
+-    const torch::Tensor& mat_b,
+-    const torch::Tensor& scales_a,
+-    const torch::Tensor& scales_b,
+-    const torch::Dtype& out_dtype);
+ void sgl_per_token_group_quant_8bit(
+     at::Tensor input,
+     at::Tensor output_q,
+diff --git a/sgl-kernel/python/sgl_kernel/__init__.py b/sgl-kernel/python/sgl_kernel/__init__.py
+index 199c1f92264d..21f5eb90f487 100644
+--- a/sgl-kernel/python/sgl_kernel/__init__.py
++++ b/sgl-kernel/python/sgl_kernel/__init__.py
+@@ -57,7 +57,6 @@
+         awq_dequantize,
+         bmm_fp8,
+         dsv3_fused_a_gemm,
+-        fp8_blockwise_scaled_mm,
+         fp8_scaled_mm,
+         gptq_gemm,
+         gptq_shuffle,
+@@ -178,7 +177,6 @@
+         "fast_topk_transform_ragged_fused",
+         "fast_topk_v2",
+         "fp8_blockwise_scaled_grouped_mm",
+-        "fp8_blockwise_scaled_mm",
+         "fp8_scaled_mm",
+         "fused_add_rmsnorm",
+         "fused_qk_norm_rope",
+diff --git a/sgl-kernel/python/sgl_kernel/gemm.py b/sgl-kernel/python/sgl_kernel/gemm.py
+index 1d68cdf94943..56d88ae14d99 100644
+--- a/sgl-kernel/python/sgl_kernel/gemm.py
++++ b/sgl-kernel/python/sgl_kernel/gemm.py
+@@ -21,16 +21,6 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+     )
+ 
+ 
+-def fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype):
+-    return torch.ops.sgl_kernel.fp8_blockwise_scaled_mm.default(
+-        mat_a,
+-        mat_b,
+-        scales_a,
+-        scales_b,
+-        out_dtype,
+-    )
+-
+-
+ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+     return torch.ops.sgl_kernel.fp8_scaled_mm.default(
+         mat_a,
+diff --git a/test/registered/jit/benchmark/bench_fp8_blockwise_gemm.py b/test/registered/jit/benchmark/bench_fp8_blockwise_gemm.py
+new file mode 100644
+index 000000000000..dcab974f154a
+--- /dev/null
++++ b/test/registered/jit/benchmark/bench_fp8_blockwise_gemm.py
+@@ -0,0 +1,103 @@
++from __future__ import annotations
++
++import sys
++
++import torch
++import triton
++
++from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
++from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
++from sglang.srt.utils import is_sm120_supported
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(
++    est_time=5,
++    stage="base-b-kernel-benchmark",
++    runner_config="1-gpu-large",
++)
++
++
++def _make_inputs(m: int, n: int, k: int, device: str = "cuda"):
++    fp8_info = torch.finfo(torch.float8_e4m3fn)
++    fp8_max, fp8_min = fp8_info.max, fp8_info.min
++    a_fp32 = (torch.rand(m, k, dtype=torch.float32, device=device) - 0.5) * 2 * fp8_max
++    a_fp8 = a_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
++    b_fp32 = (torch.rand(n, k, dtype=torch.float32, device=device) - 0.5) * 2 * fp8_max
++    b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn).t()
++
++    scale_a = torch.randn((m, k // 128), device=device, dtype=torch.float32) * 0.001
++    scale_b = (
++        torch.randn((k // 128, n // 128), device=device, dtype=torch.float32) * 0.001
++    )
++    scale_a = scale_a.t().contiguous().t()
++    scale_b = scale_b.t().contiguous().t()
++    return a_fp8, b_fp8, scale_a, scale_b
++
++
++def _torch_ref(a_fp8, b_fp8, scale_a, scale_b):
++    def group_broadcast(t, shape):
++        for i, s in enumerate(shape):
++            if t.shape[i] != s and t.shape[i] != 1:
++                assert s % t.shape[i] == 0
++                t = (
++                    t.unsqueeze(i + 1)
++                    .expand(*t.shape[: i + 1], s // t.shape[i], *t.shape[i + 1 :])
++                    .flatten(i, i + 1)
++                )
++        return t
++
++    sa = group_broadcast(scale_a, a_fp8.shape)
++    sb = group_broadcast(scale_b, b_fp8.shape)
++    return torch.mm(sa * a_fp8.to(torch.float32), sb * b_fp8.to(torch.float32)).to(
++        torch.bfloat16
++    )
++
++
++shape_range = get_benchmark_range(
++    full_range=[
++        (16, 4096, 4096),  # swapAB tile N=32
++        (64, 4096, 4096),  # swapAB tile N=64
++        (128, 4096, 4096),  # non-swap 128
++        (512, 4096, 4096),
++        (1024, 8192, 4096),
++    ],
++    ci_range=[(16, 4096, 4096), (128, 4096, 4096)],
++)
++
++
++@triton.testing.perf_report(
++    triton.testing.Benchmark(
++        x_names=["m", "n", "k"],
++        x_vals=shape_range,
++        x_log=False,
++        line_arg="provider",
++        line_vals=["jit", "torch_ref"],
++        line_names=["JIT FP8 Blockwise GEMM", "Torch Ref"],
++        styles=[("green", "-"), ("blue", "-")],
++        ylabel="us",
++        plot_name="fp8-blockwise-scaled-mm-performance",
++        args={},
++    )
++)
++def benchmark(m, n, k, provider):
++    a_fp8, b_fp8, scale_a, scale_b = _make_inputs(m, n, k)
++
++    if provider == "jit":
++        fn = lambda: fp8_blockwise_scaled_mm(
++            a_fp8, b_fp8, scale_a, scale_b, out_dtype=torch.bfloat16
++        )
++    elif provider == "torch_ref":
++        fn = lambda: _torch_ref(a_fp8, b_fp8, scale_a, scale_b)
++    else:
++        raise ValueError(f"Unknown provider: {provider}")
++
++    return run_benchmark(fn)
++
++
++if __name__ == "__main__":
++    if not is_sm120_supported():
++        print(
++            "[skip] fp8_blockwise_scaled_mm benchmark requires SM120 with CUDA 12.8+."
++        )
++        sys.exit(0)
++    benchmark.run(print_data=True)
+diff --git a/sgl-kernel/tests/test_fp8_blockwise_gemm.py b/test/registered/jit/test_fp8_blockwise_gemm.py
+similarity index 69%
+rename from sgl-kernel/tests/test_fp8_blockwise_gemm.py
+rename to test/registered/jit/test_fp8_blockwise_gemm.py
+index a4438de4afc4..5d097b9d28d3 100644
+--- a/sgl-kernel/tests/test_fp8_blockwise_gemm.py
++++ b/test/registered/jit/test_fp8_blockwise_gemm.py
+@@ -1,11 +1,18 @@
+-import os
+-import random
+ import sys
+ from typing import Optional, Type
+ 
+ import pytest
+ import torch
+-from sgl_kernel import fp8_blockwise_scaled_mm
++
++from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
++from sglang.srt.utils import is_sm120_supported
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(
++    est_time=30,
++    stage="base-b",
++    runner_config="1-gpu-small",
++)
+ 
+ 
+ def cdiv(a: int, b: int) -> int:
+@@ -25,20 +32,6 @@ def baseline_scaled_mm(
+     out_dtype: Type[torch.dtype],
+     bias: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+-    # We treat N-dimensional group scaling as extended numpy-style broadcasting
+-    # in numpy simply stretches dimensions with an extent of 1 to match the
+-    # the target shape by repeating the data along that dimension (broadcasting)
+-    # , we extend these semantics to say if the extent of a dimension in the
+-    # source shape is not 1 and does not match the target shape we repeat each
+-    # element along that dimension src_shape[dim] // target_shape[dim] times
+-    # example if we have:
+-    #       a = [[1, 2], and target_shape = (2, 4)
+-    #            [3, 4]]
+-    # then we would expand a to:
+-    #       a = [[1, 1, 2, 2],
+-    #            [3, 3, 4, 4]]
+-    # NOTE this function this function does not explicitly broadcast dimensions
+-    # with an extent of 1, since this can be done implicitly by pytorch
+     def group_broadcast(t, shape):
+         for i, s in enumerate(shape):
+             if t.shape[i] != s and t.shape[i] != 1:
+@@ -82,13 +75,16 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
+     torch.testing.assert_close(o, o1, rtol=rtol, atol=atol)
+ 
+ 
+-@pytest.mark.parametrize("M", [1, 3, 5, 127, 128, 512, 1024, 4096])
+-@pytest.mark.parametrize("N", [128, 512, 1024, 4096, 8192, 14080])
+-@pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 14080, 16384])
++@pytest.mark.skipif(
++    not is_sm120_supported(), reason="fp8_blockwise_scaled_mm requires SM120 (>= 12.0)"
++)
++@pytest.mark.parametrize("M", [1, 3, 5, 32, 48, 64, 127, 128, 512, 1024, 4096])
++@pytest.mark.parametrize("N", [128, 512, 1024, 4096, 8192])
++@pytest.mark.parametrize("K", [512, 1024, 4096, 8192])
+ @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+ def test_accuracy(M, N, K, out_dtype):
+     _test_accuracy_once(M, N, K, out_dtype, "cuda")
+ 
+ 
+ if __name__ == "__main__":
+-    sys.exit(pytest.main([__file__]))
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/test/registered/quant/test_fp8_blockwise_row_padding.py b/test/registered/quant/test_fp8_blockwise_row_padding.py
+deleted file mode 100644
+index 43b49b5ecc09..000000000000
+--- a/test/registered/quant/test_fp8_blockwise_row_padding.py
++++ /dev/null
+@@ -1,136 +0,0 @@
+-"""Unit tests for the row-padded quant path of the cutlass FP8 blockwise linear.
+-
+-`cutlass_w8a8_block_fp8_linear_with_fallback` quantizes activations into
+-row-aligned buffers (`sglang_per_token_group_quant_fp8_row_padded`) so the
+-`fp8_blockwise_scaled_mm` wrapper's per-call mat_a/scales_a padding short-
+-circuits. These tests pin the invariant that this is numerically identical to
+-the legacy unpadded path, across both row-aligned and unaligned M.
+-"""
+-
+-import unittest
+-
+-import torch
+-
+-from sglang.kernels.ops.quantization.fp8_kernel import (
+-    fp8_dtype,
+-    per_token_group_quant_fp8,
+-    sglang_per_token_group_quant_fp8_row_padded,
+-)
+-from sglang.srt.layers.quantization.fp8_utils import (
+-    _check_cutlass_block_fp8_hardware_support,
+-    cutlass_w8a8_block_fp8_linear_with_fallback,
+-)
+-from sglang.test.ci.ci_register import register_cuda_ci
+-from sglang.test.test_utils import CustomTestCase
+-
+-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+-
+-_FP8_MAX = torch.finfo(fp8_dtype).max
+-_BLOCK = 128
+-# Cover M == 1 (greedy decode), small unaligned M (speculative draft tokens),
+-# the 4-row alignment boundary, and a large aligned batch.
+-_M_VALUES = [1, 2, 3, 4, 5, 7, 13, 16, 31, 64, 256]
+-
+-
+-def _quant_weight_blockwise(weight_bf16: torch.Tensor, block: int = _BLOCK):
+-    """Block-quantize a (N, K) bf16 weight to fp8 with (N//block, K//block) fp32 scales."""
+-    n, k = weight_bf16.shape
+-    assert n % block == 0 and k % block == 0
+-    w = weight_bf16.float().reshape(n // block, block, k // block, block)
+-    amax = w.abs().amax(dim=(1, 3)).clamp(min=1e-12)  # (N//block, K//block)
+-    scale = amax / _FP8_MAX
+-    wq = (w / scale[:, None, :, None]).clamp(-_FP8_MAX, _FP8_MAX).to(fp8_dtype)
+-    return wq.reshape(n, k), scale.to(torch.float32)
+-
+-
+-def _legacy_cutlass_linear(x_2d, weight, weight_scale):
+-    """The pre-optimization path: unpadded quant, wrapper pads internally."""
+-    from sgl_kernel import fp8_blockwise_scaled_mm
+-
+-    q_input, x_scale = per_token_group_quant_fp8(x_2d, _BLOCK, column_major_scales=True)
+-    return fp8_blockwise_scaled_mm(
+-        q_input, weight.T, x_scale, weight_scale.T, out_dtype=x_2d.dtype
+-    )
+-
+-
+-@unittest.skipUnless(
+-    _check_cutlass_block_fp8_hardware_support(),
+-    "cutlass block FP8 requires Hopper (SM90) or newer",
+-)
+-class TestFP8BlockwiseRowPadding(CustomTestCase):
+-    @classmethod
+-    def setUpClass(cls):
+-        cls.K = 512
+-        cls.N = 256
+-        torch.manual_seed(0)
+-
+-    def test_quant_buffers_row_aligned(self):
+-        """Row-padded quant returns 4-aligned, M-major buffers whose live rows
+-        match the legacy column-major quant bit-for-bit."""
+-        for m in _M_VALUES:
+-            x = torch.randn(m, self.K, device="cuda", dtype=torch.bfloat16) * 0.1
+-            xq, xs = sglang_per_token_group_quant_fp8_row_padded(x, _BLOCK)
+-            m_pad = (m + 3) // 4 * 4
+-
+-            self.assertEqual(xq.shape, (m_pad, self.K), f"M={m}")
+-            self.assertEqual(xs.shape[0], m_pad, f"M={m}")
+-            # scales_a must stay M-major (stride(0) == 1) for the kernel contract.
+-            self.assertEqual(xs.stride(0), 1, f"M={m}")
+-
+-            xq_ref, xs_ref = per_token_group_quant_fp8(
+-                x, _BLOCK, column_major_scales=True
+-            )
+-            self.assertEqual(xq_ref.shape, (m, self.K), f"M={m}")
+-            # Live rows are produced by the same kernel, so they must be identical.
+-            self.assertTrue(
+-                torch.equal(xq[:m].view(torch.uint8), xq_ref.view(torch.uint8)),
+-                f"quantized activation mismatch at M={m}",
+-            )
+-            torch.testing.assert_close(xs[:m], xs_ref, atol=0.0, rtol=0.0)
+-
+-    def test_gemm_bit_exact_vs_legacy(self):
+-        """The full linear (row-padded) is bit-identical to the legacy unpadded GEMM."""
+-        weight_bf16 = (
+-            torch.randn(self.N, self.K, device="cuda", dtype=torch.bfloat16) * 0.1
+-        )
+-        weight, weight_scale = _quant_weight_blockwise(weight_bf16)
+-
+-        for m in _M_VALUES:
+-            x = torch.randn(m, self.K, device="cuda", dtype=torch.bfloat16) * 0.1
+-
+-            out_ref = _legacy_cutlass_linear(x, weight, weight_scale)
+-            out_new = cutlass_w8a8_block_fp8_linear_with_fallback(
+-                input=x,
+-                weight=weight,
+-                block_size=[_BLOCK, _BLOCK],
+-                weight_scale=weight_scale,
+-            )
+-
+-            self.assertEqual(out_new.shape, (m, self.N), f"M={m}")
+-            self.assertTrue(
+-                torch.equal(out_ref, out_new),
+-                f"row-padded GEMM differs from legacy at M={m}: "
+-                f"max_abs_diff={(out_ref.float() - out_new.float()).abs().max().item()}",
+-            )
+-
+-    def test_linear_matches_bf16_reference(self):
+-        """Sanity: the FP8 linear stays close to a bf16 reference matmul."""
+-        weight_bf16 = (
+-            torch.randn(self.N, self.K, device="cuda", dtype=torch.bfloat16) * 0.1
+-        )
+-        weight, weight_scale = _quant_weight_blockwise(weight_bf16)
+-
+-        for m in [1, 5, 64]:
+-            x = torch.randn(m, self.K, device="cuda", dtype=torch.bfloat16) * 0.1
+-            ref = (x.float() @ weight_bf16.float().T).to(torch.bfloat16)
+-            out = cutlass_w8a8_block_fp8_linear_with_fallback(
+-                input=x,
+-                weight=weight,
+-                block_size=[_BLOCK, _BLOCK],
+-                weight_scale=weight_scale,
+-            )
+-            torch.testing.assert_close(out, ref, atol=0.5, rtol=0.1)
+-
+-
+-if __name__ == "__main__":
+-    unittest.main()

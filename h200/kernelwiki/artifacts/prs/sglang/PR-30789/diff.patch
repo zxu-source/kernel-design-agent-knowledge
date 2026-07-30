@@ -1,0 +1,780 @@
+diff --git a/python/sglang/kernels/ops/attention/__init__.py b/python/sglang/kernels/ops/attention/__init__.py
+index 7e46e7803920..5d10a066207c 100644
+--- a/python/sglang/kernels/ops/attention/__init__.py
++++ b/python/sglang/kernels/ops/attention/__init__.py
+@@ -43,6 +43,26 @@
+ __all__ = []
+ 
+ 
++# Generic attention kernels migrated in Phase 2.5 (RFC #29630).
++for _mod, _fn in [
++    ("utils", "mla_quantize_and_rope_for_fp8"),
++    ("utils", "launch_reshape_and_cache_flash"),
++    ("utils", "launch_reshape_and_cache_shuffle_5d"),
++    ("flash_mla_sm120", "flash_mla_with_kvcache_sm120"),
++    ("dcp_kernels", "create_dcp_kv_indices"),
++    ("dcp_kernels", "correct_attn_out"),
++    ("pa_page_table", "_build_pa_page_table"),
++    ("nsa_triton_decode", "triton_sparse_attn_decode"),
++]:
++    register_kernel(
++        KernelSpec(
++            op=f"attention.{_fn.lstrip('_')}",
++            backend=KernelBackend.TRITON,
++            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
++        )
++    )
++del _mod, _fn
++
+ # RoPE / QK-norm fusion kernels migrated from srt/layers top-level strays
+ # (RFC #29630, Phase 2.5); registered for inventory.
+ for _mod, _fn in [
+diff --git a/python/sglang/srt/layers/dcp/kernels.py b/python/sglang/kernels/ops/attention/dcp_kernels.py
+similarity index 100%
+rename from python/sglang/srt/layers/dcp/kernels.py
+rename to python/sglang/kernels/ops/attention/dcp_kernels.py
+diff --git a/python/sglang/srt/layers/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+similarity index 99%
+rename from python/sglang/srt/layers/attention/flash_mla_sm120.py
+rename to python/sglang/kernels/ops/attention/flash_mla_sm120.py
+index 12c74f10552b..5bca1372ab24 100644
+--- a/python/sglang/srt/layers/attention/flash_mla_sm120.py
++++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+@@ -235,7 +235,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
+         )
+ 
+     if _sm120_default_backend == "triton":
+-        from sglang.srt.layers.attention.flash_mla_sm120_triton import (
++        from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
+             flash_mla_sparse_decode_triton,
+         )
+ 
+diff --git a/python/sglang/srt/layers/attention/flash_mla_sm120_triton.py b/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
+similarity index 100%
+rename from python/sglang/srt/layers/attention/flash_mla_sm120_triton.py
+rename to python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
+diff --git a/python/sglang/srt/layers/attention/nsa/triton_decode/__init__.py b/python/sglang/kernels/ops/attention/nsa_triton_decode/__init__.py
+similarity index 96%
+rename from python/sglang/srt/layers/attention/nsa/triton_decode/__init__.py
+rename to python/sglang/kernels/ops/attention/nsa_triton_decode/__init__.py
+index 7762b8bd2cd0..f3e8bfc39d0f 100644
+--- a/python/sglang/srt/layers/attention/nsa/triton_decode/__init__.py
++++ b/python/sglang/kernels/ops/attention/nsa_triton_decode/__init__.py
+@@ -9,7 +9,7 @@
+ 
+ import torch
+ 
+-from sglang.srt.layers.attention.nsa.triton_decode.triton_mla_kernels_decode_optimized import (
++from sglang.kernels.ops.attention.nsa_triton_decode.triton_mla_kernels_decode_optimized import (
+     triton_sparse_attn_decode,
+ )
+ 
+diff --git a/python/sglang/srt/layers/attention/nsa/triton_decode/triton_mla_kernels_decode_fused.py b/python/sglang/kernels/ops/attention/nsa_triton_decode/triton_mla_kernels_decode_fused.py
+similarity index 100%
+rename from python/sglang/srt/layers/attention/nsa/triton_decode/triton_mla_kernels_decode_fused.py
+rename to python/sglang/kernels/ops/attention/nsa_triton_decode/triton_mla_kernels_decode_fused.py
+diff --git a/python/sglang/srt/layers/attention/nsa/triton_decode/triton_mla_kernels_decode_optimized.py b/python/sglang/kernels/ops/attention/nsa_triton_decode/triton_mla_kernels_decode_optimized.py
+similarity index 100%
+rename from python/sglang/srt/layers/attention/nsa/triton_decode/triton_mla_kernels_decode_optimized.py
+rename to python/sglang/kernels/ops/attention/nsa_triton_decode/triton_mla_kernels_decode_optimized.py
+diff --git a/python/sglang/kernels/ops/attention/pa_page_table.py b/python/sglang/kernels/ops/attention/pa_page_table.py
+new file mode 100644
+index 000000000000..cb6f0096885a
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/pa_page_table.py
+@@ -0,0 +1,98 @@
++"""Paged-attention page-table builder, migrated from
++``sglang.srt.layers.attention.flashattention_backend`` (RFC #29630, Phase 2.5).
++"""
++
++from typing import Optional
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _build_pa_page_table_kernel(
++    req_to_token_ptr,
++    req_pool_indices_ptr,
++    seq_lens_ptr,
++    prefill_lens_ptr,
++    dst_page_table_ptr,
++    kv_lens_ptr,
++    window_size: tl.constexpr,
++    req_to_token_stride,
++    dst_stride,
++    BLOCK_SIZE: tl.constexpr,
++):
++    """Build PA-SWA page_table directly from req_to_token.
++
++    For each request, dst row = [0..prefill_len) ∪ [decode_start..seq_len).
++    decode_start = max(prefill_len, seq_len - window_size)
++
++    prefill_lens_ptr is the full pool-sized buffer, prefill_len is loaded
++    via indirect indexing using req_idx.
++    """
++    bid = tl.program_id(0)
++    req_idx = tl.load(req_pool_indices_ptr + bid)
++    sl = tl.load(seq_lens_ptr + bid).to(tl.int32)
++    pf = tl.load(prefill_lens_ptr + req_idx).to(tl.int32)
++
++    decode_start = tl.maximum(pf, sl - window_size)
++    gap = tl.where(decode_start > pf, decode_start - pf, 0)
++    kv_len = sl - gap
++
++    tl.store(kv_lens_ptr + bid, kv_len)
++
++    src_base = req_idx * req_to_token_stride
++    dst_base = bid * dst_stride
++
++    for start in tl.range(0, kv_len, BLOCK_SIZE):
++        offs = start + tl.arange(0, BLOCK_SIZE)
++        mask = offs < kv_len
++        pos = tl.where(offs < pf, offs, offs + gap)
++        kv_loc = tl.load(
++            req_to_token_ptr + src_base + pos,
++            mask=mask,
++            other=0,
++        )
++        tl.store(dst_page_table_ptr + dst_base + offs, kv_loc.to(tl.int32), mask=mask)
++
++
++def _build_pa_page_table(
++    req_to_token: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    seq_lens: torch.Tensor,
++    prefill_lens: torch.Tensor,
++    window_size: int,
++    bs: int,
++    pa_max_len: int,
++    device: torch.device,
++    dst_page_table: Optional[torch.Tensor] = None,
++    dst_kv_lens: Optional[torch.Tensor] = None,
++):
++    """Build prefill-aware page_table from req_to_token.
++
++    When dst_page_table/dst_kv_lens are None, allocates new tensors (non-CUDA-graph).
++    When provided, writes in-place into existing buffers (CUDA-graph replay).
++
++    prefill_lens is the full pool-sized buffer; the kernel indexes it via
++    req_pool_indices values (indirect indexing, avoids external gather).
++
++    Returns (page_table, kv_lens).
++    """
++    if dst_page_table is None:
++        dst_page_table = torch.zeros(bs, pa_max_len, dtype=torch.int32, device=device)
++    if dst_kv_lens is None:
++        dst_kv_lens = torch.empty(bs, dtype=torch.int32, device=device)
++    if bs > 0 and pa_max_len > 0:
++        _build_pa_page_table_kernel[(bs,)](
++            req_to_token,
++            req_pool_indices.contiguous(),
++            seq_lens.to(torch.int32),
++            prefill_lens,
++            dst_page_table,
++            dst_kv_lens,
++            window_size,
++            req_to_token.stride(0),
++            dst_page_table.stride(0),
++            BLOCK_SIZE=256,
++        )
++    return dst_page_table, dst_kv_lens
+diff --git a/python/sglang/srt/layers/attention/utils.py b/python/sglang/kernels/ops/attention/utils.py
+similarity index 100%
+rename from python/sglang/srt/layers/attention/utils.py
+rename to python/sglang/kernels/ops/attention/utils.py
+diff --git a/python/sglang/srt/layers/attention/aiter_backend.py b/python/sglang/srt/layers/attention/aiter_backend.py
+index 047e1849c7eb..60ef9392359d 100755
+--- a/python/sglang/srt/layers/attention/aiter_backend.py
++++ b/python/sglang/srt/layers/attention/aiter_backend.py
+@@ -14,17 +14,17 @@
+ import torch
+ import triton
+ 
+-from sglang.kernels.ops.kvcache.aiter_unified_attention import (
+-    scatter_ragged_to_page_table_kernel,
+-    scatter_req_to_token_to_page_table_kernel,
+-)
+-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+-from sglang.srt.layers.attention.utils import (
++from sglang.kernels.ops.attention.utils import (
+     assert_buffer_fits,
+     create_flashinfer_kv_indices_triton,
+     create_flashmla_kv_indices_triton,
+     get_num_kv_index_blocks_flashmla,
+ )
++from sglang.kernels.ops.kvcache.aiter_unified_attention import (
++    scatter_ragged_to_page_table_kernel,
++    scatter_req_to_token_to_page_table_kernel,
++)
++from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.dp_attention import (
+     is_dp_attention_enabled,
+ )
+@@ -60,16 +60,16 @@
+         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+     )
+ 
++from sglang.kernels.ops.attention.utils import (
++    launch_reshape_and_cache_flash,
++    pad_sequence_with_mask,
++)
+ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+ from sglang.srt.configs.model_config import AttentionArch
+ from sglang.srt.layers.attention.aiter_utils import (
+     forward_decode_vectorized_5d,
+     forward_extend_vectorized_5d,
+ )
+-from sglang.srt.layers.attention.utils import (
+-    launch_reshape_and_cache_flash,
+-    pad_sequence_with_mask,
+-)
+ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+ from sglang.srt.utils import get_bool_env_var
+diff --git a/python/sglang/srt/layers/attention/aiter_utils.py b/python/sglang/srt/layers/attention/aiter_utils.py
+index b0af9fa944ef..9d57584cca51 100644
+--- a/python/sglang/srt/layers/attention/aiter_utils.py
++++ b/python/sglang/srt/layers/attention/aiter_utils.py
+@@ -33,8 +33,8 @@
+     pa_decode_gluon = None
+     get_recommended_splits = None
+ 
++from sglang.kernels.ops.attention.utils import launch_gather_shuffle_5d_to_linear
+ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+-from sglang.srt.layers.attention.utils import launch_gather_shuffle_5d_to_linear
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+diff --git a/python/sglang/srt/layers/attention/cutlass_mla_backend.py b/python/sglang/srt/layers/attention/cutlass_mla_backend.py
+index ca156d0e7647..0bd908a8cfe7 100644
+--- a/python/sglang/srt/layers/attention/cutlass_mla_backend.py
++++ b/python/sglang/srt/layers/attention/cutlass_mla_backend.py
+@@ -13,11 +13,11 @@
+ import torch
+ import triton
+ 
+-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+-from sglang.srt.layers.attention.utils import (
++from sglang.kernels.ops.attention.utils import (
+     create_flashmla_kv_indices_triton,
+     get_num_kv_index_blocks_flashmla,
+ )
++from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.utils import is_cuda
+ 
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 316f4268506e..6fc16e4b187b 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -1671,7 +1671,7 @@ def match_num_queries(x, value):
+                 )
+ 
+             if _is_sm120:
+-                from sglang.srt.layers.attention.flash_mla_sm120 import (
++                from sglang.kernels.ops.attention.flash_mla_sm120 import (
+                     flash_mla_with_kvcache_sm120,
+                 )
+ 
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py b/python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py
+index ce26ff518daf..e4b90b7efee2 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py
+@@ -11,8 +11,8 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.attention.utils import seqlens_expand_triton
+ from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
+-from sglang.srt.layers.attention.utils import seqlens_expand_triton
+ from sglang.srt.utils import is_cuda, is_hip
+ 
+ if TYPE_CHECKING:
+diff --git a/python/sglang/srt/layers/attention/dsa_backend.py b/python/sglang/srt/layers/attention/dsa_backend.py
+index f3e637d6c554..4e2f299ac1f2 100644
+--- a/python/sglang/srt/layers/attention/dsa_backend.py
++++ b/python/sglang/srt/layers/attention/dsa_backend.py
+@@ -18,6 +18,11 @@
+ from sglang.srt.runtime_context import get_parallel
+ 
+ logger = logging.getLogger(__name__)
++from sglang.kernels.ops.attention.utils import (
++    concat_mla_absorb_q_general,
++    mla_quantize_and_rope_for_fp8,
++    seqlens_expand_triton,
++)
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+@@ -46,11 +51,6 @@
+     is_dsa_prefill_cp_in_seq_split,
+     pad_dsa_cache_seqlens,
+ )
+-from sglang.srt.layers.attention.utils import (
+-    concat_mla_absorb_q_general,
+-    mla_quantize_and_rope_for_fp8,
+-    seqlens_expand_triton,
+-)
+ from sglang.srt.layers.utils.cp_utils import (
+     cp_all_gather_rerange_output,
+     cp_split_and_rebuild_position,
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index f5a96bf9b782..71fd8eeb2a0f 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -5,19 +5,18 @@
+ 
+ import numpy as np
+ import torch
+-import triton
+-import triton.language as tl
+ 
+ from sglang.kernels.ops.attention.metadata import (
+     normal_decode_set_metadata,
+     prepare_swa_spec_page_table_triton,
+ )
++from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
++from sglang.kernels.ops.attention.utils import assert_buffer_fits
+ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+     build_trtllm_mha_page_table,
+ )
+ from sglang.srt.configs.model_config import AttentionArch
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+-from sglang.srt.layers.attention.utils import assert_buffer_fits
+ from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+ from sglang.srt.layers.cp.utils import is_cp_v2_active
+ from sglang.srt.layers.radix_attention import AttentionType
+@@ -50,95 +49,6 @@ def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
+     return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
+ 
+ 
+-@triton.jit
+-def _build_pa_page_table_kernel(
+-    req_to_token_ptr,
+-    req_pool_indices_ptr,
+-    seq_lens_ptr,
+-    prefill_lens_ptr,
+-    dst_page_table_ptr,
+-    kv_lens_ptr,
+-    window_size: tl.constexpr,
+-    req_to_token_stride,
+-    dst_stride,
+-    BLOCK_SIZE: tl.constexpr,
+-):
+-    """Build PA-SWA page_table directly from req_to_token.
+-
+-    For each request, dst row = [0..prefill_len) ∪ [decode_start..seq_len).
+-    decode_start = max(prefill_len, seq_len - window_size)
+-
+-    prefill_lens_ptr is the full pool-sized buffer, prefill_len is loaded
+-    via indirect indexing using req_idx.
+-    """
+-    bid = tl.program_id(0)
+-    req_idx = tl.load(req_pool_indices_ptr + bid)
+-    sl = tl.load(seq_lens_ptr + bid).to(tl.int32)
+-    pf = tl.load(prefill_lens_ptr + req_idx).to(tl.int32)
+-
+-    decode_start = tl.maximum(pf, sl - window_size)
+-    gap = tl.where(decode_start > pf, decode_start - pf, 0)
+-    kv_len = sl - gap
+-
+-    tl.store(kv_lens_ptr + bid, kv_len)
+-
+-    src_base = req_idx * req_to_token_stride
+-    dst_base = bid * dst_stride
+-
+-    for start in tl.range(0, kv_len, BLOCK_SIZE):
+-        offs = start + tl.arange(0, BLOCK_SIZE)
+-        mask = offs < kv_len
+-        pos = tl.where(offs < pf, offs, offs + gap)
+-        kv_loc = tl.load(
+-            req_to_token_ptr + src_base + pos,
+-            mask=mask,
+-            other=0,
+-        )
+-        tl.store(dst_page_table_ptr + dst_base + offs, kv_loc.to(tl.int32), mask=mask)
+-
+-
+-def _build_pa_page_table(
+-    req_to_token: torch.Tensor,
+-    req_pool_indices: torch.Tensor,
+-    seq_lens: torch.Tensor,
+-    prefill_lens: torch.Tensor,
+-    window_size: int,
+-    bs: int,
+-    pa_max_len: int,
+-    device: torch.device,
+-    dst_page_table: Optional[torch.Tensor] = None,
+-    dst_kv_lens: Optional[torch.Tensor] = None,
+-):
+-    """Build prefill-aware page_table from req_to_token.
+-
+-    When dst_page_table/dst_kv_lens are None, allocates new tensors (non-CUDA-graph).
+-    When provided, writes in-place into existing buffers (CUDA-graph replay).
+-
+-    prefill_lens is the full pool-sized buffer; the kernel indexes it via
+-    req_pool_indices values (indirect indexing, avoids external gather).
+-
+-    Returns (page_table, kv_lens).
+-    """
+-    if dst_page_table is None:
+-        dst_page_table = torch.zeros(bs, pa_max_len, dtype=torch.int32, device=device)
+-    if dst_kv_lens is None:
+-        dst_kv_lens = torch.empty(bs, dtype=torch.int32, device=device)
+-    if bs > 0 and pa_max_len > 0:
+-        _build_pa_page_table_kernel[(bs,)](
+-            req_to_token,
+-            req_pool_indices.contiguous(),
+-            seq_lens.to(torch.int32),
+-            prefill_lens,
+-            dst_page_table,
+-            dst_kv_lens,
+-            window_size,
+-            req_to_token.stride(0),
+-            dst_page_table.stride(0),
+-            BLOCK_SIZE=256,
+-        )
+-    return dst_page_table, dst_kv_lens
+-
+-
+ @dataclass
+ class FlashAttentionMetadata:
+     """Metadata to be init once in the model forward pass,
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index a55f7f5e75e0..97b288ac39db 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -19,13 +19,13 @@
+ import torch
+ 
+ from sglang.kernel_api_logging import debug_kernel_api
+-from sglang.srt.dllm.config import DllmConfig
+-from sglang.srt.environ import envs
+-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+-from sglang.srt.layers.attention.utils import (
++from sglang.kernels.ops.attention.utils import (
+     assert_buffer_fits,
+     create_flashinfer_kv_indices_triton,
+ )
++from sglang.srt.dllm.config import DllmConfig
++from sglang.srt.environ import envs
++from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.radix_attention import AttentionType
+ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+diff --git a/python/sglang/srt/layers/attention/flashinfer_mla_backend.py b/python/sglang/srt/layers/attention/flashinfer_mla_backend.py
+index ce57f3567e6a..0d68b303c7e9 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_mla_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_mla_backend.py
+@@ -17,12 +17,12 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.attention.utils import assert_buffer_fits
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.flashinfer_backend import (
+     create_flashinfer_kv_indices_triton,
+ )
+-from sglang.srt.layers.attention.utils import assert_buffer_fits
+ from sglang.srt.layers.dcp import (
+     DecodeContextParallelMetadata,
+     update_local_kv_lens_for_dcp,
+diff --git a/python/sglang/srt/layers/attention/flashmla_backend.py b/python/sglang/srt/layers/attention/flashmla_backend.py
+index 484f06a25bb7..19e420d2a6d1 100644
+--- a/python/sglang/srt/layers/attention/flashmla_backend.py
++++ b/python/sglang/srt/layers/attention/flashmla_backend.py
+@@ -12,12 +12,12 @@
+ import triton
+ from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+ 
+-from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+-from sglang.srt.layers.attention.utils import (
++from sglang.kernels.ops.attention.utils import (
+     create_flashmla_kv_indices_triton,
+     get_num_kv_index_blocks_flashmla,
+ )
++from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
++from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+ from sglang.srt.runtime_context import get_parallel
+ 
+diff --git a/python/sglang/srt/layers/attention/hip_flash_mla.py b/python/sglang/srt/layers/attention/hip_flash_mla.py
+index d771926cca1d..7643d190e062 100644
+--- a/python/sglang/srt/layers/attention/hip_flash_mla.py
++++ b/python/sglang/srt/layers/attention/hip_flash_mla.py
+@@ -38,7 +38,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
+         return dpsk_v4_fp8_attention_fwd(**kwargs)
+ 
+     if backend == "triton":
+-        from sglang.srt.layers.attention.nsa.triton_decode import (
++        from sglang.kernels.ops.attention.nsa_triton_decode import (
+             triton_fp8_attention_fwd,
+         )
+ 
+diff --git a/python/sglang/srt/layers/attention/trtllm_mha_backend.py b/python/sglang/srt/layers/attention/trtllm_mha_backend.py
+index b08a748f4883..c3e3346b1302 100644
+--- a/python/sglang/srt/layers/attention/trtllm_mha_backend.py
++++ b/python/sglang/srt/layers/attention/trtllm_mha_backend.py
+@@ -11,6 +11,7 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.attention.utils import canonicalize_stride
+ from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
+     fused_fp8_set_kv_buffer,
+ )
+@@ -27,7 +28,6 @@
+     FlashInferAttnBackend,
+     FlashInferMultiStepDraftBackend,
+ )
+-from sglang.srt.layers.attention.utils import canonicalize_stride
+ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+diff --git a/python/sglang/srt/layers/attention/trtllm_mla_backend.py b/python/sglang/srt/layers/attention/trtllm_mla_backend.py
+index 49f072591bfb..aeec6d1e4ae5 100755
+--- a/python/sglang/srt/layers/attention/trtllm_mla_backend.py
++++ b/python/sglang/srt/layers/attention/trtllm_mla_backend.py
+@@ -19,6 +19,10 @@
+ from sglang.kernels.ops.attention.pad import (
+     unpad_draft_extend_output as unpad_draft_extend_output_triton,
+ )
++from sglang.kernels.ops.attention.utils import (
++    concat_mla_absorb_q_general,
++    mla_quantize_and_rope_for_fp8,
++)
+ from sglang.kernels.ops.kvcache.kv_indices import (
+     create_flashmla_kv_indices_triton,
+     get_num_kv_index_blocks_flashmla,
+@@ -30,10 +34,6 @@
+     FlashInferMLAAttnBackend,
+     FlashInferMLAMultiStepDraftBackend,
+ )
+-from sglang.srt.layers.attention.utils import (
+-    concat_mla_absorb_q_general,
+-    mla_quantize_and_rope_for_fp8,
+-)
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+     is_in_tc_piecewise_cuda_graph,
+diff --git a/python/sglang/srt/layers/dcp/__init__.py b/python/sglang/srt/layers/dcp/__init__.py
+index 631026d3263a..eb6aeea65733 100644
+--- a/python/sglang/srt/layers/dcp/__init__.py
++++ b/python/sglang/srt/layers/dcp/__init__.py
+@@ -29,6 +29,9 @@
+ out-of-tree callers; in-tree code should use ``get_parallel().dcp_enabled`` and
+ ``get_parallel().attn_dcp_*``."""
+ 
++from sglang.kernels.ops.attention.dcp_kernels import (
++    create_triton_kv_indices_for_dcp_triton,
++)
+ from sglang.srt.layers.dcp.comm import (
+     all_gather_kv_cache_for_dcp,
+     all_gather_kv_cache_for_mha_chunk_extend,
+@@ -41,7 +44,6 @@
+     get_attention_dcp_rank,
+     get_attention_dcp_world_size,
+ )
+-from sglang.srt.layers.dcp.kernels import create_triton_kv_indices_for_dcp_triton
+ from sglang.srt.layers.dcp.layout import (
+     filter_dcp_local_kv_indices,
+     get_dcp_lens,
+diff --git a/python/sglang/srt/layers/dcp/comm.py b/python/sglang/srt/layers/dcp/comm.py
+index 7ba6e813b5c3..c540eeb204a7 100644
+--- a/python/sglang/srt/layers/dcp/comm.py
++++ b/python/sglang/srt/layers/dcp/comm.py
+@@ -25,11 +25,11 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.attention.dcp_kernels import CPTritonContext, correct_attn_out
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+ )
+ from sglang.srt.distributed.parallel_state import GroupCoordinator
+-from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
+ from sglang.srt.runtime_context import get_parallel
+ 
+ 
+diff --git a/python/sglang/srt/layers/dcp/planner.py b/python/sglang/srt/layers/dcp/planner.py
+index c7ee3748e19b..1a9caba76c1b 100644
+--- a/python/sglang/srt/layers/dcp/planner.py
++++ b/python/sglang/srt/layers/dcp/planner.py
+@@ -20,7 +20,7 @@
+ 
+ import torch
+ 
+-from sglang.srt.layers.dcp.kernels import (
++from sglang.kernels.ops.attention.dcp_kernels import (
+     create_dcp_kv_indices,
+     update_kv_lens_and_indices,
+ )
+diff --git a/python/sglang/srt/layers/rotary_embedding/base.py b/python/sglang/srt/layers/rotary_embedding/base.py
+index 95e5b2e7e85a..72e693b66b77 100644
+--- a/python/sglang/srt/layers/rotary_embedding/base.py
++++ b/python/sglang/srt/layers/rotary_embedding/base.py
+@@ -65,7 +65,7 @@
+         )
+ 
+ if _is_hip:
+-    from sglang.srt.layers.attention.utils import (
++    from sglang.kernels.ops.attention.utils import (
+         fused_qk_rope_reshape_and_cache,
+     )
+ 
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index e863151c3c3e..260376c9a3d5 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -1837,7 +1837,7 @@ def _store_kv_layer(
+         # and viewed as ``store_dtype`` by ``set_kv_buffer``.
+         if self.kv_cache_layout == "vectorized_5d":
+             # Late-import to keep the NHD path import-clean.
+-            from sglang.srt.layers.attention.utils import (
++            from sglang.kernels.ops.attention.utils import (
+                 launch_reshape_and_cache_shuffle_5d,
+             )
+ 
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
+index 6f2e3747ba3c..ef3bb7b837c3 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
+@@ -4,10 +4,10 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+ from sglang.srt.layers.communicator import get_attn_tp_context
+ from sglang.srt.layers.dcp import (
+     all_gather_kv_cache_for_mha_chunk_extend,
+diff --git a/python/sglang/srt/models/sarvam_moe.py b/python/sglang/srt/models/sarvam_moe.py
+index 4a343a13fc4f..4d184e11badd 100644
+--- a/python/sglang/srt/models/sarvam_moe.py
++++ b/python/sglang/srt/models/sarvam_moe.py
+@@ -12,6 +12,7 @@
+ from torch import nn
+ from transformers import PretrainedConfig
+ 
++from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+ from sglang.srt.distributed import (
+     get_pp_group,
+     tensor_model_parallel_all_reduce,
+@@ -19,7 +20,6 @@
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ from sglang.srt.layers.activation import SiluAndMul
+-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+ from sglang.srt.layers.communicator import (
+     LayerCommunicator,
+     LayerScatterModes,
+diff --git a/python/sglang/srt/speculative/dflash_info.py b/python/sglang/srt/speculative/dflash_info.py
+index ef2b8c136d6b..762e5d1642c1 100644
+--- a/python/sglang/srt/speculative/dflash_info.py
++++ b/python/sglang/srt/speculative/dflash_info.py
+@@ -5,7 +5,7 @@
+ 
+ import torch
+ 
+-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
++from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.model_executor.forward_batch_info import (
+     CaptureHiddenMode,
+diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
+index ecdb47880a58..3bbbf971bd44 100644
+--- a/python/sglang/srt/speculative/eagle_info.py
++++ b/python/sglang/srt/speculative/eagle_info.py
+@@ -4,9 +4,9 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+ from sglang.srt.environ import envs
+-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+ from sglang.srt.runtime_context import get_server_args
+ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+diff --git a/python/sglang/srt/speculative/ngram_info.py b/python/sglang/srt/speculative/ngram_info.py
+index 958b2cfe7de3..5c96872e9233 100644
+--- a/python/sglang/srt/speculative/ngram_info.py
++++ b/python/sglang/srt/speculative/ngram_info.py
+@@ -4,8 +4,8 @@
+ 
+ import torch
+ 
++from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+ 
+ 
+diff --git a/test/manual/attention/test_trtllm_mla_backend.py b/test/manual/attention/test_trtllm_mla_backend.py
+index f5aec11f7589..344e5bcce440 100755
+--- a/test/manual/attention/test_trtllm_mla_backend.py
++++ b/test/manual/attention/test_trtllm_mla_backend.py
+@@ -10,13 +10,13 @@
+ _parallel_override = get_parallel().override(attn_tp_size=1)
+ _parallel_override.__enter__()
+ 
++from sglang.kernels.ops.attention.utils import get_num_page_per_block_flashmla
+ from sglang.srt.configs.model_config import AttentionArch
+ from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+ from sglang.srt.layers.attention.trtllm_mla_backend import (
+     TRTLLMMLABackend,
+     TRTLLMMLADecodeMetadata,
+ )
+-from sglang.srt.layers.attention.utils import get_num_page_per_block_flashmla
+ from sglang.srt.layers.radix_attention import RadixAttention
+ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+diff --git a/test/registered/attention/test_create_kvindices.py b/test/registered/attention/test_create_kvindices.py
+index 898e84e808d1..907a12f865a5 100644
+--- a/test/registered/attention/test_create_kvindices.py
++++ b/test/registered/attention/test_create_kvindices.py
+@@ -3,7 +3,7 @@
+ import numpy as np
+ import torch
+ 
+-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
++from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+ from sglang.srt.utils import get_device
+ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+ from sglang.test.test_utils import CustomTestCase
+diff --git a/test/registered/kernels/test_flash_mla_backends.py b/test/registered/kernels/test_flash_mla_backends.py
+index 06ab30e85434..98dee7bf48cd 100644
+--- a/test/registered/kernels/test_flash_mla_backends.py
++++ b/test/registered/kernels/test_flash_mla_backends.py
+@@ -26,8 +26,7 @@
+ 
+ import torch
+ 
+-from sglang.srt.layers.attention import flash_mla_sm120 as fmod
+-from sglang.srt.layers.attention.flash_mla_sm120 import (
++from sglang.kernels.ops.attention.flash_mla_sm120 import (
+     _D,
+     _NOPE_DIM,
+     _NOPE_ROPE_STRIDE,
+@@ -39,11 +38,12 @@
+     _sm120_sparse_decode_fwd,
+     flash_mla_with_kvcache_sm120,
+ )
+-from sglang.srt.layers.attention.flash_mla_sm120_triton import (
++from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
+     _apply_attn_sink,
+     _merge_partial_attn,
+     flash_mla_sparse_decode_triton,
+ )
++from sglang.srt.layers.attention import flash_mla_sm120 as fmod
+ from sglang.test.ci.ci_register import register_cuda_ci
+ from sglang.test.test_utils import CustomTestCase
+ 

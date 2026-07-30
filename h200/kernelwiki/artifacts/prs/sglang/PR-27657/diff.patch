@@ -1,0 +1,558 @@
+diff --git a/python/sglang/srt/layers/cp/cp_decode_attn_tp.py b/python/sglang/srt/layers/cp/cp_decode_attn_tp.py
+new file mode 100644
+index 000000000000..b074e635c2f0
+--- /dev/null
++++ b/python/sglang/srt/layers/cp/cp_decode_attn_tp.py
+@@ -0,0 +1,213 @@
++"""CP Decode Attention TP context.
++
++When CP (Context Parallel) mode sets tp_size=1 (repeat weights), decode can
++partition attention weights across CP ranks matching normal TP behavior.
++"""
++
++from __future__ import annotations
++
++import logging
++from contextlib import contextmanager
++from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
++
++import torch
++
++from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
++from sglang.srt.layers.cp.utils import is_cp_v2_active
++from sglang.srt.layers.radix_attention import RadixAttention
++from sglang.srt.runtime_context import get_parallel, get_server_args
++
++logger = logging.getLogger(__name__)
++
++if TYPE_CHECKING:
++    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++
++# HF architectures whose attention linears are replicated with tp_size=1 under
++# context parallelism, so slicing them to the local CP partition during decode is
++# equivalent to a normal TP-layout GEMM. Any model not on this list must not use
++# CP decode attention TP. Single arch-string source of truth for the whitelist.
++CP_DECODE_ATTN_TP_SUPPORTED_ARCHS: Tuple[str, ...] = (
++    # DeepSeek-V4
++    "DeepseekV4ForCausalLM",
++    "DeepseekV4ForCausalLMNextN",
++    "DeepseekV4ForCausalLMDSpark",
++    # GLM-5.x (inherits DeepseekV2 attention; DSA path)
++    "GlmMoeDsaForCausalLM",
++    "GlmMoeDsaForCausalLMNextN",
++)
++
++_global_cp_decode_attn_tp_ctx: CpDecodeAttnTpContext | None = None
++
++
++def get_cp_decode_attn_tp_ctx() -> CpDecodeAttnTpContext:
++    """Return the global CpDecodeAttnTpContext singleton."""
++    global _global_cp_decode_attn_tp_ctx
++    if _global_cp_decode_attn_tp_ctx is None:
++        _global_cp_decode_attn_tp_ctx = CpDecodeAttnTpContext()
++    return _global_cp_decode_attn_tp_ctx
++
++
++class CpDecodeAttnTpContext:
++    """Slices replicated attention weights across CP ranks during decode."""
++
++    def __init__(self):
++        enable_attn_tp = get_server_args().enable_cp_decode_attn_tp
++
++        if enable_attn_tp and get_parallel().attn_cp_size > 1:
++            self.decode_tp_rank = get_parallel().attn_cp_rank
++            self.decode_tp_size = get_parallel().attn_cp_size
++            logger.info("Enable CP decode attention TP")
++        else:
++            self.decode_tp_rank = None
++            self.decode_tp_size = None
++            logger.info("Disable CP decode attention TP")
++
++        self.use_decode_attn_tp = False
++        self._slice_cache: Dict = {}
++
++    @property
++    def is_enabled(self) -> bool:
++        return self.decode_tp_size is not None and self.decode_tp_size > 1
++
++    def set_decode_attn_tp(self, forward_batch: ForwardBatch):
++        if not self.is_enabled:
++            self.use_decode_attn_tp = False
++            return
++        # Skip during prefill context parallel (needs all heads); apply on every
++        # other forward, which includes decode.
++        self.use_decode_attn_tp = not is_cp_v2_active(
++            forward_batch
++        ) and not dsa_use_prefill_cp(forward_batch)
++
++    def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
++        assert dim in (0, 1)
++        chunk = tensor.shape[dim] // self.decode_tp_size
++        sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
++        return sliced if dim == 0 else sliced.contiguous()
++
++    # ==================== Unified activate/restore ====================
++
++    def _activate(self, obj, attr_name: str, dim: int):
++        """Replace obj.attr_name with its TP-sliced version. No-op if attr is None."""
++        tensor = getattr(obj, attr_name, None)
++        if tensor is None:
++            return
++        is_param = isinstance(tensor, torch.nn.Parameter)
++        raw = tensor.data if is_param else tensor
++        assert isinstance(raw, torch.Tensor) and raw.dim() > dim, (
++            f"CP decode attn TP: {type(obj).__name__}.{attr_name} is not sliceable "
++            f"(type={type(tensor).__name__}, dim={raw.dim()}, required_dim>{dim})"
++        )
++        assert raw.shape[dim] % self.decode_tp_size == 0, (
++            f"CP decode attn TP: {type(obj).__name__}.{attr_name}.shape[{dim}]={raw.shape[dim]} "
++            f"not divisible by decode_tp_size={self.decode_tp_size}"
++        )
++
++        cache_key = (id(obj), attr_name)
++        cache = self._slice_cache.get(cache_key)
++        if cache is None:
++            cache = (raw, self._slice(raw, dim), is_param)
++            self._slice_cache[cache_key] = cache
++
++        if cache[2]:
++            tensor.data = cache[1]
++        else:
++            setattr(obj, attr_name, cache[1])
++
++    def _restore(self, obj, attr_name: str):
++        cache = self._slice_cache.get((id(obj), attr_name))
++        if cache is None:
++            return
++        orig, _, is_param = cache
++        if is_param:
++            getattr(obj, attr_name).data = orig
++        else:
++            setattr(obj, attr_name, orig)
++
++    # ==================== Linear helpers ====================
++
++    def _get_linear_attrs(self, linear_instance) -> List[Tuple]:
++        """Return (obj, attr_name, dim) list for a linear layer."""
++        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
++
++        if isinstance(linear_instance, RowParallelLinear):
++            dim = 1
++        elif isinstance(linear_instance, ColumnParallelLinear):
++            dim = 0
++        else:
++            return []
++
++        attrs = [(linear_instance, "weight", dim)]
++        for scale_name in ("weight_scale_inv", "weight_scale"):
++            if getattr(linear_instance, scale_name, None) is not None:
++                attrs.append((linear_instance, scale_name, dim))
++        return attrs
++
++    # ==================== Context manager ====================
++
++    @contextmanager
++    def maybe_use_decode_attn_tp(
++        self,
++        forward_batch: ForwardBatch,
++        modules: list,
++        tensor_attrs: List[Tuple] = None,
++        radix_attn: Optional[RadixAttention] = None,
++    ):
++        """Activate decode attention TP for the duration of the block.
++
++        Args:
++            modules: Linear layers (ColumnParallel/RowParallel) to slice.
++            tensor_attrs: (obj, attr_name, dim) tuples for absorbed weights.
++            radix_attn: RadixAttention instance whose tp_q_head_num should be
++                overridden to match the sliced head count during decode TP.
++        """
++        self.set_decode_attn_tp(forward_batch)
++        if not self.use_decode_attn_tp:
++            yield
++            return
++
++        all_attrs = []  # (obj, attr_name) pairs to restore
++        size_overrides = []  # (linear, size_attr, orig_size)
++        row_parallel_decode_flags = []  # (RowParallelLinear, orig_flag) to restore
++        orig_tp_q_head_num = None
++        try:
++            for linear in modules:
++                for obj, attr_name, dim in self._get_linear_attrs(linear):
++                    self._activate(obj, attr_name, dim)
++                    all_attrs.append((obj, attr_name))
++                from sglang.srt.layers.linear import RowParallelLinear
++
++                size_attr = (
++                    "input_size_per_partition"
++                    if isinstance(linear, RowParallelLinear)
++                    else "output_size_per_partition"
++                )
++                orig_size = getattr(linear, size_attr)
++                setattr(linear, size_attr, orig_size // self.decode_tp_size)
++                size_overrides.append((linear, size_attr, orig_size))
++
++                # Set the decode attn TP flag on RowParallelLinear instances
++                if isinstance(linear, RowParallelLinear):
++                    row_parallel_decode_flags.append(
++                        (linear, linear.use_decode_attn_tp)
++                    )
++                    linear.use_decode_attn_tp = True
++
++            if tensor_attrs:
++                for obj, attr_name, dim in tensor_attrs:
++                    self._activate(obj, attr_name, dim)
++                    all_attrs.append((obj, attr_name))
++
++            if radix_attn is not None:
++                orig_tp_q_head_num = radix_attn.tp_q_head_num
++                radix_attn.tp_q_head_num = orig_tp_q_head_num // self.decode_tp_size
++            yield
++        finally:
++            if radix_attn is not None and orig_tp_q_head_num is not None:
++                radix_attn.tp_q_head_num = orig_tp_q_head_num
++            for linear, orig_flag in reversed(row_parallel_decode_flags):
++                linear.use_decode_attn_tp = orig_flag
++            for linear, size_attr, orig_size in reversed(size_overrides):
++                setattr(linear, size_attr, orig_size)
++            for obj, attr_name in reversed(all_attrs):
++                self._restore(obj, attr_name)
+diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
+index 57aae27ba712..12acd2fbd834 100644
+--- a/python/sglang/srt/layers/linear.py
++++ b/python/sglang/srt/layers/linear.py
+@@ -1438,6 +1438,8 @@ def __init__(
+         self.input_size_per_partition = divide(input_size, self.tp_size)
+         assert self.quant_method is not None
+         self.use_presharded_weights = use_presharded_weights
++        # Flag set by CpDecodeAttnTpContext to enable all_reduce during decode.
++        self.use_decode_attn_tp: bool = False
+ 
+         self.quant_method.create_weights(
+             layer=self,
+@@ -1585,8 +1587,7 @@ def forward(self, input_, skip_all_reduce=False, forward_batch=None):
+         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
+         # the decoder — callers should not thread those flags into modules.
+         if (
+-            self.reduce_results
+-            and self.tp_size > 1
++            ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
+             and not skip_all_reduce
+             and not should_skip_mlp_all_reduce()
+         ):
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index fdb863a0171a..be65778066ed 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -21,7 +21,7 @@
+ from __future__ import annotations
+ 
+ import logging
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+ 
+ import torch
+@@ -77,6 +77,7 @@
+     DSACPLayerCommunicator,
+     maybe_prefetch_next_full_attention_kv,
+ )
++from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+ from sglang.srt.layers.cp.utils import is_cp_v2_active
+ from sglang.srt.layers.dcp.planner import (
+     prepare_decode_context_parallel_metadata,
+@@ -1795,6 +1796,34 @@ def __init__(
+         self.init_mla_fused_rope_rocm_forward()
+         self.init_mla_fused_rope_cpu_forward()
+ 
++    @contextmanager
++    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
++        if self.q_lora_rank is None:
++            yield
++            return
++        tensor_attrs = [
++            (self, "w_kc", 0),
++            (self, "w_vc", 0),
++            (self, "w_scale_k", 0),
++            (self, "w_scale_v", 0),
++        ]
++        ctx = get_cp_decode_attn_tp_ctx()
++        with ctx.maybe_use_decode_attn_tp(
++            forward_batch,
++            [self.q_b_proj, self.o_proj],
++            tensor_attrs=tensor_attrs,
++            radix_attn=self.attn_mqa,
++        ):
++            if ctx.use_decode_attn_tp:
++                orig_num_local_heads = self.num_local_heads
++                self.num_local_heads = self.num_heads // ctx.decode_tp_size
++                try:
++                    yield
++                finally:
++                    self.num_local_heads = orig_num_local_heads
++            else:
++                yield
++
+     def dispatch_attn_forward_method(
+         self, forward_batch: ForwardBatch
+     ) -> AttnForwardMethod:
+@@ -2212,15 +2241,16 @@ def forward(
+             )
+         )
+ 
+-        hidden_states = self.self_attn(
+-            positions=positions,
+-            hidden_states=hidden_states,
+-            forward_batch=forward_batch,
+-            zero_allocator=zero_allocator,
+-            llama_4_scaling=llama_4_scaling,
+-            layer_scatter_modes=self.layer_scatter_modes,
+-            prev_topk_indices=prev_topk_indices,
+-        )
++        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
++            hidden_states = self.self_attn(
++                positions=positions,
++                hidden_states=hidden_states,
++                forward_batch=forward_batch,
++                zero_allocator=zero_allocator,
++                llama_4_scaling=llama_4_scaling,
++                layer_scatter_modes=self.layer_scatter_modes,
++                prev_topk_indices=prev_topk_indices,
++            )
+         if isinstance(hidden_states, tuple):
+             hidden_states, topk_indices = hidden_states
+         else:
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index e3c11aae396f..b14089001981 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -4,7 +4,7 @@
+ import functools
+ import logging
+ import time
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+@@ -60,6 +60,7 @@
+     dsa_cp_gather_hidden_states,
+     dsa_cp_reduce_scatter_hidden_states,
+ )
++from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+ from sglang.srt.layers.dp_attention import (
+     _tbo_event,
+     attn_tp_all_gather,
+@@ -453,9 +454,7 @@ def __init__(
+         self.fuse_wqa_wkv = fuse
+ 
+         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+-        self._attn_sink_local: Optional[torch.Tensor] = (
+-            self.attn_sink if self.attn_tp_size == 1 else None
+-        )
++        self._attn_sink_local: Optional[torch.Tensor] = None
+         if fuse:
+             self.wqkv_a = ReplicatedLinear(
+                 self.hidden_size,
+@@ -545,6 +544,51 @@ def __init__(
+         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+         self.freqs_cis: torch.Tensor
+ 
++    def _local_attn_sink(self) -> torch.Tensor:
++        if self.attn_tp_size == 1:
++            return self.attn_sink
++        if self._attn_sink_local is None:
++            rank = self.attn_tp_rank
++            num_heads = self.n_local_heads
++            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
++            sink = self.attn_sink.new_zeros(padded_num_heads)
++            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
++            self._attn_sink_local = sink
++        return self._attn_sink_local
++
++    @contextmanager
++    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
++        ctx = get_cp_decode_attn_tp_ctx()
++        attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
++        with ctx.maybe_use_decode_attn_tp(
++            forward_batch,
++            [self.wq_b, self.wo_a, self.wo_b],
++            radix_attn=attn,
++        ):
++            if ctx.use_decode_attn_tp:
++                orig = (
++                    self.n_local_heads,
++                    self.n_local_groups,
++                    self.attn_tp_rank,
++                    self.attn_tp_size,
++                )
++                decode_tp_size = ctx.decode_tp_size
++                self.n_local_heads = self.n_heads // decode_tp_size
++                self.n_local_groups = self.n_groups // decode_tp_size
++                self.attn_tp_rank = ctx.decode_tp_rank
++                self.attn_tp_size = decode_tp_size
++                try:
++                    yield
++                finally:
++                    (
++                        self.n_local_heads,
++                        self.n_local_groups,
++                        self.attn_tp_rank,
++                        self.attn_tp_size,
++                    ) = orig
++            else:
++                yield
++
+ 
+ class MQALayer(MqaAttentionBase):
+     def __init__(
+@@ -563,8 +607,6 @@ def __init__(
+             prefix,
+             compress_ratio=compress_ratio_override,
+         )
+-        self.tp_rank = self.attn_tp_rank
+-        self.tp_size = self.attn_tp_size
+ 
+         if self.rope_scaling:
+             self.rope_scaling["rope_type"] = "deepseek_yarn"
+@@ -1107,7 +1149,7 @@ def forward(
+         )
+ 
+         tp_slice, q_padded, q_out = slice(None), None, None
+-        if self.tp_size > 1:
++        if self.attn_tp_size > 1:
+             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
+             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
+             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
+@@ -1123,15 +1165,7 @@ def forward(
+                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+             tp_slice = slice(0, self.n_local_heads)
+             q_out = q_padded[:, tp_slice, :]
+-            if self._attn_sink_local is None:
+-                # Build once on the first forward (post weight load); a per-call
+-                # rebuild would replay a fill+copy per layer in the decode graph.
+-                rank = self.tp_rank
+-                sink = self.attn_sink.new_zeros(padded_num_heads)
+-                sink[: self.n_local_heads] = self.attn_sink[
+-                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+-                ]
+-                self._attn_sink_local = sink
++        attn_sink = self._local_attn_sink()
+ 
+         if enable_multi_stream:
+             # Multi-stream path always fuses cache write into the K kernel,
+@@ -1198,7 +1232,7 @@ def forward(
+                     o,
+                     self.attn_mqa.layer_id,
+                     self.compress_ratio,
+-                    self._attn_sink_local,
++                    attn_sink,
+                     save_kv_cache,
+                 )
+             else:
+@@ -1209,7 +1243,7 @@ def forward(
+                     layer=self.attn_mqa,
+                     forward_batch=forward_batch,
+                     compress_ratio=self.compress_ratio,
+-                    attn_sink=self._attn_sink_local,
++                    attn_sink=attn_sink,
+                     save_kv_cache=save_kv_cache,
+                 )
+             o = o[:, tp_slice, :]
+@@ -1267,7 +1301,7 @@ def forward(
+             o = torch.einsum("tgd,grd->tgr", o, wo_a)
+ 
+         o, _ = self.wo_b(o.flatten(1))
+-        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
++        if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
+             o = attn_tp_all_reduce(o)
+ 
+         return o
+@@ -1605,12 +1639,13 @@ def forward(
+             else:
+                 x_quant = None
+ 
+-        hidden_states = self.self_attn(
+-            x=hidden_states,
+-            positions=positions,
+-            forward_batch=forward_batch,
+-            x_quant=x_quant,
+-        )
++        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
++            hidden_states = self.self_attn(
++                x=hidden_states,
++                positions=positions,
++                forward_batch=forward_batch,
++                x_quant=x_quant,
++            )
+ 
+         if use_fused:
+             fused_mhc = try_fused_hc_post_pre(
+diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
+index ac7d60cf68d8..fc2185e6e61a 100644
+--- a/python/sglang/srt/models/deepseek_v4_dspark.py
++++ b/python/sglang/srt/models/deepseek_v4_dspark.py
+@@ -121,17 +121,6 @@ def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
+         kv, _ = self.wkv(x)
+         return kv
+ 
+-    def _local_attn_sink(self) -> torch.Tensor:
+-        if self.attn_tp_size == 1:
+-            return self.attn_sink
+-        if self._attn_sink_local is None:
+-            rank = self.attn_tp_rank
+-            num_heads = self.n_local_heads
+-            sink = self.attn_sink.new_zeros(max(num_heads, _PAD_NUM_HEADS))
+-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+-            self._attn_sink_local = sink
+-        return self._attn_sink_local
+-
+     def _store_block_kv(
+         self,
+         *,
+@@ -536,7 +525,8 @@ def forward(
+             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+         )
+         x = self.input_layernorm(x)
+-        x = self.self_attn(positions, x, forward_batch)
++        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
++            x = self.self_attn(positions, x, forward_batch)
+         x = self._hc_post_block(x, residual, post, comb)
+ 
+         residual = x
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 1d24447629c9..6a2485eeefb5 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1063,6 +1063,11 @@ class ServerArgs:
+     dsa_prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "round-robin-split"
+     enable_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = False
+     prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "in-seq-split"
++    enable_cp_decode_attn_tp: A[
++        bool,
++        "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
++        NS("parallel"),
++    ] = False
+     # DP attention
+     enable_dp_attention: A[
+         bool,
+@@ -4730,6 +4735,19 @@ def _handle_model_specific_adjustments(self):
+                 "(DeepSeek Sparse Attention) models."
+             )
+ 
++        if self.enable_cp_decode_attn_tp:
++            from sglang.srt.layers.cp.cp_decode_attn_tp import (
++                CP_DECODE_ATTN_TP_SUPPORTED_ARCHS,
++            )
++
++            if model_arch not in CP_DECODE_ATTN_TP_SUPPORTED_ARCHS:
++                raise ValueError(
++                    "--enable-cp-decode-attn-tp is only supported for models "
++                    "whose attention linears are replicated across CP ranks "
++                    f"(attn_tp_size=1). Got {model_arch}; supported: "
++                    f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
++                )
++
+         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
+         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
+             self._handle_mamba_radix_cache(model_arch=model_arch)

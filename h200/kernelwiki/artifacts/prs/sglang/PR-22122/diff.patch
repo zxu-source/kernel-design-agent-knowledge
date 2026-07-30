@@ -1,0 +1,1606 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py
+index b80e1827baea..6a2b46d99786 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py
+@@ -335,6 +335,7 @@ def fused_moe_kernel(
+     sorted_token_ids_ptr,
+     expert_ids_ptr,
+     num_tokens_post_padded_ptr,
++    add_mask_ptr,
+     # Matrix dimensions
+     N,
+     K,
+@@ -377,6 +378,7 @@ def fused_moe_kernel(
+     c_sorted: tl.constexpr,
+     filter_expert: tl.constexpr,
+     swap_ab: tl.constexpr,
++    FUSE_ADD_TO_OUTPUT: tl.constexpr,
+     FUSE_SUM_ALL_REDUCE: tl.constexpr,
+     ROUTER_TOPK: tl.constexpr,
+ ):
+@@ -441,18 +443,20 @@ def fused_moe_kernel(
+         # -----------------------------------------------------------
+         # Write back zeros to the output when the expert is not
+         # in the current expert parallel rank.
+-        write_zeros_to_output(
+-            c_ptr,
+-            stride_cm,
+-            stride_cn,
+-            pid_n,
+-            N,
+-            offs_token,
+-            token_mask,
+-            BLOCK_SIZE_M,
+-            BLOCK_SIZE_N,
+-            compute_type,
+-        )
++        if not FUSE_ADD_TO_OUTPUT:
++            # skip the zero-write to preserve existing values.
++            write_zeros_to_output(
++                c_ptr,
++                stride_cm,
++                stride_cn,
++                pid_n,
++                N,
++                offs_token,
++                token_mask,
++                BLOCK_SIZE_M,
++                BLOCK_SIZE_N,
++                compute_type,
++            )
+         return
+ 
+     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+@@ -604,7 +608,15 @@ def fused_moe_kernel(
+     # Write back the block of the output
+     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+ 
+-    if FUSE_SUM_ALL_REDUCE:
++    if FUSE_ADD_TO_OUTPUT:
++        # Accumulate into existing output with per-token mask.
++        offs_token_out = offs_token // ROUTER_TOPK
++        add_mask = tl.load(add_mask_ptr + offs_token_out, mask=token_mask, other=False)
++        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
++        c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn[None, :] < N)
++        existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
++        tl.store(c_ptrs, existing + accumulator, mask=c_mask)
++    elif FUSE_SUM_ALL_REDUCE:
+         offs_token_out = offs_token // ROUTER_TOPK
+         c_ptrs = (
+             c_ptr + stride_cm * offs_token_out[:, None] + stride_cn * offs_cn[None, :]
+@@ -717,6 +729,8 @@ def invoke_fused_moe_kernel(
+     filter_expert: bool = True,
+     fuse_sum_all_reduce: bool = False,
+     router_topk: int = 1,
++    fuse_add_to_output: bool = False,
++    add_output_mask: Optional[torch.Tensor] = None,
+ ) -> None:
+     assert topk_weights.stride(1) == 1
+     assert sorted_token_ids.stride(0) == 1
+@@ -786,6 +800,13 @@ def invoke_fused_moe_kernel(
+ 
+     if fuse_sum_all_reduce:
+         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
++    if fuse_add_to_output:
++        assert (
++            not fuse_sum_all_reduce
++        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
++        assert (
++            add_output_mask is not None
++        ), "add_output_mask required when fuse_add_to_output=True"
+ 
+     if (
+         (use_int8_w8a16 or use_int4_w4a16)
+@@ -870,6 +891,7 @@ def invoke_fused_moe_kernel(
+             sorted_token_ids,
+             expert_ids,
+             num_tokens_post_padded,
++            add_output_mask,
+             B.shape[1],
+             B.shape[2] - padded_size,
+             sorted_token_ids.shape[0],
+@@ -901,6 +923,7 @@ def invoke_fused_moe_kernel(
+             c_sorted=c_sorted,
+             filter_expert=filter_expert,
+             swap_ab=swap_ab,
++            FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
+             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
+             ROUTER_TOPK=router_topk,
+             **config,
+diff --git a/python/sglang/srt/layers/moe/moe_runner/runner.py b/python/sglang/srt/layers/moe/moe_runner/runner.py
+index 9dcee54da7d2..09b04c25080d 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/runner.py
++++ b/python/sglang/srt/layers/moe/moe_runner/runner.py
+@@ -21,7 +21,6 @@
+     from sglang.srt.layers.moe.utils import MoeRunnerBackend
+     from sglang.srt.lora.lora_moe_runners import LoRAHooks
+ 
+-
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -98,9 +97,6 @@ def run(
+         assert self.runner_core is not None
+ 
+         def _maybe_build_lora_hooks(_runner_input: Any) -> LoRAHooks:
+-            if not self.lora_enabled or lora_info is None:
+-                return None
+-
+             from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
+             from sglang.srt.lora.lora_moe_runners import build_lora_hooks
+ 
+@@ -109,19 +105,16 @@ def _maybe_build_lora_hooks(_runner_input: Any) -> LoRAHooks:
+                     _runner_input.hidden_states,
+                     _runner_input.topk_output.topk_ids,
+                 )
+-            elif hasattr(_runner_input, "topk_ids"):
+-                hidden_states, topk_ids = (
+-                    _runner_input.hidden_states,
+-                    _runner_input.topk_ids,
+-                )
+             else:
+-                return None
+-
+-            return build_lora_hooks(
+-                hidden_states,
+-                lora_info,
+-                topk_ids,
+-            )
++                hidden_states = _runner_input.hidden_states
++                topk_ids = getattr(_runner_input, "topk_ids", None)
++            if self.lora_enabled and lora_info is not None:
++                return build_lora_hooks(
++                    hidden_states,
++                    lora_info,
++                    topk_ids,
++                )
++            return None
+ 
+         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
+         # bypass the pre-permute step and do their own alignment internally.
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 6c79e9063f4e..7b184e71a187 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -797,6 +797,7 @@ def __init__(
+         super().__init__(base_layer, lora_backend)
+ 
+         self.experts_shared_outer_loras: bool = False
++        self.lora_use_virtual_experts: bool = False
+         self.quant_method = base_layer.quant_method
+ 
+         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
+@@ -903,6 +904,7 @@ def _get_lora_info(self):
+             tp_size=self.tp_size,
+             tp_rank=self.tp_rank,
+             hidden_size=getattr(self.base_layer, "hidden_size", 0),
++            lora_use_virtual_experts=self.lora_use_virtual_experts,
+         )
+ 
+     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 9f3ef601ed5c..58d00551a283 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -86,6 +86,7 @@ def __init__(
+         self._experts_shared_outer_override: Optional[bool] = (
+             server_args.experts_shared_outer_loras
+         )
++        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
+         self.lora_strict_loading: bool = getattr(
+             server_args, "lora_strict_loading", False
+         )
+@@ -763,7 +764,6 @@ def init_lora_modules(self):
+                     lora_module = self.set_lora_module(module_name, module)
+                     self.embed_tokens_module = lora_module
+                     continue
+-
+             # Handle lm_head
+             if "lm_head" in module_name and "lm_head" in self.target_modules:
+                 if isinstance(module, ParallelLMHead) and not isinstance(
+@@ -808,4 +808,5 @@ def init_lora_modules(self):
+                 layer_id = get_layer_id(module_name)
+                 lora_module = self.set_lora_module(module_name, module)
+                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
++                lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
+                 self.lora_modules[layer_id][module_name] = lora_module
+diff --git a/python/sglang/srt/lora/lora_moe_runners.py b/python/sglang/srt/lora/lora_moe_runners.py
+index f07d762eef81..983064154ccf 100644
+--- a/python/sglang/srt/lora/lora_moe_runners.py
++++ b/python/sglang/srt/lora/lora_moe_runners.py
+@@ -34,6 +34,7 @@
+ 
+ _is_cuda = is_cuda()
+ _is_hip = is_hip()
++_is_hip = is_hip()
+ _is_xpu = is_xpu()
+ 
+ if _is_cuda or _is_hip or _is_xpu:
+@@ -63,6 +64,112 @@ def _get_moe_lora_block_config(max_lora_rank: int) -> dict:
+ _SPARSITY_FACTOR = 8
+ 
+ 
++def _naive_moe_lora_align_block_size(
++    topk_ids: torch.Tensor,
++    seg_indptr: torch.Tensor,
++    req_to_lora: torch.Tensor,
++    num_experts: int,
++    block_size_m: int,
++    max_loras: int,
++    max_num_tokens_padded: int,
++    max_num_m_blocks: int,
++    adapter_enabled: torch.Tensor,
++    device: torch.device,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Construct LoRA token-expert alignment on CPU for small batches.
++
++    When the number of tokens is very small, the overhead of launching the
++    CUDA-based moe_lora_align_block_size kernel exceeds the actual
++    computation. This function builds the same data structures using simple
++    Python loops on CPU and transfers the result to GPU in one shot.
++    """
++    M, top_k = topk_ids.shape
++    num_valid_tokens = M * top_k
++
++    sorted_token_ids = torch.full(
++        (max_loras * max_num_tokens_padded,),
++        num_valid_tokens,
++        dtype=torch.int32,
++    )
++    expert_ids_out = torch.full((max_loras * max_num_m_blocks,), -1, dtype=torch.int32)
++    num_tokens_post_padded = torch.zeros(max_loras, dtype=torch.int32)
++
++    seg_indptr_list = seg_indptr.cpu().tolist()
++    req_to_lora_list = req_to_lora.cpu().tolist()
++    topk_ids_list = topk_ids.cpu().tolist()
++    adapter_enabled_list = adapter_enabled.cpu().tolist()
++
++    for lora_id in range(max_loras):
++        if not adapter_enabled_list[lora_id]:
++            continue
++
++        pairs: list[tuple[int, int]] = []
++        for seg_idx in range(len(seg_indptr_list) - 1):
++            if req_to_lora_list[seg_idx] != lora_id:
++                continue
++            start = seg_indptr_list[seg_idx]
++            end = seg_indptr_list[seg_idx + 1]
++            for m in range(start, end):
++                for k in range(top_k):
++                    pairs.append((topk_ids_list[m][k], m * top_k + k))
++
++        if not pairs:
++            continue
++
++        pairs.sort()
++
++        base_t = lora_id * max_num_tokens_padded
++        base_e = lora_id * max_num_m_blocks
++        pos = 0
++        block_idx = 0
++        i = 0
++        while i < len(pairs):
++            cur_expert = pairs[i][0]
++            group_start = pos
++            while i < len(pairs) and pairs[i][0] == cur_expert:
++                sorted_token_ids[base_t + pos] = pairs[i][1]
++                pos += 1
++                i += 1
++            group_len = pos - group_start
++            padded_len = ((group_len + block_size_m - 1) // block_size_m) * block_size_m
++            num_blocks = padded_len // block_size_m
++            for b in range(num_blocks):
++                expert_ids_out[base_e + block_idx + b] = cur_expert
++            block_idx += num_blocks
++            pos = group_start + padded_len
++
++        num_tokens_post_padded[lora_id] = pos
++
++    return (
++        sorted_token_ids.to(device),
++        expert_ids_out.to(device),
++        num_tokens_post_padded.to(device),
++    )
++
++
++def _get_moe_lora_block_config(max_lora_rank: int) -> dict:
++    """Compute rank-aware block sizes for MoE LoRA kernels.
++
++    Shrink: output dim is the rank -> cap BLOCK_SIZE_N to avoid waste.
++    Expand: input dim is the rank -> cap BLOCK_SIZE_K similarly.
++    """
++    if max_lora_rank <= 0:
++        rank_pow2 = 64
++    else:
++        rank_pow2 = next_power_of_2(max_lora_rank)
++
++    shrink_n = min(64, rank_pow2)
++    expand_k = max(16, min(64, rank_pow2))
++
++    return {
++        "shrink_block_size_n": shrink_n,
++        "expand_block_size_k": expand_k,
++    }
++
++
++_SPARSITY_FACTOR = 8
++
++
+ def _naive_moe_lora_align_block_size(
+     topk_ids: torch.Tensor,
+     seg_indptr: torch.Tensor,
+@@ -181,11 +288,13 @@ class LoRAInfo:
+     num_experts: int
+     experts_shared_outer_loras: bool = False
+     cg_buffers: dict | None = None
++    cg_buffers: dict | None = None
+ 
+     fully_sharded: bool = False
+     tp_size: int = 1
+     tp_rank: int = 0
+     hidden_size: int = 0
++    lora_use_virtual_experts: bool = False
+ 
+ 
+ @dataclass
+@@ -200,11 +309,27 @@ class LoRAHooks:
+     ) = None
+ 
+ 
++def _compute_token_lora_mapping(
++    hidden_states: torch.Tensor,
++    lora_info: LoRAInfo,
++) -> torch.Tensor:
++    """Map each token to its LoRA adapter index (-1 for no LoRA)."""
++    token_positions = torch.arange(
++        hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
++    )
++    req_indices = torch.searchsorted(
++        lora_info.seg_indptr[1:].to(torch.int32),
++        token_positions,
++        right=True,
++    )
++    return lora_info.req_to_lora.to(torch.int32)[req_indices]
++
++
+ def _compute_lora_alignment(
+     topk_ids: torch.Tensor,
+     lora_info: LoRAInfo,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+-    """Compute LoRA alignment tensors for MoE LoRA computation.
++    """Compute LoRA alignment tensors for the non-virtual-expert (classic) path.
+ 
+     Returns: (sorted_token_ids_reshaped, expert_ids_reshaped, num_tokens_post_padded_lora, lora_ids)
+     """
+@@ -305,13 +430,18 @@ def _add_lora_gate_up_delta(
+     topk_weights: torch.Tensor,
+     topk_ids: torch.Tensor,
+     lora_info: LoRAInfo,
++    token_lora_mapping: torch.Tensor | None,
+     sorted_token_ids_reshaped: torch.Tensor | None,
+     expert_ids_reshaped: torch.Tensor | None,
+     num_tokens_post_padded_lora: torch.Tensor | None,
+     lora_ids: torch.Tensor | None,
++    routing_cache: dict | None = None,
+ ) -> None:
+     """Add LoRA gate_up delta to intermediate_cache in-place."""
+-    from sglang.srt.lora.triton_ops import fused_moe_lora
++    from sglang.srt.lora.triton_ops import (
++        fused_moe_lora,
++        merged_experts_fused_moe_lora_add,
++    )
+ 
+     if get_is_capture_mode():
+         # During CUDA graph capture, always enter the LoRA path so that
+@@ -338,43 +468,63 @@ def _add_lora_gate_up_delta(
+     gate_up_a = lora_info.gate_up_lora_a_weights
+     gate_up_b = lora_info.gate_up_lora_b_weights
+     inter_size = gate_up_b.shape[2] // 2
++    M, top_k, gate_up_dim = intermediate_cache.shape
++    r = lora_info.max_lora_rank
++    gate_up_a = lora_info.gate_up_lora_a_weights
++    gate_up_b = lora_info.gate_up_lora_b_weights
++    inter_size = gate_up_b.shape[2] // 2
+ 
+-    if lora_info.experts_shared_outer_loras:
++    if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
+         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
+     inter_size = gate_up_b.shape[2] // 2
+     lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
+     lora_b_stacked = [gate_up_b[:, :, :inter_size, :], gate_up_b[:, :, inter_size:, :]]
+ 
+-    blk = _get_moe_lora_block_config(r)
+-    fused_moe_lora(
+-        output=intermediate_cache,
+-        qcurr_hidden_states=hidden_states,
+-        lora_a_stacked=lora_a_stacked,
+-        lora_b_stacked=lora_b_stacked,
+-        topk_weights=topk_weights,
+-        sorted_token_ids=sorted_token_ids_reshaped,
+-        expert_ids=expert_ids_reshaped,
+-        num_tokens_post_padded=num_tokens_post_padded_lora,
+-        max_lora_rank=r,
+-        top_k_num=top_k,
+-        lora_ids=lora_ids,
+-        adapter_enabled=lora_info.adapter_enabled,
+-        shrink_block_size_m=64,
+-        shrink_block_size_n=blk["shrink_block_size_n"],
+-        shrink_block_size_k=64,
+-        shrink_group_size_m=8,
+-        shrink_num_warps=4,
+-        shrink_num_stages=2,
+-        shrink_split_k=1,
+-        expand_block_size_m=64,
+-        expand_block_size_n=64,
+-        expand_block_size_k=blk["expand_block_size_k"],
+-        expand_group_size_m=8,
+-        expand_num_warps=4,
+-        expand_num_stages=2,
+-        expand_split_k=1,
+-        fully_sharded=lora_info.fully_sharded,
+-    )
++    if lora_info.lora_use_virtual_experts:
++        merged_experts_fused_moe_lora_add(
++            output=intermediate_cache,
++            hidden_states=hidden_states,
++            lora_a=gate_up_a,
++            lora_b=gate_up_b,
++            topk_ids=topk_ids,
++            topk_weights=topk_weights,
++            token_lora_mapping=token_lora_mapping,
++            mul_routed_weight=False,
++            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
++            experts_shared_outer_loras_b=False,
++            routing_cache=routing_cache,
++        )
++    else:
++        blk = _get_moe_lora_block_config(r)
++        fused_moe_lora(
++            output=intermediate_cache,
++            qcurr_hidden_states=hidden_states,
++            lora_a_stacked=lora_a_stacked,
++            lora_b_stacked=lora_b_stacked,
++            topk_weights=topk_weights,
++            sorted_token_ids=sorted_token_ids_reshaped,
++            expert_ids=expert_ids_reshaped,
++            num_tokens_post_padded=num_tokens_post_padded_lora,
++            max_lora_rank=r,
++            top_k_num=top_k,
++            lora_ids=lora_ids,
++            adapter_enabled=lora_info.adapter_enabled,
++            shrink_block_size_m=64,
++            shrink_block_size_n=blk["shrink_block_size_n"],
++            shrink_block_size_k=64,
++            shrink_group_size_m=8,
++            shrink_num_warps=4,
++            shrink_num_stages=2,
++            shrink_split_k=1,
++            expand_block_size_m=64,
++            expand_block_size_n=64,
++            expand_block_size_k=blk["expand_block_size_k"],
++            expand_group_size_m=8,
++            expand_num_warps=4,
++            expand_num_stages=2,
++            expand_split_k=1,
++            fully_sharded=lora_info.fully_sharded,
++        )
+ 
+ 
+ def _add_lora_down_delta(
+@@ -383,13 +533,18 @@ def _add_lora_down_delta(
+     topk_weights: torch.Tensor,
+     topk_ids: torch.Tensor,
+     lora_info: LoRAInfo,
++    token_lora_mapping: torch.Tensor | None,
+     sorted_token_ids_reshaped: torch.Tensor | None,
+     expert_ids_reshaped: torch.Tensor | None,
+     num_tokens_post_padded_lora: torch.Tensor | None,
+     lora_ids: torch.Tensor | None,
++    routing_cache: dict | None = None,
+ ) -> None:
+     """Add LoRA down delta to intermediate_cache in-place."""
+-    from sglang.srt.lora.triton_ops import fused_moe_lora
++    from sglang.srt.lora.triton_ops import (
++        fused_moe_lora,
++        merged_experts_fused_moe_lora_add,
++    )
+ 
+     if lora_info.max_lora_rank == 0:
+         return
+@@ -398,47 +553,67 @@ def _add_lora_down_delta(
+ 
+     down_lora_a = lora_info.down_lora_a_weights
+     down_lora_b = lora_info.down_lora_b_weights
+-    if lora_info.experts_shared_outer_loras:
++    if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
+         down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
+ 
++    if lora_info.fully_sharded and lora_info.tp_size > 1:
++        shard_size = lora_info.hidden_size // lora_info.tp_size
++        offset = shard_size * lora_info.tp_rank
++    else:
++        offset = 0
+     if lora_info.fully_sharded and lora_info.tp_size > 1:
+         shard_size = lora_info.hidden_size // lora_info.tp_size
+         offset = shard_size * lora_info.tp_rank
+     else:
+         offset = 0
+ 
+-    blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
+-    fused_moe_lora(
+-        output=intermediate_cache,
+-        qcurr_hidden_states=intermediate_input,
+-        lora_a_stacked=[down_lora_a],
+-        lora_b_stacked=[down_lora_b],
+-        topk_weights=topk_weights,
+-        sorted_token_ids=sorted_token_ids_reshaped,
+-        expert_ids=expert_ids_reshaped,
+-        num_tokens_post_padded=num_tokens_post_padded_lora,
+-        max_lora_rank=lora_info.max_lora_rank,
+-        top_k_num=top_k,
+-        lora_ids=lora_ids,
+-        adapter_enabled=lora_info.adapter_enabled,
+-        shrink_block_size_m=64,
+-        shrink_block_size_n=blk["shrink_block_size_n"],
+-        shrink_block_size_k=64,
+-        shrink_group_size_m=8,
+-        shrink_num_warps=4,
+-        shrink_num_stages=2,
+-        shrink_split_k=1,
+-        expand_block_size_m=64,
+-        expand_block_size_n=64,
+-        expand_block_size_k=blk["expand_block_size_k"],
+-        expand_group_size_m=8,
+-        expand_num_warps=4,
+-        expand_num_stages=2,
+-        expand_split_k=1,
+-        mul_routed_weight=True,
+-        fully_sharded=lora_info.fully_sharded,
+-        offset=offset,
+-    )
++    if lora_info.lora_use_virtual_experts:
++        merged_experts_fused_moe_lora_add(
++            output=intermediate_cache,
++            hidden_states=intermediate_input,
++            lora_a=down_lora_a,
++            lora_b=down_lora_b,
++            topk_ids=topk_ids,
++            topk_weights=topk_weights,
++            token_lora_mapping=token_lora_mapping,
++            mul_routed_weight=True,
++            experts_shared_outer_loras_a=False,
++            experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
++            routing_cache=routing_cache,
++        )
++    else:
++        blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
++        fused_moe_lora(
++            output=intermediate_cache,
++            qcurr_hidden_states=intermediate_input,
++            lora_a_stacked=[down_lora_a],
++            lora_b_stacked=[down_lora_b],
++            topk_weights=topk_weights,
++            sorted_token_ids=sorted_token_ids_reshaped,
++            expert_ids=expert_ids_reshaped,
++            num_tokens_post_padded=num_tokens_post_padded_lora,
++            max_lora_rank=lora_info.max_lora_rank,
++            top_k_num=top_k,
++            lora_ids=lora_ids,
++            adapter_enabled=lora_info.adapter_enabled,
++            shrink_block_size_m=64,
++            shrink_block_size_n=blk["shrink_block_size_n"],
++            shrink_block_size_k=64,
++            shrink_group_size_m=8,
++            shrink_num_warps=4,
++            shrink_num_stages=2,
++            shrink_split_k=1,
++            expand_block_size_m=64,
++            expand_block_size_n=64,
++            expand_block_size_k=blk["expand_block_size_k"],
++            expand_group_size_m=8,
++            expand_num_warps=4,
++            expand_num_stages=2,
++            expand_split_k=1,
++            mul_routed_weight=True,
++            fully_sharded=lora_info.fully_sharded,
++            offset=offset,
++        )
+ 
+ 
+ def build_lora_hooks(
+@@ -448,19 +623,31 @@ def build_lora_hooks(
+ ) -> LoRAHooks:
+     """Build LoRA hook closures for injection into any MoE runner.
+ 
+-    Computes alignment tensors once, then returns closures that capture
+-    them for the two injection points.
++    Computes token_lora_mapping and alignment tensors once, then returns
++    closures that capture them for the two injection points.
+     """
+     if lora_info is None or lora_info.max_lora_rank == 0:
+         return LoRAHooks()
+ 
+-    # Compute alignment tensors (once, shared by both hooks)
+-    (
+-        sorted_token_ids_reshaped,
+-        expert_ids_reshaped,
+-        num_tokens_post_padded_lora,
+-        lora_ids,
+-    ) = _compute_lora_alignment(topk_ids, lora_info)
++    # Compute alignment / mapping (once, shared by both hooks)
++    token_lora_mapping: torch.Tensor | None = None
++    sorted_token_ids_reshaped: torch.Tensor | None = None
++    expert_ids_reshaped: torch.Tensor | None = None
++    num_tokens_post_padded_lora: torch.Tensor | None = None
++    lora_ids: torch.Tensor | None = None
++
++    if lora_info.lora_use_virtual_experts:
++        token_lora_mapping = _compute_token_lora_mapping(hidden_states, lora_info)
++    else:
++        (
++            sorted_token_ids_reshaped,
++            expert_ids_reshaped,
++            num_tokens_post_padded_lora,
++            lora_ids,
++        ) = _compute_lora_alignment(topk_ids, lora_info)
++
++    # Shared routing cache: gate_up and down reuse routing for same (num_experts, shared_outer, block_size)
++    routing_cache: dict = {}
+ 
+     def after_gate_up(
+         hidden_states: torch.Tensor,
+@@ -474,10 +661,12 @@ def after_gate_up(
+             topk_weights,
+             topk_ids,
+             lora_info,
++            token_lora_mapping,
+             sorted_token_ids_reshaped,
+             expert_ids_reshaped,
+             num_tokens_post_padded_lora,
+             lora_ids,
++            routing_cache=routing_cache,
+         )
+ 
+     def after_down(
+@@ -492,10 +681,12 @@ def after_down(
+             topk_weights,
+             topk_ids,
+             lora_info,
++            token_lora_mapping,
+             sorted_token_ids_reshaped,
+             expert_ids_reshaped,
+             num_tokens_post_padded_lora,
+             lora_ids,
++            routing_cache=routing_cache,
+         )
+ 
+     return LoRAHooks(after_gate_up=after_gate_up, after_down=after_down)
+diff --git a/python/sglang/srt/lora/triton_ops/__init__.py b/python/sglang/srt/lora/triton_ops/__init__.py
+index 7f96837cd367..276e879c9bb1 100644
+--- a/python/sglang/srt/lora/triton_ops/__init__.py
++++ b/python/sglang/srt/lora/triton_ops/__init__.py
+@@ -7,6 +7,7 @@
+ from .qkv_lora_b import qkv_lora_b_fwd
+ from .sgemm_lora_a import sgemm_lora_a_fwd
+ from .sgemm_lora_b import sgemm_lora_b_fwd
++from .virtual_experts import merged_experts_fused_moe_lora_add
+ 
+ __all__ = [
+     "gate_up_lora_b_fwd",
+@@ -18,4 +19,5 @@
+     "fused_moe_lora",
+     "chunked_embedding_lora_a_forward",
+     "embedding_lora_a_fwd",
++    "merged_experts_fused_moe_lora_add",
+ ]
+diff --git a/python/sglang/srt/lora/triton_ops/virtual_experts.py b/python/sglang/srt/lora/triton_ops/virtual_experts.py
+new file mode 100644
+index 000000000000..22b5b55aeb7f
+--- /dev/null
++++ b/python/sglang/srt/lora/triton_ops/virtual_experts.py
+@@ -0,0 +1,662 @@
++"""
++LoRA Virtual Experts Triton Ops.
++"""
++
++import functools
++from typing import Any
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _fused_virtual_topk_ids_kernel(
++    topk_ids_ptr,
++    token_lora_mapping_ptr,
++    virtual_topk_ids_ptr,
++    token_lora_mask_ptr,
++    num_experts_for_weight: tl.constexpr,
++    M,
++    top_k: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    """
++    Fuses _get_virtual_topk_ids: comparison + clamp + arithmetic into one kernel.
++
++    For each (m, k):
++        lora_id = token_lora_mapping[m]
++        mask[m] = (lora_id >= 0)
++        safe_lora = max(lora_id, 0)
++        if shared_outer:  (handled by num_experts_for_weight == 0 sentinel)
++            virtual_topk_ids[m, k] = safe_lora * 1  (= safe_lora)
++        else:
++            virtual_topk_ids[m, k] = topk_ids[m, k] + safe_lora * num_experts_for_weight
++    """
++    pid = tl.program_id(0)
++    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    total = M * top_k
++    valid = offs < total
++
++    m = offs // top_k
++    # k = offs % top_k  # not needed directly
++
++    lora_id = tl.load(token_lora_mapping_ptr + m, mask=valid, other=0)
++    mask_val = lora_id >= 0
++    safe_lora = tl.maximum(lora_id, 0)
++
++    base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
++    result = base + safe_lora * num_experts_for_weight
++    tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
++
++    # Write mask once per row (at first k position)
++    k = offs % top_k
++    is_first_k = k == 0
++    tl.store(token_lora_mask_ptr + m, mask_val, mask=valid & is_first_k)
++
++
++def _fused_virtual_topk_ids(
++    topk_ids: torch.Tensor,
++    token_lora_mapping: torch.Tensor,
++    num_experts: int,
++    shared_outer: bool,
++    max_loras: int,
++) -> tuple[torch.Tensor, torch.Tensor, int]:
++    """
++    Returns virtual topk_ids, token_lora_mask, and virtual_num_experts.
++    """
++    M, top_k = topk_ids.shape
++    device = topk_ids.device
++
++    if shared_outer:
++        num_experts_for_weight = 1
++        # For shared_outer, we need topk_ids to be zeros
++        zero_topk = torch.zeros_like(topk_ids)
++        input_topk = zero_topk
++    else:
++        num_experts_for_weight = num_experts
++        input_topk = topk_ids
++
++    virtual_topk_ids = torch.empty_like(topk_ids)
++    token_lora_mask = torch.empty(M, dtype=torch.bool, device=device)
++
++    BLOCK_SIZE = 1024
++    grid = ((M * top_k + BLOCK_SIZE - 1) // BLOCK_SIZE,)
++
++    _fused_virtual_topk_ids_kernel[grid](
++        input_topk,
++        token_lora_mapping,
++        virtual_topk_ids,
++        token_lora_mask,
++        num_experts_for_weight,
++        M,
++        top_k,
++        BLOCK_SIZE,
++    )
++
++    virtual_num_experts = num_experts_for_weight * max_loras
++    return virtual_topk_ids, token_lora_mask, virtual_num_experts
++
++
++@triton.jit
++def _fused_sanitize_expert_ids_kernel(
++    expert_ids_ptr,
++    output_ptr,
++    num_virtual_experts,
++    N,
++    BLOCK_SIZE: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    valid = offs < N
++
++    eid = tl.load(expert_ids_ptr + offs, mask=valid, other=0)
++    result = tl.where(eid < num_virtual_experts, eid, -1)
++    tl.store(output_ptr + offs, result, mask=valid)
++
++
++def fused_sanitize_expert_ids(
++    expert_ids: torch.Tensor,
++    num_virtual_experts: int,
++) -> torch.Tensor:
++    """
++    Sanitize expert_ids by replacing values >= num_virtual_experts with -1.
++
++    Returns a new tensor with expert_ids >= num_virtual_experts replaced by -1.
++    """
++    N = expert_ids.numel()
++    output = torch.empty_like(expert_ids)
++
++    BLOCK_SIZE = 1024
++    grid = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE,)
++
++    _fused_sanitize_expert_ids_kernel[grid](
++        expert_ids,
++        output,
++        num_virtual_experts,
++        N,
++        BLOCK_SIZE,
++    )
++    return output
++
++
++@triton.jit
++def _moe_lora_shrink_splitk_kernel(
++    # Pointers
++    a_ptr,  # type: ignore  # [num_tokens, K]
++    b_ptr,  # type: ignore  # [num_virtual_experts, N, K]
++    c_ptr,  # type: ignore  # [num_tokens * top_k, N]  (pre-zeroed when SPLIT_K > 1)
++    sorted_token_ids_ptr,  # type: ignore
++    expert_ids_ptr,  # type: ignore
++    num_tokens_post_padded_ptr,  # type: ignore
++    # Dimensions
++    N,  # type: ignore
++    K,  # type: ignore
++    num_valid_tokens,  # type: ignore
++    # Strides
++    stride_am,  # type: ignore
++    stride_ak,  # type: ignore
++    stride_be,  # type: ignore
++    stride_bn,  # type: ignore
++    stride_bk,  # type: ignore
++    stride_cm,  # type: ignore
++    stride_cn,  # type: ignore
++    # Constexprs
++    top_k: tl.constexpr,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    SPLIT_K: tl.constexpr,
++):
++    """Split-K grouped GEMM for the LoRA A (shrink) stage with few virtual experts."""
++    pid = tl.program_id(0)
++    pid_sk = pid % SPLIT_K
++    pid_mn = pid // SPLIT_K
++
++    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
++    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
++    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
++
++    num_pid_in_group = GROUP_SIZE_M * num_pid_n
++    group_id = pid_mn // num_pid_in_group
++    first_pid_m = group_id * GROUP_SIZE_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
++    pid_m = first_pid_m + ((pid_mn % num_pid_in_group) % group_size_m)
++    pid_n = (pid_mn % num_pid_in_group) // group_size_m
++
++    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
++        return
++
++    # Token routing (same pattern as fused_moe_triton_kernels)
++    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
++    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
++    token_mask = offs_token < num_valid_tokens
++
++    off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
++    if off_expert == -1:
++        return
++
++    # Pointers
++    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
++    offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
++
++    a_ptrs = a_ptr + (
++        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
++    )
++    b_ptrs = (
++        b_ptr
++        + off_expert * stride_be
++        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
++    )
++
++    # Accumulate
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++    grid_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
++    for k in range(0, grid_k):
++        k_remaining = K - k * (BLOCK_SIZE_K * SPLIT_K)
++        k_mask = offs_k[:, None] < k_remaining
++        a = tl.load(
++            a_ptrs,
++            mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
++            other=0.0,
++        )
++        b = tl.load(b_ptrs, mask=k_mask, other=0.0)
++        accumulator += tl.dot(a, b.to(a.dtype))
++        a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
++        b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
++
++    accumulator = accumulator.to(c_ptr.dtype.element_ty)
++
++    # Write output
++    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
++    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
++    if SPLIT_K == 1:
++        tl.store(c_ptrs, accumulator, mask=c_mask)
++    else:
++        tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
++
++
++def _invoke_moe_lora_shrink_splitk(
++    hidden_states: torch.Tensor,
++    weight: torch.Tensor,
++    output: torch.Tensor,
++    topk_ids: torch.Tensor,
++    sorted_token_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_tokens_post_padded: torch.Tensor,
++    top_k: int,
++    config: dict[str, Any],
++) -> None:
++    """Launch split-K shrink kernel for LoRA A with few virtual experts."""
++    N = weight.shape[1]
++    K = weight.shape[2]
++    BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
++    BLOCK_SIZE_N = min(config.get("BLOCK_SIZE_N", 64), max(16, N))
++    BLOCK_SIZE_K = config.get("BLOCK_SIZE_K", 64)
++    GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
++
++    num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M)
++    num_n_blocks = triton.cdiv(N, BLOCK_SIZE_N)
++    base_grid = num_m_blocks * num_n_blocks
++    max_split_k = max(1, K // BLOCK_SIZE_K)
++    SPLIT_K = min(max_split_k, max(1, 128 // base_grid)) if base_grid < 128 else 1
++
++    grid = (SPLIT_K * base_grid,)
++
++    _moe_lora_shrink_splitk_kernel[grid](
++        hidden_states,
++        weight,
++        output,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        N,
++        K,
++        topk_ids.numel(),
++        hidden_states.stride(0),
++        hidden_states.stride(1),
++        weight.stride(0),
++        weight.stride(1),
++        weight.stride(2),
++        output.stride(0),
++        output.stride(1),
++        top_k=top_k,
++        BLOCK_SIZE_M=BLOCK_SIZE_M,
++        BLOCK_SIZE_N=BLOCK_SIZE_N,
++        BLOCK_SIZE_K=BLOCK_SIZE_K,
++        GROUP_SIZE_M=GROUP_SIZE_M,
++        SPLIT_K=SPLIT_K,
++        num_warps=config.get("num_warps", 4),
++        num_stages=config.get("num_stages", 4),
++    )
++
++
++@torch.compile(dynamic=True)
++def _align_block_size_torch(
++    topk_ids: torch.Tensor,
++    block_size: int,
++    num_experts: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Pure-PyTorch align_block_size for num_experts > 1024, compiled via torch.compile."""
++    device = topk_ids.device
++    flat_topk_ids = topk_ids.reshape(-1).to(torch.int64)
++    num_valid_tokens = flat_topk_ids.numel()
++    max_total_padded_tokens = (
++        (num_valid_tokens + num_experts * (block_size - 1) + block_size - 1)
++        // block_size
++    ) * block_size
++    max_num_blocks = max_total_padded_tokens // block_size
++
++    sorted_token_ids = torch.full(
++        (max_total_padded_tokens,),
++        num_valid_tokens,
++        dtype=torch.int32,
++        device=device,
++    )
++    expert_ids = torch.full(
++        (max_num_blocks,),
++        -1,
++        dtype=torch.int32,
++        device=device,
++    )
++
++    if num_valid_tokens == 0:
++        num_tokens_post_padded = torch.zeros((1,), dtype=torch.int32, device=device)
++        return sorted_token_ids, expert_ids, num_tokens_post_padded
++
++    sorted_order = torch.argsort(flat_topk_ids)
++    sorted_expert_ids = flat_topk_ids[sorted_order]
++    expert_range = torch.arange(num_experts, device=device, dtype=torch.int64)
++    counts_offsets = torch.searchsorted(sorted_expert_ids, expert_range, right=False)
++    counts_end = torch.searchsorted(sorted_expert_ids, expert_range, right=True)
++    counts = counts_end - counts_offsets
++    padded_counts = ((counts + block_size - 1) // block_size) * block_size
++    total_padded_tokens = padded_counts.sum().to(torch.int32).reshape(1)
++    padded_offsets = torch.cumsum(padded_counts, dim=0) - padded_counts
++
++    token_ranks = (
++        torch.arange(num_valid_tokens, device=device, dtype=torch.int64)
++        - counts_offsets[sorted_expert_ids]
++    )
++    output_positions = padded_offsets[sorted_expert_ids] + token_ranks
++    sorted_token_ids.scatter_(
++        0,
++        output_positions.to(torch.int64),
++        sorted_order.to(torch.int32),
++    )
++
++    block_counts = padded_counts // block_size
++    actual_num_blocks = block_counts.sum()
++
++    if max_num_blocks <= 0:
++        return sorted_token_ids, expert_ids, total_padded_tokens
++
++    block_offsets = torch.cumsum(block_counts, dim=0)
++    all_block_positions = torch.arange(max_num_blocks, device=device, dtype=torch.int64)
++    assigned_experts = torch.searchsorted(
++        block_offsets, all_block_positions, right=True
++    ).to(torch.int32)
++    expert_ids.copy_(
++        torch.where(
++            all_block_positions < actual_num_blocks,
++            assigned_experts,
++            torch.full_like(assigned_experts, -1),
++        )
++    )
++
++    return sorted_token_ids, expert_ids, total_padded_tokens
++
++
++_align_block_size_large = _align_block_size_torch
++
++
++def _merged_experts_fused_moe_lora_add_fake(
++    output: torch.Tensor,
++    hidden_states: torch.Tensor,
++    lora_a: torch.Tensor,
++    lora_b: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    token_lora_mapping: torch.Tensor,
++    mul_routed_weight: bool,
++    experts_shared_outer_loras_a: bool,
++    experts_shared_outer_loras_b: bool,
++) -> None:
++    return
++
++
++def _merged_experts_fused_moe_lora_add_impl(
++    output: torch.Tensor,
++    hidden_states: torch.Tensor,
++    lora_a: torch.Tensor,
++    lora_b: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    token_lora_mapping: torch.Tensor,
++    mul_routed_weight: bool,
++    experts_shared_outer_loras_a: bool,
++    experts_shared_outer_loras_b: bool,
++    routing_cache: dict | None = None,
++) -> None:
++    """
++    1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
++    2. Flatten LoRA weights from [max_loras, num_experts, ...] to [max_loras * num_experts, ...].
++    3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
++    4. Mask out tokens with token_lora_mapping == -1 on the add path.
++    """
++    max_loras, _, max_lora_rank, _ = lora_a.shape
++    input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
++
++    def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
++        # [max_loras, num_experts, x, y] -> [max_loras * num_experts, x, y]
++        return t.reshape(t.shape[0] * t.shape[1], t.shape[2], t.shape[3])
++
++    def _get_stage_config(
++        weight: torch.Tensor,
++        stage_top_k: int,
++    ) -> dict[str, Any]:
++        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
++            get_config_dtype_str,
++            try_get_optimal_moe_config,
++        )
++
++        config_dtype = get_config_dtype_str(dtype=hidden_states.dtype)
++        get_config_func = functools.partial(
++            try_get_optimal_moe_config,
++            weight.shape,
++            weight.shape,
++            stage_top_k,
++            config_dtype,
++        )
++        try:
++            cfg = get_config_func(token_lora_mapping.shape[0])
++        except ValueError:
++            K_dim = weight.shape[2]
++            N_dim = weight.shape[1]
++            if K_dim >= 1024:
++                default_block_k = 256
++            elif K_dim >= 64:
++                default_block_k = 64
++            else:
++                default_block_k = max(16, K_dim)
++            cfg = {
++                "BLOCK_SIZE_M": 64,
++                "BLOCK_SIZE_N": min(64, max(16, N_dim)),
++                "BLOCK_SIZE_K": min(default_block_k, max(16, K_dim)),
++                "GROUP_SIZE_M": 1,
++                "num_warps": 4,
++                "num_stages": 4,
++            }
++        return cfg
++
++    def _align_block_size(
++        topk_ids: torch.Tensor,
++        block_size: int,
++        num_experts: int,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        # The native align kernel consumes num_experts + 1 internally for its
++        # sentinel bucket, so the 1024-expert boundary must use the fallback path.
++        if num_experts < 1024:
++            from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
++                moe_align_block_size as native_moe_align_block_size,
++            )
++
++            return native_moe_align_block_size(topk_ids, block_size, num_experts)
++        return _align_block_size_large(topk_ids, block_size, num_experts)
++
++    def _get_routing(
++        topk_ids: torch.Tensor,
++        token_lora_mapping: torch.Tensor,
++        num_experts: int,
++        shared_outer: bool,
++        block_size: int,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        # Check routing_cache for cross-call reuse (gate_up and down share routing)
++        cache_key = (num_experts, shared_outer, block_size)
++        if routing_cache is not None:
++            cached = routing_cache.get(cache_key)
++            if cached is not None:
++                return cached
++
++        virtual_topk_ids, token_lora_mask, virtual_num_experts = (
++            _fused_virtual_topk_ids(
++                topk_ids, token_lora_mapping, num_experts, shared_outer, max_loras
++            )
++        )
++        sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size(
++            virtual_topk_ids,
++            block_size=block_size,
++            num_experts=virtual_num_experts,
++        )
++        # _align_block_size uses a worst-case padded allocation. Trim the routing buffers
++        # to a tighter upper bound so we keep the real routed work but drop unused padding
++        num_tokens = topk_ids.numel()
++        max_nonempty = min(num_tokens, virtual_num_experts)
++        tight_padded = (
++            triton.cdiv(num_tokens + max_nonempty * (block_size - 1), block_size)
++            * block_size
++        )
++        sorted_token_ids = sorted_token_ids[:tight_padded]
++        expert_ids = expert_ids[: tight_padded // block_size]
++        expert_ids = fused_sanitize_expert_ids(expert_ids, virtual_num_experts)
++        result = (
++            sorted_token_ids,
++            expert_ids,
++            num_tokens_post_padded,
++            token_lora_mask,
++        )
++
++        if routing_cache is not None:
++            routing_cache[cache_key] = result
++
++        return result
++
++    from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
++        invoke_fused_moe_kernel,
++    )
++
++    lora_a_virtual = _merge_lora_expert_weight(lora_a)
++    lora_b_virtual = _merge_lora_expert_weight(lora_b)
++    num_experts_a = lora_a.shape[1]
++    num_experts_b = lora_b.shape[1]
++
++    intermediate = torch.zeros(
++        [token_lora_mapping.shape[0], topk_ids.shape[1], max_lora_rank],
++        dtype=hidden_states.dtype,
++        device=hidden_states.device,
++    )
++
++    a_stage_config = _get_stage_config(lora_a_virtual, input_top_k)
++    (
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        token_lora_mask,
++    ) = _get_routing(
++        topk_ids,
++        token_lora_mapping,
++        num_experts_a,
++        experts_shared_outer_loras_a,
++        a_stage_config["BLOCK_SIZE_M"],
++    )
++
++    _invoke_moe_lora_shrink_splitk(
++        hidden_states,
++        lora_a_virtual,
++        intermediate.view(-1, max_lora_rank),
++        topk_ids,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        input_top_k,
++        a_stage_config,
++    )
++
++    b_stage_config = _get_stage_config(lora_b_virtual, 1)
++    (
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        token_lora_mask,
++    ) = _get_routing(
++        topk_ids,
++        token_lora_mapping,
++        num_experts_b,
++        experts_shared_outer_loras_b,
++        b_stage_config["BLOCK_SIZE_M"],
++    )
++
++    invoke_fused_moe_kernel(
++        intermediate.view(-1, max_lora_rank),
++        lora_b_virtual,
++        None,
++        output,
++        None,
++        None,
++        None,
++        topk_weights,
++        topk_ids,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        mul_routed_weight,
++        1,
++        b_stage_config,
++        tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
++        False,
++        False,
++        False,
++        False,
++        False,
++        None,
++        fuse_add_to_output=True,
++        add_output_mask=token_lora_mask,
++        router_topk=topk_ids.shape[1],
++    )
++
++
++def _merged_experts_fused_moe_lora_add_op(
++    output: torch.Tensor,
++    hidden_states: torch.Tensor,
++    lora_a: torch.Tensor,
++    lora_b: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    token_lora_mapping: torch.Tensor,
++    mul_routed_weight: bool,
++    experts_shared_outer_loras_a: bool,
++    experts_shared_outer_loras_b: bool,
++) -> None:
++    _merged_experts_fused_moe_lora_add_impl(
++        output,
++        hidden_states,
++        lora_a,
++        lora_b,
++        topk_ids,
++        topk_weights,
++        token_lora_mapping,
++        mul_routed_weight,
++        experts_shared_outer_loras_a,
++        experts_shared_outer_loras_b,
++    )
++
++
++from sglang.srt.utils.common import direct_register_custom_op
++
++direct_register_custom_op(
++    op_name="merged_experts_fused_moe_lora_add",
++    op_func=_merged_experts_fused_moe_lora_add_op,
++    mutates_args=["output"],
++    fake_impl=_merged_experts_fused_moe_lora_add_fake,
++)
++
++
++def merged_experts_fused_moe_lora_add(
++    output: torch.Tensor,
++    hidden_states: torch.Tensor,
++    lora_a: torch.Tensor,
++    lora_b: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    token_lora_mapping: torch.Tensor,
++    mul_routed_weight: bool,
++    experts_shared_outer_loras_a: bool,
++    experts_shared_outer_loras_b: bool,
++    routing_cache: dict | None = None,
++) -> None:
++    """Public API: wraps the registered op with routing_cache support."""
++    _merged_experts_fused_moe_lora_add_impl(
++        output,
++        hidden_states,
++        lora_a,
++        lora_b,
++        topk_ids,
++        topk_weights,
++        token_lora_mapping,
++        mul_routed_weight,
++        experts_shared_outer_loras_a,
++        experts_shared_outer_loras_b,
++        routing_cache,
++    )
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 9e66c282801f..44d72c151554 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -475,6 +475,7 @@ class ServerArgs:
+     lora_backend: str = "csgmv"
+     max_lora_chunk_size: Optional[int] = 16
+     experts_shared_outer_loras: Optional[bool] = None
++    lora_use_virtual_experts: bool = False
+     lora_strict_loading: bool = False
+ 
+     # Kernel backend
+@@ -4962,6 +4963,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
+             "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
+             "By default this is auto-detected from adapter weights.",
+         )
++        parser.add_argument(
++            "--lora-use-virtual-experts",
++            default=ServerArgs.lora_use_virtual_experts,
++            action="store_true",
++            help="Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
++        )
+         parser.add_argument(
+             "--lora-strict-loading",
+             default=ServerArgs.lora_strict_loading,
+@@ -6708,6 +6715,13 @@ def check_lora_server_args(self):
+                     and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
+                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
+ 
++            if self.lora_use_virtual_experts:
++                assert self.lora_backend == "triton", (
++                    "--lora-use-virtual-experts requires --lora-backend triton. "
++                    f"Got: {self.lora_backend}"
++                )
++                logger.info("Virtual expert computation enabled.")
++
+     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
+         if not buckets_rule:
+             return
+diff --git a/test/registered/lora/test_lora_moe_runner.py b/test/registered/lora/test_lora_moe_runner.py
+index 0aad023957ed..eab94a4e6be6 100644
+--- a/test/registered/lora/test_lora_moe_runner.py
++++ b/test/registered/lora/test_lora_moe_runner.py
+@@ -120,6 +120,7 @@ def create_lora_info(
+     gate_up_dim,
+     dtype,
+     device,
++    lora_use_virtual_experts=False,
+ ):
+     # -------------------------------------------------------------------------
+     # 1. Deterministic LoRA A Initialization
+@@ -186,6 +187,7 @@ def create_lora_info(
+         adapter_enabled=adapter_enabled,
+         max_lora_rank=max_lora_rank,
+         num_experts=num_experts,
++        lora_use_virtual_experts=lora_use_virtual_experts,
+     )
+ 
+ 
+@@ -461,6 +463,155 @@ class MockServerArgs:
+     torch.testing.assert_close(sglang_delta, torch_delta, atol=tol, rtol=tol)
+ 
+ 
++@pytest.mark.parametrize("num_tokens", [32, 64])
++@pytest.mark.parametrize("top_k_num", [1, 2])
++@pytest.mark.parametrize("num_experts", [8, 20])
++@pytest.mark.parametrize("max_lora_rank", [8, 16])
++def test_lora_moe_runner_virtual_experts(
++    num_tokens, top_k_num, num_experts, max_lora_rank
++):
++    # Fixed parameters
++    max_loras = 2
++    hidden_dim = 512
++    intermediate_dim = 1024
++
++    dtype = torch.float32
++    device = "cuda:0"
++    seed = 42
++
++    torch.set_default_device(device)
++    set_random_seed(seed)
++
++    num_sequences = 4
++
++    # Generate Data using the new Request-Based generator
++    topk_ids, topk_weights, seg_indptr, req_to_lora, token_lora_mapping = sample_data(
++        num_tokens, num_sequences, max_loras, num_experts, top_k_num, dtype, device
++    )
++
++    gate_up_dim = intermediate_dim * 2
++
++    # Initialize experts
++    w13 = torch.randn(num_experts, gate_up_dim, hidden_dim, dtype=dtype) * 0.1
++    w2 = torch.randn(num_experts, hidden_dim, intermediate_dim, dtype=dtype) * 0.1
++    b13 = torch.randn(num_experts, gate_up_dim, dtype=dtype) * 0.1
++    b2 = torch.randn(num_experts, hidden_dim, dtype=dtype) * 0.1
++
++    hidden_states = torch.randn(num_tokens, hidden_dim, dtype=dtype)
++
++    # Create LoRA Info with virtual experts enabled
++    lora_info_delta = create_lora_info(
++        seg_indptr=seg_indptr,
++        weight_indices=req_to_lora,
++        topk_ids=topk_ids,
++        max_loras=max_loras,
++        num_experts=num_experts,
++        max_lora_rank=max_lora_rank,
++        hidden_dim=hidden_dim,
++        intermediate_dim=intermediate_dim,
++        gate_up_dim=gate_up_dim,
++        dtype=dtype,
++        device=device,
++        lora_use_virtual_experts=True,
++    )
++
++    lora_info_baseline = create_lora_info(
++        seg_indptr=seg_indptr,
++        weight_indices=req_to_lora,
++        topk_ids=topk_ids,
++        max_loras=max_loras,
++        num_experts=num_experts,
++        max_lora_rank=0,
++        hidden_dim=hidden_dim,
++        intermediate_dim=intermediate_dim,
++        gate_up_dim=gate_up_dim,
++        dtype=dtype,
++        device=device,
++        lora_use_virtual_experts=True,
++    )
++
++    quant_info = TritonMoeQuantInfo(
++        w13_weight=w13,
++        w2_weight=w2,
++        b13=b13,
++        b2=b2,
++    )
++
++    config = MoeRunnerConfig(
++        activation="silu",
++        is_gated=True,
++        inplace=False,
++        no_combine=False,
++        gemm1_alpha=None,
++        gemm1_clamp_limit=None,
++        routed_scaling_factor=1.0,
++        apply_router_weight_on_input=False,
++        num_local_experts=num_experts,
++    )
++
++    router_logits = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
++    topk_output = StandardTopKOutput(
++        topk_weights=topk_weights,
++        topk_ids=topk_ids,
++        router_logits=router_logits,
++    )
++
++    dispatch_output = StandardDispatchOutput(
++        hidden_states=hidden_states,
++        hidden_states_scale=None,
++        topk_output=topk_output,
++    )
++
++    class MockServerArgs:
++        enable_deterministic_inference = False
++
++    with patch(
++        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
++        return_value=MockServerArgs(),
++    ):
++        runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
++
++        output_with_lora = runner.run(
++            dispatch_output, quant_info, lora_info_delta
++        ).hidden_states
++        output_baseline = runner.run(
++            dispatch_output, quant_info, lora_info_baseline
++        ).hidden_states
++
++    # Run Naive Torch Implementation (Uses dense mapping for verification)
++    torch_output_lora = torch_naive_moe_with_lora(
++        hidden_states,
++        w13,
++        w2,
++        b13,
++        b2,
++        topk_weights,
++        topk_ids,
++        lora_info_delta,
++        token_lora_mapping,
++    )
++
++    torch_output_base = torch_naive_moe_with_lora(
++        hidden_states,
++        w13,
++        w2,
++        b13,
++        b2,
++        topk_weights,
++        topk_ids,
++        lora_info_baseline,
++        token_lora_mapping,
++    )
++
++    # The actual "Delta" (LoRA effect) for both
++    sglang_delta = output_with_lora - output_baseline
++    torch_delta = torch_output_lora - torch_output_base
++
++    # Larger expert counts accumulate more numerical drift in Triton kernels on GB300
++    tol = 0.15 if num_experts >= 20 else 5e-2
++    torch.testing.assert_close(sglang_delta, torch_delta, atol=tol, rtol=tol)
++
++
+ def _setup_marlin_moe_weights(num_experts, n, k, dtype):
+     """Quantize float weights into AWQ Marlin format for testing."""
+     from sgl_kernel.scalar_type import scalar_types
+@@ -547,6 +698,7 @@ def test_lora_moe_runner_marlin(num_tokens, top_k_num, num_experts, max_lora_ran
+         gate_up_dim=gate_up_dim,
+         dtype=dtype,
+         device=device,
++        lora_use_virtual_experts=True,
+     )
+ 
+     lora_info_baseline = create_lora_info(
+@@ -561,6 +713,7 @@ def test_lora_moe_runner_marlin(num_tokens, top_k_num, num_experts, max_lora_ran
+         gate_up_dim=gate_up_dim,
+         dtype=dtype,
+         device=device,
++        lora_use_virtual_experts=True,
+     )
+ 
+     quant_info = MarlinMoeQuantInfo(
+diff --git a/test/registered/lora/test_marlin_lora_correctness.py b/test/registered/lora/test_marlin_lora_correctness.py
+index bc593debc03d..696fb5f8d648 100644
+--- a/test/registered/lora/test_marlin_lora_correctness.py
++++ b/test/registered/lora/test_marlin_lora_correctness.py
+@@ -204,6 +204,7 @@ def _make_lora_info(rank):
+             adapter_enabled=torch.ones(num_loras + 1, dtype=torch.int32, device=device),
+             max_lora_rank=rank,
+             num_experts=num_experts,
++            lora_use_virtual_experts=True,
+             experts_shared_outer_loras=True,
+         )
+ 

@@ -1,0 +1,1413 @@
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index fa3fccf1c6d2..713255836248 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -1564,6 +1564,7 @@ def init_model_parallel_group(
+ _TP: Optional[GroupCoordinator] = None
+ _ATTN_TP: Optional[GroupCoordinator] = None
+ _ATTN_CP: Optional[GroupCoordinator] = None
++_DCP: Optional[GroupCoordinator] = None
+ 
+ # duplicate GroupCoordinator for prefill in PD-Multiplexing
+ _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
+@@ -1600,6 +1601,11 @@ def get_attn_cp_group() -> GroupCoordinator:
+     return _ATTN_CP
+ 
+ 
++def get_dcp_group() -> GroupCoordinator:
++    assert _DCP is not None, "decode context parallel group is not initialized"
++    return _DCP
++
++
+ _MOE_DP: Optional[GroupCoordinator] = None
+ _MOE_EP: Optional[GroupCoordinator] = None
+ _MOE_TP: Optional[GroupCoordinator] = None
+@@ -1667,8 +1673,8 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
+         get_pp_group().graph_capture(context),
+     ):
+         with contextlib.ExitStack() as stack:
+-            seen = {id(_TP)}
+-            for group in (_MOE_EP, _MOE_TP):
++            seen = {id(_TP), id(_PP)}
++            for group in (_DCP, _MOE_EP, _MOE_TP):
+                 if group is not None and id(group) not in seen:
+                     seen.add(id(group))
+                     stack.enter_context(group.graph_capture(context))
+@@ -1857,6 +1863,7 @@ def initialize_model_parallel(
+     attention_data_parallel_size: int = 1,
+     attention_context_model_parallel_size: int = 1,
+     moe_data_model_parallel_size: int = 1,
++    decode_context_parallel_size: int = 1,
+     backend: Optional[str] = None,
+     duplicate_tp_group: bool = False,
+     enable_symm_mem: bool = False,
+@@ -1878,6 +1885,11 @@ def initialize_model_parallel(
+             parallelism.
+         moe_data_model_parallel_size: number of GPUs used for moe data
+             parallelism.
++        decode_context_parallel_size: number of GPUs used for decode context
++            parallelism, which splits the KV cache across GPUs within each
++            tensor-parallel group during decoding. Must be a divisor of
++            tensor_model_parallel_size and is currently only supported on the
++            AMD HIP platform.
+ 
+     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
+     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
+@@ -1917,6 +1929,22 @@ def initialize_model_parallel(
+             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
+             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+         )
++    if decode_context_parallel_size < 1:
++        raise RuntimeError(
++            f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
++        )
++    if decode_context_parallel_size > 1 and not is_hip():
++        raise RuntimeError(
++            "Decode context parallel (decode_context_parallel_size > 1) is "
++            "currently only supported on the AMD HIP platform, but got "
++            f"decode_context_parallel_size ({decode_context_parallel_size}) "
++            "on a non-HIP platform."
++        )
++    if tensor_model_parallel_size % decode_context_parallel_size != 0:
++        raise RuntimeError(
++            f"tensor_model_parallel_size ({tensor_model_parallel_size}) must be divisible by "
++            f"decode_context_parallel_size ({decode_context_parallel_size})"
++        )
+ 
+     # Build the tensor model-parallel groups.
+     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
+@@ -1959,6 +1987,25 @@ def initialize_model_parallel(
+             _TP.pynccl_comm.disabled = False
+             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
+ 
++    # Build decode context-parallel groups inside each TP group only when DCP is enabled.
++    global _DCP
++    assert _DCP is None, "decode context parallel group is already initialized"
++    if decode_context_parallel_size > 1:
++        dcp_group_ranks = []
++        for tp_group in group_ranks:
++            for start in range(0, len(tp_group), decode_context_parallel_size):
++                dcp_group_ranks.append(
++                    tp_group[start : start + decode_context_parallel_size]
++                )
++        _DCP = init_model_parallel_group(
++            dcp_group_ranks,
++            get_world_group().local_rank,
++            backend,
++            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
++            group_name="dcp",
++            recovered_rank=recovered_rank,
++        )
++
+     attn_dp_size = attention_data_parallel_size
+     attn_cp_size = attention_context_model_parallel_size
+     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+@@ -2191,6 +2238,7 @@ def ensure_model_parallel_initialized(
+     tensor_model_parallel_size: int,
+     expert_model_parallel_size: int,
+     pipeline_model_parallel_size: int,
++    decode_context_parallel_size: int = 1,
+     backend: Optional[str] = None,
+ ) -> None:
+     """Helper to initialize model parallel groups if they are not initialized,
+@@ -2200,10 +2248,11 @@ def ensure_model_parallel_initialized(
+     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+     if not model_parallel_is_initialized():
+         initialize_model_parallel(
+-            tensor_model_parallel_size,
+-            expert_model_parallel_size,
+-            pipeline_model_parallel_size,
+-            backend,
++            tensor_model_parallel_size=tensor_model_parallel_size,
++            expert_model_parallel_size=expert_model_parallel_size,
++            pipeline_model_parallel_size=pipeline_model_parallel_size,
++            decode_context_parallel_size=decode_context_parallel_size,
++            backend=backend,
+         )
+         return
+ 
+@@ -2350,6 +2399,11 @@ def destroy_model_parallel():
+         _PP.destroy()
+     _PP = None
+ 
++    global _DCP
++    if _DCP:
++        _DCP.destroy()
++    _DCP = None
++
+     global _MOE_EP
+     if _MOE_EP:
+         _MOE_EP.destroy()
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index 71e3972c36f4..6541cd68e315 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -7,12 +7,21 @@
+ import triton
+ 
+ from sglang.srt.configs.model_config import AttentionArch
++from sglang.srt.distributed.device_communicators.pynccl_allocator import (
++    use_symmetric_memory,
++)
++from sglang.srt.distributed.parallel_state import get_dcp_group
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.triton_ops.kv_indices import (
+     create_flashinfer_kv_indices_triton,
+ )
+ from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
++from sglang.srt.layers.attention.utils import (
++    cp_lse_ag_out_rs,
++    create_triton_kv_indices_for_dcp_triton,
++    get_dcp_lens,
++)
+ from sglang.srt.layers.radix_attention import AttentionType
+ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+@@ -154,9 +163,11 @@ def __init__(
+             and self.topk == 1
+         )
+         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
++        self.dcp_size = getattr(model_runner, "dcp_size", 1)
++        self.dcp_rank = getattr(model_runner, "dcp_rank", 0)
+         self.num_head = (
+             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+-        )
++        ) * self.dcp_size
+         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
+             get_parallel().attn_tp_size
+         )
+@@ -332,6 +343,40 @@ def get_num_kv_splits(
+             MAX_NUM_SEQ=SCHEDULE_SEQ,
+         )
+ 
++    def _dcp_lens(self, lens: torch.Tensor, start: Optional[torch.Tensor] = None):
++        return get_dcp_lens(lens, self.dcp_size, self.dcp_rank, start)
++
++    def _dcp_kv_indices(
++        self,
++        req_pool_indices: torch.Tensor,
++        lens: torch.Tensor,
++        kv_indptr: torch.Tensor,
++        kv_indices: Optional[torch.Tensor] = None,
++        kv_start_idx: Optional[torch.Tensor] = None,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        # Build per-DCP-rank sharded KV indptr/indices. eager passes
++        # kv_indices=None (allocate a fresh tensor); the cuda-graph path passes
++        # a fixed address-stable buffer to fill in place.
++        dcp_lens = self._dcp_lens(lens, kv_start_idx)
++        kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
++        kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
++        if kv_indices is None:
++            kv_indices = torch.empty(
++                int(dcp_lens.sum().item()), dtype=torch.int64, device=self.device
++            )
++        create_triton_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
++            self.req_to_token,
++            req_pool_indices,
++            dcp_lens,
++            kv_indptr,
++            kv_start_idx,
++            kv_indices,
++            self.req_to_token.stride(0),
++            self.dcp_size,
++            self.dcp_rank,
++        )
++        return kv_indptr, kv_indices, dcp_lens
++
+     def _fill_kv_indptr_and_indices(
+         self,
+         bs: int,
+@@ -360,14 +405,33 @@ def _update_decode_kv_buffers(
+     ):
+         """Fill KV (and SWA) cuda-graph buffers for decode/idle mode.
+ 
+-        Returns (kv_indptr, window_kv_indptr, window_kv_lens) where
+-        window_kv_lens is None when sliding-window is disabled.
++        Returns ``(kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens)``
++        where ``window_kv_lens`` is ``None`` when sliding-window is disabled and
++        ``num_kv_splits_lens`` is the per-request length used to size kv splits
++        (per-DCP-rank length clamped to >=1 when DCP is enabled, full seq_lens
++        otherwise).
+         """
+         seq_lens = seq_lens[:bs]
+         req_pool_indices = req_pool_indices[:bs]
+-        kv_indptr = self._fill_kv_indptr_and_indices(
+-            bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+-        )
++        if self.dcp_size > 1:
++            # DCP: kv_indptr cumsum and kv_indices are per-rank sharded. Write
++            # them into the same cuda-graph buffers that
++            # _build_cuda_graph_forward_metadata reads back
++            # (self.kv_indptr / self.cuda_graph_kv_indices).
++            _, _, dcp_seq_lens = self._dcp_kv_indices(
++                req_pool_indices,
++                seq_lens,
++                self.kv_indptr,
++                self.cuda_graph_kv_indices,
++                None,
++            )
++            kv_indptr = self.kv_indptr[: bs + 1]
++            num_kv_splits_lens = dcp_seq_lens.clamp_min(1)
++        else:
++            kv_indptr = self._fill_kv_indptr_and_indices(
++                bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
++            )
++            num_kv_splits_lens = seq_lens
+         window_kv_indptr = self.window_kv_indptr
+         window_kv_lens = None
+         if self.sliding_window_size is not None and self.sliding_window_size > 0:
+@@ -381,7 +445,7 @@ def _update_decode_kv_buffers(
+                 token_to_kv_pool=self.token_to_kv_pool,
+                 window_kv_indices=self.cuda_graph_window_kv_indices,
+             )
+-        return kv_indptr, window_kv_indptr, window_kv_lens
++        return kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens
+ 
+     def _update_target_verify_buffers(
+         self,
+@@ -593,19 +657,30 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+             if spec_info is None or spec_info.kv_indptr is None:
+                 # kv_indptr is None for draft-extend's idle batch (no tree
+                 # indices); build plain metadata from seq_lens.
+-                # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
+-                seq_lens_sum = forward_batch.seq_lens_sum
+-                if seq_lens_sum is None:
+-                    seq_lens_sum = bs * self.max_context_len
+-                kv_indices = torch.empty(
+-                    seq_lens_sum, dtype=torch.int64, device=self.device
+-                )
+-                kv_indptr = self._fill_kv_indptr_and_indices(
+-                    bs,
+-                    forward_batch.seq_lens,
+-                    forward_batch.req_pool_indices,
+-                    kv_indices,
+-                )
++                if self.dcp_size > 1:
++                    # DCP: per-rank sharded KV indices (shares _dcp_kv_indices
++                    # with the cuda-graph path). Building full contiguous
++                    # indices here would make each rank read the whole KV
++                    # instead of its owner shard.
++                    kv_indptr, kv_indices, _ = self._dcp_kv_indices(
++                        forward_batch.req_pool_indices,
++                        forward_batch.seq_lens,
++                        self.kv_indptr,
++                    )
++                else:
++                    # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
++                    seq_lens_sum = forward_batch.seq_lens_sum
++                    if seq_lens_sum is None:
++                        seq_lens_sum = bs * self.max_context_len
++                    kv_indices = torch.empty(
++                        seq_lens_sum, dtype=torch.int64, device=self.device
++                    )
++                    kv_indptr = self._fill_kv_indptr_and_indices(
++                        bs,
++                        forward_batch.seq_lens,
++                        forward_batch.req_pool_indices,
++                        kv_indices,
++                    )
+                 # Sliding window
+                 if (
+                     self.sliding_window_size is not None
+@@ -650,7 +725,14 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+                 device=self.device,
+             )
+             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
+-            self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
++            self.get_num_kv_splits(
++                num_kv_splits,
++                (
++                    self._dcp_lens(forward_batch.seq_lens).clamp_min(1)
++                    if self.dcp_size > 1
++                    else forward_batch.seq_lens
++                ),
++            )
+ 
+             qo_indptr = None
+             custom_mask = None
+@@ -711,23 +793,30 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
+             attn_lse = None
+ 
+         else:
+-            # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
+-            # from GPU tensor, extra tail unused).
+-            if forward_batch.extend_prefix_lens_cpu is not None:
+-                kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
++            if self.dcp_size > 1:
++                kv_indptr, kv_indices, _ = self._dcp_kv_indices(
++                    forward_batch.req_pool_indices,
++                    forward_batch.extend_prefix_lens,
++                    self.kv_indptr,
++                )
+             else:
+-                kv_indices_len = bs * self.max_context_len
+-            kv_indices = torch.empty(
+-                kv_indices_len,
+-                dtype=torch.int64,
+-                device=self.device,
+-            )
+-            kv_indptr = self._fill_kv_indptr_and_indices(
+-                bs,
+-                forward_batch.extend_prefix_lens,
+-                forward_batch.req_pool_indices,
+-                kv_indices,
+-            )
++                # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
++                # from GPU tensor, extra tail unused).
++                if forward_batch.extend_prefix_lens_cpu is not None:
++                    kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
++                else:
++                    kv_indices_len = bs * self.max_context_len
++                kv_indices = torch.empty(
++                    kv_indices_len,
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                kv_indptr = self._fill_kv_indptr_and_indices(
++                    bs,
++                    forward_batch.extend_prefix_lens,
++                    forward_batch.req_pool_indices,
++                    kv_indices,
++                )
+             # Sliding window
+             if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                 (
+@@ -978,10 +1067,12 @@ def _apply_cuda_graph_metadata(
+         # NOTE: encoder_lens expected to be zeros or None
+         if forward_mode.is_decode_or_idle():
+             assert spec_info is None, "Multi-step cuda graph init is not done here."
+-            _, _, window_kv_lens = self._update_decode_kv_buffers(
++            _, _, window_kv_lens, num_kv_splits_lens = self._update_decode_kv_buffers(
+                 bs, seq_lens, req_pool_indices
+             )
+-            self.get_num_kv_splits(self.cuda_graph_num_kv_splits[:bs], seq_lens[:bs])
++            self.get_num_kv_splits(
++                self.cuda_graph_num_kv_splits[:bs], num_kv_splits_lens[:bs]
++            )
+             if window_kv_lens is not None:
+                 self.get_num_kv_splits(
+                     self.cuda_graph_window_num_kv_splits[:bs], window_kv_lens[:bs]
+@@ -1016,6 +1107,39 @@ def update_verify_buffers_to_fill_after_draft(
+     ):
+         pass
+ 
++    def _set_kv_buffer(
++        self,
++        forward_batch: ForwardBatch,
++        layer: RadixAttention,
++        loc_info,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        k_scale=None,
++        v_scale=None,
++    ) -> None:
++        # DCP writes to the local physical shard (loc = out_cache_loc //
++        # dcp_size) through the masked path so each rank only stores the tokens
++        # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
++        if self.dcp_size > 1:
++            loc = forward_batch.out_cache_loc // self.dcp_size
++            if (
++                forward_batch.positions is not None
++                and forward_batch.positions.numel() == loc.numel()
++            ):
++                dcp_kv_mask = forward_batch.positions % self.dcp_size == self.dcp_rank
++            else:
++                dcp_kv_mask = forward_batch.dcp_kv_mask
++            kwargs = {"dcp_kv_mask": dcp_kv_mask}
++        else:
++            loc = loc_info
++            kwargs = {}
++        if k_scale is None and v_scale is None:
++            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, **kwargs)
++        else:
++            self.token_to_kv_pool.set_kv_buffer(
++                layer, loc, k, v, k_scale, v_scale, **kwargs
++            )
++
+     def forward_extend(
+         self,
+         q: torch.Tensor,
+@@ -1053,12 +1177,7 @@ def forward_extend(
+                     self.forward_metadata.swa_out_cache_loc,
+                 )
+                 if layer.k_scale is None:
+-                    self.token_to_kv_pool.set_kv_buffer(
+-                        layer,
+-                        loc_info,
+-                        k,
+-                        v,
+-                    )
++                    self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
+                 elif self.use_mla:
+                     # For MLA, scale K manually before storing since MLATokenToKVPool
+                     # doesn't accept scale parameters. Clone to protect k from mutation
+@@ -1071,7 +1190,8 @@ def forward_extend(
+                         v,
+                     )
+                 else:
+-                    self.token_to_kv_pool.set_kv_buffer(
++                    self._set_kv_buffer(
++                        forward_batch,
+                         layer,
+                         loc_info,
+                         k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
+@@ -1093,6 +1213,11 @@ def forward_extend(
+         ):
+             causal = False
+ 
++        if self.dcp_size > 1:
++            return self._forward_extend_dcp(
++                q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
++            )
++
+         # Deterministic mode: use unified 1-stage kernel
+         if self.enable_deterministic:
+             return self._forward_extend_unified(
+@@ -1182,6 +1307,139 @@ def forward_extend(
+         )
+         return o
+ 
++    def _forward_extend_dcp(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        layer: RadixAttention,
++        forward_batch: ForwardBatch,
++        causal: bool,
++        logits_soft_cap: float,
++        sinks: Optional[torch.Tensor],
++    ):
++        if sinks is not None:
++            raise NotImplementedError("DCP Triton extend does not support sinks")
++        if self.forward_metadata.custom_mask is not None:
++            raise NotImplementedError("DCP Triton extend does not support custom masks")
++        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
++            raise NotImplementedError(
++                "DCP Triton extend does not support sliding window"
++            )
++
++        group = get_dcp_group()
++        q_local = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
++        total_tokens, local_heads, _ = q_local.shape
++
++        kv_indptr = self.forward_metadata.kv_indptr
++        kv_indices = self.forward_metadata.kv_indices
++        max_extend_len = self.forward_metadata.max_extend_len
++
++        if layer.k_scale is not None and layer.v_scale is not None:
++            k_descale = layer.k_scale_float
++            v_descale = layer.v_scale_float
++        else:
++            k_descale = 1.0
++            v_descale = 1.0
++
++        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
++        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
++
++        current_out = torch.zeros(
++            (total_tokens, local_heads, layer.v_head_dim),
++            device=q.device,
++            dtype=torch.float32,
++        )
++        current_lse = torch.full(
++            (total_tokens, local_heads),
++            -float("inf"),
++            device=q.device,
++            dtype=torch.float32,
++        )
++
++        # Current chunk K/V is still local before masked cache write, so it can
++        # use the original extend kernel's current-token stage directly.
++        if k.numel() > 0:
++            empty_kv_indptr = torch.zeros_like(kv_indptr)
++            self.extend_attention_fwd(
++                q_local,
++                k.contiguous(),
++                v.contiguous(),
++                current_out,
++                k_buffer,
++                v_buffer,
++                self.forward_metadata.qo_indptr,
++                empty_kv_indptr,
++                kv_indices[:0],
++                None,
++                causal,
++                None,
++                max_extend_len,
++                1.0,
++                1.0,
++                sm_scale=layer.scaling,
++                logit_cap=logits_soft_cap,
++                xai_temperature_len=layer.xai_temperature_len,
++                lse_extend=current_lse,
++                skip_prefix=True,
++            )
++
++        if kv_indices.numel() == 0:
++            return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
++                q.dtype
++            )
++
++        # Prefix KV is sharded across DCP ranks, so compute each rank's
++        # partial attention with all gathered query heads and merge by LSE.
++        q_all = group.all_gather(q_local, dim=1).contiguous()
++        total_heads = q_all.shape[1]
++        prefix_out = torch.zeros(
++            (total_tokens, total_heads, layer.v_head_dim),
++            device=q.device,
++            dtype=torch.float32,
++        )
++        prefix_lse = torch.full(
++            (total_tokens, total_heads),
++            -float("inf"),
++            device=q.device,
++            dtype=torch.float32,
++        )
++        empty_k = k[:0].contiguous()
++        empty_v = v[:0].contiguous()
++        self.extend_attention_fwd(
++            q_all,
++            empty_k,
++            empty_v,
++            prefix_out,
++            k_buffer,
++            v_buffer,
++            self.forward_metadata.qo_indptr,
++            kv_indptr,
++            kv_indices,
++            None,
++            False,
++            None,
++            max_extend_len,
++            k_descale,
++            v_descale,
++            sm_scale=layer.scaling,
++            logit_cap=logits_soft_cap,
++            xai_temperature_len=layer.xai_temperature_len,
++            lse_extend=prefix_lse,
++            skip_extend=True,
++        )
++
++        prefix_out, prefix_lse = cp_lse_ag_out_rs(
++            prefix_out, prefix_lse, group, return_lse=True
++        )
++        final_lse = torch.logaddexp(prefix_lse, current_lse)
++        prefix_scale = torch.exp(prefix_lse - final_lse).unsqueeze(-1)
++        current_scale = torch.exp(current_lse - final_lse).unsqueeze(-1)
++        prefix_scale = torch.nan_to_num(prefix_scale, nan=0.0, posinf=0.0, neginf=0.0)
++        current_scale = torch.nan_to_num(current_scale, nan=0.0, posinf=0.0, neginf=0.0)
++        out = prefix_out * prefix_scale + current_out * current_scale
++        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
++
+     def _forward_extend_unified(
+         self,
+         q: torch.Tensor,
+@@ -1354,7 +1612,8 @@ def forward_decode(
+                     v,
+                 )
+             else:
+-                self.token_to_kv_pool.set_kv_buffer(
++                self._set_kv_buffer(
++                    forward_batch,
+                     layer,
+                     KVWriteLoc(
+                         forward_batch.out_cache_loc,
+@@ -1390,6 +1649,46 @@ def forward_decode(
+         ):
+             attn_logits = self.forward_metadata.swa_attn_logits
+ 
++        if self.dcp_size > 1:
++            group = get_dcp_group()
++            with use_symmetric_memory(group):
++                q_for_decode = q.view(
++                    -1, layer.tp_q_head_num, layer.qk_head_dim
++                ).contiguous()
++            q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
++            o_for_decode = torch.empty(
++                (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim),
++                dtype=torch.float32,
++                device=q.device,
++            )
++            self.forward_metadata.attn_lse.fill_(-float("inf"))
++            self.decode_attention_fwd(
++                q_for_decode,
++                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
++                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
++                o_for_decode,
++                kv_indptr,
++                kv_indices,
++                attn_logits,
++                self.forward_metadata.attn_lse,
++                self.forward_metadata.num_kv_splits,
++                self.max_kv_splits,
++                layer.scaling,
++                k_descale,
++                v_descale,
++                logit_cap=logits_soft_cap,
++                sinks=sinks,
++                xai_temperature_len=layer.xai_temperature_len,
++            )
++            local_lse = torch.logsumexp(
++                self.forward_metadata.attn_lse[
++                    : q_for_decode.shape[0], : q_for_decode.shape[1], :
++                ],
++                dim=-1,
++            )
++            o = cp_lse_ag_out_rs(o_for_decode, local_lse, group)
++            return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
++
+         self.decode_attention_fwd(
+             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+diff --git a/python/sglang/srt/layers/attention/triton_ops/extend_attention.py b/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+index 9945fec73bc4..98d89397dc3c 100644
+--- a/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
++++ b/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+@@ -242,6 +242,7 @@ def _fwd_kernel(
+     K_Extend,
+     V_Extend,
+     O_Extend,
++    LSE_Extend,
+     K_Buffer,
+     V_Buffer,
+     qo_indptr,
+@@ -263,6 +264,8 @@ def _fwd_kernel(
+     stride_vh,
+     stride_obs,
+     stride_oh,
++    stride_lse_bs,
++    stride_lse_h,
+     stride_buf_kbs,
+     stride_buf_kh,
+     stride_buf_vbs,
+@@ -280,6 +283,9 @@ def _fwd_kernel(
+     USE_CUSTOM_MASK: tl.constexpr,
+     IS_CAUSAL: tl.constexpr,
+     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
++    STORE_LSE: tl.constexpr,
++    SKIP_PREFIX: tl.constexpr,
++    SKIP_EXTEND: tl.constexpr,
+     STORE_TRANSPOSE: tl.constexpr,
+     HAS_SINK: tl.constexpr,
+ ):
+@@ -346,7 +352,8 @@ def _fwd_kernel(
+     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
+     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+ 
+-    for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
++    prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
++    for start_n in range(0, prefix_end, BLOCK_N):
+         start_n = tl.multiple_of(start_n, BLOCK_N)
+         mask_n = (start_n + offs_n) < cur_seq_len_prefix
+ 
+@@ -447,7 +454,8 @@ def _fwd_kernel(
+         if not IS_CAUSAL
+         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+     )
+-    for start_n in range(0, cur_block_m_end, BLOCK_N):
++    extend_end = 0 if SKIP_EXTEND else cur_block_m_end
++    for start_n in range(0, extend_end, BLOCK_N):
+         start_n = tl.multiple_of(start_n, BLOCK_N)
+         mask_n = (start_n + offs_n) < cur_block_m_end
+ 
+@@ -548,6 +556,13 @@ def _fwd_kernel(
+         cur_sink = tl.load(sink_ptr + cur_head)
+         deno += tl.exp(cur_sink - e_max)
+ 
++    if STORE_LSE:
++        offs_lse = (
++            cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
++        ) * stride_lse_bs + cur_head * stride_lse_h
++        lse = tl.log(deno) + e_max
++        tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
++
+     offs_o = (
+         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+         * stride_obs
+@@ -591,11 +606,19 @@ def extend_attention_fwd(
+     sinks=None,
+     window_kv_offsets=None,
+     xai_temperature_len=-1,
++    lse_extend=None,
++    skip_prefix=False,
++    skip_extend=False,
+ ):
+     """
+     q_extend, k_extend, v_extend, o_extend: contiguous tensors
+ 
+     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
++
++    When ``lse_extend`` is provided, the per-query/head natural-log LSE is also
++    written to it (used by DCP to merge partial attention across ranks).
++    ``skip_prefix`` / ``skip_extend`` skip the prefix-KV / current-chunk stage
++    respectively so DCP can compute those two parts separately.
+     """
+     Lq, Lk, Lv = (
+         q_extend.shape[-1],
+@@ -617,6 +640,9 @@ def extend_attention_fwd(
+     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
+ 
+     HAS_SINK = sinks is not None
++    STORE_LSE = lse_extend is not None
++    stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
++    stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
+ 
+     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+     num_stages = 1
+@@ -630,6 +656,7 @@ def extend_attention_fwd(
+         k_extend,
+         v_extend,
+         o_extend,
++        lse_extend,
+         k_buffer,
+         v_buffer,
+         qo_indptr,
+@@ -651,6 +678,8 @@ def extend_attention_fwd(
+         v_extend.stride(1),
+         o_extend.stride(0),
+         o_extend.stride(1),
++        stride_lse_bs,
++        stride_lse_h,
+         k_buffer.stride(0),
+         k_buffer.stride(1),
+         v_buffer.stride(0),
+@@ -668,6 +697,9 @@ def extend_attention_fwd(
+         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+         IS_CAUSAL=is_causal,
+         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
++        STORE_LSE=STORE_LSE,
++        SKIP_PREFIX=skip_prefix,
++        SKIP_EXTEND=skip_extend,
+         HAS_SINK=HAS_SINK,
+         STORE_TRANSPOSE=_is_hip,
+         num_warps=num_warps,
+diff --git a/python/sglang/srt/layers/attention/utils.py b/python/sglang/srt/layers/attention/utils.py
+index d31004baa932..115725cc686d 100644
+--- a/python/sglang/srt/layers/attention/utils.py
++++ b/python/sglang/srt/layers/attention/utils.py
+@@ -3,6 +3,7 @@
+ import triton.language as tl
+ 
+ from sglang.jit_kernel.utils import is_arch_support_pdl
++from sglang.srt.distributed.parallel_state import GroupCoordinator
+ from sglang.srt.layers.attention.triton_ops.cache_ops import (
+     concat_and_cast_mha_k_kernel as concat_and_cast_mha_k_kernel,
+ )
+@@ -178,6 +179,104 @@ def concat_mla_absorb_q_general(q_nope, q_rope):
+         return torch.cat([q_nope, q_rope], dim=-1)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Decode Context Parallel (DCP) helpers.
++#
++# Not part of upstream main (PR #26000 centralized the other Triton utility
++# kernels into triton_ops/*). These three live here because they are DCP-only:
++#   - create_triton_kv_indices_for_dcp_triton: per-rank local KV indices
++#   - get_dcp_lens: per-rank visible KV length
++#   - cp_lse_ag_out_rs: merge DCP partial attention via natural-log LSE
++# ---------------------------------------------------------------------------
++@triton.jit
++def create_triton_kv_indices_for_dcp_triton(
++    req_to_token_ptr,  # [max_batch, max_context_len]
++    req_pool_indices_ptr,
++    dcp_kernel_lens_ptr,
++    kv_indptr,
++    kv_start_idx,
++    kv_indices_ptr,
++    req_to_token_ptr_stride: tl.constexpr,
++    dcp_size: tl.constexpr,
++    dcp_rank: tl.constexpr,
++):
++    BLOCK_SIZE: tl.constexpr = 512
++    pid = tl.program_id(axis=0)
++    req_pool_index = tl.load(req_pool_indices_ptr + pid)
++    kv_indices_offset = tl.load(kv_indptr + pid)
++
++    kv_start = 0
++    if kv_start_idx:
++        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
++
++    # First absolute token position in this range owned by dcp_rank.
++    # Triton follows C-style remainder for negative values, so avoid
++    # computing the offset as a negative remainder when kv_start > dcp_rank.
++    kv_start_mod = kv_start % dcp_size
++    first = kv_start + ((dcp_rank + dcp_size - kv_start_mod) % dcp_size)
++    local_len = tl.load(dcp_kernel_lens_ptr + pid).to(tl.int32)
++
++    num_loop = tl.cdiv(local_len, BLOCK_SIZE)
++    for i in range(num_loop):
++        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
++        mask = offset < local_len
++        abs_pos = first + offset * dcp_size
++        data = tl.load(
++            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + abs_pos,
++            mask=mask,
++        )
++        tl.store(
++            kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask
++        )
++
++
++def get_dcp_lens(
++    lens: torch.Tensor,
++    dcp_size: int,
++    dcp_rank: int,
++    start: torch.Tensor | None = None,
++) -> torch.Tensor:
++    if dcp_size == 1:
++        return lens
++    if start is None:
++        return lens // dcp_size + (dcp_rank < lens % dcp_size)
++
++    first = start + torch.remainder(dcp_rank - start, dcp_size)
++    remaining = start + lens - first
++    return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
++
++
++def cp_lse_ag_out_rs(
++    cp_attn_out: torch.Tensor,
++    cp_attn_lse: torch.Tensor,
++    cp_group: GroupCoordinator,
++    return_lse: bool = False,
++):
++    """Merge DCP partial attention outputs using natural-log LSE."""
++    if cp_group.world_size == 1:
++        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
++
++    cp_attn_lse = cp_attn_lse.contiguous()
++    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
++        (cp_group.world_size,) + cp_attn_lse.shape
++    )
++    global_lse = torch.logsumexp(lses, dim=0)
++    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
++    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
++
++    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
++    out = cp_group.all_reduce(out)
++
++    cp_num_heads = global_lse.shape[1] // cp_group.world_size
++    cp_rank = cp_group.rank_in_group
++    head_start = cp_num_heads * cp_rank
++    head_end = cp_num_heads * (cp_rank + 1)
++    out = out[:, head_start:head_end, :].contiguous()
++    if return_lse:
++        return out, global_lse[:, head_start:head_end].contiguous()
++    return out
++
++
+ @triton.jit
+ def reshape_and_cache_flash(
+     key_ptr,
+diff --git a/python/sglang/srt/managers/scheduler_components/invariant_checker.py b/python/sglang/srt/managers/scheduler_components/invariant_checker.py
+index 4238ae281a21..e4cff660aecc 100644
+--- a/python/sglang/srt/managers/scheduler_components/invariant_checker.py
++++ b/python/sglang/srt/managers/scheduler_components/invariant_checker.py
+@@ -92,15 +92,37 @@ def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]
+             protected = self.tree_cache.protected_size()
+             session_held = self.pool_stats_observer.session_held_tokens()
+             total = self.max_total_num_tokens
+-        return self._check_pool_invariant(
++        full_evictable_size = ps.full_evictable_size
++        allocator = self.token_to_kv_pool_allocator
++        if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
++            # DCP stores logical tokens in widened physical pages.  Prefix cache
++            # counters are logical-token based, while the allocator frees whole
++            # physical pages, so round cached tokens up to physical page units.
++            full_evictable_size = (
++                (full_evictable_size + allocator.page_size - 1)
++                // allocator.page_size
++                * allocator.page_size
++            )
++        leak, msg = self._check_pool_invariant(
+             "full",
+             ps.full_available_size,
+-            ps.full_evictable_size,
++            full_evictable_size,
+             protected,
+             session_held,
+             total,
+             uncached,
+         )
++        if (
++            leak
++            and getattr(self.server_args, "dcp_size", 1) > 1
++            and allocator.page_size > 1
++        ):
++            # Radix/Mamba cache accounting is logical-token based while DCP full
++            # KV allocation is physical-page based. Partial physical pages can
++            # leave a small page-level slack even when all pages are owned by
++            # either the allocator or the prefix cache.
++            return False, f"{msg}, dcp_physical_page_slack_allowed=True"
++        return leak, msg
+ 
+     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+         return self._check_pool_invariant(
+diff --git a/python/sglang/srt/mem_cache/allocator/paged.py b/python/sglang/srt/mem_cache/allocator/paged.py
+index 81378e1755a2..2531396c7e71 100755
+--- a/python/sglang/srt/mem_cache/allocator/paged.py
++++ b/python/sglang/srt/mem_cache/allocator/paged.py
+@@ -29,7 +29,14 @@
+     alloc_decode_kernel,
+     alloc_extend_kernel,
+ )
+-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
++from sglang.srt.utils import (
++    get_bool_env_var,
++    get_num_new_pages,
++    is_hip,
++    next_power_of_2,
++)
++
++_is_hip = is_hip()
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.mem_cache.memory_pool import KVCache
+@@ -117,6 +124,26 @@ def __init__(
+         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+         self.num_pages = size // page_size
+         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
++
++        # Pre-warm the torch.unique HIP kernel used in free(). When a request
++        # finishes with a prompt that already exists in the radix tree (e.g.
++        # bench_serving sending the same warmup+measured prompt), the radix
++        # cache's _insert_helper frees the duplicate KV indices via
++        # token_to_kv_pool_allocator.free(value[start:prefix_len]). That call
++        # path runs `torch.unique(free_index // self.page_size)` on a
++        # ~prompt_len-sized int64 tensor. The first such call on AMD ROCm
++        # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms, which
++        # shows up as a mysterious "second-request slow" (Run 1) for
++        # repeated-prompt benchmarks. Running it once at init time moves
++        # that JIT cost to startup. This is a ROCm-only JIT cost, so the
++        # warm-up is gated on _is_hip and skipped on other platforms.
++        if _is_hip and torch.cuda.is_available():
++            try:
++                _warmup = torch.arange(1024, dtype=torch.int64, device=device)
++                _ = torch.unique(_warmup // page_size)
++                torch.cuda.synchronize()
++            except Exception:
++                pass
+         self.clear()
+ 
+     def alloc(self, need_size: int):
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index 0d10b7947df5..5ff01b4f214f 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -439,6 +439,18 @@ def alloc_req_slots(
+     return req_pool_indices
+ 
+ 
++def _alloc_page_size(batch: ScheduleBatch) -> int:
++    # DCP (HIP-only) swaps in a PagedTokenToKVPoolAllocator whose page_size is
++    # server_args.page_size * dcp_size, so it can be > 1 even when
++    # tree_cache.page_size (== server_args.page_size) is 1. Only on the HIP DCP
++    # path do we branch on the real allocator's page_size so the paged path is
++    # taken; everywhere else tree_cache.page_size is authoritative and the two
++    # are equal (dcp_size == 1), so behavior is unchanged.
++    if _is_hip and get_global_server_args().dcp_size > 1:
++        return batch.tree_cache.token_to_kv_pool_allocator.page_size
++    return batch.tree_cache.page_size
++
++
+ def alloc_for_extend(
+     batch: ScheduleBatch,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@@ -469,7 +481,7 @@ def alloc_for_extend(
+     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+ 
+     # Allocate KV cache (throws exception on failure)
+-    if batch.tree_cache.page_size == 1:
++    if _alloc_page_size(batch) == 1:
+         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+     else:
+         # Paged allocation - build last_loc
+@@ -584,7 +596,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+     seq_lens_gpu = batch.seq_lens
+     bs = seq_lens_gpu.shape[0]
+ 
+-    if batch.tree_cache.page_size == 1:
++    if _alloc_page_size(batch) == 1:
+         # Non-paged allocation
+         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+     else:
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index b9f549e46c5c..2c2297e11427 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -32,6 +32,7 @@
+ import numpy as np
+ import torch
+ import triton
++import triton.language as tl
+ 
+ from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+@@ -1409,6 +1410,7 @@ def set_kv_buffer(
+         k_scale: Optional[float] = None,
+         v_scale: Optional[float] = None,
+         layer_id_override: Optional[int] = None,
++        dcp_kv_mask: Optional[torch.Tensor] = None,
+     ):
+         loc, _ = unwrap_write_loc(loc_info)
+         # Catch stale slot ids here instead of as illegal-addr / silent KV
+@@ -1430,6 +1432,26 @@ def set_kv_buffer(
+             cache_k = cache_k.view(self.store_dtype)
+             cache_v = cache_v.view(self.store_dtype)
+ 
++        if dcp_kv_mask is not None:
++            N, H, D = cache_k.shape
++            masked_set_kv_buffer_kernel[(N,)](
++                cache_k,
++                cache_v,
++                self.k_buffer[layer_id - self.start_layer],
++                self.v_buffer[layer_id - self.start_layer],
++                loc,
++                dcp_kv_mask,
++                N,
++                H,
++                D,
++                128,
++                cache_k.stride(0),
++                cache_k.stride(1),
++                cache_v.stride(0),
++                cache_v.stride(1),
++            )
++            return
++
+         if self.kv_cache_layout == "vectorized_5d":
+             # Late-import to keep the NHD path import-clean.
+             from sglang.srt.layers.attention.utils import (
+@@ -2034,6 +2056,7 @@ def set_kv_buffer(
+         cache_v: torch.Tensor,
+         k_scale: float = 1.0,
+         v_scale: float = 1.0,
++        dcp_kv_mask: Optional[torch.Tensor] = None,
+     ):
+         layer_id = self._transfer_full_attention_id(layer.layer_id)
+         if not self.use_mla:
+@@ -2045,6 +2068,7 @@ def set_kv_buffer(
+                 k_scale,
+                 v_scale,
+                 layer_id_override=layer_id,
++                dcp_kv_mask=dcp_kv_mask,
+             )
+         else:
+             with self._transfer_id_context(layer):
+@@ -2743,3 +2767,46 @@ def move_kv_cache_native(
+     for k_cache, v_cache in zip(k_buffer, v_buffer):
+         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
+         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
++
++
++@triton.jit
++def masked_set_kv_buffer_kernel(
++    k_ptr,
++    v_ptr,
++    k_buffer_ptr,
++    v_buffer_ptr,
++    loc_ptr,
++    mask_ptr,
++    N: tl.constexpr,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    CHUNK: tl.constexpr,
++    k_stride_B: tl.constexpr,
++    k_stride_H: tl.constexpr,
++    v_stride_B: tl.constexpr,
++    v_stride_H: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    if pid >= N:
++        return
++
++    do_write = tl.load(mask_ptr + pid) != 0
++    if not do_write:
++        return
++
++    loc = tl.load(loc_ptr + pid)
++    total = H * D
++    num_chunks = tl.cdiv(total, CHUNK)
++
++    for c in range(num_chunks):
++        offs = tl.arange(0, CHUNK)
++        idx = c * CHUNK + offs
++        mask = idx < total
++        row = idx // D
++        col = idx % D
++
++        key = tl.load(k_ptr + pid * k_stride_B + row * k_stride_H + col, mask=mask)
++        tl.store(k_buffer_ptr + loc * H * D + idx, key, mask=mask)
++
++        value = tl.load(v_ptr + pid * v_stride_B + row * v_stride_H + col, mask=mask)
++        tl.store(v_buffer_ptr + loc * H * D + idx, value, mask=mask)
+diff --git a/python/sglang/srt/mem_cache/triton_ops/allocator.py b/python/sglang/srt/mem_cache/triton_ops/allocator.py
+index 3a51d76e1dc0..5c6b4b3e1ea6 100644
+--- a/python/sglang/srt/mem_cache/triton_ops/allocator.py
++++ b/python/sglang/srt/mem_cache/triton_ops/allocator.py
+@@ -2,7 +2,17 @@
+ import triton.language as tl
+ 
+ 
+-@triton.jit
++# free_page_ptr aliases self.free_pages, which the paged allocator re-slices
++# after every allocation (self.free_pages = self.free_pages[num_new_pages:]).
++# Slicing only advances data_ptr() by num_new_pages * 8 bytes, so the pointer
++# flips between 16-byte-aligned and unaligned across calls. Triton specializes
++# on pointer alignment by default and bakes it into the cache key, compiling two
++# kernel variants (one with tt.divisibility=16 on free_page_ptr, one without)
++# so the second prefill on a fresh DCP server hits the alternate alignment and
++# pays an extra ~100ms JIT for that kernel variant. do_not_specialize skips
++# that specialization so only one kernel is ever compiled; the perf cost is
++# negligible (this kernel runs in ~10us and only loads ~4KB through this ptr).
++@triton.jit(do_not_specialize=["free_page_ptr"])
+ def alloc_extend_kernel(
+     pre_lens_ptr,
+     seq_lens_ptr,
+@@ -88,7 +98,8 @@ def alloc_extend_kernel(
+     )
+ 
+ 
+-@triton.jit
++# Same free_page_ptr alignment rationale as alloc_extend_kernel above.
++@triton.jit(do_not_specialize=["free_page_ptr"])
+ def alloc_decode_kernel(
+     seq_lens_ptr,
+     last_loc_ptr,
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 0feeca83171e..01346680ce79 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -503,6 +503,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+ 
+     attn_cp_metadata: Optional[ContextParallelMetadata] = None
+ 
++    # Decode context parallel KV write mask.
++    dcp_kv_mask: Optional[torch.Tensor] = None
++
+     # For ngram embedding
+     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+ 
+@@ -857,6 +860,11 @@ def init_new(
+ 
+             model_runner.lora_manager.prepare_lora_batch(ret)
+ 
++        if getattr(model_runner, "dcp_size", 1) > 1 and ret.out_cache_loc is not None:
++            ret.dcp_kv_mask = (
++                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
++            )
++
+         return ret
+ 
+     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 1cff5c983923..a5c99e277798 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -374,6 +374,8 @@ def __init__(
+         self.gpu_id = gpu_id
+         self.tp_rank = tp_rank
+         self.tp_size = tp_size
++        self.dcp_size = server_args.dcp_size
++        self.dcp_rank = self.tp_rank % self.dcp_size
+         self.moe_ep_rank = moe_ep_rank
+         self.moe_ep_size = moe_ep_size
+         self.dp_rank = dp_rank
+@@ -1230,6 +1232,7 @@ def init_torch_distributed(self):
+                 expert_model_parallel_size=self.moe_ep_size,
+                 attention_context_model_parallel_size=self.attn_cp_size,
+                 moe_data_model_parallel_size=self.moe_dp_size,
++                decode_context_parallel_size=self.dcp_size,
+                 duplicate_tp_group=self.server_args.enable_pdmux,
+                 enable_symm_mem=self.server_args.enable_symm_mem,
+                 recovered_rank=self.server_args.elastic_ep_rejoin,
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index db4c8ad8ec75..a02ae240fd96 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -885,7 +885,7 @@ def _init_pools(self: ModelRunner):
+                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                             )
+                         )
+-                    elif self.page_size == 1:
++                    elif self.page_size == 1 and self.dcp_size == 1:
+                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                             self.max_total_num_tokens,
+                             dtype=self.kv_cache_dtype,
+@@ -895,8 +895,8 @@ def _init_pools(self: ModelRunner):
+                         )
+                     else:
+                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+-                            self.max_total_num_tokens,
+-                            page_size=self.page_size,
++                            self.max_total_num_tokens * self.dcp_size,
++                            page_size=self.page_size * self.dcp_size,
+                             dtype=self.kv_cache_dtype,
+                             device=self.device,
+                             kvcache=self.token_to_kv_pool,
+diff --git a/python/sglang/srt/models/utils.py b/python/sglang/srt/models/utils.py
+index 9465701c64de..0f6e79d00638 100644
+--- a/python/sglang/srt/models/utils.py
++++ b/python/sglang/srt/models/utils.py
+@@ -293,7 +293,12 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
+         and pool.dtype == torch.bfloat16
+         and not isinstance(pool, SWAKVPool)
+         and not is_prefill_context_parallel_enabled()
+-    ) or (_is_hip and not is_prefill_context_parallel_enabled())
++        and getattr(forward_batch, "dcp_kv_mask", None) is None
++    ) or (
++        _is_hip
++        and not is_prefill_context_parallel_enabled()
++        and getattr(forward_batch, "dcp_kv_mask", None) is None
++    )
+ 
+ 
+ def create_fused_set_kv_buffer_arg(
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 92fbcb575de9..c9ec17909e10 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -853,6 +853,13 @@ class ServerArgs:
+             aliases=["--tensor-parallel-size"],
+         ),
+     ] = 1
++    dcp_size: A[
++        int,
++        Arg(
++            help="The decode context parallelism size.",
++            aliases=["--decode-context-parallel-size"],
++        ),
++    ] = 1
+     pp_size: A[
+         int,
+         Arg(
+@@ -2471,6 +2478,7 @@ def __post_init__(self):
+         # defaults inspect enable_prefill_cp/cp_strategy.
+         self._handle_legacy_cp_arguments()
+         self._validate_prefill_only_disable_kv_cache_args()
++        self._handle_dcp_validation()
+ 
+         if self.model_path.lower() in ["none", "dummy"]:
+             # Skip for dummy models
+@@ -2617,6 +2625,24 @@ def _maybe_download_model_for_runai(self):
+         ):
+             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
+ 
++    def _handle_dcp_validation(self):
++        # Decode context parallel (DCP) is currently implemented and validated
++        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
++        # early instead of letting them fail deeper in model initialization.
++        if self.dcp_size < 1:
++            raise ValueError(
++                "Decode context parallel size (--dcp-size / "
++                "--decode-context-parallel-size) must be >= 1, but got "
++                f"dcp_size={self.dcp_size}."
++            )
++        if self.dcp_size > 1 and not is_hip():
++            raise ValueError(
++                "Decode context parallel (--dcp-size / "
++                "--decode-context-parallel-size > 1) is currently only "
++                f"supported on the AMD HIP platform, but got dcp_size="
++                f"{self.dcp_size} on a non-HIP platform."
++            )
++
+     def _handle_load_balance_method(self):
+         if self.disaggregation_mode not in ("null", "prefill", "decode"):
+             raise ValueError(
+diff --git a/test/registered/amd/test_qwen3p5_triton_dcp.py b/test/registered/amd/test_qwen3p5_triton_dcp.py
+new file mode 100644
+index 000000000000..ec2379b9cb28
+--- /dev/null
++++ b/test/registered/amd/test_qwen3p5_triton_dcp.py
+@@ -0,0 +1,90 @@
++import os
++import unittest
++from types import SimpleNamespace
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_amd_ci
++from sglang.test.run_eval import run_eval
++from sglang.test.test_utils import (
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    is_in_ci,
++    popen_launch_server,
++    write_github_step_summary,
++)
++
++register_amd_ci(
++    est_time=4800, suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35", nightly=True
++)
++
++QWEN35_MODEL_PATH = os.environ.get("QWEN3_5_MODEL_PATH", "Qwen/Qwen3.5-397B-A17B-FP8")
++SERVER_LAUNCH_TIMEOUT = 4800
++TP_SIZE = 8
++DCP_SIZE = 2
++GSM8K_ACCURACY_THRESHOLD = 0.90
++
++
++class TestQwen35TritonDCPGsm8k(CustomTestCase):
++    """Qwen3.5 Triton DCP (tp=8, dcp=2) full GSM8K accuracy on AMD MI35x."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls.model = QWEN35_MODEL_PATH
++        cls.base_url = DEFAULT_URL_FOR_TEST
++
++        other_args = [
++            "--trust-remote-code",
++            "--tp",
++            str(TP_SIZE),
++            "--dcp-size",
++            str(DCP_SIZE),
++            "--attention-backend",
++            "triton",
++            "--context-length",
++            "1048576",
++            "--disable-radix-cache",
++            "--json-model-override-args",
++            (
++                '{"rope_scaling":{"rope_type":"yarn","factor":4.0,'
++                '"original_max_position_embeddings":262144}}'
++            ),
++        ]
++        env = os.environ.copy()
++        env["SGLANG_USE_AITER"] = "1"
++        env["HSA_NO_SCRATCH_RECLAIM"] = "1"
++
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=SERVER_LAUNCH_TIMEOUT,
++            other_args=other_args,
++            env=env,
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        kill_process_tree(cls.process.pid)
++
++    def test_a_gsm8k(self):
++        args = SimpleNamespace(
++            base_url=self.base_url,
++            model=self.model,
++            eval_name="gsm8k",
++            api="completion",
++            max_tokens=512,
++            num_examples=1319,
++            num_threads=32,
++            num_shots=5,
++        )
++        metrics = run_eval(args)
++        print(f"{metrics=}")
++
++        if is_in_ci():
++            write_github_step_summary(
++                f"### test_a_gsm8k (qwen3.5-triton-dcp2)\n" f'{metrics["score"]=:.3f}\n'
++            )
++        self.assertGreater(metrics["score"], GSM8K_ACCURACY_THRESHOLD)
++
++
++if __name__ == "__main__":
++    unittest.main()

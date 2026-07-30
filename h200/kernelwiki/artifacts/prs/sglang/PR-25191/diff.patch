@@ -1,0 +1,197 @@
+diff --git a/python/sglang/srt/layers/quantization/mlx.py b/python/sglang/srt/layers/quantization/mlx.py
+index 60d43cdd3dd9..ecb786b6cdd2 100644
+--- a/python/sglang/srt/layers/quantization/mlx.py
++++ b/python/sglang/srt/layers/quantization/mlx.py
+@@ -1,19 +1,27 @@
+-"""Marker config for MLX backend on-the-fly quantization (mlx_q4 / mlx_q8).
++"""Marker config and auto-detect hook for MLX backend quantization presets.
+ 
+ The MLX backend (``python/sglang/srt/hardware_backend/mlx/``) performs its own
+-quantization at model-load time via :func:`mlx_lm.utils.quantize_model`. The
+-standard PyTorch ``QuantizationConfig`` machinery is **never** invoked on that
++quantization at model load time via :func:`mlx_lm.utils.quantize_model`. The
++standard PyTorch ``QuantizationConfig`` machinery is never invoked on that
+ path.
+ 
+-This module exists purely so that the names ``mlx_q4`` and ``mlx_q8`` are
+-recognized by ``QUANTIZATION_METHODS`` — that way
+-:meth:`ModelConfig._verify_quantization` and downstream registry lookups treat
+-them as known methods without any backend-specific carve-outs in the generic
+-config code.
++This module serves two purposes:
+ 
+-If a user passes ``--quantization mlx_q4`` without ``SGLANG_USE_MLX=1`` they
+-will eventually reach a code path that tries to instantiate this Config class,
+-at which point we raise a clear error.
++1. Registry registration. Listing ``mlx_q4`` and ``mlx_q8`` in
++   ``QUANTIZATION_METHODS`` lets :meth:`ModelConfig._verify_quantization`
++   recognize them as known methods without backend-specific exceptions in
++   the generic config code.
++
++2. Auto-detection for mlx-community HF repos.
++   :meth:`override_quantization_method` claims ``config.json`` blocks of
++   the form ``{"group_size": <int>, "bits": <int>}`` with no
++   ``quant_method`` key and resolves them to the matching preset.
++   Already-quantized mlx-community repos load on Apple Silicon without the
++   user passing ``--quantization`` on the CLI. Resolves #25119.
++
++The PyTorch path constructors (``from_config``, ``get_quant_method``) raise
++``NotImplementedError`` with a clear pointer to ``SGLANG_USE_MLX=1``, since
++this class is not a real PyTorch quantization implementation.
+ """
+ 
+ from __future__ import annotations
+@@ -68,6 +76,48 @@ def get_config_filenames(cls) -> List[str]:
+     def from_config(cls, config: Dict[str, Any]) -> "MlxQuantizationConfig":
+         raise NotImplementedError(cls._ERR)
+ 
++    @classmethod
++    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
++        """Auto-detect mlx-community-shape quantization configs.
++
++        mlx-community models ship ``config.json`` with::
++
++            "quantization_config": {"group_size": <int>, "bits": <int>}
++
++        No ``quant_method`` key, no other identifying field. Without this
++        override, :meth:`ModelConfig._verify_quantization` cannot match the
++        shape to any registered method and raises ``Unknown quantization
++        method`` (see #25119). Match it here and return the preset whose
++        bit-width agrees, so pre-quantized HF repos load on Apple Silicon
++        without the user having to pass ``--quantization`` on the CLI.
++
++        Returns ``None`` for any input that does not look like a bare MLX
++        preset: non-dict, dict with an explicit ``quant_method``, missing
++        keys, non-integer values, or unsupported bit-width. Also defers to
++        any explicit ``--quantization`` CLI choice (``user_quant``) per the
++        registry contract: CLI selection takes priority over auto-detect.
++        """
++        if user_quant is not None:
++            # User passed --quantization explicitly; respect that choice
++            # regardless of the HF config shape. Matches the moe_wna16 /
++            # modelopt convention.
++            return None
++        if not isinstance(hf_quant_cfg, dict):
++            return None
++        if "quant_method" in hf_quant_cfg:
++            # Configs that declare a quant_method belong to whichever method
++            # registers under that name; do not hijack them.
++            return None
++        bits = hf_quant_cfg.get("bits")
++        group_size = hf_quant_cfg.get("group_size")
++        if not isinstance(bits, int) or not isinstance(group_size, int):
++            return None
++        if bits == 4:
++            return "mlx_q4"
++        if bits == 8:
++            return "mlx_q8"
++        return None
++
+     def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> Optional[QuantizeMethodBase]:
+diff --git a/test/registered/unit/hardware_backend/mlx/test_quantization.py b/test/registered/unit/hardware_backend/mlx/test_quantization.py
+index 76f427f2dc1b..f518d80b3dec 100644
+--- a/test/registered/unit/hardware_backend/mlx/test_quantization.py
++++ b/test/registered/unit/hardware_backend/mlx/test_quantization.py
+@@ -17,6 +17,7 @@
+ import platform
+ import unittest
+ 
++from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
+ from sglang.test.ci.ci_register import register_cpu_ci
+ 
+ # Registered with the CPU suite (runtime no-op marker, parsed via AST).
+@@ -186,5 +187,92 @@ def test_quantize_flag_on_already_quantized_model_is_noop(self):
+             self._reset_mlx_memory()
+ 
+ 
++class TestMlxQuantizationOverride(unittest.TestCase):
++    """Pure-logic tests for ``MlxQuantizationConfig.override_quantization_method``.
++
++    The override is a classmethod over a dict; no mlx / Apple Silicon
++    dependency. Runs on every CI platform and guards #25119 from regression.
++    """
++
++    def test_mlx_q4_dict_config_autodetect(self):
++        """Bare {group_size, bits=4} dict maps to mlx_q4."""
++        result = MlxQuantizationConfig.override_quantization_method(
++            {"group_size": 64, "bits": 4}, None
++        )
++        self.assertEqual(result, "mlx_q4")
++
++    def test_mlx_q8_dict_config_autodetect(self):
++        """Bare {group_size, bits=8} dict maps to mlx_q8."""
++        result = MlxQuantizationConfig.override_quantization_method(
++            {"group_size": 32, "bits": 8}, None
++        )
++        self.assertEqual(result, "mlx_q8")
++
++    def test_non_mlx_dict_not_matched(self):
++        """Dicts with an explicit quant_method belong to that method, not ours."""
++        # modelopt-style: explicit quant_method takes priority.
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method(
++                {"quant_method": "modelopt", "bits": 4, "group_size": 64}, None
++            )
++        )
++        # gptq-style: same.
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method(
++                {"quant_method": "gptq", "bits": 4, "group_size": 128}, None
++            )
++        )
++
++    def test_non_dict_not_matched(self):
++        """Non-dict inputs and malformed dicts return None."""
++        # None / string inputs.
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method(None, None)
++        )
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method("mlx_q4", None)
++        )
++        # Missing keys.
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method({"bits": 4}, None)
++        )
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method({"group_size": 64}, None)
++        )
++        # Non-integer values.
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method(
++                {"bits": "4", "group_size": 64}, None
++            )
++        )
++        # Unsupported bit-width.
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method(
++                {"bits": 2, "group_size": 64}, None
++            )
++        )
++
++    def test_user_quant_explicit_defers_to_user(self):
++        """When the user passes --quantization explicitly, defer to that choice."""
++        # User chose mlx_q8 explicitly, even though config dict shape suggests q4
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method(
++                {"group_size": 64, "bits": 4}, "mlx_q8"
++            )
++        )
++        # User chose mlx_q4 explicitly with matching config
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method(
++                {"group_size": 64, "bits": 4}, "mlx_q4"
++            )
++        )
++        # User chose something completely different
++        self.assertIsNone(
++            MlxQuantizationConfig.override_quantization_method(
++                {"group_size": 64, "bits": 4}, "fp8"
++            )
++        )
++
++
+ if __name__ == "__main__":
+     unittest.main()

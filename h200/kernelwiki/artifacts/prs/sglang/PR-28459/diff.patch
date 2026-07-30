@@ -1,0 +1,138 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index 46c4cb3acb6d..0706206f7d77 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -593,6 +593,21 @@ def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
+             scale_u8 = layer.weight_scale_inv.data
+             n, k = weight.shape
+             epilogue_tile_m = 128
++            sf_cols = k // 32
++
++            scale_u8 = scale_u8.contiguous().view(torch.uint8).reshape(n, sf_cols)
++            padded_n = ((n + epilogue_tile_m - 1) // epilogue_tile_m) * (
++                epilogue_tile_m
++            )
++            pad_rows = padded_n - n
++
++            if pad_rows:
++                scale_u8 = F.pad(
++                    scale_u8,
++                    (0, 0, 0, pad_rows),
++                    mode="constant",
++                    value=0,
++                )
+ 
+             copy_or_rebind_param(
+                 layer,
+@@ -603,9 +618,9 @@ def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
+             )
+             copy_or_rebind_param(
+                 layer,
+-                "weight_scale_inv",
++                "weight_scale_inv_shuffled",
+                 shuffle_matrix_sf_a(
+-                    scale_u8.contiguous().view(torch.uint8).reshape(n, k // 32),
++                    scale_u8,
+                     epilogue_tile_m,
+                     num_elts_per_sf=32,
+                 )
+@@ -775,8 +790,11 @@ def apply(
+             )
+ 
+         if self.use_mxfp8:
+-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+-                weight_scale = layer.weight_scale_inv_swizzled
++            if (
++                get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
++                or get_fp8_gemm_runner_backend().is_flashinfer_trtllm()
++            ):
++                weight_scale = layer.weight_scale_inv_shuffled
+             else:
+                 weight_scale = layer.weight_scale_inv
+             if isinstance(x, tuple):
+diff --git a/test/registered/backends/test_flashinfer_trtllm_gen_moe_backend.py b/test/registered/backends/test_flashinfer_trtllm_gen_moe_backend.py
+index ca66e6f9a51f..d875c4a0c3b1 100644
+--- a/test/registered/backends/test_flashinfer_trtllm_gen_moe_backend.py
++++ b/test/registered/backends/test_flashinfer_trtllm_gen_moe_backend.py
+@@ -171,7 +171,7 @@ def setUpClass(cls):
+                 "--kv-cache-dtype",
+                 "bf16",
+                 "--fp8-gemm-backend",
+-                "flashinfer_cutlass",
++                "flashinfer_trtllm",
+                 "--moe-runner-backend",
+                 cls.backend,
+                 "--tp-size",
+diff --git a/test/registered/rl/test_update_weights_from_disk_blackwell.py b/test/registered/rl/test_update_weights_from_disk_blackwell.py
+index 086488965c6e..78fd977d9930 100644
+--- a/test/registered/rl/test_update_weights_from_disk_blackwell.py
++++ b/test/registered/rl/test_update_weights_from_disk_blackwell.py
+@@ -2,6 +2,7 @@
+ 
+ register_cuda_ci(est_time=320, stage="extra-b", runner_config="4-gpu-b200")
+ 
++import time
+ import unittest
+ 
+ import requests
+@@ -20,6 +21,7 @@ class UpdateWeightsFromDiskBase:
+     base_url = DEFAULT_URL_FOR_TEST
+     request_timeout = 120
+     update_timeout = 240
++    idle_timeout = 30
+     launch_env = None
+     decode_payload = {
+         "text": "The capital of France is",
+@@ -74,6 +76,19 @@ def _post_json(self, endpoint, payload, timeout=None):
+     def _run_decode(self):
+         return self._post_json("/generate", self.decode_payload)["text"]
+ 
++    def _wait_until_idle(self):
++        deadline = time.monotonic() + self.idle_timeout
++        last_loads = None
++        while time.monotonic() < deadline:
++            last_loads = self._get_json("/v1/loads?include=core")["loads"]
++            if last_loads and all(
++                load["num_running_reqs"] == 0 and load["num_waiting_reqs"] == 0
++                for load in last_loads
++            ):
++                return
++            time.sleep(0.1)
++        self.fail(f"Server did not become idle before weight update: {last_loads=}")
++
+     def _assert_non_empty_decode(self):
+         self.assertTrue(len(self._run_decode()) > 0)
+ 
+@@ -138,6 +153,7 @@ def test_parameterized_update_weights_from_disk(self):
+ 
+                     for update_test_suite in self.update_test_suites:
+                         with self.subTest(case_name=case_name, **update_test_suite):
++                            self._wait_until_idle()
+                             ret = self._run_update_weights(
+                                 self.model,
+                                 flush_cache=update_test_suite["flush_cache"],
+@@ -157,7 +173,8 @@ def test_parameterized_update_weights_from_disk(self):
+ 
+ 
+ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
+-    model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8-last-8-BF16"
++    model = "zianglih/JoyAI-LLM-Flash-MXFP8-last-6-BF16"
++    decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
+     backend_test_suites = (
+         {
+             "name": "flashinfer_trtllm_routed_mxfp8",
+@@ -166,10 +183,14 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
+                 "0",
+                 "--tp-size",
+                 "4",
++                "--dp-size",
++                "4",
++                "--enable-dp-attention",
+                 "--fp8-gemm-backend",
+                 "flashinfer_trtllm",
+                 "--moe-runner-backend",
+                 "flashinfer_trtllm_routed",
++                "--trust-remote-code",
+             ),
+         },
+     )

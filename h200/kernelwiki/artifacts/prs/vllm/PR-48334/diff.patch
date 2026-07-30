@@ -1,0 +1,231 @@
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index 8875ed49f6e7..a131d5e4d31e 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -219,6 +219,63 @@ def _xpu_ops_deepseek_scaling_rope_fake(
+     return query, key
+ 
+ 
++def _xpu_fp8_bmm_impl(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    out_dtype: torch.dtype,
++    a_scale: torch.Tensor,
++    b_scale: torch.Tensor,
++    bias: torch.Tensor | None,
++) -> torch.Tensor:
++    """XPU FP8 batched GEMM implementation for ``torch.ops.vllm.xpu_fp8_bmm``.
++
++    Computes batched matrix multiplication over the leading group dimension:
++    ``[G, M, K] @ [G, K, N] -> [G, M, N]``.
++
++    Args:
++        a: FP8 activation tensor with shape ``[G, M, K]``.
++            Does not need to be contiguous.
++        b: FP8 weight tensor with shape ``[G, K, N]``.
++            Does not need to be contiguous.
++        out_dtype: Output dtype accepted by the kernel (typically
++            ``torch.bfloat16`` for the DeepSeek-V4 O-proj path).
++        a_scale: Activation scale tensor for ``a``.
++            In current DeepSeek-V4 XPU usage it is block-scaled with shape
++            ``[G, M, K/bs]`` (``bs`` is the quant block size, e.g. 128).
++            Must be contiguous.
++        b_scale: Weight scale tensor for ``b``.
++            In current DeepSeek-V4 XPU usage it is block-scaled with shape
++            ``[G, K/bs, N/bs]`` (``bs`` is the quant block size, e.g. 128).
++            Must be contiguous.
++        bias: Optional bias tensor. Pass ``None`` when no bias is required.
++
++    Returns:
++        Output tensor with shape ``[G, M, N]`` and dtype ``out_dtype``.
++
++    Notes:
++        This implementation centralizes access to
++        ``torch.ops._xpu_C.fp8_bmm``. Both scales must be contiguous, while
++        ``a`` and ``b`` may be non-contiguous views.
++    """
++    return torch.ops._xpu_C.fp8_bmm(a, b, out_dtype, a_scale, b_scale, bias)
++
++
++def _xpu_fp8_bmm_fake(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    out_dtype: torch.dtype,
++    a_scale: torch.Tensor,
++    b_scale: torch.Tensor,
++    bias: torch.Tensor | None,
++) -> torch.Tensor:
++    # [G, M, K] @ [G, K, N] => [G, M, N]
++    return torch.empty(
++        (a.shape[0], a.shape[1], b.shape[2]),
++        dtype=out_dtype,
++        device=a.device,
++    )
++
++
+ def _xpu_fp8_mqa_logits_impl(
+     q: torch.Tensor,
+     k_quant: torch.Tensor,
+@@ -1053,6 +1110,12 @@ def register_ops_once() -> None:
+                 fake_impl=_xpu_mxfp4_quantize_fake,
+             )
+ 
++            direct_register_custom_op(
++                op_name="xpu_fp8_bmm",
++                op_func=_xpu_fp8_bmm_impl,
++                fake_impl=_xpu_fp8_bmm_fake,
++            )
++
+             direct_register_custom_op(
+                 op_name="xpu_fp8_mqa_logits",
+                 op_func=_xpu_fp8_mqa_logits_impl,
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/xpu.py b/vllm/model_executor/kernels/linear/scaled_mm/xpu.py
+index f30d6ced1d35..1441c118e7a5 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/xpu.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/xpu.py
+@@ -197,6 +197,37 @@ def is_supported(
+             return False, "XPUFp8BlockScaledMM only support on XPU"
+         return True, None
+ 
++    def process_weights_after_loading(self, layer: torch.nn.Module):
++        super().process_weights_after_loading(layer)
++        scale_attr = (
++            "weight_scale_inv" if hasattr(layer, "weight_scale_inv") else "weight_scale"
++        )
++        scale = getattr(layer, scale_attr)
++        # Transpose scale from checkpoint layout [N/128, K/128] to
++        # oneDNN expected layout [K/128, N/128] at load time (one-time cost).
++        scale_t = scale.data.t().contiguous()
++        replace_parameter(layer, scale_attr, scale_t)
++
++        # For BMM layers (e.g. wo_a), precompute 3D scale and weight:
++        # [K/bs, N/bs] -> [batch, K/bs, N_per_batch/bs]
++        if getattr(layer, "is_bmm", False):
++            batch = layer.bmm_batch_size
++            k_blocks = scale_t.shape[0]
++            n_per_batch_blocks = scale_t.shape[1] // batch
++            layer.bmm_scale = (
++                scale_t.reshape(k_blocks, batch, n_per_batch_blocks)
++                .permute(1, 0, 2)
++                .contiguous()
++            )
++            # Precompute [G, K, N] weight for fp8_bmm.
++            # Original weight is [N_total, K] where N_total = G * N_per_group.
++            w = layer.weight.data
++            N_total, K = w.shape
++            N_per_group = N_total // batch
++            layer.bmm_weight = w.reshape(batch, N_per_group, K).permute(
++                0, 2, 1
++            )  # [G, K, N]
++
+     def apply_block_scaled_mm(
+         self,
+         A: torch.Tensor,
+@@ -205,12 +236,12 @@ def apply_block_scaled_mm(
+         Bs: torch.Tensor,
+     ) -> torch.Tensor:
+         # Weight is [N, K]. Use .t() to create a [K, N] view without copying.
+-        # Bs is [N/128, K/128] — transpose to [K/128, N/128] for oneDNN.
++        # Bs is already [K/128, N/128] from process_weights_after_loading.
+         return torch.ops._xpu_C.fp8_gemm(
+             A,
+             B.t(),
+             self.config.out_dtype,
+             As,
+-            Bs.t().contiguous(),
++            Bs,
+             torch.Tensor(),
+         )
+diff --git a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
+index b667b87679cd..aa8750580d04 100644
+--- a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
+@@ -257,7 +257,6 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
+     )
+     grid = (tma_aligned_T, n_groups * heads_per_group)
+     use_gdc = current_platform.is_arch_support_pdl()
+-    pdl_kwargs = {"launch_pdl": True} if use_gdc else {}
+     _fused_inv_rope_fp8_quant_per_head[grid](
+         o,
+         positions,
+@@ -281,8 +280,8 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
+         HALF_ROPE=half_rope,
+         TMA_ALIGNED_SCALES=tma_aligned_scales,
+         USE_GDC=use_gdc,
++        launch_pdl=use_gdc,
+         num_stages=1,
+-        **pdl_kwargs,
+         num_warps=1,
+     )
+     return fp8_buf, scale_buf
+diff --git a/vllm/models/deepseek_v4/xpu/model.py b/vllm/models/deepseek_v4/xpu/model.py
+index e8449b9c058b..f70cac1bce62 100644
+--- a/vllm/models/deepseek_v4/xpu/model.py
++++ b/vllm/models/deepseek_v4/xpu/model.py
+@@ -8,7 +8,6 @@
+ import torch
+ import torch.nn as nn
+ 
+-from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig
+ from vllm.distributed import (
+     get_ep_group,
+@@ -978,7 +977,6 @@ def forward(
+         return x, residual, post_mix, res_mix
+ 
+ 
+-@support_torch_compile
+ class DeepseekV4Model(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+diff --git a/vllm/models/deepseek_v4/xpu/xpu_sparse.py b/vllm/models/deepseek_v4/xpu/xpu_sparse.py
+index 77cc35cf492a..73439d86461d 100644
+--- a/vllm/models/deepseek_v4/xpu/xpu_sparse.py
++++ b/vllm/models/deepseek_v4/xpu/xpu_sparse.py
+@@ -89,19 +89,37 @@ def get_padded_num_q_heads(cls, num_heads: int) -> int:
+         return num_heads
+ 
+     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+-        # XPU uses BF16 reference wo_a path (same as ROCm).
+-        from vllm.models.deepseek_v4.amd.rocm import rocm_inv_rope_einsum
++        from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
++            fused_inv_rope_fp8_quant,
++        )
+ 
+-        z = rocm_inv_rope_einsum(
+-            self.rotary_emb,
++        o_fp8, o_scale = fused_inv_rope_fp8_quant(
+             o,
+             positions,
+-            self.rope_head_dim,
+-            self.n_local_groups,
+-            self.o_lora_rank,
+-            self.wo_a,
++            self.rotary_emb.cos_sin_cache,
++            n_groups=self.n_local_groups,
++            heads_per_group=self.n_local_heads // self.n_local_groups,
++            nope_dim=self.nope_head_dim,
++            rope_dim=self.rope_head_dim,
++            tma_aligned_scales=False,
+         )
+-        return self.wo_b(z.flatten(1))
++
++        # Precomputed contiguous [G, K, N] weight and [G, K/bs, N/bs] scale.
++        wo_a_weight = self.wo_a.bmm_weight
++        wo_a_scale = self.wo_a.bmm_scale
++
++        # TODO: optimize fused_inv_rope_fp8_quant for xpu bmm to
++        # eliminate o_scale transpose + contiguous
++        z = torch.ops.vllm.xpu_fp8_bmm(
++            o_fp8.transpose(0, 1),
++            wo_a_weight,
++            torch.bfloat16,
++            o_scale.transpose(0, 1).contiguous(),
++            wo_a_scale,
++            None,
++        )
++
++        return self.wo_b(z.transpose(0, 1).flatten(1))
+ 
+     def forward_mqa(
+         self,

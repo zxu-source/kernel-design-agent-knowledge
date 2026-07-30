@@ -1,0 +1,228 @@
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py b/tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py
+index 492a905ed16c..677e4de22b2a 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py
+@@ -15,7 +15,7 @@
+ )
+ 
+ 
+-def _make_coord(groups, hash_block_size, use_eagle=False):
++def _make_coord(groups, hash_block_size, use_eagle=False, retention_interval=None):
+     """Construct a coordinator using the natural LCM of group block sizes as
+     the scheduler block size — mirrors ``resolve_kv_cache_block_sizes`` for
+     the test fixtures."""
+@@ -26,6 +26,7 @@ def _make_coord(groups, hash_block_size, use_eagle=False):
+         scheduler_block_size=scheduler_block_size,
+         hash_block_size=hash_block_size,
+         use_eagle=use_eagle,
++        retention_interval=retention_interval,
+     )
+ 
+ 
+@@ -302,6 +303,55 @@ def test_store_mask_fast_path_single_attention_group():
+     assert masks == ([True] * 4, [True] * 4)
+ 
+ 
++# ----- store_mask with retention_interval (DSV4 sparse SWA checkpointing) -----
++
++
++def _retention_groups():
++    """Hybrid full-attn(block=32) + SWA(block=8, sw=8); lcm=32. The SWA group
++    densely keeps one tail block per 32-token boundary."""
++    full = _full(32)
++    swa = _swa(block_size=8, sliding_window=8)
++    return [KVCacheGroupSpec(["L0"], full), KVCacheGroupSpec(["L1"], swa)]
++
++
++def test_store_mask_dense_default_matches_every_lcm_boundary():
++    """retention_interval=None (default) keeps the SWA tail at every lcm
++    boundary: tokens 32/64/96/128 -> chunks 3/7/11/15."""
++    coord = _make_coord(_retention_groups(), hash_block_size=8)
++    masks = coord.store_mask(128)
++    assert masks[0] == [True, True, True, True]
++    assert masks[1] == [i % 4 == 3 for i in range(16)]
++
++
++def test_store_mask_retention_interval_sparsifies_swa_tails():
++    """retention_interval=64 keeps an SWA tail once per 64-token segment
++    (chunks 7 and 15) instead of every 32 tokens, dropping the mid-segment
++    boundaries at 32 and 96."""
++    coord = _make_coord(_retention_groups(), hash_block_size=8, retention_interval=64)
++    masks = coord.store_mask(128)
++    assert masks[0] == [True, True, True, True]  # full attn unaffected
++    assert masks[1] == [i in (7, 15) for i in range(16)]
++
++
++def test_store_mask_retention_interval_zero_keeps_only_replay_boundary():
++    """retention_interval=0 drops all segment tails; only the latest replay
++    boundary (capped at num_prompt-1, aligned down to lcm) is retained."""
++    coord = _make_coord(_retention_groups(), hash_block_size=8, retention_interval=0)
++    # No replay info -> nothing reachable for the SWA group.
++    assert coord.store_mask(128)[1] == [False] * 16
++    # num_prompt=100 -> latest hit boundary = (100-1)//32*32 = 96 -> chunk 11.
++    masks = coord.store_mask(128, num_prompt_tokens=100)
++    assert masks[1] == [i == 11 for i in range(16)]
++
++
++def test_store_mask_retention_interval_keeps_segment_and_replay_tails():
++    """Sparse segment tails (interval=64 -> chunks 7,15) plus the replay
++    boundary tail (num_prompt=100 -> chunk 11) coexist."""
++    coord = _make_coord(_retention_groups(), hash_block_size=8, retention_interval=64)
++    masks = coord.store_mask(128, num_prompt_tokens=100)
++    assert masks[1] == [i in (7, 11, 15) for i in range(16)]
++
++
+ # ----- Eagle / MTP interaction with load_mask -----
+ 
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index ad5281409664..227575c92677 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -22,9 +22,6 @@
+ )
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ 
+-# Dummy placeholder hash for store_mask's template computation.
+-_DUMMY_BLOCK_HASH = BlockHash(b"\x00" * 32)
+-
+ 
+ class ExternalCachedBlockPool:
+     """Duck-typed BlockPool backed by a ``(group_id, hash)`` exists set."""
+@@ -62,6 +59,7 @@ def __init__(
+         scheduler_block_size: int,
+         hash_block_size: int,
+         use_eagle: bool = False,
++        retention_interval: int | None = None,
+     ) -> None:
+         assert all(
+             g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
+@@ -78,6 +76,13 @@ def __init__(
+         self.hash_block_size = hash_block_size
+         self.lcm_block_size = scheduler_block_size
+         self.use_eagle = use_eagle
++        # Mirror vLLM core's KVCacheCoordinator.retention_interval.
++        self.retention_interval = retention_interval
++        self.eagle_group_ids = {
++            i for i, g in enumerate(kv_cache_groups) if g.is_eagle_group
++        }
++        if use_eagle and not self.eagle_group_ids:
++            self.eagle_group_ids = set(range(len(kv_cache_groups)))
+         self._verify_and_split_kv_cache_groups()
+ 
+     def _verify_and_split_kv_cache_groups(self) -> None:
+@@ -163,44 +168,39 @@ def load_mask(
+         )
+         return masks
+ 
+-    def store_mask(self, aligned_token_len: int) -> tuple[list[bool], ...]:
++    def store_mask(
++        self,
++        aligned_token_len: int,
++        num_prompt_tokens: int | None = None,
++    ) -> tuple[list[bool], ...]:
+         """Per-group store masks: ``mask[g][i]`` is True iff chunk ``i`` of
+-        group ``g`` would be populated by some future cache hit at length
+-        ``L = N * lcm_block_size <= aligned_token_len``.
++        group ``g`` should be written to the store so a future cache hit can
++        consume it.
++
++        Reuses the engine's ``SingleTypeKVCacheManager.reachable_block_mask``
++        so the store retains exactly the blocks the local prefix cache would.
+         """
+         assert aligned_token_len % self.lcm_block_size == 0, (
+             f"aligned_token_len ({aligned_token_len}) must be a multiple of "
+             f"lcm_block_size ({self.lcm_block_size})"
+         )
+-        if aligned_token_len == 0:
+-            return tuple([] for _ in self.kv_cache_groups)
+-
+-        num_chunks_per_group = [
+-            aligned_token_len // g.kv_cache_spec.block_size
+-            for g in self.kv_cache_groups
+-        ]
+-
+-        # Fast path: single group or full attn groups or uniform block_sizes
+-        if all(
+-            isinstance(spec, FullAttentionSpec)
+-            or spec.block_size == self.lcm_block_size
+-            for spec, _, _ in self.attention_groups
+-        ):
+-            return tuple([True] * n for n in num_chunks_per_group)
+-
+-        n_segments = aligned_token_len // self.lcm_block_size
+-        dummy_hashes: list[BlockHash] = [_DUMMY_BLOCK_HASH] * (
+-            self.lcm_block_size // self.hash_block_size
+-        )
+-        template_masks, _ = self.find_longest_cache_hit(
+-            dummy_hashes,
+-            max_length=self.lcm_block_size,
+-            cached_block_pool=ExternalCachedBlockPool(),
+-        )
+-        return tuple(
+-            list(template_masks[g]) * n_segments
+-            for g in range(len(self.kv_cache_groups))
+-        )
++        masks: list[list[bool]] = []
++        for g_idx, g in enumerate(self.kv_cache_groups):
++            spec = _unwrap_spec(g.kv_cache_spec)
++            num_chunks = aligned_token_len // spec.block_size
++            manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
++            assert manager_cls is not None
++            mask = manager_cls.reachable_block_mask(
++                start_block=0,
++                end_block=num_chunks,
++                alignment_tokens=self.lcm_block_size,
++                kv_cache_spec=spec,
++                use_eagle=g_idx in self.eagle_group_ids,
++                retention_interval=self.retention_interval,
++                num_prompt_tokens=num_prompt_tokens,
++            )
++            masks.append([True] * num_chunks if mask is None else mask)
++        return tuple(masks)
+ 
+     def block_hashes_for_spec(
+         self, block_hashes: list[BlockHash], spec: KVCacheSpec
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+index b26e6835a9c9..0136a26067e7 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -213,6 +213,7 @@ class ReqMeta:
+     current_event: torch.cuda.Event | None = None
+ 
+     token_ids: list[int] | None = None
++    num_prompt_tokens: int | None = None
+ 
+     @staticmethod
+     def from_request_tracker(
+@@ -272,6 +273,7 @@ def from_request_tracker(
+             block_hashes=block_hashes,
+             is_last_chunk=is_last_chunk,
+             token_ids=token_ids,
++            num_prompt_tokens=tracker.prefill_end_tokens,
+         )
+ 
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 18cae18ee984..9c3ac83e06a7 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -535,7 +535,9 @@ def _handle_request(self, req_meta: ReqMeta):
+ 
+             # Within each lcm region only per-spec relevant chunks are loaded
+             # (e.g., SWA or linear attn), so mask out irrelevant chunks
+-            store_masks = self.coord.store_mask(token_len)
++            store_masks = self.coord.store_mask(
++                token_len, num_prompt_tokens=req_meta.num_prompt_tokens
++            )
+             starts: list[int] = []
+             ends: list[int] = []
+             keys: list[str] = []
+@@ -1091,6 +1093,7 @@ def __init__(
+             scheduler_block_size=self.block_size,
+             hash_block_size=self.hash_block_size,
+             use_eagle=use_eagle,
++            retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+         )
+         # One ChunkedTokenDatabase per group; addresses populated in
+         # register_kv_caches once the kv-cache layout is known.
